@@ -518,6 +518,33 @@ def encode_imad_wide(dest: int, src0: int, src1_imm: int, src2: int,
 #
 # All 64 instances in JSON are identical — single unique load pattern.
 
+def encode_ldg_e(dest: int, ur_desc: int, src_addr: int,
+                  width: int = 32, ctrl: int = 0) -> bytes:
+    """Encode LDG.E dest, desc[ur_desc][src_addr.64] with variable width (32/64/128 bits)."""
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    b9_map = {32: 0x19, 64: 0x1b, 128: 0x1d}
+    return _build(0x81, 0x79,
+                  b2=dest, b3=src_addr, b4=ur_desc & 0xFF,
+                  b8=0x00,
+                  b9=b9_map.get(width, 0x1b), b10=0x1e, b11=0x0c,
+                  ctrl=ctrl)
+
+
+def encode_stg_e(ur_desc: int, src_addr: int, src_data: int,
+                  width: int = 32, ctrl: int = 0) -> bytes:
+    """Encode STG.E desc[ur_desc][src_addr.64], src_data with variable width."""
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    b9_map = {32: 0x19, 64: 0x1b, 128: 0x1d}
+    b10_map = {32: 0x10, 64: 0x10, 128: 0x10}
+    return _build(0x86, 0x79,
+                  b2=0x00, b3=src_addr, b4=ur_desc & 0xFF,
+                  b8=src_data,
+                  b9=b9_map.get(width, 0x1b), b10=0x10, b11=0x0c,
+                  ctrl=ctrl)
+
+
 def encode_ldg_e_64(dest: int, ur_desc: int, src_addr: int,
                     ctrl: int = 0) -> bytes:
     """
@@ -637,6 +664,38 @@ def encode_isetp_ge_and(pred_dest: int, src_reg: int, ur_src: int,
                   b8=0x70,
                   b9=0x62, b10=0xf0, b11=0x0b,
                   ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# LDSM: Load Shared to Matrix (warp-level shared→register matrix load)
+# ---------------------------------------------------------------------------
+# LDSM.16.M88.4 R_dest, [R_addr] — loads 4 registers from shared memory
+# in a warp-cooperative pattern for feeding tensor cores.
+# Opcode: 0x83b, b2=dest_base, b3=addr_reg, b9=0x02
+
+def encode_ldsm_x4(dest: int, addr_reg: int, ctrl: int = 0) -> bytes:
+    """Encode LDSM.16.M88.4 dest, [addr_reg] — load 4 matrix regs from smem."""
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x3b, 0x78, b2=dest, b3=addr_reg, b4=0x00,
+                  b8=0x00, b9=0x02, b10=0x00, b11=0x00, ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# CVT: Type conversion instructions
+# ---------------------------------------------------------------------------
+
+def encode_i2f_f32_s32(dest: int, src: int, ctrl: int = 0) -> bytes:
+    """Encode I2FP.F32.S32 dest, src (signed int32 to float32)."""
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x45, 0x72, b2=dest, b3=0x00, b4=src,
+                  b8=0x00, b9=0x14, b10=0x20, b11=0x00, ctrl=ctrl)
+
+
+def encode_f2i_s32_f32(dest: int, src: int, ctrl: int = 0) -> bytes:
+    """Encode F2I.TRUNC.NTZ dest, src (float32 to signed int32, truncate)."""
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x05, 0x73, b2=dest, b3=0x00, b4=src,
+                  b8=0x00, b9=0xf1, b10=0x20, b11=0x00, ctrl=ctrl)
 
 
 # ---------------------------------------------------------------------------

@@ -453,6 +453,31 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     output.append(SassInstr(encode_imad_wide(d, a, b, RZ),
                                             f'IMAD R{d}, R{a}, R{b}, RZ  // mul.lo.{typ}'))
 
+                elif op == 'st' and 'shared' in instr.types:
+                    from sass.encoding.sm_120_opcodes import encode_sts
+                    from ptx.ir import MemOp
+                    addr_op = instr.srcs[0]
+                    data_op = instr.srcs[1]
+                    offset = addr_op.offset if isinstance(addr_op, MemOp) else 0
+                    data_r = ctx.ra.r32(data_op.name) if isinstance(data_op, RegOp) else RZ
+                    # UR4 is the smem base on Blackwell
+                    output.append(SassInstr(encode_sts(4, offset, data_r),
+                                            f'STS [UR4+{offset:#x}], R{data_r}  // st.shared'))
+
+                elif op == 'ld' and 'shared' in instr.types:
+                    from sass.encoding.sm_120_opcodes import encode_lds
+                    from ptx.ir import MemOp
+                    dest_r = ctx.ra.r32(instr.dest.name)
+                    addr_op = instr.srcs[0]
+                    offset = addr_op.offset if isinstance(addr_op, MemOp) else 0
+                    output.append(SassInstr(encode_lds(dest_r, 4, offset),
+                                            f'LDS R{dest_r}, [UR4+{offset:#x}]  // ld.shared'))
+
+                elif op == 'bar':
+                    from sass.encoding.sm_120_opcodes import encode_bar_sync
+                    output.append(SassInstr(encode_bar_sync(0),
+                                            f'BAR.SYNC 0'))
+
                 elif op == 'add' and typ == 'f32':
                     from sass.encoding.sm_120_opcodes import encode_fadd
                     d = ctx.ra.r32(instr.dest.name)

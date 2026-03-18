@@ -640,6 +640,113 @@ def encode_isetp_ge_and(pred_dest: int, src_reg: int, ur_src: int,
 
 
 # ---------------------------------------------------------------------------
+# Shared memory: STS, LDS, BAR.SYNC
+# ---------------------------------------------------------------------------
+
+def encode_sts(ur_addr: int, offset: int, data_reg: int, ctrl: int = 0) -> bytes:
+    """Encode STS [UR_addr + offset], data_reg (32-bit shared store)."""
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0x88
+    raw[1] = 0x79
+    raw[2] = 0x00
+    raw[3] = 0xFF
+    raw[4] = data_reg & 0xFF
+    raw[5] = offset & 0xFF
+    raw[6] = (offset >> 8) & 0xFF
+    raw[7] = 0x00
+    raw[8] = ur_addr & 0xFF
+    raw[9] = 0x08
+    raw[10] = 0x00
+    raw[11] = 0x08
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+def encode_lds(dest: int, ur_addr: int, offset: int, ctrl: int = 0) -> bytes:
+    """Encode LDS dest, [UR_addr + offset] (32-bit shared load)."""
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0x84
+    raw[1] = 0x79
+    raw[2] = dest & 0xFF
+    raw[3] = 0xFF
+    raw[4] = ur_addr & 0xFF
+    raw[5] = offset & 0xFF
+    raw[6] = (offset >> 8) & 0xFF
+    raw[7] = 0x00
+    raw[8] = 0x00
+    raw[9] = 0x08
+    raw[10] = 0x00
+    raw[11] = 0x08
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+def encode_bar_sync(barrier_id: int = 0, ctrl: int = 0) -> bytes:
+    """Encode BAR.SYNC barrier_id (thread barrier synchronization)."""
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0x1d
+    raw[1] = 0x7b
+    raw[2] = 0x00
+    raw[3] = 0x00
+    raw[4] = 0x00
+    raw[5] = 0x00
+    raw[6] = 0x00
+    raw[7] = 0x00
+    raw[8] = 0x00
+    raw[9] = 0x00
+    raw[10] = 0x01
+    raw[11] = 0x00
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+# System register to Uniform Register
+SR_CGA_CTA_ID = 0x88
+
+def encode_s2ur(dest_ur: int, sr_code: int, ctrl: int = 0) -> bytes:
+    """Encode S2UR dest_ur, SR_xxx (system register to uniform register)."""
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0xc3
+    raw[1] = 0x79
+    raw[2] = dest_ur & 0xFF
+    raw[3] = 0x00
+    raw[4] = 0x00
+    raw[5] = 0x00
+    raw[6] = 0x00
+    raw[7] = 0x00
+    raw[8] = 0x00
+    raw[9] = sr_code & 0xFF
+    raw[10] = 0x00
+    raw[11] = 0x00
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
 # FP32 instructions
 # ---------------------------------------------------------------------------
 

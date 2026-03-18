@@ -211,6 +211,7 @@ class KernelDesc:
     param_offsets: dict[str, int]
     param_base: int = 0x380
     const0_size: int = 0x390
+    smem_size: int = 0           # static shared memory size in bytes (0 = none)
 
 
 def emit_cubin(kernel: KernelDesc) -> bytes:
@@ -250,19 +251,23 @@ def emit_cubin(kernel: KernelDesc) -> bytes:
     merc_info_sec = f'.nv.merc.nv.info'
     merc_info_k_sec = f'.nv.merc.nv.info.{kernel.name}'
     merc_symtab_sec = '.nv.merc.symtab'
+    nv_shared_sec = f'.nv.shared.{kernel.name}'
 
-    # Section indices
+    has_smem = kernel.smem_size > 0
+
+    # Section indices (conditional on smem)
     TKINFO_IDX = 4
     CUINFO_IDX = 5
     COMPAT_IDX = 7
     TEXT_IDX = 10
-    SHARED_IDX = 11
-    CONST0_IDX = 12
-    CAPMERC_IDX = 13
-    MERC_INFO_IDX = 14
-    MERC_INFO_K_IDX = 15
-    MERC_SYMTAB_IDX = 16
-    NUM_SECTIONS = 17
+    SHARED_IDX = 11       # .nv.shared.reserved.0
+    NV_SHARED_IDX = 12 if has_smem else -1  # .nv.shared.<kernel>
+    CONST0_IDX = 13 if has_smem else 12
+    CAPMERC_IDX = 14 if has_smem else 13
+    MERC_INFO_IDX = 15 if has_smem else 14
+    MERC_INFO_K_IDX = 16 if has_smem else 15
+    MERC_SYMTAB_IDX = 17 if has_smem else 16
+    NUM_SECTIONS = 18 if has_smem else 17
 
     sec_names = [
         '',                          # 0
@@ -277,12 +282,16 @@ def emit_cubin(kernel: KernelDesc) -> bytes:
         '.nv.callgraph',             # 9
         text_sec,                    # 10
         '.nv.shared.reserved.0',     # 11
-        const0_sec,                  # 12
-        capmerc_sec,                 # 13
-        merc_info_sec,               # 14
-        merc_info_k_sec,             # 15
-        merc_symtab_sec,             # 16
     ]
+    if has_smem:
+        sec_names.append(nv_shared_sec)   # 12
+    sec_names.extend([
+        const0_sec,                  # 12 or 13
+        capmerc_sec,                 # 13 or 14
+        merc_info_sec,               # 14 or 15
+        merc_info_k_sec,             # 15 or 16
+        merc_symtab_sec,             # 16 or 17
+    ])
 
     name_offsets = {}
     for n in sec_names:
@@ -334,19 +343,8 @@ def emit_cubin(kernel: KernelDesc) -> bytes:
         _build_callgraph(),          # 9
         text_data,                   # 10
         shared_reserved,             # 11 (NOBITS)
-        const0_data,                 # 12
-        _build_capmerc(kernel.num_gprs),  # 13 capmerc
-        _build_nv_info_global(),     # 14 merc nv.info (same as global)
-        _build_nv_info_kernel(num_gprs=kernel.num_gprs),  # 15 merc nv.info.kernel
-        symtab_data,                 # 16 merc symtab (mirror of main symtab)
     ]
-
-    SHT_CUDA_CAPMERC = 0x70000016
-    SHT_CUDA_MERC_INFO = 0x70000083
-    SHT_CUDA_MERC_SYMTAB = 0x70000085
-
-    # (type, flags, link, info, align, entsize)
-    section_meta = [
+    meta_base = [
         (SHT_NULL,         0, 0, 0, 0, 0),
         (SHT_STRTAB,       0, 0, 0, 1, 0),
         (SHT_STRTAB,       0, 0, 0, 1, 0),
@@ -359,16 +357,40 @@ def emit_cubin(kernel: KernelDesc) -> bytes:
         (SHT_NV_CALLGRAPH, 0, 3, 0, 4, 8),
         (SHT_PROGBITS,     SHF_ALLOC|SHF_EXECINSTR, 3, KERNEL_SYM_IDX, 128, 0),
         (SHT_NOBITS,       SHF_WRITE|SHF_ALLOC, 0, 0, 1, 0),
+    ]
+
+    # Optionally add .nv.shared.<kernel> for smem kernels
+    if has_smem:
+        # .nv.shared.<kernel>: NOBITS, flags=0x43, info=TEXT_IDX, size=smem_size
+        section_datas.append(b'')  # NOBITS: no file content
+        meta_base.append(
+            (SHT_NOBITS, SHF_WRITE|SHF_ALLOC|0x40, 0, TEXT_IDX, 4, 0))
+
+    SHT_CUDA_CAPMERC = 0x70000016
+    SHT_CUDA_MERC_INFO = 0x70000083
+    SHT_CUDA_MERC_SYMTAB = 0x70000085
+
+    section_datas.extend([
+        const0_data,
+        _build_capmerc(kernel.num_gprs),
+        _build_nv_info_global(),
+        _build_nv_info_kernel(num_gprs=kernel.num_gprs),
+        symtab_data,
+    ])
+
+    meta_base.extend([
         (SHT_PROGBITS,     SHF_ALLOC|0x40, 0, TEXT_IDX, 4, 0),
-        # 13: .nv.capmerc.text.<kernel>
+        # capmerc
         (SHT_CUDA_CAPMERC, 0x10000000, MERC_SYMTAB_IDX, KERNEL_SYM_IDX, 16, 0),
-        # 14: .nv.merc.nv.info
+        # merc nv.info
         (SHT_CUDA_MERC_INFO, 0x10000000, MERC_SYMTAB_IDX, 0, 4, 0),
-        # 15: .nv.merc.nv.info.<kernel>
+        # merc nv.info.<kernel>
         (SHT_CUDA_MERC_INFO, 0x10000040, MERC_SYMTAB_IDX, CAPMERC_IDX, 4, 0),
         # 16: .nv.merc.symtab
         (SHT_CUDA_MERC_SYMTAB, 0x10000000, 2, KERNEL_SYM_IDX, 8, 24),
-    ]
+    ])
+
+    section_meta = meta_base
 
     # Compute file offsets
     NUM_PHDRS = 5
@@ -433,9 +455,11 @@ def emit_cubin(kernel: KernelDesc) -> bytes:
         n_off = name_offsets.get(sec_names[i], 0)
         sh_type, sh_flags, sh_link, sh_info, sh_align, sh_entsize = section_meta[i]
         sh_size = len(section_datas[i]) if i > 0 else 0
-        # NOBITS: file size in section_datas is 0, but sh_size should be 64
+        # NOBITS sections: sh_size is virtual size, not file size
         if i == SHARED_IDX:
-            sh_size = 64
+            sh_size = 64  # .nv.shared.reserved.0
+        if has_smem and i == NV_SHARED_IDX:
+            sh_size = kernel.smem_size  # .nv.shared.<kernel>
 
         struct.pack_into('<I', buf, base + 0, n_off)
         struct.pack_into('<I', buf, base + 4, sh_type)

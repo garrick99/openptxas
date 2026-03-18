@@ -24,6 +24,8 @@ def main():
                     help="Check for ptxas-miscompiled patterns and exit")
     ap.add_argument("--scan", metavar="CUBIN",
                     help="Scan a cubin for rotate-miscompilation bugs")
+    ap.add_argument("--audit", metavar="CUBIN",
+                    help="Full audit: bugs, hazards, scheduling, register pressure")
     ap.add_argument("--dump-ir", action="store_true",
                     help="Parse PTX and dump the IR, then exit")
     ap.add_argument("-v", "--verbose", action="store_true",
@@ -34,6 +36,11 @@ def main():
         from tools.autofix import scan_cubin
         count = scan_cubin(args.scan)
         sys.exit(1 if count > 0 else 0)
+
+    if args.audit:
+        from tools.audit import print_audit
+        print_audit(args.audit, verbose=args.verbose)
+        sys.exit(0)
 
     if args.ptx_file is None:
         ap.print_help()

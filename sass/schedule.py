@@ -120,13 +120,21 @@ def _patch_ctrl(raw: bytes, ctrl: int) -> bytes:
 
 
 def _reorder_after_ldg(instrs: list[SassInstr]) -> list[SassInstr]:
-    """Move independent LDC after LDG to hide latency."""
+    """Move independent LDC after LDG to hide latency.
+
+    Only moves an LDC if its destination doesn't conflict with the LDG output.
+    """
     result = list(instrs)
     for i in range(len(result) - 1):
         if _get_opcode(result[i].raw) == 0x981:  # LDG
+            ldg_dests = _get_dest_regs(result[i].raw)
             if _get_opcode(result[i + 1].raw) != 0xb82:  # next isn't LDC
                 for j in range(i + 2, len(result)):
                     if _get_opcode(result[j].raw) == 0xb82:
+                        # Check if this LDC would clobber LDG output registers
+                        ldc_dests = _get_dest_regs(result[j].raw)
+                        if ldc_dests & ldg_dests:
+                            continue  # skip — would clobber LDG data
                         moved = result.pop(j)
                         result.insert(i + 1, moved)
                         break

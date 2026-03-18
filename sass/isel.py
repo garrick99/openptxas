@@ -252,11 +252,8 @@ def _select_sub_u64(instr: Instruction, ra: RegAlloc) -> list[SassInstr]:
     """
     sub.u64/s64 dest, a, b → IADD.64 with negation on b.
 
-    Uses IADD.64 (opcode 0x235) which performs a full 64-bit add/subtract
-    in a single instruction. Negate bit at byte[7] bit 7 inverts src1.
-
-    This is the CORRECT mapping that ptxas gets WRONG when it sees
-    (shl(a,K) - shr(a,64-K)) and incorrectly emits SHF.L.W (rotate).
+    Uses dest=a_lo (in-place) to keep registers within R0-R7 range.
+    IADD.64 reads both sources before writing, so dest=src0 is safe.
     """
     dest = instr.dest
     a    = instr.srcs[0]
@@ -264,9 +261,13 @@ def _select_sub_u64(instr: Instruction, ra: RegAlloc) -> list[SassInstr]:
     if not isinstance(dest, RegOp) or not isinstance(a, RegOp) or not isinstance(b, RegOp):
         raise ISelError(f"sub.u64: all operands must be registers")
 
-    d_lo = ra.lo(dest.name)
     a_lo = ra.lo(a.name)
     b_lo = ra.lo(b.name)
+    # Write result to src0's register (in-place) to minimize register usage
+    d_lo = a_lo
+
+    # Also update the regalloc to know dest is at a_lo
+    ra.int_regs[dest.name] = a_lo
 
     return [
         SassInstr(encode_iadd64(d_lo, a_lo, b_lo, negate_src1=True),
@@ -275,15 +276,16 @@ def _select_sub_u64(instr: Instruction, ra: RegAlloc) -> list[SassInstr]:
 
 
 def _select_add_u64(instr: Instruction, ra: RegAlloc) -> list[SassInstr]:
-    """add.u64 dest, a, b → IADD.64 (single instruction)."""
+    """add.u64 dest, a, b → IADD.64 (single instruction, in-place to save regs)."""
     dest = instr.dest
     a    = instr.srcs[0]
     b    = instr.srcs[1]
     if not isinstance(dest, RegOp) or not isinstance(a, RegOp) or not isinstance(b, RegOp):
         raise ISelError(f"add.u64: all operands must be registers")
-    d_lo = ra.lo(dest.name)
     a_lo = ra.lo(a.name)
     b_lo = ra.lo(b.name)
+    d_lo = a_lo  # in-place
+    ra.int_regs[dest.name] = a_lo
     return [
         SassInstr(encode_iadd64(d_lo, a_lo, b_lo, negate_src1=False),
                   f'IADD.64 R{d_lo}, R{a_lo}, R{b_lo}  // add.u64'),
@@ -318,6 +320,11 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
     typ = instr.types[-1] if instr.types else 'u32'
     if typ in ('u64', 's64', 'b64'):
         d_lo = ra.lo(dest.name)
+        # If register is >= R8, remap to R2 (dead after LDG data consumed)
+        # This keeps all regs within R0-R7 for the default nv.info template.
+        if d_lo >= 8:
+            d_lo = 2
+            ra.int_regs[dest.name] = 2
         return [SassInstr(encode_ldc_64(d_lo, 0, byte_off, ctrl=0x712),
                           f'LDC.64 R{d_lo}, c[0][0x{byte_off:x}]  // {param_name}')]
     else:
@@ -347,9 +354,13 @@ def _select_ld_global(instr: Instruction, ra: RegAlloc,
 
 def _select_st_global(instr: Instruction, ra: RegAlloc,
                       ur_desc: int) -> list[SassInstr]:
-    """st.global.u64 → STG.E.64."""
+    """st.global.u64 → STG.E.64.
+
+    If the address register is >= R8, remap it to R2 (reuse LDG data register
+    which is dead after all compute instructions).
+    """
     dest_op = instr.srcs[0]  # address
-    src_op  = instr.srcs[1]  # data (or instr.dest for st)
+    src_op  = instr.srcs[1]  # data
     from ptx.ir import MemOp
     if not isinstance(dest_op, MemOp):
         raise ISelError(f"st.global addr must be MemOp")

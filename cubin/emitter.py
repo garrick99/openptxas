@@ -153,6 +153,49 @@ def _build_callgraph():
     )
 
 
+def _build_capmerc(num_gprs: int = 8):
+    """
+    .nv.capmerc.text.<kernel> — Mercury compiler metadata encoding register
+    allocation. The CUDA driver reads this to determine PRF allocation.
+
+    Ground truth from ptxas 13.0:
+      use_r4 (R0-R7, 10 regs declared): 146 bytes
+      force_highreg (R0-R11, 10 regs declared): 166 bytes
+
+    The key difference is in the first few bytes and additional register
+    descriptor entries for higher registers.
+    """
+    if num_gprs <= 8:
+        # Template for R0-R7 (from use_r4.cubin)
+        return bytes.fromhex(
+            '0c000000010000c00a00000068010000'
+            '010b040af80004000000410000040000'
+            '010b0e0afa0005000000030139040000'
+            '02220e06f80052000000830040000200'
+            '00000000000000000000000008000000'
+            '02220e06f80052000000030140000200'
+            '00000000000000000000000000000000'
+            '02380e32f80050110000000002010a00'
+            '00020182010000000000000000000000'
+            'd007'
+        )
+    else:
+        # Template for R0-R11+ (from force_highreg.cubin)
+        return bytes.fromhex(
+            '0c000000010000c00f00000048210000'
+            '010b040af80004000000410000040000'
+            '010b0e0afa0005000000030139040000'
+            '02220e06f80052000000830040000200'
+            '00000000000000000000000008000000'
+            '02220e06f80052000000830140000200'
+            '00000000000000000000000000000000'
+            '410c5004410c5004410c5004410c5004'
+            '410c500402380e32f800501100000000'
+            '82010a00000201020100000000000000'
+            '000000005005'
+        )
+
+
 # ---------------------------------------------------------------------------
 # Main emitter
 # ---------------------------------------------------------------------------
@@ -202,16 +245,23 @@ def emit_cubin(kernel: KernelDesc) -> bytes:
     strtab = bytearray()
     _strtab_add(strtab, '')
 
+    capmerc_sec = f'.nv.capmerc.text.{kernel.name}'
+    merc_info_sec = f'.nv.merc.nv.info'
+    merc_info_k_sec = f'.nv.merc.nv.info.{kernel.name}'
+    merc_symtab_sec = '.nv.merc.symtab'
+
     # Section indices
-    # 0:null 1:shstrtab 2:strtab 3:symtab 4:tkinfo 5:cuinfo
-    # 6:nv.info 7:nv.compat 8:nv.info.K 9:callgraph 10:text 11:shared 12:const0
     TKINFO_IDX = 4
     CUINFO_IDX = 5
     COMPAT_IDX = 7
     TEXT_IDX = 10
     SHARED_IDX = 11
     CONST0_IDX = 12
-    NUM_SECTIONS = 13
+    CAPMERC_IDX = 13
+    MERC_INFO_IDX = 14
+    MERC_INFO_K_IDX = 15
+    MERC_SYMTAB_IDX = 16
+    NUM_SECTIONS = 17
 
     sec_names = [
         '',                          # 0
@@ -227,6 +277,10 @@ def emit_cubin(kernel: KernelDesc) -> bytes:
         text_sec,                    # 10
         '.nv.shared.reserved.0',     # 11
         const0_sec,                  # 12
+        capmerc_sec,                 # 13
+        merc_info_sec,               # 14
+        merc_info_k_sec,             # 15
+        merc_symtab_sec,             # 16
     ]
 
     name_offsets = {}
@@ -280,7 +334,15 @@ def emit_cubin(kernel: KernelDesc) -> bytes:
         text_data,                   # 10
         shared_reserved,             # 11 (NOBITS)
         const0_data,                 # 12
+        _build_capmerc(kernel.num_gprs),  # 13 capmerc
+        _build_nv_info_global(),     # 14 merc nv.info (same as global)
+        _build_nv_info_kernel(num_gprs=kernel.num_gprs),  # 15 merc nv.info.kernel
+        symtab_data,                 # 16 merc symtab (mirror of main symtab)
     ]
+
+    SHT_CUDA_CAPMERC = 0x70000016
+    SHT_CUDA_MERC_INFO = 0x70000083
+    SHT_CUDA_MERC_SYMTAB = 0x70000085
 
     # (type, flags, link, info, align, entsize)
     section_meta = [
@@ -297,6 +359,14 @@ def emit_cubin(kernel: KernelDesc) -> bytes:
         (SHT_PROGBITS,     SHF_ALLOC|SHF_EXECINSTR, 3, KERNEL_SYM_IDX, 128, 0),
         (SHT_NOBITS,       SHF_WRITE|SHF_ALLOC, 0, 0, 1, 0),
         (SHT_PROGBITS,     SHF_ALLOC|0x40, 0, TEXT_IDX, 4, 0),
+        # 13: .nv.capmerc.text.<kernel>
+        (SHT_CUDA_CAPMERC, 0x10000000, MERC_SYMTAB_IDX, KERNEL_SYM_IDX, 16, 0),
+        # 14: .nv.merc.nv.info
+        (SHT_CUDA_MERC_INFO, 0x10000000, MERC_SYMTAB_IDX, 0, 4, 0),
+        # 15: .nv.merc.nv.info.<kernel>
+        (SHT_CUDA_MERC_INFO, 0x10000040, MERC_SYMTAB_IDX, CAPMERC_IDX, 4, 0),
+        # 16: .nv.merc.symtab
+        (SHT_CUDA_MERC_SYMTAB, 0x10000000, 2, KERNEL_SYM_IDX, 8, 24),
     ]
 
     # Compute file offsets

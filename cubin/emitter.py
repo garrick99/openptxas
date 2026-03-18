@@ -124,32 +124,61 @@ def _build_nv_info_global():
     )
 
 
-def _build_nv_info_kernel(num_gprs: int = 8):
-    """Per-kernel .nv.info. Based on ptxas template for 2-param u64 kernels.
+def _build_nv_info_kernel(num_gprs: int = 8, num_params: int = 2,
+                          param_sizes: list[int] = None):
+    """Generate per-kernel .nv.info attributes dynamically.
 
-    Uses real_sub template (supports up to R11) when num_gprs > 8,
-    otherwise probe_k1 template (R0-R7 only).
+    Builds the attribute stream based on actual kernel parameters
+    instead of using a fixed template.
     """
-    if num_gprs <= 8:
-        # probe_k1 template: EIATTR_MAX_REG_COUNT=0x80, compact
-        return bytes.fromhex(
-            '043704008200000004170c00000000000100080000f02100'
-            '04170c00000000000000000000f02100'
-            '03500000031bff00035f0101024a0000'
-            '041c04008000000003191000'
-            '040a08000900000080031000'
-            '0436040000000000'
-        )
-    else:
-        # real_sub template: EIATTR_MAX_REG_COUNT=0x90, allows R8+
-        return bytes.fromhex(
-            '043704008200000004170c00000000000100080000f02100'
-            '04170c00000000000000000000f02100'
-            '03500000031bff00035f0101024a0000'
-            '041c04009000000003191800'
-            '040a08000900000080031800'
-            '0436040000000000'
-        )
+    if param_sizes is None:
+        param_sizes = [8] * num_params  # default: all u64
+
+    buf = bytearray()
+
+    # EIATTR_REGCOUNT (0x37): always 0x82
+    buf.extend(bytes([0x04, 0x37, 0x04, 0x00, 0x82, 0x00, 0x00, 0x00]))
+
+    # EIATTR_PARAM_INFO (0x17): one entry per parameter
+    # ptxas emits in reverse order. Param 0 (first in decl, last emitted)
+    # has size=0 in the attribute (observed from ptxas ground truth).
+    for i in range(num_params - 1, -1, -1):
+        buf.extend(bytes([0x04, 0x17, 0x0c, 0x00]))
+        buf.extend(bytes([0x00, 0x00, 0x00, 0x00]))  # padding
+        buf.extend(bytes([i & 0xFF, 0x00]))  # param ordinal
+        psize = param_sizes[i] if i > 0 else 0  # param 0 size = 0 (ptxas convention)
+        buf.extend(bytes([psize & 0xFF, 0x00]))
+        buf.extend(bytes([0x00, 0xf0, 0x21, 0x00]))  # flags
+
+    # EIATTR_PARAM_CBANK (0x50)
+    buf.extend(bytes([0x03, 0x50, 0x00, 0x00]))
+
+    # EIATTR_CBANK_PARAM_SIZE (0x1b): 0xFF (wildcard, matches ptxas behavior)
+    buf.extend(bytes([0x03, 0x1b, 0xFF, 0x00]))
+
+    # EIATTR_EXIT_INSTR_OFFSETS (0x5f)
+    buf.extend(bytes([0x03, 0x5f, 0x01, 0x01]))
+
+    # EIATTR_CTAID_DIMS (0x4a)
+    buf.extend(bytes([0x02, 0x4a, 0x00, 0x00]))
+
+    # EIATTR_MAX_REG_COUNT (0x1c): 0x80 for <=8 GPRs, 0x90 for more
+    max_reg = 0x90 if num_gprs > 8 else 0x80
+    buf.extend(bytes([0x04, 0x1c, 0x04, 0x00, max_reg, 0x00, 0x00, 0x00]))
+
+    # EIATTR_S2RCTAID (0x19)
+    s2r_val = 0x18 if num_gprs > 8 else 0x10
+    buf.extend(bytes([0x03, 0x19, s2r_val, 0x00]))
+
+    # EIATTR_CRS_STACK (0x0a)
+    buf.extend(bytes([0x04, 0x0a, 0x08, 0x00]))
+    buf.extend(bytes([0x09, 0x00, 0x00, 0x00]))
+    buf.extend(bytes([0x80, 0x03, s2r_val, 0x00]))
+
+    # EIATTR_COOP_GROUP (0x36)
+    buf.extend(bytes([0x04, 0x36, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00]))
+
+    return bytes(buf)
 
 
 def _build_nv_compat():
@@ -351,7 +380,7 @@ def emit_cubin(kernel: KernelDesc) -> bytes:
         _patch_cuinfo_sm(kernel.sm_version),  # 5
         _build_nv_info_global(),     # 6
         _build_nv_compat(),          # 7
-        _build_nv_info_kernel(num_gprs=kernel.num_gprs),  # 8
+        _build_nv_info_kernel(num_gprs=kernel.num_gprs, num_params=kernel.num_params, param_sizes=kernel.param_sizes),
         _build_callgraph(),          # 9
         text_data,                   # 10
         shared_reserved,             # 11 (NOBITS)

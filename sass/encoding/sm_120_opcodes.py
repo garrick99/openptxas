@@ -640,6 +640,83 @@ def encode_isetp_ge_and(pred_dest: int, src_reg: int, ur_src: int,
 
 
 # ---------------------------------------------------------------------------
+# FP32 instructions
+# ---------------------------------------------------------------------------
+
+def encode_fadd(dest: int, src0: int, src1: int,
+                negate_src0: bool = False, ctrl: int = 0) -> bytes:
+    """Encode FADD dest, [+-]src0, src1 (FP32 add/subtract)."""
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    return _build(0x21, 0x72,
+                  b2=dest, b3=src0, b4=src1,
+                  b8=0x00,
+                  b9=0x01 if negate_src0 else 0x00, b10=0x00, b11=0x00,
+                  ctrl=ctrl)
+
+
+def encode_fmul(dest: int, src0: int, src1: int, ctrl: int = 0) -> bytes:
+    """Encode FMUL dest, src0, src1 (FP32 multiply)."""
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    # FMUL is FFMA with src2=RZ (addend=0): dest = src0 * src1 + 0
+    return _build(0x23, 0x72,
+                  b2=dest, b3=src0, b4=src1,
+                  b8=RZ,
+                  b9=0x00, b10=0x00, b11=0x00,
+                  ctrl=ctrl)
+
+
+def encode_ffma(dest: int, src0: int, src1: int, src2: int,
+                negate_src0: bool = False, ctrl: int = 0) -> bytes:
+    """Encode FFMA dest, [+-]src0, src1, src2 (FP32 fused multiply-add)."""
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    return _build(0x23, 0x72,
+                  b2=dest, b3=src0, b4=src1,
+                  b8=src2,
+                  b9=0x01 if negate_src0 else 0x00, b10=0x00, b11=0x00,
+                  ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# LOP3.LUT (3-input logic op with truth table)
+# ---------------------------------------------------------------------------
+# Opcode 0x212. LUT byte at b4 encodes the operation:
+#   AND = 0xC0, OR = 0xFC, XOR = 0x3C
+# Ground truth: LOP3.LUT R3, R3, R2, RZ, 0x3c, !PT
+#   hex: 1272030302000000ff3c8e0700ca0f00
+
+LOP3_AND = 0xC0
+LOP3_OR  = 0xFC
+LOP3_XOR = 0x3C
+
+def encode_lop3(dest: int, src0: int, src1: int, src2: int,
+                lut: int, ctrl: int = 0) -> bytes:
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0x12
+    raw[1] = 0x72
+    raw[2] = dest & 0xFF
+    raw[3] = src0 & 0xFF
+    raw[4] = src1 & 0xFF
+    raw[5] = 0x00
+    raw[6] = 0x00
+    raw[7] = 0x00
+    raw[8] = src2 & 0xFF
+    raw[9] = lut & 0xFF
+    raw[10] = 0x8e
+    raw[11] = 0x07
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
 # IMAD.SHL.U32 (multiply-add as shift-left, avoids SHF pipeline conflicts)
 # ---------------------------------------------------------------------------
 # Ground truth: "IMAD.SHL.U32 R6, R2, 0x100, RZ"

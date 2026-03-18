@@ -423,6 +423,74 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                 elif op == 'add' and typ in ('u64', 's64'):
                     output.extend(_select_add_u64(instr, ctx.ra))
 
+                elif op == 'add' and typ in ('u32', 's32'):
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = ctx.ra.r32(instr.srcs[0].name)
+                    b = ctx.ra.r32(instr.srcs[1].name)
+                    output.append(SassInstr(encode_iadd3(d, a, b, RZ),
+                                            f'IADD3 R{d}, R{a}, R{b}, RZ  // add.{typ}'))
+
+                elif op == 'sub' and typ in ('u32', 's32'):
+                    # 32-bit sub: IADD3 with negated src
+                    # For now use IADD3(d, a, ~b, RZ) — needs negate modifier
+                    # TODO: proper IADD3 negation. For now emit as TODO.
+                    output.append(_nop(f'TODO: sub.{typ} (need IADD3 negate)'))
+
+                elif op in ('and', 'or', 'xor') and typ in ('b32', 'u32', 's32'):
+                    from sass.encoding.sm_120_opcodes import encode_lop3, LOP3_AND, LOP3_OR, LOP3_XOR
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = ctx.ra.r32(instr.srcs[0].name)
+                    b = ctx.ra.r32(instr.srcs[1].name)
+                    lut = {'and': LOP3_AND, 'or': LOP3_OR, 'xor': LOP3_XOR}[op]
+                    output.append(SassInstr(encode_lop3(d, a, b, RZ, lut),
+                                            f'LOP3.LUT R{d}, R{a}, R{b}, RZ, 0x{lut:02x}  // {op}.{typ}'))
+
+                elif op == 'mul' and 'lo' in instr.types and typ in ('u32', 's32'):
+                    # mul.lo.s32 → IMAD dest, src0, src1, RZ
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = ctx.ra.r32(instr.srcs[0].name)
+                    b = ctx.ra.r32(instr.srcs[1].name)
+                    output.append(SassInstr(encode_imad_wide(d, a, b, RZ),
+                                            f'IMAD R{d}, R{a}, R{b}, RZ  // mul.lo.{typ}'))
+
+                elif op == 'add' and typ == 'f32':
+                    from sass.encoding.sm_120_opcodes import encode_fadd
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = ctx.ra.r32(instr.srcs[0].name)
+                    b = ctx.ra.r32(instr.srcs[1].name)
+                    output.append(SassInstr(encode_fadd(d, a, b),
+                                            f'FADD R{d}, R{a}, R{b}  // add.f32'))
+
+                elif op == 'sub' and typ == 'f32':
+                    from sass.encoding.sm_120_opcodes import encode_fadd
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = ctx.ra.r32(instr.srcs[0].name)
+                    b = ctx.ra.r32(instr.srcs[1].name)
+                    # sub.f32 = FADD with negated src1... actually FADD negate is on src0
+                    # sub a,b = a + (-b) = FADD(a, -b)? Need to check encoding.
+                    # Actually from ptxas: FFMA R9, -R2, R5, R9 uses negate on src0.
+                    # For FADD: negate_src0=True gives -src0 + src1. For sub we want src0 - src1.
+                    # Use FADD with swapped args and negate: FADD(d, -b, a) = a - b
+                    output.append(SassInstr(encode_fadd(d, b, a, negate_src0=True),
+                                            f'FADD R{d}, -R{b}, R{a}  // sub.f32'))
+
+                elif op == 'mul' and typ == 'f32':
+                    from sass.encoding.sm_120_opcodes import encode_fmul
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = ctx.ra.r32(instr.srcs[0].name)
+                    b = ctx.ra.r32(instr.srcs[1].name)
+                    output.append(SassInstr(encode_fmul(d, a, b),
+                                            f'FMUL R{d}, R{a}, R{b}  // mul.f32'))
+
+                elif op == 'fma' and typ == 'f32':
+                    from sass.encoding.sm_120_opcodes import encode_ffma
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = ctx.ra.r32(instr.srcs[0].name)
+                    b = ctx.ra.r32(instr.srcs[1].name)
+                    c = ctx.ra.r32(instr.srcs[2].name)
+                    output.append(SassInstr(encode_ffma(d, a, b, c),
+                                            f'FFMA R{d}, R{a}, R{b}, R{c}  // fma.f32'))
+
                 elif op == 'ld' and 'param' in instr.types:
                     output.extend(_select_ld_param(instr, ctx.ra, ctx.param_offsets))
 
@@ -436,8 +504,20 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     output.append(SassInstr(encode_exit(ctrl=0x7f5), 'EXIT'))
 
                 elif op == 'bra':
-                    # Placeholder offset; caller fixes up after layout
-                    output.append(SassInstr(encode_bra(0), f'BRA {instr.srcs[0] if instr.srcs else "?"}'))
+                    # Record BRA with target label for fixup after layout
+                    target = None
+                    if instr.srcs:
+                        from ptx.ir import LabelOp
+                        if isinstance(instr.srcs[0], LabelOp):
+                            target = instr.srcs[0].name
+                    bra_idx = len(output)
+                    output.append(SassInstr(encode_bra(0),
+                                            f'BRA {target or "?"}'))
+                    # Store fixup info: (output_index, target_label)
+                    if target:
+                        if not hasattr(ctx, '_bra_fixups'):
+                            ctx._bra_fixups = []
+                        ctx._bra_fixups.append((bra_idx, target))
 
                 elif op == 'nop':
                     output.append(_nop())
@@ -463,5 +543,16 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
             except ISelError as e:
                 # Emit NOP with error comment rather than crashing
                 output.append(_nop(f'ISEL ERROR: {e}  [{instr.op}]'))
+
+    # BRA offset fixup pass
+    if hasattr(ctx, '_bra_fixups'):
+        for bra_idx, target_label in ctx._bra_fixups:
+            if target_label in ctx.label_map:
+                target_byte = ctx.label_map[target_label]
+                bra_byte = (bra_idx + 1) * 16  # offset from NEXT instruction
+                rel_offset = target_byte - bra_byte
+                output[bra_idx] = SassInstr(
+                    encode_bra(rel_offset),
+                    f'BRA {target_label} (offset={rel_offset})')
 
     return output

@@ -153,21 +153,19 @@ def _build_callgraph():
     )
 
 
-def _build_capmerc(num_gprs: int = 8):
+def _build_capmerc(num_gprs: int = 10):
     """
-    .nv.capmerc.text.<kernel> — Mercury compiler metadata encoding register
-    allocation. The CUDA driver reads this to determine PRF allocation.
+    .nv.capmerc.text.<kernel> — Mercury compiler metadata encoding PRF allocation.
 
-    Ground truth from ptxas 13.0:
-      use_r4 (R0-R7, 10 regs declared): 146 bytes
-      force_highreg (R0-R11, 10 regs declared): 166 bytes
+    Header byte[8] = register count. This is what tells the CUDA driver how many
+    physical registers to allocate per thread.
 
-    The key difference is in the first few bytes and additional register
-    descriptor entries for higher registers.
+    Uses the R0-R7 template (146 bytes) with patched register count for any
+    kernel that fits within 8 GPRs. For larger kernels, uses the force_highreg
+    template (166 bytes) with patched register count.
     """
-    if num_gprs <= 8:
-        # Template for R0-R7 (from use_r4.cubin)
-        return bytes.fromhex(
+    if num_gprs <= 10:
+        buf = bytearray.fromhex(
             '0c000000010000c00a00000068010000'
             '010b040af80004000000410000040000'
             '010b0e0afa0005000000030139040000'
@@ -179,9 +177,10 @@ def _build_capmerc(num_gprs: int = 8):
             '00020182010000000000000000000000'
             'd007'
         )
+        buf[8] = num_gprs & 0xFF
+        return bytes(buf)
     else:
-        # Template for R0-R11+ (from force_highreg.cubin)
-        return bytes.fromhex(
+        buf = bytearray.fromhex(
             '0c000000010000c00f00000048210000'
             '010b040af80004000000410000040000'
             '010b0e0afa0005000000030139040000'
@@ -194,6 +193,8 @@ def _build_capmerc(num_gprs: int = 8):
             '82010a00000201020100000000000000'
             '000000005005'
         )
+        buf[8] = num_gprs & 0xFF
+        return bytes(buf)
 
 
 # ---------------------------------------------------------------------------

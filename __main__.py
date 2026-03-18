@@ -22,11 +22,18 @@ def main():
     ap.add_argument("--out",   default=None,     help="Output .cubin (default: <input>.cubin)")
     ap.add_argument("--check", action="store_true",
                     help="Check for ptxas-miscompiled patterns and exit")
+    ap.add_argument("--scan", metavar="CUBIN",
+                    help="Scan a cubin for rotate-miscompilation bugs")
     ap.add_argument("--dump-ir", action="store_true",
                     help="Parse PTX and dump the IR, then exit")
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="Verbose output (show SASS instructions)")
     args = ap.parse_args()
+
+    if args.scan:
+        from tools.autofix import scan_cubin
+        count = scan_cubin(args.scan)
+        sys.exit(1 if count > 0 else 0)
 
     if args.ptx_file is None:
         ap.print_help()

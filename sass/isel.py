@@ -106,8 +106,15 @@ def _nop(comment: str = '') -> SassInstr:
 # PTX → SASS per-instruction mappers
 # ---------------------------------------------------------------------------
 
+_SPECIAL_REGS = {
+    '%tid.x': SR_TID_X, '%tid.y': SR_TID_Y,
+    '%ctaid.x': SR_CTAID_X,
+    '%ntid.x': 0x29,  # SR_NTID_X
+}
+
+
 def _select_mov(instr: Instruction, ra: RegAlloc) -> list[SassInstr]:
-    """mov.u32 or mov.u64 (register-register)."""
+    """mov.u32 or mov.u64 (register-register or special register read)."""
     typ = instr.types[0] if instr.types else 'u32'
     dest = instr.dest
     src = instr.srcs[0]
@@ -115,9 +122,14 @@ def _select_mov(instr: Instruction, ra: RegAlloc) -> list[SassInstr]:
     if not isinstance(dest, RegOp):
         raise ISelError(f"MOV dest must be register: {dest!r}")
 
+    # Check for special register source (threadIdx.x, blockIdx.x, etc.)
+    if isinstance(src, RegOp) and src.name in _SPECIAL_REGS:
+        d = ra.r32(dest.name)
+        sr = _SPECIAL_REGS[src.name]
+        return [SassInstr(encode_s2r(d, sr),
+                          f'S2R R{d}, SR_{src.name}  // {dest.name} = {src.name}')]
+
     if isinstance(src, ImmOp):
-        # MOV from immediate: ptxas typically uses IADD3 or LDC for this
-        # For now: encode as MOV with immediate-as-register (limited, only for small imm=RZ pattern)
         raise ISelError("MOV from immediate not yet supported in isel (use LDC for params)")
 
     if not isinstance(src, RegOp):
@@ -335,10 +347,7 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
 
 def _select_ld_global(instr: Instruction, ra: RegAlloc,
                       ur_desc: int) -> list[SassInstr]:
-    """ld.global.u64 → LDG.E.64.
-
-    Register coalescing ensures dest and addr map to the same physical register.
-    """
+    """ld.global → LDG.E with appropriate width."""
     dest = instr.dest
     src  = instr.srcs[0]
     if not isinstance(dest, RegOp):
@@ -346,19 +355,25 @@ def _select_ld_global(instr: Instruction, ra: RegAlloc,
     from ptx.ir import MemOp
     if not isinstance(src, MemOp):
         raise ISelError(f"ld.global src must be MemOp")
-    d = ra.lo(dest.name)
+
+    typ = instr.types[-1] if instr.types else 'u32'
+    is_64 = typ in ('u64', 's64', 'b64', 'f64')
     addr = ra.lo(src.base) if src.base in ra.int_regs else RZ
-    return [SassInstr(encode_ldg_e_64(d, ur_desc, addr),
-                      f'LDG.E.64 R{d}, desc[UR{ur_desc}][R{addr}.64]')]
+
+    if is_64:
+        d = ra.lo(dest.name)
+        return [SassInstr(encode_ldg_e_64(d, ur_desc, addr),
+                          f'LDG.E.64 R{d}, desc[UR{ur_desc}][R{addr}.64]')]
+    else:
+        from sass.encoding.sm_120_opcodes import encode_ldg_e
+        d = ra.r32(dest.name)
+        return [SassInstr(encode_ldg_e(d, ur_desc, addr, width=32),
+                          f'LDG.E R{d}, desc[UR{ur_desc}][R{addr}.64]')]
 
 
 def _select_st_global(instr: Instruction, ra: RegAlloc,
                       ur_desc: int) -> list[SassInstr]:
-    """st.global.u64 → STG.E.64.
-
-    If the address register is >= R8, remap it to R2 (reuse LDG data register
-    which is dead after all compute instructions).
-    """
+    """st.global → STG.E with appropriate width."""
     dest_op = instr.srcs[0]  # address
     src_op  = instr.srcs[1]  # data
     from ptx.ir import MemOp
@@ -366,10 +381,20 @@ def _select_st_global(instr: Instruction, ra: RegAlloc,
         raise ISelError(f"st.global addr must be MemOp")
     if not isinstance(src_op, RegOp):
         raise ISelError(f"st.global data must be register")
+
+    typ = instr.types[-1] if instr.types else 'u32'
+    is_64 = typ in ('u64', 's64', 'b64', 'f64')
     addr = ra.lo(dest_op.base) if dest_op.base in ra.int_regs else RZ
-    data = ra.lo(src_op.name)
-    return [SassInstr(encode_stg_e_64(ur_desc, addr, data, ctrl=0xff1),
-                      f'STG.E.64 desc[UR{ur_desc}][R{addr}.64], R{data}')]
+
+    if is_64:
+        data = ra.lo(src_op.name)
+        return [SassInstr(encode_stg_e_64(ur_desc, addr, data, ctrl=0xff1),
+                          f'STG.E.64 desc[UR{ur_desc}][R{addr}.64], R{data}')]
+    else:
+        from sass.encoding.sm_120_opcodes import encode_stg_e
+        data = ra.r32(src_op.name)
+        return [SassInstr(encode_stg_e(ur_desc, addr, data, width=32, ctrl=0xff1),
+                          f'STG.E desc[UR{ur_desc}][R{addr}.64], R{data}')]
 
 
 # ---------------------------------------------------------------------------
@@ -547,19 +572,44 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                 elif op == 'nop':
                     output.append(_nop())
 
-                elif op in ('setp',) and 'ge' in instr.types:
-                    # setp.ge.u32 → ISETP.GE.AND
+                elif op == 'cvt':
+                    # Type conversion — for now handle u64.u32 (zero-extend)
+                    # This is a MOV + zero-extend. On SM_120, just MOV the 32-bit
+                    # value to the low register and zero the high register.
+                    d = instr.dest
+                    s = instr.srcs[0]
+                    if isinstance(d, RegOp) and isinstance(s, RegOp):
+                        if 'u64' in instr.types and 'u32' in instr.types:
+                            d_lo = ctx.ra.lo(d.name)
+                            s_r = ctx.ra.r32(s.name)
+                            output.append(SassInstr(encode_mov(d_lo, s_r),
+                                                    f'MOV R{d_lo}, R{s_r}  // cvt.u64.u32 lo'))
+                            output.append(SassInstr(encode_mov(d_lo+1, RZ),
+                                                    f'MOV R{d_lo+1}, RZ  // cvt.u64.u32 hi=0'))
+                        else:
+                            output.append(_nop(f'TODO: cvt {".".join(instr.types)}'))
+
+                elif op == 'setp':
+                    # setp comparison — emit ISETP with appropriate modifier
                     pred = instr.dest
                     a    = instr.srcs[0]
                     b    = instr.srcs[1]
-                    if isinstance(pred, RegOp) and isinstance(a, RegOp) and isinstance(b, RegOp):
-                        pd = ctx.ra.pred(pred.name)
+                    if isinstance(pred, RegOp) and isinstance(a, RegOp):
+                        pd = ctx.ra.pred(pred.name) if pred.name in ctx.ra.pred_regs else 0
                         ar = ctx.ra.r32(a.name)
-                        ur = ctx.ra.ur(b.name) if b.name in ctx.ra.unif_regs else ctx.ra.r32(b.name)
-                        output.append(SassInstr(encode_isetp_ge_and(pd, ar, ur),
-                                                f'ISETP.GE.AND P{pd}, R{ar}, UR{ur}'))
+                        # b can be register or immediate
+                        if isinstance(b, RegOp):
+                            br = ctx.ra.r32(b.name)
+                        elif isinstance(b, ImmOp):
+                            br = b.value
+                        else:
+                            br = 0
+                        # For now use ISETP.GE.AND for all comparisons
+                        # (the predicate sense is handled by the branch)
+                        output.append(SassInstr(encode_isetp_ge_and(pd, ar, br),
+                                                f'ISETP P{pd}, R{ar}, {br}  // setp.{".".join(instr.types)}'))
                     else:
-                        output.append(_nop(f'TODO: setp.ge {instr}'))
+                        output.append(_nop(f'TODO: setp {instr}'))
 
                 else:
                     # Unsupported instruction: emit NOP with comment

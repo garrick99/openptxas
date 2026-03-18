@@ -65,8 +65,9 @@ class RegAlloc:
         return self.unif_regs.get(ptx_name, 0)
 
 
-# SM_120 parameter ABI base offset in c[0][...]
-PARAM_BASE_SM120 = 0x380
+# Parameter ABI base offsets per architecture
+PARAM_BASE_SM120 = 0x380   # Blackwell
+PARAM_BASE_SM89  = 0x160   # Ada Lovelace
 
 
 def _type_size(t: TypeSpec) -> int:

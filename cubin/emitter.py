@@ -38,7 +38,9 @@ SHF_EXECINSTR = 0x4
 PT_LOAD = 1
 PT_PHDR = 6
 
+# Architecture-specific ELF flags
 SM120_FLAGS = 0x06007802
+SM89_FLAGS  = 0x06005904
 
 STB_LOCAL  = 0
 STB_GLOBAL = 1
@@ -103,6 +105,15 @@ def _load_note_templates():
         tkinfo.extend(b'NVIDIA Corp\x00')
         tkinfo.extend(bytes([0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]))
         _NOTE_TKINFO = bytes(tkinfo)
+
+
+def _patch_cuinfo_sm(sm_version: int) -> bytes:
+    """Patch .note.nv.cuinfo with the target SM version."""
+    _load_note_templates()
+    buf = bytearray(_NOTE_CUINFO)
+    sm_hex = {89: 0x59, 120: 0x78}.get(sm_version, 0x78)
+    buf[26] = sm_hex
+    return bytes(buf)
 
 
 def _build_nv_info_global():
@@ -212,6 +223,7 @@ class KernelDesc:
     param_base: int = 0x380
     const0_size: int = 0x390
     smem_size: int = 0           # static shared memory size in bytes (0 = none)
+    sm_version: int = 120        # 89 (Ada) or 120 (Blackwell)
 
 
 def emit_cubin(kernel: KernelDesc) -> bytes:
@@ -336,7 +348,7 @@ def emit_cubin(kernel: KernelDesc) -> bytes:
         strtab_data,                 # 2
         symtab_data,                 # 3
         _NOTE_TKINFO,                # 4
-        _NOTE_CUINFO,                # 5
+        _patch_cuinfo_sm(kernel.sm_version),  # 5
         _build_nv_info_global(),     # 6
         _build_nv_compat(),          # 7
         _build_nv_info_kernel(num_gprs=kernel.num_gprs),  # 8
@@ -433,7 +445,8 @@ def emit_cubin(kernel: KernelDesc) -> bytes:
     struct.pack_into('<Q', buf, 24, 0)
     struct.pack_into('<Q', buf, 32, phoff)
     struct.pack_into('<Q', buf, 40, shoff)
-    struct.pack_into('<I', buf, 48, SM120_FLAGS)
+    elf_flags = SM89_FLAGS if kernel.sm_version == 89 else SM120_FLAGS
+    struct.pack_into('<I', buf, 48, elf_flags)
     struct.pack_into('<H', buf, 52, ELF_HEADER_SIZE)
     struct.pack_into('<H', buf, 54, PH_ENTRY_SIZE)
     struct.pack_into('<H', buf, 56, NUM_PHDRS)

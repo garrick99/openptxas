@@ -892,6 +892,108 @@ def encode_s2ur(dest_ur: int, sr_code: int, ctrl: int = 0) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# SM_89 (Ada Lovelace / RTX 4090) specific instructions
+# ---------------------------------------------------------------------------
+# SM_89 uses direct addressing for LDG/STG (no descriptor) and
+# loads constants via MOV/IMAD.MOV from constant bank instead of LDC.
+
+def encode_mov_from_cbank(dest: int, const_bank: int, const_offset_bytes: int,
+                           ctrl: int = 0) -> bytes:
+    """Encode MOV dest, c[bank][offset] — SM_89 constant bank load (32-bit).
+
+    Opcode 0xa02. Different from SM_120's LDC (0xb82).
+    Ground truth: MOV R2, c[0][0x168] → 027a0200005a0000000f000000e20f00
+    Offset is stored as word offset (bytes/4) at b5.
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    word_off = (const_offset_bytes // 4) & 0xFF
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0x02; raw[1] = 0x7a
+    raw[2] = dest & 0xFF
+    raw[3] = 0x00
+    raw[4] = const_bank & 0xFF
+    raw[5] = word_off
+    raw[6] = 0x00; raw[7] = 0x00; raw[8] = 0x00
+    raw[9] = 0x0f; raw[10] = 0x00; raw[11] = 0x00; raw[12] = 0x00
+    raw[13] = b13; raw[14] = b14; raw[15] = b15
+    return bytes(raw)
+
+
+def encode_imad_mov_u32_cbank(dest: int, const_bank: int, const_offset_bytes: int,
+                               ctrl: int = 0) -> bytes:
+    """Encode IMAD.MOV.U32 dest, RZ, RZ, c[bank][offset] — SM_89 constant load.
+
+    Opcode 0x624. Used for loading constants when MOV encoding isn't available.
+    Ground truth: IMAD.MOV.U32 R1, RZ, RZ, c[0][0x28] → 247601ff000a0000ff008e0700e40f00
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    word_off = (const_offset_bytes // 4) & 0xFF
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0x24; raw[1] = 0x76
+    raw[2] = dest & 0xFF
+    raw[3] = RZ
+    raw[4] = const_bank & 0xFF
+    raw[5] = word_off
+    raw[6] = 0x00; raw[7] = 0x00
+    raw[8] = RZ
+    raw[9] = 0x00; raw[10] = 0x8e; raw[11] = 0x07; raw[12] = 0x00
+    raw[13] = b13; raw[14] = b14; raw[15] = b15
+    return bytes(raw)
+
+
+def encode_uldc_64(dest_ur: int, const_bank: int, const_offset_bytes: int,
+                    ctrl: int = 0) -> bytes:
+    """Encode ULDC.64 dest_ur, c[bank][offset] — SM_89 uniform constant load.
+
+    Opcode 0xab9. SM_89 equivalent of SM_120's LDCU (0x7ac).
+    Ground truth: ULDC.64 UR4, c[0][0x118] → b97a040000460000000a000000ca0f00
+    Offset stored as word offset at b5.
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    word_off = (const_offset_bytes // 4) & 0xFF
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0xb9; raw[1] = 0x7a
+    raw[2] = dest_ur & 0xFF
+    raw[3] = 0x00
+    raw[4] = const_bank & 0xFF
+    raw[5] = word_off
+    raw[6] = 0x00; raw[7] = 0x00; raw[8] = 0x00
+    raw[9] = 0x0a; raw[10] = 0x00; raw[11] = 0x00; raw[12] = 0x00
+    raw[13] = b13; raw[14] = b14; raw[15] = b15
+    return bytes(raw)
+
+
+def encode_ldg_e_64_direct(dest: int, addr: int, ctrl: int = 0) -> bytes:
+    """Encode LDG.E.64 dest, [addr.64] — SM_89 direct addressing (no descriptor).
+
+    Same opcode 0x981 as SM_120, but b4=0x04 is hardcoded (not UR descriptor).
+    Ground truth: LDG.E.64 R2, [R2.64] → 8179020204000000001b1e0c00a20e00
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x81, 0x79,
+                  b2=dest, b3=addr, b4=0x04,
+                  b8=0x00,
+                  b9=0x1b, b10=0x1e, b11=0x0c,
+                  ctrl=ctrl)
+
+
+def encode_stg_e_64_direct(addr: int, data: int, ctrl: int = 0) -> bytes:
+    """Encode STG.E.64 [addr.64], data — SM_89 direct addressing.
+
+    Ground truth: STG.E.64 [R6.64], R4 → 8679000604000000041b100c00e20f00
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x86, 0x79,
+                  b2=0x00, b3=addr, b4=0x04,
+                  b8=data,
+                  b9=0x1b, b10=0x10, b11=0x0c,
+                  ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
 # FP32 instructions
 # ---------------------------------------------------------------------------
 

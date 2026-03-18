@@ -640,6 +640,92 @@ def encode_isetp_ge_and(pred_dest: int, src_reg: int, ur_src: int,
 
 
 # ---------------------------------------------------------------------------
+# Tensor Core: HMMA (FP16 MMA) and IMMA (INT8 MMA)
+# ---------------------------------------------------------------------------
+# HMMA.16816.F32 R_d, R_a, R_b, R_c — FP16 matrix multiply-accumulate
+#   Shape: m16 n8 k16, FP16 inputs (A: 4 regs, B: 2 regs), FP32 accumulation (4 regs)
+#   Opcode: 0x23c, b9=0x18 (shape+type modifier)
+#   Ground truth: HMMA.16816.F32 R12, R8, R4, R12
+#     lo=0x00000004080c723c  hi=0x008fe2000000180c
+
+def encode_hmma_f16_f32(dest: int, src_a: int, src_b: int, src_c: int,
+                         ctrl: int = 0) -> bytes:
+    """
+    Encode HMMA.16816.F32 dest, src_a, src_b, src_c.
+
+    Tensor core FP16 matrix multiply-accumulate (m16n8k16 shape):
+      D[dest:dest+3] = A[src_a:src_a+3] * B[src_b:src_b+1] + C[src_c:src_c+3]
+
+    All register arguments are base indices. A uses 4 regs (8 FP16 values),
+    B uses 2 regs (4 FP16), C and D use 4 regs (4 FP32).
+
+    Ground truth: encode_hmma_f16_f32(12, 8, 4, 12, ctrl=0x47f1)
+        -> matches ptxas HMMA.16816.F32 R12, R8, R4, R12
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0x3c
+    raw[1] = 0x72
+    raw[2] = dest & 0xFF
+    raw[3] = src_a & 0xFF
+    raw[4] = src_b & 0xFF
+    raw[5] = 0x00
+    raw[6] = 0x00
+    raw[7] = 0x00
+    raw[8] = src_c & 0xFF
+    raw[9] = 0x18       # m16n8k16 + F32 accum
+    raw[10] = 0x00
+    raw[11] = 0x00
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+# IMMA.16832.S8.S8 — INT8 matrix multiply-accumulate
+#   Shape: m16 n8 k32, INT8 inputs (A: 4 regs, B: 2 regs), INT32 accumulation (4 regs)
+#   Opcode: 0x237, b9=0x5c, b10=0x40
+#   Ground truth: IMMA.16832.S8.S8 R12, R8.ROW, R4.COL, R12
+#     lo=0x00000004080c7237  hi=0x008fe20000405c0c
+
+def encode_imma_s8_s32(dest: int, src_a: int, src_b: int, src_c: int,
+                        ctrl: int = 0) -> bytes:
+    """
+    Encode IMMA.16832.S8.S8 dest, src_a.ROW, src_b.COL, src_c.
+
+    Tensor core INT8 matrix multiply-accumulate (m16n8k32 shape):
+      D[dest:dest+3] = A[src_a:src_a+3] * B[src_b:src_b+1] + C[src_c:src_c+3]
+
+    All register arguments are base indices. A uses 4 regs (16 INT8 values),
+    B uses 2 regs (8 INT8), C and D use 4 regs (4 INT32).
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0x37
+    raw[1] = 0x72
+    raw[2] = dest & 0xFF
+    raw[3] = src_a & 0xFF
+    raw[4] = src_b & 0xFF
+    raw[5] = 0x00
+    raw[6] = 0x00
+    raw[7] = 0x00
+    raw[8] = src_c & 0xFF
+    raw[9] = 0x5c       # m16n8k32 + S8
+    raw[10] = 0x40      # signed format flag
+    raw[11] = 0x00
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
 # Shared memory: STS, LDS, BAR.SYNC
 # ---------------------------------------------------------------------------
 

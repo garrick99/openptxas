@@ -161,7 +161,16 @@ def _select_shl_b64(instr: Instruction, ra: RegAlloc) -> list[SassInstr]:
     d_lo = ra.lo(dest.name); d_hi = d_lo + 1
     s_lo = ra.lo(src.name);  s_hi = s_lo + 1
 
-    if k < 32:
+    if k < 32 and k <= 15:
+        # Use IMAD.SHL for lo (avoids SHF.L/SHF.R pipeline conflicts)
+        from sass.encoding.sm_120_opcodes import encode_imad_shl_u32
+        return [
+            SassInstr(encode_imad_shl_u32(d_lo, s_lo, k),
+                      f'IMAD.SHL.U32 R{d_lo}, R{s_lo}, {1<<k:#x}, RZ  // {dest.name}.lo = {src.name}.lo << {k}'),
+            SassInstr(encode_shf_l_u64_hi(d_hi, s_lo, k, s_hi),
+                      f'SHF.L.U64.HI R{d_hi}, R{s_lo}, 0x{k:x}, R{s_hi}  // {dest.name}.hi'),
+        ]
+    elif k < 32:
         return [
             SassInstr(encode_shf_l_u32(d_lo, s_lo, k),
                       f'SHF.L.U32 R{d_lo}, R{s_lo}, 0x{k:x}, RZ  // {dest.name}.lo = {src.name}.lo << {k}'),

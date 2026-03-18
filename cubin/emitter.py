@@ -113,21 +113,32 @@ def _build_nv_info_global():
     )
 
 
-def _build_nv_info_kernel():
-    """Per-kernel .nv.info — exact 88 bytes from ptxas (2-param u64 kernel).
+def _build_nv_info_kernel(num_gprs: int = 8):
+    """Per-kernel .nv.info. Based on ptxas template for 2-param u64 kernels.
 
-    REGCOUNT=0x82 is constant across all probe cubins regardless of actual
-    register usage (10 or 12 GPRs both use 0x82). The GPU hardware handles
-    register allocation independently of this field.
+    Uses real_sub template (supports up to R11) when num_gprs > 8,
+    otherwise probe_k1 template (R0-R7 only).
     """
-    return bytes.fromhex(
-        '043704008200000004170c00000000000100080000f02100'
-        '04170c00000000000000000000f02100'
-        '03500000031bff00035f0101024a0000'
-        '041c04008000000003191000'
-        '040a08000900000080031000'
-        '0436040000000000'
-    )
+    if num_gprs <= 8:
+        # probe_k1 template: EIATTR_MAX_REG_COUNT=0x80, compact
+        return bytes.fromhex(
+            '043704008200000004170c00000000000100080000f02100'
+            '04170c00000000000000000000f02100'
+            '03500000031bff00035f0101024a0000'
+            '041c04008000000003191000'
+            '040a08000900000080031000'
+            '0436040000000000'
+        )
+    else:
+        # real_sub template: EIATTR_MAX_REG_COUNT=0x90, allows R8+
+        return bytes.fromhex(
+            '043704008200000004170c00000000000100080000f02100'
+            '04170c00000000000000000000f02100'
+            '03500000031bff00035f0101024a0000'
+            '041c04009000000003191800'
+            '040a08000900000080031800'
+            '0436040000000000'
+        )
 
 
 def _build_nv_compat():
@@ -264,7 +275,7 @@ def emit_cubin(kernel: KernelDesc) -> bytes:
         _NOTE_CUINFO,                # 5
         _build_nv_info_global(),     # 6
         _build_nv_compat(),          # 7
-        _build_nv_info_kernel(),  # 8
+        _build_nv_info_kernel(num_gprs=kernel.num_gprs),  # 8
         _build_callgraph(),          # 9
         text_data,                   # 10
         shared_reserved,             # 11 (NOBITS)

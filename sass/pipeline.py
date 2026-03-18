@@ -56,7 +56,10 @@ def compile_function(fn: Function, verbose: bool = False) -> bytes:
         param_offsets=alloc.param_offsets,
         ur_desc=4,  # UR4 for memory descriptors (ptxas convention)
     )
-    raw_instrs = preamble + select_function(fn, ctx)
+    body_instrs = select_function(fn, ctx)
+
+    # 4. Schedule: reorder for LDG latency + assign ctrl values
+    raw_instrs = preamble + body_instrs
     sass_instrs = schedule(raw_instrs)
 
     if verbose:

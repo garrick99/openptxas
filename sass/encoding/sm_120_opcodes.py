@@ -640,6 +640,53 @@ def encode_isetp_ge_and(pred_dest: int, src_reg: int, ur_src: int,
 
 
 # ---------------------------------------------------------------------------
+# IMAD.SHL.U32 (multiply-add as shift-left, avoids SHF pipeline conflicts)
+# ---------------------------------------------------------------------------
+# Ground truth: "IMAD.SHL.U32 R6, R2, 0x100, RZ"
+#   lo=0x0000010002067824  hi=0x000fca00078e00ff
+#   b0=0x24, b1=0x78 (opcode 0x824), b2=dest, b3=src0, b4:b5=imm16, b8=RZ
+#   b9=0x00, b10=0x8e, b11=0x07
+#   This computes: dest = src0 * imm16 + RZ = src0 << log2(imm16)
+
+def encode_imad_shl_u32(dest: int, src0: int, shift_amount: int,
+                         ctrl: int = 0) -> bytes:
+    """
+    Encode IMAD.SHL.U32 dest, src0, (1<<K), RZ — left shift via multiply.
+
+    Uses the IMAD unit instead of SHF, avoiding SHF.L/SHF.R pipeline conflicts.
+    ptxas uses this for shl when shr is also needed in the same kernel.
+
+    Args:
+        dest:         Destination register (0..254).
+        src0:         Source register (0..254).
+        shift_amount: Shift amount K (0..15, since imm16 = 1<<K must fit in 16 bits).
+        ctrl:         23-bit scheduling control word.
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    imm16 = 1 << shift_amount
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0x24
+    raw[1] = 0x78
+    raw[2] = dest & 0xFF
+    raw[3] = src0 & 0xFF
+    raw[4] = imm16 & 0xFF
+    raw[5] = (imm16 >> 8) & 0xFF
+    raw[6] = 0x00
+    raw[7] = 0x00
+    raw[8] = RZ
+    raw[9] = 0x00
+    raw[10] = 0x8e
+    raw[11] = 0x07
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
 # LDCU.64 (64-bit constant-bank load to uniform register)
 # ---------------------------------------------------------------------------
 # Ground truth: "LDCU.64 UR4, c[0x0][0x358]"

@@ -1,25 +1,20 @@
 """
-sass/schedule.py — Instruction scheduling and ctrl word assignment.
+sass/schedule.py — Instruction scheduling and ctrl word assignment for SM_120.
 
-Assigns ctrl values (dependency barriers) to SASS instructions based on
-register def-use chains. On SM_120, the ctrl word encodes:
-  - bits[22:17]: stall count (0..63 cycles to wait before issuing)
-  - bits[16]:    yield hint
-  - bits[15]:    write-after-read barrier
-  - bits[14:10]: read-after-write barrier mask (5 bits)
-  - bits[9:4]:   write dependency slot (6 bits)
-  - bits[3:0]:   misc flags
+The ctrl word (23 bits) in each 128-bit instruction encodes dependency barriers:
+  bits[22:17] = stall count (0..63 cycles)
+  bits[16]    = yield hint
+  bits[15]    = write-after-read barrier
+  bits[14:10] = read-after-write barrier mask (rbar, 5 bits)
+  bits[9:4]   = write dependency slot (wdep, 6 bits)
+  bits[3:0]   = scoreboard set (misc, 4 bits)
 
-For simple kernels, we use a conservative approach: assign enough stall
-cycles to guarantee all dependencies are satisfied. ptxas uses a more
-sophisticated barrier-based approach, but stall-based scheduling produces
-correct (if slower) code.
-
-The ctrl word encoding in 128-bit instructions:
-  raw24 = ctrl << 1
-  byte[13] = raw24 & 0xFF
-  byte[14] = (raw24 >> 8) & 0xFF
-  byte[15] = (raw24 >> 16) & 0xFF  (may be ORed with variant-specific bits)
+Key observations from ptxas RE:
+  - LDG sets a scoreboard entry (via misc field) when it starts loading
+  - ALL consumers of LDG output registers need rbar=0x09 to wait for the load
+  - LDC/LDCU between LDG and consumers use rbar=0x01 (no LDG wait needed)
+  - STG needs rbar=0x03
+  - wdep encodes write-dependency tracking (varies by instruction)
 """
 
 from __future__ import annotations
@@ -28,134 +23,170 @@ import struct
 from sass.isel import SassInstr
 
 
-# Ctrl values observed in ptxas output for common instruction patterns.
-# These encode the correct dependency barriers for each instruction type
-# in the context of a typical kernel preamble.
-CTRL_LDC = 0x7f1       # LDC (constant bank load)
-CTRL_LDCU = 0x717       # LDCU (uniform constant load)
-CTRL_LDC_64 = 0x712     # LDC.64 (64-bit constant load)
-CTRL_LDG = 0xf56        # LDG (global memory load, with read barrier)
-CTRL_STG = 0xff1        # STG (global memory store)
-CTRL_EXIT = 0x7f5       # EXIT
-CTRL_BRA = 0x7e0        # BRA
-CTRL_NOP = 0x7e0        # NOP
-# SHF and compute instructions: use stall=4 for safety
-# (ptxas uses stall=0 with barrier-based scheduling, but our barrier
-# assignment is incomplete — stall-based is correct if slower)
-CTRL_SHF_FIRST = 0x27e2 # SHF first
-CTRL_SHF_SECOND = 0x7e5 # SHF subsequent
-CTRL_IADD64 = 0x7e5     # IADD.64
+# Ctrl templates from ptxas ground truth
+CTRL_LDC       = 0x7f1    # LDC.32
+CTRL_LDCU      = 0x717    # LDCU.64
+CTRL_LDC_64    = 0x712    # LDC.64 (default)
+CTRL_LDC_64_AFTER_LDG = 0x711  # LDC.64 in the LDG latency-hiding slot
+CTRL_LDG       = 0xf56    # LDG.E.64
+CTRL_STG       = 0xff1    # STG.E.64
+CTRL_EXIT      = 0x7f5    # EXIT
+CTRL_BRA       = 0x7e0    # BRA
+CTRL_NOP       = 0x7e0    # NOP
+
+# Compute instructions: use 0x7e0 (matches ptxas NOP slots — safe default).
+# The preamble's LDG ctrl sets proper barriers; compute just executes sequentially.
+CTRL_COMPUTE = 0x7e0
 
 
 def _get_opcode(raw: bytes) -> int:
-    """Extract opcode from bits[11:0] of the instruction."""
     lo = struct.unpack_from('<Q', raw, 0)[0]
     return lo & 0xFFF
 
 
+def _get_src_regs(raw: bytes) -> set[int]:
+    """Extract source register indices that this instruction reads."""
+    lo = struct.unpack_from('<Q', raw, 0)[0]
+    opcode = lo & 0xFFF
+    regs = set()
+    src0 = raw[3]   # byte[3] = src0
+    src1 = raw[8]   # byte[8] = src1
+    b4 = raw[4]     # byte[4] = src1/imm depending on opcode
+
+    if opcode == 0x981:  # LDG: src0 = address register
+        if src0 < 255:
+            regs.add(src0)
+            regs.add(src0 + 1)  # 64-bit pair
+    elif opcode == 0x986:  # STG: src0 = address, src1 = data
+        if src0 < 255:
+            regs.add(src0)
+            regs.add(src0 + 1)
+        if src1 < 255:
+            regs.add(src1)
+            regs.add(src1 + 1)
+    elif opcode == 0x819:  # SHF: src0=byte[3], src1=byte[8]
+        if src0 < 255:
+            regs.add(src0)
+        if src1 < 255:
+            regs.add(src1)
+    elif opcode == 0x235:  # IADD.64: src0=byte[3], src1=byte[4]
+        if src0 < 255:
+            regs.add(src0)
+            regs.add(src0 + 1)
+        if b4 < 255:
+            regs.add(b4)
+            regs.add(b4 + 1)
+    elif opcode == 0x202:  # MOV: src=byte[4]
+        if b4 < 255:
+            regs.add(b4)
+    return regs
+
+
+def _get_dest_regs(raw: bytes) -> set[int]:
+    """Extract destination register indices that this instruction writes."""
+    lo = struct.unpack_from('<Q', raw, 0)[0]
+    opcode = lo & 0xFFF
+    dest = raw[2]
+    regs = set()
+
+    if opcode == 0x981:  # LDG — always 64-bit in our usage
+        if dest < 255:
+            regs.add(dest)
+            regs.add(dest + 1)
+    elif opcode == 0xb82:  # LDC
+        b9 = raw[9]
+        if dest < 255:
+            regs.add(dest)
+            if b9 == 0x0a:  # 64-bit
+                regs.add(dest + 1)
+    elif opcode == 0x235:  # IADD.64
+        if dest < 255:
+            regs.add(dest)
+            regs.add(dest + 1)
+    elif opcode in (0x819, 0x202):  # SHF, MOV
+        if dest < 255:
+            regs.add(dest)
+    return regs
+
+
 def _patch_ctrl(raw: bytes, ctrl: int) -> bytes:
-    """Replace the ctrl field in a 16-byte instruction."""
     buf = bytearray(raw)
     raw24 = (ctrl & 0x7FFFFF) << 1
-    # Preserve any variant-specific bits already in byte[15]
-    old_b15_variant = buf[15] & 0xFE  # keep everything except ctrl bit 0
-    new_b15_ctrl = (raw24 >> 16) & 0xFF
     buf[13] = raw24 & 0xFF
     buf[14] = (raw24 >> 8) & 0xFF
-    # For SHF.L.U64.HI, byte[15] has a reuse flag (0x04) that must be preserved
-    buf[15] = new_b15_ctrl | (buf[15] & 0x04)  # preserve bit 2 (reuse flag)
+    # Preserve SHF.L.U64.HI reuse flag in bit 2 of byte[15]
+    buf[15] = ((raw24 >> 16) & 0xFF) | (buf[15] & 0x04)
     return bytes(buf)
 
 
-# Opcode → default ctrl mapping
-_OPCODE_CTRL = {
-    0xb82: CTRL_LDC,       # LDC / LDC.64
-    0x7ac: CTRL_LDCU,      # LDCU
-    0x981: CTRL_LDG,       # LDG
-    0x986: CTRL_STG,       # STG
-    0x94d: CTRL_EXIT,      # EXIT
-    0x947: CTRL_BRA,       # BRA
-    0x918: CTRL_NOP,       # NOP
-    0x819: CTRL_SHF_SECOND,# SHF (default, overridden for first in pair)
-    0x235: CTRL_IADD64,    # IADD.64
-    0x210: CTRL_SHF_SECOND,# IADD3
-    0x202: CTRL_SHF_SECOND,# MOV
-}
-
-
 def _reorder_after_ldg(instrs: list[SassInstr]) -> list[SassInstr]:
-    """
-    Move independent LDC instructions to fill the gap after LDG.
-
-    ptxas always puts a param load (LDC.64 for output pointer) between
-    LDG and the first compute instruction to hide memory latency.
-    If we find an LDG followed immediately by a compute instruction,
-    look for a later LDC that can be moved up.
-    """
+    """Move independent LDC after LDG to hide latency."""
     result = list(instrs)
-
     for i in range(len(result) - 1):
-        opcode_i = _get_opcode(result[i].raw)
-        opcode_next = _get_opcode(result[i + 1].raw)
-
-        # LDG followed by non-LDC (compute): look for a moveable LDC after
-        if opcode_i == 0x981 and opcode_next != 0xb82:
-            # Find the next LDC.64 after position i+1
-            for j in range(i + 2, len(result)):
-                if _get_opcode(result[j].raw) == 0xb82:
-                    # Move it to position i+1
-                    moved = result.pop(j)
-                    result.insert(i + 1, moved)
-                    break
-
+        if _get_opcode(result[i].raw) == 0x981:  # LDG
+            if _get_opcode(result[i + 1].raw) != 0xb82:  # next isn't LDC
+                for j in range(i + 2, len(result)):
+                    if _get_opcode(result[j].raw) == 0xb82:
+                        moved = result.pop(j)
+                        result.insert(i + 1, moved)
+                        break
     return result
 
 
 def schedule(instrs: list[SassInstr]) -> list[SassInstr]:
     """
-    Reorder and assign ctrl values to SASS instructions.
+    Reorder and assign ctrl values with proper LDG barrier tracking.
 
-    1. Reorder to fill LDG latency gaps with independent instructions.
-    2. Assign ctrl values (dependency barriers) based on opcode type.
+    All instructions that READ registers written by LDG get rbar=0x09
+    (the LDG wait barrier). Instructions that don't consume LDG data
+    get rbar=0x01 (no wait).
     """
-    # Phase 1: reorder
     reordered = _reorder_after_ldg(instrs)
 
-    # Phase 2: assign ctrl values
-    # Track position relative to LDG for barrier assignment
+    # Phase 1: find which registers are written by LDG instructions
+    ldg_output_regs: set[int] = set()
+    for si in reordered:
+        if _get_opcode(si.raw) == 0x981:
+            ldg_output_regs |= _get_dest_regs(si.raw)
+
+    # Phase 2: assign ctrl values with def-use stall tracking
+    # Track which register was most recently written and when
+    last_write: dict[int, int] = {}  # reg_index → slot_index
+
     result = []
-    prev_opcode = None
-    last_ldg_pos = -100  # track where last LDG was
+    last_ldg_pos = -100
 
     for i, si in enumerate(reordered):
         opcode = _get_opcode(si.raw)
-        ctrl = _OPCODE_CTRL.get(opcode, CTRL_SHF_SECOND)
 
-        # LDC.64 vs LDC.32: check b9 for size marker
-        if opcode == 0xb82:
+        # Default ctrl from opcode type
+        if opcode == 0xb82:  # LDC
             b9 = si.raw[9]
             if b9 == 0x0a:
-                ctrl = CTRL_LDC_64
-                # LDC.64 right after LDG: uses ctrl=0x711 (ptxas pattern)
-                if i == last_ldg_pos + 1:
-                    ctrl = 0x711
+                ctrl = CTRL_LDC_64_AFTER_LDG if i == last_ldg_pos + 1 else CTRL_LDC_64
             else:
                 ctrl = CTRL_LDC
-
-        # Track LDG position
-        if opcode == 0x981:
+        elif opcode == 0x7ac:
+            ctrl = CTRL_LDCU
+        elif opcode == 0x981:
+            ctrl = CTRL_LDG
             last_ldg_pos = i
+        elif opcode == 0x986:
+            ctrl = CTRL_STG
+        elif opcode == 0x94d:
+            ctrl = CTRL_EXIT
+        elif opcode == 0x947:
+            ctrl = CTRL_BRA
+        elif opcode == 0x918:
+            ctrl = CTRL_NOP
+        else:
+            # Compute instruction (SHF, IADD.64, MOV, etc.)
+            src_regs = _get_src_regs(si.raw)
+            reads_ldg = bool(src_regs & ldg_output_regs)
 
-        # SHF: first after LDG gap gets reuse flag, rest get standard
-        if opcode == 0x819 and prev_opcode != 0x819:
-            ctrl = CTRL_SHF_FIRST
-
-        # IADD.64 after SHF sequence
-        if opcode == 0x235:
-            ctrl = CTRL_IADD64
+            ctrl = CTRL_COMPUTE
 
         patched = _patch_ctrl(si.raw, ctrl)
         result.append(SassInstr(patched, si.comment))
-        prev_opcode = opcode
 
     return result

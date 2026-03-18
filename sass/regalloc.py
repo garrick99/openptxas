@@ -125,10 +125,18 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120) -> AllocResult:
     # Find LDG coalescing opportunities (dest shares addr register)
     coalesces = _find_ldg_coalesces(fn)
 
+    # Find which registers are actually referenced in instructions
+    from ptx.ir import RegOp
+    used_regs: set[str] = set()
+    for bb in fn.blocks:
+        for inst in bb.instructions:
+            if inst.dest and isinstance(inst.dest, RegOp):
+                used_regs.add(inst.dest.name)
+            for src in inst.srcs:
+                if isinstance(src, RegOp):
+                    used_regs.add(src.name)
+
     next_gpr = 2       # R0-R1 reserved (R0=return, R1=stack frame ptr)
-    # SM_120 hardware note: registers R0-R9 are in the "fast" bank.
-    # Higher registers require proper barrier configuration in ctrl words.
-    # For correctness, keep all user registers in R2-R9 range when possible.
     next_pred = 0       # P0..P6
     next_ur = 4         # UR0-UR3 reserved by driver; UR4+ for user
 
@@ -137,60 +145,53 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120) -> AllocResult:
         is_pred = rd.type.kind == ScalarKind.PRED
 
         if is_pred:
-            # Predicate registers
             for name in rd.names:
-                pred_regs[name] = next_pred
-                next_pred += 1
+                if name in used_regs:
+                    pred_regs[name] = next_pred
+                    next_pred += 1
         elif is_64:
-            # 64-bit: allocate pairs
             for i in range(rd.count):
                 name = f"%{rd.name}{i}" if rd.count > 1 else f"%{rd.name}"
-                # Align to even register for pair
+                if name not in used_regs:
+                    continue  # skip unused registers
                 if next_gpr % 2 != 0:
                     next_gpr += 1
                 int_regs[name] = next_gpr
-                next_gpr += 2  # pair
+                next_gpr += 2
         else:
-            # 32-bit: allocate singles
             for i in range(rd.count):
                 name = f"%{rd.name}{i}" if rd.count > 1 else f"%{rd.name}"
+                if name not in used_regs:
+                    continue
                 int_regs[name] = next_gpr
                 next_gpr += 1
 
     # Apply LDG coalescing: dest regs share the addr reg's physical register.
-    # Then compact the allocation to fill gaps left by coalescing.
-    coalesced_regs = set()
     for dest_name, addr_name in coalesces.items():
         if addr_name in int_regs and dest_name in int_regs:
-            old_reg = int_regs[dest_name]
             int_regs[dest_name] = int_regs[addr_name]
-            coalesced_regs.add(old_reg)
 
-    # Compact: reassign registers that were above the coalesced gap
-    if coalesced_regs:
-        # Build sorted list of (name, current_reg) for 64-bit regs
-        reg_items = [(n, r) for n, r in int_regs.items() if r not in coalesced_regs]
-        # Also include coalesced entries
-        for n, r in int_regs.items():
-            if (n, r) not in reg_items:
-                reg_items.append((n, r))
+    # Compact allocation: pack register pairs tightly starting at R2
+    seen_regs = set()
+    remap = {}
+    next_r = 2
+    for name, reg in sorted(int_regs.items(), key=lambda x: x[1]):
+        if reg in remap:
+            int_regs[name] = remap[reg]
+        elif reg not in seen_regs:
+            if next_r % 2 != 0:
+                next_r += 1
+            remap[reg] = next_r
+            int_regs[name] = next_r
+            seen_regs.add(reg)
+            next_r += 2
+        else:
+            int_regs[name] = remap.get(reg, reg)
+    next_gpr = next_r if int_regs else next_gpr
 
-        # Reassign: pack 64-bit pairs tightly starting at R2
-        assigned = {}  # old_reg -> new_reg
-        next_r = 2
-        for name, reg in sorted(set(int_regs.items()), key=lambda x: x[1]):
-            if reg in assigned:
-                int_regs[name] = assigned[reg]
-            else:
-                if next_r % 2 != 0:
-                    next_r += 1
-                assigned[reg] = next_r
-                int_regs[name] = next_r
-                if reg != next_r:
-                    next_r += 2
-                else:
-                    next_r = max(next_r, reg + 2)
-        next_gpr = max(int_regs.values()) + 2 if int_regs else next_gpr
+    # Note: nv.info EIATTR_MAX_REG_COUNT limits available registers.
+    # Default template uses 0x80 (8 GPR groups). For > 8 GPRs, the emitter
+    # uses the 0x90 template. This is handled in cubin/emitter.py.
 
     # Parameter offsets in c[0][...]
     param_offsets: dict[str, int] = {}

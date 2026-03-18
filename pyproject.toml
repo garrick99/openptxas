@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openptxas"
+version = "0.1.0"
+description = "Open-source PTX assembler and optimizer — SM_120 focused"
+requires-python = ">=3.11"
+dependencies = [
+    "lark>=1.2",
+    "pyelftools>=0.31",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-xdist"]
+
+[project.scripts]
+openptxas = "openptxas.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]

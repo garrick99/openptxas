@@ -1,0 +1,18 @@
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry probe_k29(
+    .param .u64 out_ptr,
+    .param .u64 in_ptr)
+{
+    .reg .b64   %rd<8>;
+    ld.param.u64    %rd0, [in_ptr];
+    ld.global.u64   %rd1, [%rd0];
+    shl.b64         %rd2, %rd1, 29;
+    shr.u64         %rd3, %rd1, 35;
+    add.s64         %rd4, %rd2, %rd3;
+    ld.param.u64    %rd5, [out_ptr];
+    st.global.u64   [%rd5], %rd4;
+    ret;
+}

@@ -1,0 +1,6 @@
+lark>=1.2
+pyelftools>=0.31
+
+[dev]
+pytest
+pytest-xdist

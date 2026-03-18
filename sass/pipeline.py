@@ -19,6 +19,7 @@ from ptx.passes.rotate import run as rotate_run
 from sass.regalloc import allocate
 from sass.isel import ISelContext, select_function, SassInstr
 from sass.schedule import schedule
+from sass.scoreboard import assign_ctrl
 from cubin.emitter import emit_cubin, KernelDesc
 
 
@@ -58,9 +59,15 @@ def compile_function(fn: Function, verbose: bool = False) -> bytes:
     )
     body_instrs = select_function(fn, ctx)
 
-    # 4. Schedule: reorder for LDG latency + assign ctrl values
+    # 4. Schedule: reorder for LDG latency, then assign ctrl via scoreboard
     raw_instrs = preamble + body_instrs
-    sass_instrs = schedule(raw_instrs)
+    reordered = schedule(raw_instrs)
+    # The preamble instructions (LDC R1, LDCU UR4) have hardcoded ctrl from ptxas.
+    # Only assign scoreboard ctrl to body instructions (after preamble).
+    n_preamble = len(preamble)
+    preamble_instrs = reordered[:n_preamble]
+    body_scheduled = assign_ctrl(reordered[n_preamble:])
+    sass_instrs = preamble_instrs + body_scheduled
 
     if verbose:
         print(f"[pipeline] {len(sass_instrs)} SASS instructions:")

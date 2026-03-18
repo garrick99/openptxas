@@ -123,78 +123,36 @@ def _reorder_after_ldg(instrs: list[SassInstr]) -> list[SassInstr]:
     """Move independent LDC after LDG to hide latency.
 
     Only moves an LDC if its destination doesn't conflict with the LDG output.
+    If no moveable LDC is found, insert a NOP to provide minimum latency gap.
     """
+    from sass.encoding.sm_120_opcodes import encode_nop
     result = list(instrs)
-    for i in range(len(result) - 1):
+    i = 0
+    while i < len(result) - 1:
         if _get_opcode(result[i].raw) == 0x981:  # LDG
             ldg_dests = _get_dest_regs(result[i].raw)
             if _get_opcode(result[i + 1].raw) != 0xb82:  # next isn't LDC
+                moved = False
                 for j in range(i + 2, len(result)):
                     if _get_opcode(result[j].raw) == 0xb82:
-                        # Check if this LDC would clobber LDG output registers
                         ldc_dests = _get_dest_regs(result[j].raw)
                         if ldc_dests & ldg_dests:
-                            continue  # skip — would clobber LDG data
-                        moved = result.pop(j)
-                        result.insert(i + 1, moved)
+                            continue
+                        m = result.pop(j)
+                        result.insert(i + 1, m)
+                        moved = True
                         break
+                if not moved:
+                    # No moveable LDC — insert NOP for latency gap
+                    result.insert(i + 1, SassInstr(encode_nop(), 'NOP  // LDG latency'))
+        i += 1
     return result
 
 
 def schedule(instrs: list[SassInstr]) -> list[SassInstr]:
     """
-    Reorder and assign ctrl values with proper LDG barrier tracking.
+    Reorder instructions for LDG latency hiding.
 
-    All instructions that READ registers written by LDG get rbar=0x09
-    (the LDG wait barrier). Instructions that don't consume LDG data
-    get rbar=0x01 (no wait).
+    Ctrl assignment is handled separately by sass.scoreboard.assign_ctrl().
     """
-    reordered = _reorder_after_ldg(instrs)
-
-    # Phase 1: find which registers are written by LDG instructions
-    ldg_output_regs: set[int] = set()
-    for si in reordered:
-        if _get_opcode(si.raw) == 0x981:
-            ldg_output_regs |= _get_dest_regs(si.raw)
-
-    # Phase 2: assign ctrl values with def-use stall tracking
-    # Track which register was most recently written and when
-    last_write: dict[int, int] = {}  # reg_index → slot_index
-
-    result = []
-    last_ldg_pos = -100
-
-    for i, si in enumerate(reordered):
-        opcode = _get_opcode(si.raw)
-
-        # Default ctrl from opcode type
-        if opcode == 0xb82:  # LDC
-            b9 = si.raw[9]
-            if b9 == 0x0a:
-                ctrl = CTRL_LDC_64_AFTER_LDG if i == last_ldg_pos + 1 else CTRL_LDC_64
-            else:
-                ctrl = CTRL_LDC
-        elif opcode == 0x7ac:
-            ctrl = CTRL_LDCU
-        elif opcode == 0x981:
-            ctrl = CTRL_LDG
-            last_ldg_pos = i
-        elif opcode == 0x986:
-            ctrl = CTRL_STG
-        elif opcode == 0x94d:
-            ctrl = CTRL_EXIT
-        elif opcode == 0x947:
-            ctrl = CTRL_BRA
-        elif opcode == 0x918:
-            ctrl = CTRL_NOP
-        else:
-            # Compute instruction (SHF, IADD.64, MOV, etc.)
-            src_regs = _get_src_regs(si.raw)
-            reads_ldg = bool(src_regs & ldg_output_regs)
-
-            ctrl = CTRL_COMPUTE
-
-        patched = _patch_ctrl(si.raw, ctrl)
-        result.append(SassInstr(patched, si.comment))
-
-    return result
+    return _reorder_after_ldg(instrs)

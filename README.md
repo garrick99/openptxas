@@ -1,133 +1,146 @@
 # OpenPTXas
 
-Open-source PTX assembler for NVIDIA Blackwell (SM_120 / RTX 5090).
+Open-source PTX-to-SASS assembler for NVIDIA GPUs. Compiles PTX assembly to executable cubin binaries — no NVIDIA ptxas required.
 
-Generates executable cubins from PTX source, with correct results verified on hardware. Includes a scoreboard emulator that auto-generates dependency barriers, a cubin scanner that detects the ptxas rotate-miscompilation bug, and 34 ground-truth verified SASS instruction encoders.
+Targets SM_120 (Blackwell / RTX 5090) with 60+ ground-truth verified SASS instruction encoders, automated dependency barrier generation, and a fix for a critical ptxas miscompilation bug affecting every NVIDIA GPU since 2014.
 
-## Status
+## What You Can Do
 
-**Working.** Three standalone cubins execute correctly on RTX 5090. Matches or beats ptxas 13.0 performance.
+```bash
+# Compile PTX to cubin
+python __main__.py kernel.ptx -v
+
+# Scan an existing cubin for the ptxas rotate-sub bug
+python __main__.py --scan suspicious.cubin
+
+# Audit a cubin for scheduling hazards
+python __main__.py --audit kernel.cubin
+
+# Run tests (71 tests, all passing)
+pytest tests/ -v
+```
+
+The generated cubins execute correctly on RTX 5090 hardware, verified against ptxas 13.0 output.
+
+## Full Pipeline: CUDA C → PTX → cubin
+
+With [OpenCUDA](https://github.com/garrick99/opencuda), you get a complete open-source GPU compilation pipeline:
+
+```bash
+# Step 1: CUDA C → PTX (OpenCUDA)
+cd opencuda && python -m opencuda kernel.cu --emit-ptx
+
+# Step 2: PTX → cubin (OpenPTXas)
+cd openptxas && python __main__.py kernel.ptx -v
+```
+
+**33 CUDA kernels compile through this pipeline with zero errors** — from vector_add through tiled matrix multiply, shared memory reductions, atomic operations, warp shuffles, and control flow.
+
+## Instruction Coverage (60+ SASS Encoders)
+
+All encoders are byte-verified against ptxas 13.0 output on SM_120.
+
+| Category | Instructions |
+|---|---|
+| **Integer arithmetic** | IADD3, IADD3.X, IADD.64, IMAD, IMAD.WIDE, IMAD.HI, IMAD.SHL |
+| **Float arithmetic** | FADD, FMUL, FFMA |
+| **Transcendentals** | MUFU.RCP, MUFU.SQRT, MUFU.RSQ, MUFU.SIN, MUFU.COS, MUFU.EX2, MUFU.LG2 |
+| **Shifts** | SHF.L.W.U32.HI, SHF.L.U32, SHF.L.U64.HI, SHF.R.U64, SHF.R.U32.HI |
+| **Bitwise** | LOP3.LUT (AND/OR/XOR via lookup table), POPC, BREV, FLO |
+| **Comparison** | ISETP (6 modes, signed/unsigned), FSETP (8 modes) |
+| **Min/Max** | VIMNMX.S32, VIMNMX.U32, FMNMX |
+| **Conditional** | SEL, FSEL |
+| **Memory** | LDG.E (u8/u16/u32/u64/u128), STG.E (u32/u64/u128), LDS, STS, LDC, LDC.64, LDCU.64 |
+| **Atomics** | ATOMG.E (ADD, MIN, MAX, AND, OR, XOR, EXCH) — 7 operations |
+| **Warp** | SHFL (IDX/UP/DOWN/BFLY), VOTE.BALLOT |
+| **Type convert** | I2FP.F32 (S32/U32), F2I (S32/U32), CVT (u32↔u64) |
+| **Byte manip** | PRMT (byte permute with immediate selector) |
+| **Control** | MOV, NOP, EXIT, S2R, S2UR, BAR.SYNC, BRA (predicated), IABS |
+| **Tensor** | HMMA.16816.F32, IMMA.16832.S8.S8, LDSM.16.M88.4 (encoders present, isel pending) |
+
+## Key Features
+
+### Automated Scoreboard Emulation
+The SM_120 scoreboard protocol (rbar/wdep barriers) is generated automatically from def-use analysis — no manual control word matching required. Hardware-verified on RTX 5090.
+
+### ptxas Miscompilation Bug Fix
+Detects and correctly compiles a pattern that NVIDIA's ptxas has miscompiled since SM_50 (~2014):
+
+```
+shl.b64  %lo, %a, K
+shr.u64  %hi, %a, (64-K)
+sub.s64  %res, %lo, %hi    ← ptxas incorrectly emits ROTATE instead of SUBTRACT
+```
+
+OpenPTXas validates all three conditions (commutative op, unsigned shift, matching sources) before emitting a rotate instruction. ptxas skips these checks.
+
+**Verified:** 500K iterations on RTX 5090 — OpenPTXas produces correct results, ptxas produces wrong answers.
+
+### GPU Binary Auditor
+6-check static analysis tool for existing cubins:
+1. ptxas rotate-sub miscompilation detection
+2. Scheduling hazard identification (missing rbar barriers)
+3. Register pressure warnings
+4. Memory access pattern analysis
+5. Synchronization correctness
+6. Instruction mix profiling
+
+## Architecture
+
+```
+PTX source (.ptx)
+    ↓
+[Parser]       Hand-rolled recursive descent (full PTX grammar)
+    ↓
+[IR]           Module → Function → BasicBlock → Instruction
+    ↓
+[Passes]       Rotate-left bug detection and validation
+    ↓
+[RegAlloc]     Sequential GPR allocation, 64-bit pair alignment, LDG coalescing
+    ↓
+[ISel]         PTX → SASS instruction selection (60+ mappings)
+    ↓
+[Scheduler]    LDG latency hiding (moves LDC after LDG)
+    ↓
+[Scoreboard]   Automated rbar/wdep barrier generation
+    ↓
+[ELF Emitter]  Full cubin with .nv.info, .nv.capmerc, .note sections
+    ↓
+GPU execution  RTX 5090 verified ✓
+```
+
+Pure Python 3.11+. No dependencies beyond pytest for testing.
+
+## Requirements
+
+- Python 3.11+
+- For GPU execution: NVIDIA CUDA toolkit + RTX 5090/4090
+- For validation testing: NVIDIA ptxas (optional)
+
+## Performance
 
 ```
 OpenPTXas v0.1.0 vs NVIDIA ptxas 13.0 — RTX 5090 (SM_120)
 500,000 iterations:
 
-  Test 1: Rotate-Left (both correct)
-    ptxas 13.0:   5.446 us/iter
-    OpenPTXas:    5.250 us/iter  — 1.04x faster
+  Rotate-Left (both correct):
+    ptxas 13.0:   5.446 µs/iter
+    OpenPTXas:    5.250 µs/iter  — 1.04x faster
 
-  Test 2: Bug-Fix (ptxas WRONG, OpenPTXas CORRECT)
-    ptxas 13.0:   5.632 us/iter  — WRONG ANSWER
-    OpenPTXas:    5.257 us/iter  — CORRECT
+  Bug-Fix (ptxas WRONG, OpenPTXas CORRECT):
+    ptxas 13.0:   5.632 µs/iter  — WRONG ANSWER
+    OpenPTXas:    5.257 µs/iter  — correct
 ```
 
-## The ptxas Bug
+## Known Limitations
 
-NVIDIA's `ptxas` has a miscompilation bug affecting SM_50 through SM_120 (every GPU since ~2014):
-
-```
-PTX:    (a << K) - (a >> (64-K))    // subtraction
-ptxas:  SHF.L.W.U32.HI              // emits rotate — WRONG
-```
-
-The peephole optimizer pattern-matches `shl + shr` and converts to rotate without checking that the combining operation is subtraction (not add/or/xor). OpenPTXas correctly emits `IADD.64` with negate.
-
-### Scan for the bug
-
-```bash
-python -m openptxas --scan suspicious.cubin
-```
-
-### Compile with the fix
-
-```bash
-python -m openptxas kernel.ptx --out kernel.cubin
-```
-
-## Usage
-
-```bash
-# Compile PTX to cubin
-python -m openptxas kernel.ptx --out kernel.cubin
-
-# Scan a cubin for rotate-miscompilation bugs
-python -m openptxas --scan input.cubin
-
-# Parse and dump IR
-python -m openptxas kernel.ptx --dump-ir
-
-# Verbose output (show SASS instructions)
-python -m openptxas kernel.ptx -v
-```
-
-## Instruction Encoders (34)
-
-All encoders produce byte-identical output to ptxas 13.0.
-
-| Category | Instructions |
-|----------|-------------|
-| Integer | IADD3, IADD3.X, IADD.64, IMAD.WIDE, IMAD.SHL.U32, LOP3.LUT |
-| FP32 | FADD, FMUL, FFMA |
-| Shifts | SHF.L.W.U32.HI, SHF.L.U32, SHF.L.U64.HI, SHF.R.U64, SHF.R.U32.HI |
-| Tensor | HMMA.16816.F32, IMMA.16832.S8.S8, LDSM.16.M88.4 |
-| Memory | LDC, LDC.64, LDCU.64, LDG.E (32/64/128), STG.E (32/64/128), STS, LDS |
-| CVT | I2FP.F32.S32, F2I.TRUNC.NTZ |
-| Control | MOV, NOP, EXIT, S2R, S2UR, BAR.SYNC, BRA, ISETP.GE.AND |
-
-## Architecture
-
-```
-  PTX source
-      |
-  [Parser]     — hand-rolled recursive descent
-      |
-  [IR]         — Module / Function / BasicBlock / Instruction
-      |
-  [Rotate Pass] — detects ptxas miscompilation patterns
-      |
-  [RegAlloc]   — sequential allocation with LDG coalescing
-      |
-  [ISel]       — PTX → SASS instruction selection
-      |
-  [Scheduler]  — LDG latency hiding reorder
-      |
-  [Scoreboard] — automated ctrl/depbar generation
-      |
-  [Emitter]    — ELF64 cubin with ELFOSABI_CUDA, .nv.info, .nv.capmerc
-      |
-  [RTX 5090]
-```
-
-## Key Technical Details
-
-- **Scoreboard emulator**: auto-generates SM_120 dependency barriers (rbar/wdep) from register def-use chains. No manual ptxas-matching needed.
-- **Capmerc section**: `.nv.capmerc.text.<kernel>` header byte[8] encodes physical register file allocation. Without it, R8+ registers are uninitialized.
-- **ELFOSABI_CUDA**: `e_ident[7]=0x41, e_ident[8]=0x08` — required for CUDA driver to accept the binary.
-- **CGA addressing**: shared memory on Blackwell uses `S2UR(CgaCtaId) + UMOV + ULEA` with a 24-bit shift for CTA-local base computation.
-
-## Stack
-
-| Layer | Project | Role |
-|-------|---------|------|
-| Frontend | [OpenCUDA](https://github.com/garrick99/opencuda) | C → PTX |
-| Backend | **OpenPTXas** | PTX → cubin |
-| Hardware | RTX 5090 | SM_120 / Blackwell |
-
-## Tests
-
-71 unit tests + 3 GPU integration tests (compute, bug-fix, shared memory).
-
-```bash
-python -m pytest tests/ -v
-```
-
-## Requirements
-
-- Python 3.11+
-- `lark` (optional, for grammar-based parsing)
-- `pyelftools` (optional, for ELF inspection)
-- CUDA toolkit (only for GPU tests)
+- No register spilling (fails if >255 GPRs needed)
+- No liveness analysis (all registers treated as live)
+- Integer div/rem emit placeholder (ptxas generates 20-instruction Newton-Raphson sequences)
+- Scheduler only does one transformation (LDC after LDG)
+- f64 SASS instructions not yet encoded
+- SM_89 (Ada Lovelace) support is secondary — SM_120 is primary target
 
 ## License
 
-Private. All rights reserved.
+See LICENSE file.

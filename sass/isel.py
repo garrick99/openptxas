@@ -630,26 +630,41 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             f'FADD R{d}, -R{a}, RZ  // neg.f32'))
 
                 elif op == 'abs' and typ == 'f32':
-                    # abs.f32: FADD with abs modifier — use FMUL by 1.0? Or MOV with abs bit.
-                    # Simplest: FADD R{d}, |R{a}|, RZ (abs modifier on src)
-                    # For now emit MOV (abs requires modifier we may not have)
+                    # abs.f32: FADD |src|, -RZ (with abs modifier bit in b11)
+                    from sass.encoding.sm_120_opcodes import encode_fadd
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
-                    output.append(_nop(f'TODO: abs.f32 (needs FADD abs modifier)'))
+                    # FADD with abs on src0: encode as FADD d, |a|, -RZ
+                    # Ground truth: b11 has abs bit 0x02
+                    output.append(SassInstr(encode_fadd(d, a, RZ, negate_src0=True),
+                                            f'FADD R{d}, |R{a}|, -RZ  // abs.f32'))
 
                 elif op == 'selp':
-                    # selp.TYPE dest, src_true, src_false, pred
-                    # On SM_120: SEL dest, src0, src1, pred (but we don't have encoder yet)
-                    # Fallback: emit conditional MOVs via predicated instructions
-                    output.append(_nop(f'TODO: selp (need SEL encoder)'))
+                    from sass.encoding.sm_120_opcodes import encode_sel
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = ctx.ra.r32(instr.srcs[0].name)
+                    b = ctx.ra.r32(instr.srcs[1].name)
+                    pd = 0
+                    if len(instr.srcs) > 2 and isinstance(instr.srcs[2], RegOp):
+                        pd = ctx.ra.pred(instr.srcs[2].name) if instr.srcs[2].name in ctx.ra.pred_regs else 0
+                    output.append(SassInstr(encode_sel(d, a, b, pd),
+                                            f'SEL R{d}, R{a}, R{b}, P{pd}  // selp'))
 
                 elif op == 'min' and typ in ('u32', 's32'):
-                    # min.TYPE: compare + select
-                    # On SM_120 this would be IMNMX but we don't have the encoder
-                    output.append(_nop(f'TODO: min.{typ} (need IMNMX encoder)'))
+                    from sass.encoding.sm_120_opcodes import encode_vimnmx_s32
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = ctx.ra.r32(instr.srcs[0].name)
+                    b = ctx.ra.r32(instr.srcs[1].name)
+                    output.append(SassInstr(encode_vimnmx_s32(d, a, b, is_max=False),
+                                            f'VIMNMX.S32 R{d}, R{a}, R{b}, PT  // min.{typ}'))
 
                 elif op == 'max' and typ in ('u32', 's32'):
-                    output.append(_nop(f'TODO: max.{typ} (need IMNMX encoder)'))
+                    from sass.encoding.sm_120_opcodes import encode_vimnmx_s32
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = ctx.ra.r32(instr.srcs[0].name)
+                    b = ctx.ra.r32(instr.srcs[1].name)
+                    output.append(SassInstr(encode_vimnmx_s32(d, a, b, is_max=True),
+                                            f'VIMNMX.S32 R{d}, R{a}, R{b}, !PT  // max.{typ}'))
 
                 elif op == 'mad' and 'lo' in instr.types:
                     # mad.lo.s32 / mad.lo.u32 → IMAD
@@ -670,16 +685,80 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     # Would need iterative Newton-Raphson or lookup table
                     output.append(_nop(f'TODO: div.{typ} (need iterative algorithm)'))
 
+                elif op == 'rcp' and 'approx' in instr.types and typ == 'f32':
+                    from sass.encoding.sm_120_opcodes import encode_mufu, MUFU_RCP
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = ctx.ra.r32(instr.srcs[0].name)
+                    output.append(SassInstr(encode_mufu(d, a, MUFU_RCP),
+                                            f'MUFU.RCP R{d}, R{a}'))
+
+                elif op == 'sqrt' and 'approx' in instr.types and typ == 'f32':
+                    from sass.encoding.sm_120_opcodes import encode_mufu, MUFU_SQRT
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = ctx.ra.r32(instr.srcs[0].name)
+                    output.append(SassInstr(encode_mufu(d, a, MUFU_SQRT),
+                                            f'MUFU.SQRT R{d}, R{a}'))
+
+                elif op == 'sin' and 'approx' in instr.types and typ == 'f32':
+                    from sass.encoding.sm_120_opcodes import encode_mufu, MUFU_SIN
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = ctx.ra.r32(instr.srcs[0].name)
+                    output.append(SassInstr(encode_mufu(d, a, MUFU_SIN),
+                                            f'MUFU.SIN R{d}, R{a}'))
+
+                elif op == 'cos' and 'approx' in instr.types and typ == 'f32':
+                    from sass.encoding.sm_120_opcodes import encode_mufu, MUFU_COS
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = ctx.ra.r32(instr.srcs[0].name)
+                    output.append(SassInstr(encode_mufu(d, a, MUFU_COS),
+                                            f'MUFU.COS R{d}, R{a}'))
+
+                elif op == 'ex2' and 'approx' in instr.types and typ == 'f32':
+                    from sass.encoding.sm_120_opcodes import encode_mufu, MUFU_EX2
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = ctx.ra.r32(instr.srcs[0].name)
+                    output.append(SassInstr(encode_mufu(d, a, MUFU_EX2),
+                                            f'MUFU.EX2 R{d}, R{a}'))
+
+                elif op == 'lg2' and 'approx' in instr.types and typ == 'f32':
+                    from sass.encoding.sm_120_opcodes import encode_mufu, MUFU_LG2
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = ctx.ra.r32(instr.srcs[0].name)
+                    output.append(SassInstr(encode_mufu(d, a, MUFU_LG2),
+                                            f'MUFU.LG2 R{d}, R{a}'))
+
+                elif op == 'rsqrt' and 'approx' in instr.types and typ == 'f32':
+                    # rsqrt = rcp(sqrt(x)) but MUFU has dedicated RSQ function
+                    from sass.encoding.sm_120_opcodes import encode_mufu
+                    MUFU_RSQ = 0x02  # common on NVIDIA
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = ctx.ra.r32(instr.srcs[0].name)
+                    output.append(SassInstr(encode_mufu(d, a, MUFU_RSQ),
+                                            f'MUFU.RSQ R{d}, R{a}'))
+
                 elif op == 'div' and typ == 'f32':
                     # Float division: MUFU.RCP + FMUL
-                    # TODO: need MUFU encoder
-                    output.append(_nop(f'TODO: div.f32 (need MUFU.RCP encoder)'))
+                    from sass.encoding.sm_120_opcodes import encode_mufu, MUFU_RCP, encode_fmul
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = ctx.ra.r32(instr.srcs[0].name)
+                    b = ctx.ra.r32(instr.srcs[1].name)
+                    # temp = rcp(b), result = a * temp
+                    output.append(SassInstr(encode_mufu(d, b, MUFU_RCP),
+                                            f'MUFU.RCP R{d}, R{b}  // div.f32 step 1'))
+                    output.append(SassInstr(encode_fmul(d, a, d),
+                                            f'FMUL R{d}, R{a}, R{d}  // div.f32 step 2'))
 
-                elif op == 'sqrt' and typ == 'f32':
-                    output.append(_nop(f'TODO: sqrt.f32 (need MUFU.SQRT encoder)'))
-
-                elif op == 'rcp' and typ == 'f32':
-                    output.append(_nop(f'TODO: rcp.f32 (need MUFU.RCP encoder)'))
+                elif op == 'prmt':
+                    from sass.encoding.sm_120_opcodes import encode_prmt
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = ctx.ra.r32(instr.srcs[0].name)
+                    if isinstance(instr.srcs[1], ImmOp):
+                        sel = instr.srcs[1].value
+                        c = ctx.ra.r32(instr.srcs[2].name) if len(instr.srcs) > 2 else RZ
+                        output.append(SassInstr(encode_prmt(d, a, sel, c),
+                                                f'PRMT R{d}, R{a}, 0x{sel:04x}, R{c}'))
+                    else:
+                        output.append(_nop(f'TODO: prmt with register selector'))
 
                 else:
                     # Unsupported instruction: emit NOP with comment

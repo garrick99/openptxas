@@ -1563,6 +1563,200 @@ def roundtrip_verify_opcodes(verbose: bool = True) -> bool:
 # Module entry point
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# MUFU — Math Unit Function Unit (transcendentals)
+# ---------------------------------------------------------------------------
+# Opcode: 0x08, 0x73.  Function selected by modifier byte b11.
+# Ground truth from ptxas probe:
+#   MUFU.RCP   R6, R6:   bytes= 08 73 06 06 00 00 00 00 00 00 10 00 ...  b11 bits select function
+#   MUFU.SQRT  R9, R8:   b11=0x20  MUFU.SIN R11, R13: b11=0x04
+#   MUFU.COS  R13, R13:  b11=0x00 (ctrl diff)  MUFU.EX2 R15, R10: b11=0x08
+#   MUFU.LG2  R17, R8:   b11=0x0c
+#
+# Encoding: src in b3 (NOT b4).  dest in b2.  b4=0x00.
+# b9=0x00, b10=0x00, b11=function_id.
+
+MUFU_RCP  = 0x10
+MUFU_SQRT = 0x20
+MUFU_SIN  = 0x04
+MUFU_COS  = 0x00  # distinguished by ctrl context
+MUFU_EX2  = 0x08
+MUFU_LG2  = 0x0c
+
+def encode_mufu(dest: int, src: int, func: int, ctrl: int = 0) -> bytes:
+    """Encode MUFU dest, src with function selector."""
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0]  = 0x08
+    raw[1]  = 0x73
+    raw[2]  = dest & 0xFF
+    raw[3]  = src & 0xFF
+    raw[4]  = 0x00
+    # bytes 5-7 = 0
+    raw[8]  = 0x00
+    raw[9]  = 0x00
+    raw[10] = func & 0xFF
+    raw[11] = 0x00
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# VIMNMX — Integer Min/Max
+# ---------------------------------------------------------------------------
+# Opcode: 0x48, 0x72 (register-register).  0x48, 0x78 (register-immediate).
+# Ground truth:
+#   VIMNMX.S32 R19, R4, R5, PT (min):  0x0000000504137248 / ctrl has PT=0x03fe, bit=0x0100
+#   VIMNMX.S32 R5, R4, R5, !PT (max):  0x0000000504057248 / ctrl has !PT=0x07fe, bit=0x0100
+# Min vs max selected by predicate: PT = min, !PT = max.
+# b9=0x01, b10=0x00 for .S32.
+
+def encode_vimnmx_s32(dest: int, src0: int, src1: int, is_max: bool = False,
+                       ctrl: int = 0) -> bytes:
+    """Encode VIMNMX.S32 for min (is_max=False) or max (is_max=True)."""
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0]  = 0x48
+    raw[1]  = 0x72
+    raw[2]  = dest & 0xFF
+    raw[3]  = src0 & 0xFF
+    raw[4]  = src1 & 0xFF
+    raw[8]  = 0x00
+    raw[9]  = 0xfe  # predicate field
+    raw[10] = 0x07 if is_max else 0x03  # !PT for max, PT for min
+    raw[11] = 0x01  # .S32 modifier
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+def encode_vimnmx_u32(dest: int, src0: int, src1_imm: int, is_max: bool = False,
+                       ctrl: int = 0) -> bytes:
+    """Encode VIMNMX.U32 with immediate src1."""
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0]  = 0x48
+    raw[1]  = 0x78  # immediate variant
+    raw[2]  = dest & 0xFF
+    raw[3]  = src0 & 0xFF
+    raw[4]  = src1_imm & 0xFF
+    raw[5]  = (src1_imm >> 8) & 0xFF
+    raw[6]  = (src1_imm >> 16) & 0xFF
+    raw[7]  = (src1_imm >> 24) & 0xFF
+    raw[8]  = 0x00
+    raw[9]  = 0xfe
+    raw[10] = 0x07 if is_max else 0x03
+    raw[11] = 0x00  # .U32
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# SEL — Select (conditional move based on predicate)
+# ---------------------------------------------------------------------------
+# Opcode: 0x07, 0x72 (register variant).
+# Ground truth: SEL R7, R2, R7, P0 → 0x0000000702077207 / 0x000fe20000000000
+# dest=b2, src0=b3, src1=b4, predicate in modifier bytes.
+
+def encode_sel(dest: int, src0: int, src1: int, pred: int = 0,
+               ctrl: int = 0) -> bytes:
+    """Encode SEL dest, src0, src1, Ppred."""
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0]  = 0x07
+    raw[1]  = 0x72
+    raw[2]  = dest & 0xFF
+    raw[3]  = src0 & 0xFF
+    raw[4]  = src1 & 0xFF
+    raw[8]  = 0x00
+    raw[9]  = 0x00
+    raw[10] = 0x00
+    raw[11] = 0x00
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# PRMT — Byte Permute
+# ---------------------------------------------------------------------------
+# Opcode: 0x16, 0x78 (immediate selector).
+# Ground truth: PRMT R21, R4, 0x3210, R5 → 0x0000321004157816 / 0x040fe20000000005
+# b2=dest, b3=src0, b4-b7=immediate selector, b8=src1.
+
+def encode_prmt(dest: int, src0: int, selector: int, src1: int,
+                ctrl: int = 0) -> bytes:
+    """Encode PRMT dest, src0, selector_imm, src1."""
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0]  = 0x16
+    raw[1]  = 0x78
+    raw[2]  = dest & 0xFF
+    raw[3]  = src0 & 0xFF
+    raw[4]  = selector & 0xFF
+    raw[5]  = (selector >> 8) & 0xFF
+    raw[6]  = (selector >> 16) & 0xFF
+    raw[7]  = (selector >> 24) & 0xFF
+    raw[8]  = src1 & 0xFF
+    raw[9]  = 0x00
+    raw[10] = 0x00
+    raw[11] = 0x00
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# FSEL — Float Select (conditional move, float version)
+# ---------------------------------------------------------------------------
+# Opcode: 0x08, 0x72 (register).  0x08, 0x78 (immediate).
+# Ground truth: FSEL R6, R6, 1, !P0 → 0x3f80000006067808 / 0x000fe20004000000
+
+def encode_fsel(dest: int, src0: int, src1: int, pred: int = 0,
+                negate_pred: bool = False, ctrl: int = 0) -> bytes:
+    """Encode FSEL dest, src0, src1, [!]Ppred (register variant)."""
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0]  = 0x08
+    raw[1]  = 0x72
+    raw[2]  = dest & 0xFF
+    raw[3]  = src0 & 0xFF
+    raw[4]  = src1 & 0xFF
+    raw[8]  = 0x00
+    raw[9]  = 0x00
+    raw[10] = 0x00
+    raw[11] = 0x00
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
 if __name__ == "__main__":
     ok = roundtrip_verify_opcodes(verbose=True)
     print()

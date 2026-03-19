@@ -126,7 +126,8 @@ def _build_nv_info_global():
 
 def _build_nv_info_kernel(num_gprs: int = 8, num_params: int = 2,
                           param_sizes: list[int] = None,
-                          exit_instr_offset: int = 0x10):
+                          exit_instr_offset: int = 0x10,
+                          s2r_instr_offset: int = 0x10):
     """Generate per-kernel .nv.info attributes dynamically.
 
     Builds the attribute stream based on actual kernel parameters
@@ -173,15 +174,19 @@ def _build_nv_info_kernel(num_gprs: int = 8, num_params: int = 2,
     # EIATTR_CTAID_DIMS (0x4a)
     buf.extend(bytes([0x02, 0x4a, 0x00, 0x00]))
 
-    # EIATTR_MAX_REG_COUNT (0x1c): 0xFF = no limit (let hardware decide)
-    buf.extend(bytes([0x04, 0x1c, 0x04, 0x00, 0xFF, 0x00, 0x00, 0x00]))
+    # EIATTR_MAX_REG_COUNT (0x1c): ptxas uses 0x60 (96) as default for SM_120.
+    # This tells the hardware how many physical registers to allocate per thread.
+    # Higher = fewer concurrent warps. 0x60 is the ptxas default.
+    buf.extend(bytes([0x04, 0x1c, 0x04, 0x00, 0x60, 0x00, 0x00, 0x00]))
 
-    # EIATTR_S2RCTAID (0x19): s2r instruction offset
-    buf.extend(bytes([0x03, 0x19, 0x08, 0x00]))
+    s2r_offset = s2r_instr_offset
+    buf.extend(bytes([0x03, 0x19, s2r_offset & 0xFF, (s2r_offset >> 8) & 0xFF]))
 
-    # EIATTR_EXTERNS (0x0a): external dependencies (matches ptxas ground truth)
+    # EIATTR_EXTERNS (0x0a): external dependencies
+    # Second word's low byte matches S2RCTAID offset
     buf.extend(bytes([0x04, 0x0a, 0x08, 0x00,
-                      0x09, 0x00, 0x00, 0x00, 0x80, 0x03, 0x08, 0x00]))
+                      0x09, 0x00, 0x00, 0x00, 0x80, 0x03,
+                      s2r_offset & 0xFF, (s2r_offset >> 8) & 0xFF]))
 
     # EIATTR 0x36: always zero payload (matches ptxas)
     buf.extend(bytes([0x04, 0x36, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00]))
@@ -252,6 +257,7 @@ class KernelDesc:
     param_base: int = 0x380
     const0_size: int = 0x390  # default, overridden by pipeline based on params
     exit_offset: int = 0x10  # byte offset of EXIT instruction in .text
+    s2r_offset: int = 0x10  # byte offset of first S2R instruction in .text
     smem_size: int = 0           # static shared memory size in bytes (0 = none)
     sm_version: int = 120        # 89 (Ada) or 120 (Blackwell)
 
@@ -381,7 +387,9 @@ def emit_cubin(kernel: KernelDesc) -> bytes:
         _patch_cuinfo_sm(kernel.sm_version),  # 5
         _build_nv_info_global(),     # 6
         _build_nv_compat(),          # 7
-        _build_nv_info_kernel(num_gprs=kernel.num_gprs, num_params=kernel.num_params, param_sizes=kernel.param_sizes, exit_instr_offset=kernel.exit_offset),
+        _build_nv_info_kernel(num_gprs=kernel.num_gprs, num_params=kernel.num_params,
+                              param_sizes=kernel.param_sizes, exit_instr_offset=kernel.exit_offset,
+                              s2r_instr_offset=kernel.s2r_offset),
         _build_callgraph(),          # 9
         text_data,                   # 10
         shared_reserved,             # 11 (NOBITS)

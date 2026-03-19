@@ -134,6 +134,10 @@ def compile_function(fn: Function, verbose: bool = False) -> bytes:
             param_sizes.append(p.type.width // 8)
 
     # 5. Emit cubin
+    # Compute constant bank size: param_base + sum of all param sizes, rounded up to 4
+    total_param_bytes = sum(param_sizes)
+    const0_size = ((0x380 + total_param_bytes + 3) // 4) * 4  # 4-byte aligned
+
     desc = KernelDesc(
         name=fn.name,
         sass_bytes=sass_bytes,
@@ -141,6 +145,7 @@ def compile_function(fn: Function, verbose: bool = False) -> bytes:
         num_params=len(fn.params),
         param_sizes=param_sizes,
         param_offsets=alloc.param_offsets,
+        const0_size=const0_size,
     )
     return emit_cubin(desc)
 

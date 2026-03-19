@@ -161,17 +161,17 @@ def _select_mov(instr: Instruction, ra: RegAlloc) -> list[SassInstr]:
         s_hi = s_lo + 1
         instrs = []
         if d_lo != s_lo:
-            instrs.append(SassInstr(encode_mov(d_lo, s_lo),
+            instrs.append(SassInstr(encode_iadd3(d_lo, s_lo, RZ, RZ),
                                     f'MOV R{d_lo}, R{s_lo}  // {dest.name}.lo = {src.name}.lo'))
         if d_hi != s_hi:
-            instrs.append(SassInstr(encode_mov(d_hi, s_hi),
+            instrs.append(SassInstr(encode_iadd3(d_hi, s_hi, RZ, RZ),
                                     f'MOV R{d_hi}, R{s_hi}  // {dest.name}.hi = {src.name}.hi'))
         return instrs or [_nop(f'MOV {dest.name} = {src.name} (same reg, elided)')]
     else:
         # 32-bit
         d = ra.r32(dest.name)
         s = ra.r32(src.name)
-        return [SassInstr(encode_mov(d, s), f'MOV R{d}, R{s}  // {dest.name} = {src.name}')]
+        return [SassInstr(encode_iadd3(d, s, RZ, RZ), f'MOV R{d}, R{s}  // {dest.name} = {src.name}')]
 
 
 def _select_shl_b64(instr: Instruction, ra: RegAlloc) -> list[SassInstr]:
@@ -210,7 +210,7 @@ def _select_shl_b64(instr: Instruction, ra: RegAlloc) -> list[SassInstr]:
         # K >= 32: result.hi = src.lo << (K-32), result.lo = 0
         k32 = k - 32
         return [
-            SassInstr(encode_mov(d_lo, RZ),
+            SassInstr(encode_iadd3(d_lo, RZ, RZ, RZ),
                       f'MOV R{d_lo}, RZ  // shl.b64 lo = 0 (K>={k})'),
             SassInstr(encode_shf_l_u32(d_hi, s_lo, k32),
                       f'SHF.L.U32 R{d_hi}, R{s_lo}, 0x{k32:x}, RZ  // shl.b64 hi'),
@@ -271,7 +271,7 @@ def _select_shr_u64(instr: Instruction, ra: RegAlloc) -> list[SassInstr]:
         return [
             SassInstr(encode_shf_r_u32_hi(d_lo, s_hi, k32),
                       f'SHF.R.U32.HI R{d_lo}, RZ, 0x{k32:x}, R{s_hi}  // shr.u64 lo (K>={k})'),
-            SassInstr(encode_mov(d_hi, RZ),
+            SassInstr(encode_iadd3(d_hi, RZ, RZ, RZ),
                       f'MOV R{d_hi}, RZ  // shr.u64 hi = 0'),
         ]
 
@@ -616,9 +616,9 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         if 'u64' in instr.types and 'u32' in instr.types:
                             d_lo = ctx.ra.lo(d.name)
                             s_r = ctx.ra.r32(s.name)
-                            output.append(SassInstr(encode_mov(d_lo, s_r),
+                            output.append(SassInstr(encode_iadd3(d_lo, s_r, RZ, RZ),
                                                     f'MOV R{d_lo}, R{s_r}  // cvt.u64.u32 lo'))
-                            output.append(SassInstr(encode_mov(d_lo+1, RZ),
+                            output.append(SassInstr(encode_iadd3(d_lo+1, RZ, RZ, RZ),
                                                     f'MOV R{d_lo+1}, RZ  // cvt.u64.u32 hi=0'))
                         else:
                             output.append(_nop(f'TODO: cvt {".".join(instr.types)}'))
@@ -905,7 +905,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     d = ctx.ra.r32(instr.dest.name)
                     if isinstance(instr.srcs[0], RegOp):
                         a = ctx.ra.r32(instr.srcs[0].name)
-                        output.append(SassInstr(encode_mov(d, a),
+                        output.append(SassInstr(encode_iadd3(d, a, RZ, RZ),
                                                 f'MOV R{d}, R{a}'))
                     else:
                         output.append(_nop(f'TODO: mov with immediate'))

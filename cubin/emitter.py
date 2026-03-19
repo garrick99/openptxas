@@ -170,26 +170,17 @@ def _build_nv_info_kernel(num_gprs: int = 8, num_params: int = 2,
     # EIATTR_CTAID_DIMS (0x4a)
     buf.extend(bytes([0x02, 0x4a, 0x00, 0x00]))
 
-    # EIATTR_MAX_REG_COUNT (0x1c): ptxas format is size=8, payload=regcount + padding
-    # ptxas: 041c0800 70000000 40010000 (for ~36 GPRs)
-    # Register count byte: 0x70 means up to R112 allocated
-    # Scale: approx num_gprs rounded up to nearest 8, then encoded
-    reg_alloc = ((num_gprs + 7) & ~7)  # round up to multiple of 8
-    if reg_alloc < 16: reg_alloc = 16
-    buf.extend(bytes([0x04, 0x1c, 0x08, 0x00,
-                      reg_alloc & 0xFF, 0x00, 0x00, 0x00,
-                      0x40, 0x01, 0x00, 0x00]))
+    # EIATTR_MAX_REG_COUNT (0x1c): 0xFF = no limit (let hardware decide)
+    buf.extend(bytes([0x04, 0x1c, 0x04, 0x00, 0xFF, 0x00, 0x00, 0x00]))
 
-    # EIATTR_S2RCTAID (0x19)
-    s2r_val = 0x1c if num_gprs > 16 else 0x18
-    buf.extend(bytes([0x03, 0x19, s2r_val, 0x00]))
+    # EIATTR_S2RCTAID (0x19): s2r instruction offset
+    buf.extend(bytes([0x03, 0x19, 0x08, 0x00]))
 
-    # EIATTR_CRS_STACK (0x0a)
-    buf.extend(bytes([0x04, 0x0a, 0x08, 0x00]))
-    buf.extend(bytes([0x09, 0x00, 0x00, 0x00]))
-    buf.extend(bytes([0x80, 0x03, s2r_val, 0x00]))
+    # EIATTR_EXTERNS (0x0a): external dependencies (matches ptxas ground truth)
+    buf.extend(bytes([0x04, 0x0a, 0x08, 0x00,
+                      0x09, 0x00, 0x00, 0x00, 0x80, 0x03, 0x08, 0x00]))
 
-    # EIATTR_COOP_GROUP (0x36)
+    # EIATTR 0x36: always zero payload (matches ptxas)
     buf.extend(bytes([0x04, 0x36, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00]))
 
     return bytes(buf)
@@ -218,37 +209,28 @@ def _build_capmerc(num_gprs: int = 10):
     kernel that fits within 8 GPRs. For larger kernels, uses the force_highreg
     template (166 bytes) with patched register count.
     """
-    if num_gprs <= 10:
-        buf = bytearray.fromhex(
-            '0c000000010000c00a00000068010000'
-            '010b040af80004000000410000040000'
-            '010b0e0afa0005000000030139040000'
-            '02220e06f80052000000830040000200'
-            '00000000000000000000000008000000'
-            '02220e06f80052000000030140000200'
-            '00000000000000000000000000000000'
-            '02380e32f80050110000000002010a00'
-            '00020182010000000000000000000000'
-            'd007'
-        )
-        buf[8] = num_gprs & 0xFF
-        return bytes(buf)
-    else:
-        buf = bytearray.fromhex(
-            '0c000000010000c00f00000048210000'
-            '010b040af80004000000410000040000'
-            '010b0e0afa0005000000030139040000'
-            '02220e06f80052000000830040000200'
-            '00000000000000000000000008000000'
-            '02220e06f80052000000830140000200'
-            '00000000000000000000000000000000'
-            '410c5004410c5004410c5004410c5004'
-            '410c500402380e32f800501100000000'
-            '82010a00000201020100000000000000'
-            '000000005005'
-        )
-        buf[8] = num_gprs & 0xFF
-        return bytes(buf)
+    # Capmerc (Mercury compiler metadata) is optimization hints, not required for execution.
+    # The CUDA driver launches kernels correctly with a zeroed/minimal capmerc.
+    # A proper capmerc would encode instruction scheduling and register liveness data
+    # matching the specific SASS instruction sequence — generating this requires deep
+    # reverse engineering of the Mercury compiler format.
+    # For now: emit a minimal valid header that allows execution.
+    # Capmerc byte[8] = register allocation: tells hardware how many GPRs to allocate.
+    # Must use the full 130-byte template (16-byte minimal doesn't work).
+    reg_alloc = max(((num_gprs + 7) & ~7), 16)  # minimum 16, rounded to 8
+    buf = bytearray.fromhex(
+        '0c000000010000c00800000050000000'
+        '010b040af80004000000410000040000'
+        '010b040af80004000000410101020000'
+        '010b0e0afa0005000000030139040000'
+        '02220e06f80052000000830040000200'
+        '00000000000000000000000000000000'
+        '02380e32f80040110000000082000a00'
+        '00020140010000000000000000000000'
+        'd004'
+    )
+    buf[8] = reg_alloc & 0xFF
+    return bytes(buf)
 
 
 # ---------------------------------------------------------------------------
@@ -264,7 +246,7 @@ class KernelDesc:
     param_sizes: list[int]
     param_offsets: dict[str, int]
     param_base: int = 0x380
-    const0_size: int = 0x390
+    const0_size: int = 0x390  # default, overridden by pipeline based on params
     smem_size: int = 0           # static shared memory size in bytes (0 = none)
     sm_version: int = 120        # 89 (Ada) or 120 (Blackwell)
 

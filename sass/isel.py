@@ -444,7 +444,8 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
 
         for instr in bb.instructions:
             op = instr.op.lower()
-            typ = instr.types[0].lower() if instr.types else ''
+            # typ = last type qualifier (the data type). Earlier elements are modifiers (lo, hi, approx, etc.)
+            typ = instr.types[-1].lower() if instr.types else ''
 
             try:
                 if op == 'mov' and typ in ('u32', 's32', 'b32', 'u64', 's64', 'b64'):
@@ -452,6 +453,31 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
 
                 elif op == 'shl' and typ in ('b64', 'u64'):
                     output.extend(_select_shl_b64(instr, ctx.ra))
+
+                elif op == 'shl' and typ in ('b32', 'u32', 's32'):
+                    # 32-bit shift left: SHF.L.U32 or IMAD.SHL for small constants
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = ctx.ra.r32(instr.srcs[0].name)
+                    if isinstance(instr.srcs[1], ImmOp):
+                        k = instr.srcs[1].value
+                        if k <= 15:
+                            output.append(SassInstr(encode_imad_shl_u32(d, a, k),
+                                                    f'IMAD.SHL.U32 R{d}, R{a}, {1<<k:#x}, RZ  // shl.{typ} {k}'))
+                        else:
+                            output.append(SassInstr(encode_shf_l_u32(d, a, k, RZ),
+                                                    f'SHF.L.U32 R{d}, R{a}, 0x{k:x}, RZ  // shl.{typ} {k}'))
+                    else:
+                        output.append(_nop(f'TODO: shl.{typ} with register shift amount'))
+
+                elif op == 'shr' and typ in ('b32', 'u32', 's32'):
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = ctx.ra.r32(instr.srcs[0].name)
+                    if isinstance(instr.srcs[1], ImmOp):
+                        k = instr.srcs[1].value
+                        output.append(SassInstr(encode_shf_r_u32_hi(d, a, k),
+                                                f'SHF.R.U32.HI R{d}, RZ, 0x{k:x}, R{a}  // shr.{typ} {k}'))
+                    else:
+                        output.append(_nop(f'TODO: shr.{typ} with register shift amount'))
 
                 elif op == 'shr' and typ in ('u64',):
                     output.extend(_select_shr_u64(instr, ctx.ra))

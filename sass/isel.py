@@ -37,23 +37,41 @@ from typing import Optional
 
 from ptx.ir import Instruction, Function, Operand, RegOp, ImmOp, LabelOp
 
-from sass.encoding.sm_120_encode import (
-    encode_shf_l_w_u32_hi,
-    encode_shf_l_u32,
-    encode_shf_l_u64_hi,
-)
 from sass.encoding.sm_120_opcodes import (
     encode_nop, encode_exit, encode_mov,
     encode_ldc, encode_ldc_64,
     encode_s2r,
     encode_iadd3, encode_iadd3x,
     encode_iadd64,
-    encode_imad_wide,
-    encode_ldg_e_64, encode_stg_e_64,
+    encode_imad_wide, encode_imad_hi, encode_imad_shl_u32,
+    encode_ldg_e, encode_ldg_e_64,
+    encode_stg_e, encode_stg_e_64,
+    encode_lds, encode_sts,
+    encode_ldcu_64,
+    encode_bar_sync,
     encode_isetp_ge_and,
+    encode_isetp, ISETP_LT, ISETP_EQ, ISETP_LE, ISETP_GT, ISETP_NE, ISETP_GE,
+    encode_fsetp, FSETP_LT, FSETP_EQ, FSETP_LE, FSETP_GT, FSETP_NE, FSETP_GE,
     encode_bra,
+    encode_fadd, encode_fmul, encode_ffma,
+    encode_mufu, MUFU_RCP, MUFU_SQRT, MUFU_SIN, MUFU_COS, MUFU_EX2, MUFU_LG2,
+    encode_sel, encode_fsel,
+    encode_vimnmx_s32, encode_vimnmx_u32,
+    encode_fmnmx,
+    encode_prmt,
+    encode_popc, encode_brev, encode_flo, encode_iabs,
+    encode_shfl, SHFL_IDX, SHFL_UP, SHFL_DOWN, SHFL_BFLY,
+    encode_vote_ballot,
+    encode_i2fp_u32, encode_f2i_u32,
+    encode_lop3, LOP3_AND, LOP3_OR, LOP3_XOR,
     RZ, PT, SR_TID_X, SR_TID_Y,
     SR_CTAID_X,
+)
+from sass.encoding.sm_120_encode import (
+    encode_shf_l_w_u32_hi,
+    encode_shf_l_u32,
+    encode_shf_l_u64_hi,
+    encode_shf_r_u32, encode_shf_r_u32_hi,
 )
 from sass.regalloc import RegAlloc
 
@@ -175,7 +193,6 @@ def _select_shl_b64(instr: Instruction, ra: RegAlloc) -> list[SassInstr]:
 
     if k < 32 and k <= 15:
         # Use IMAD.SHL for lo (avoids SHF.L/SHF.R pipeline conflicts)
-        from sass.encoding.sm_120_opcodes import encode_imad_shl_u32
         return [
             SassInstr(encode_imad_shl_u32(d_lo, s_lo, k),
                       f'IMAD.SHL.U32 R{d_lo}, R{s_lo}, {1<<k:#x}, RZ  // {dest.name}.lo = {src.name}.lo << {k}'),
@@ -240,7 +257,6 @@ def _select_shr_u64(instr: Instruction, ra: RegAlloc) -> list[SassInstr]:
     d_lo = ra.lo(dest.name); d_hi = d_lo + 1
     s_lo = ra.lo(src.name);  s_hi = s_lo + 1
 
-    from sass.encoding.sm_120_encode import encode_shf_r_u32, encode_shf_r_u32_hi
 
     if k < 32:
         return [
@@ -365,7 +381,6 @@ def _select_ld_global(instr: Instruction, ra: RegAlloc,
         return [SassInstr(encode_ldg_e_64(d, ur_desc, addr),
                           f'LDG.E.64 R{d}, desc[UR{ur_desc}][R{addr}.64]')]
     else:
-        from sass.encoding.sm_120_opcodes import encode_ldg_e
         d = ra.r32(dest.name)
         return [SassInstr(encode_ldg_e(d, ur_desc, addr, width=32),
                           f'LDG.E R{d}, desc[UR{ur_desc}][R{addr}.64]')]
@@ -391,7 +406,6 @@ def _select_st_global(instr: Instruction, ra: RegAlloc,
         return [SassInstr(encode_stg_e_64(ur_desc, addr, data, ctrl=0xff1),
                           f'STG.E.64 desc[UR{ur_desc}][R{addr}.64], R{data}')]
     else:
-        from sass.encoding.sm_120_opcodes import encode_stg_e
         data = ra.r32(src_op.name)
         return [SassInstr(encode_stg_e(ur_desc, addr, data, width=32, ctrl=0xff1),
                           f'STG.E desc[UR{ur_desc}][R{addr}.64], R{data}')]
@@ -464,7 +478,6 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             f'IADD3 R{d}, R{a}, -R{b}, RZ  // sub.{typ}'))
 
                 elif op in ('and', 'or', 'xor') and typ in ('b32', 'u32', 's32'):
-                    from sass.encoding.sm_120_opcodes import encode_lop3, LOP3_AND, LOP3_OR, LOP3_XOR
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
                     b = ctx.ra.r32(instr.srcs[1].name)
@@ -481,7 +494,6 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             f'IMAD R{d}, R{a}, R{b}, RZ  // mul.lo.{typ}'))
 
                 elif op == 'st' and 'shared' in instr.types:
-                    from sass.encoding.sm_120_opcodes import encode_sts
                     from ptx.ir import MemOp
                     addr_op = instr.srcs[0]
                     data_op = instr.srcs[1]
@@ -492,7 +504,6 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             f'STS [UR4+{offset:#x}], R{data_r}  // st.shared'))
 
                 elif op == 'ld' and 'shared' in instr.types:
-                    from sass.encoding.sm_120_opcodes import encode_lds
                     from ptx.ir import MemOp
                     dest_r = ctx.ra.r32(instr.dest.name)
                     addr_op = instr.srcs[0]
@@ -501,12 +512,10 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             f'LDS R{dest_r}, [UR4+{offset:#x}]  // ld.shared'))
 
                 elif op == 'bar':
-                    from sass.encoding.sm_120_opcodes import encode_bar_sync
                     output.append(SassInstr(encode_bar_sync(0),
                                             f'BAR.SYNC 0'))
 
                 elif op == 'add' and typ == 'f32':
-                    from sass.encoding.sm_120_opcodes import encode_fadd
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
                     b = ctx.ra.r32(instr.srcs[1].name)
@@ -514,7 +523,6 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             f'FADD R{d}, R{a}, R{b}  // add.f32'))
 
                 elif op == 'sub' and typ == 'f32':
-                    from sass.encoding.sm_120_opcodes import encode_fadd
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
                     b = ctx.ra.r32(instr.srcs[1].name)
@@ -527,7 +535,6 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             f'FADD R{d}, -R{b}, R{a}  // sub.f32'))
 
                 elif op == 'mul' and typ == 'f32':
-                    from sass.encoding.sm_120_opcodes import encode_fmul
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
                     b = ctx.ra.r32(instr.srcs[1].name)
@@ -535,7 +542,6 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             f'FMUL R{d}, R{a}, R{b}  // mul.f32'))
 
                 elif op == 'fma' and typ == 'f32':
-                    from sass.encoding.sm_120_opcodes import encode_ffma
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
                     b = ctx.ra.r32(instr.srcs[1].name)
@@ -592,11 +598,6 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             output.append(_nop(f'TODO: cvt {".".join(instr.types)}'))
 
                 elif op == 'setp':
-                    from sass.encoding.sm_120_opcodes import (
-                        encode_isetp, encode_fsetp,
-                        ISETP_LT, ISETP_EQ, ISETP_LE, ISETP_GT, ISETP_NE, ISETP_GE,
-                        FSETP_LT, FSETP_EQ, FSETP_LE, FSETP_GT, FSETP_NE, FSETP_GE,
-                    )
                     pred = instr.dest
                     a    = instr.srcs[0]
                     b    = instr.srcs[1]
@@ -633,7 +634,6 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
 
                 elif op == 'neg' and typ == 'f32':
                     # neg.f32: FADD with negated src and zero
-                    from sass.encoding.sm_120_opcodes import encode_fadd
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
                     output.append(SassInstr(encode_fadd(d, RZ, a, negate_src0=True),
@@ -641,7 +641,6 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
 
                 elif op == 'abs' and typ == 'f32':
                     # abs.f32: FADD |src|, -RZ (with abs modifier bit in b11)
-                    from sass.encoding.sm_120_opcodes import encode_fadd
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
                     # FADD with abs on src0: encode as FADD d, |a|, -RZ
@@ -650,7 +649,6 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             f'FADD R{d}, |R{a}|, -RZ  // abs.f32'))
 
                 elif op == 'selp':
-                    from sass.encoding.sm_120_opcodes import encode_sel
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
                     b = ctx.ra.r32(instr.srcs[1].name)
@@ -661,7 +659,6 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             f'SEL R{d}, R{a}, R{b}, P{pd}  // selp'))
 
                 elif op == 'min' and typ in ('u32', 's32'):
-                    from sass.encoding.sm_120_opcodes import encode_vimnmx_s32
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
                     b = ctx.ra.r32(instr.srcs[1].name)
@@ -669,7 +666,6 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             f'VIMNMX.S32 R{d}, R{a}, R{b}, PT  // min.{typ}'))
 
                 elif op == 'max' and typ in ('u32', 's32'):
-                    from sass.encoding.sm_120_opcodes import encode_vimnmx_s32
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
                     b = ctx.ra.r32(instr.srcs[1].name)
@@ -686,7 +682,6 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             f'IMAD R{d}, R{a}, R{b}, R{c}  // mad.lo.{typ}'))
 
                 elif op == 'mul' and 'hi' in instr.types and typ in ('u32', 's32'):
-                    from sass.encoding.sm_120_opcodes import encode_imad_hi
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
                     b = ctx.ra.r32(instr.srcs[1].name)
@@ -694,14 +689,12 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             f'IMAD.HI R{d}, R{a}, R{b}, RZ  // mul.hi.{typ}'))
 
                 elif op == 'popc' and typ in ('b32',):
-                    from sass.encoding.sm_120_opcodes import encode_popc
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
                     output.append(SassInstr(encode_popc(d, a),
                                             f'POPC R{d}, R{a}'))
 
                 elif op == 'clz' and typ in ('b32',):
-                    from sass.encoding.sm_120_opcodes import encode_flo
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
                     # CLZ = 31 - FLO for non-zero (ptxas compiles CLZ to FLO)
@@ -709,21 +702,18 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             f'FLO.U32 R{d}, R{a}  // clz.b32'))
 
                 elif op == 'brev' and typ in ('b32',):
-                    from sass.encoding.sm_120_opcodes import encode_brev
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
                     output.append(SassInstr(encode_brev(d, a),
                                             f'BREV R{d}, R{a}'))
 
                 elif op == 'abs' and typ in ('s32',):
-                    from sass.encoding.sm_120_opcodes import encode_iabs
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
                     output.append(SassInstr(encode_iabs(d, a),
                                             f'IABS R{d}, R{a}'))
 
                 elif op == 'min' and typ == 'f32':
-                    from sass.encoding.sm_120_opcodes import encode_fmnmx
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
                     b = ctx.ra.r32(instr.srcs[1].name)
@@ -731,7 +721,6 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             f'FMNMX R{d}, R{a}, R{b}, PT  // min.f32'))
 
                 elif op == 'max' and typ == 'f32':
-                    from sass.encoding.sm_120_opcodes import encode_fmnmx
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
                     b = ctx.ra.r32(instr.srcs[1].name)
@@ -739,7 +728,6 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             f'FMNMX R{d}, R{a}, R{b}, !PT  // max.f32'))
 
                 elif op == 'shfl':
-                    from sass.encoding.sm_120_opcodes import encode_shfl, SHFL_IDX, SHFL_UP, SHFL_DOWN, SHFL_BFLY
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
                     mode_map = {'idx': SHFL_IDX, 'up': SHFL_UP, 'down': SHFL_DOWN, 'bfly': SHFL_BFLY}
@@ -757,7 +745,6 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             f'SHFL R{d}, R{a}  // shfl.sync'))
 
                 elif op == 'vote':
-                    from sass.encoding.sm_120_opcodes import encode_vote_ballot
                     d = ctx.ra.r32(instr.dest.name)
                     output.append(SassInstr(encode_vote_ballot(d),
                                             f'VOTE.ANY R{d}, PT, PT  // vote.sync.ballot'))
@@ -765,10 +752,6 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                 elif op == 'div' and typ == 'u32':
                     # Unsigned integer division via Newton-Raphson reciprocal.
                     # Same sequence ptxas emits: I2F → RCP → F2I → correction loop.
-                    from sass.encoding.sm_120_opcodes import (
-                        encode_mufu, MUFU_RCP, encode_iadd3, encode_imad_hi,
-                        encode_isetp, ISETP_GE,
-                    )
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
                     b = ctx.ra.r32(instr.srcs[1].name)
@@ -776,7 +759,6 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     # This is a simplified version — full ptxas sequence has ~20 instructions.
                     # For now emit the RCP-based approximation (correct for most inputs).
                     # Step 1: float_b = I2FP(b)
-                    from sass.encoding.sm_120_opcodes import encode_i2fp_u32, encode_f2i_u32, encode_fmul
                     output.append(SassInstr(encode_i2fp_u32(d, b),
                                             f'I2FP.F32.U32 R{d}, R{b}  // div.u32: float(divisor)'))
                     output.append(SassInstr(encode_mufu(d, d, MUFU_RCP),
@@ -795,42 +777,36 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     output.append(_nop(f'TODO: rem.{typ} (needs div.{typ} + IMAD sequence)'))
 
                 elif op == 'rcp' and 'approx' in instr.types and typ == 'f32':
-                    from sass.encoding.sm_120_opcodes import encode_mufu, MUFU_RCP
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
                     output.append(SassInstr(encode_mufu(d, a, MUFU_RCP),
                                             f'MUFU.RCP R{d}, R{a}'))
 
                 elif op == 'sqrt' and 'approx' in instr.types and typ == 'f32':
-                    from sass.encoding.sm_120_opcodes import encode_mufu, MUFU_SQRT
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
                     output.append(SassInstr(encode_mufu(d, a, MUFU_SQRT),
                                             f'MUFU.SQRT R{d}, R{a}'))
 
                 elif op == 'sin' and 'approx' in instr.types and typ == 'f32':
-                    from sass.encoding.sm_120_opcodes import encode_mufu, MUFU_SIN
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
                     output.append(SassInstr(encode_mufu(d, a, MUFU_SIN),
                                             f'MUFU.SIN R{d}, R{a}'))
 
                 elif op == 'cos' and 'approx' in instr.types and typ == 'f32':
-                    from sass.encoding.sm_120_opcodes import encode_mufu, MUFU_COS
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
                     output.append(SassInstr(encode_mufu(d, a, MUFU_COS),
                                             f'MUFU.COS R{d}, R{a}'))
 
                 elif op == 'ex2' and 'approx' in instr.types and typ == 'f32':
-                    from sass.encoding.sm_120_opcodes import encode_mufu, MUFU_EX2
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
                     output.append(SassInstr(encode_mufu(d, a, MUFU_EX2),
                                             f'MUFU.EX2 R{d}, R{a}'))
 
                 elif op == 'lg2' and 'approx' in instr.types and typ == 'f32':
-                    from sass.encoding.sm_120_opcodes import encode_mufu, MUFU_LG2
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
                     output.append(SassInstr(encode_mufu(d, a, MUFU_LG2),
@@ -838,7 +814,6 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
 
                 elif op == 'rsqrt' and 'approx' in instr.types and typ == 'f32':
                     # rsqrt = rcp(sqrt(x)) but MUFU has dedicated RSQ function
-                    from sass.encoding.sm_120_opcodes import encode_mufu
                     MUFU_RSQ = 0x02  # common on NVIDIA
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
@@ -847,7 +822,6 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
 
                 elif op == 'div' and typ == 'f32':
                     # Float division: MUFU.RCP + FMUL
-                    from sass.encoding.sm_120_opcodes import encode_mufu, MUFU_RCP, encode_fmul
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
                     b = ctx.ra.r32(instr.srcs[1].name)
@@ -858,7 +832,6 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             f'FMUL R{d}, R{a}, R{d}  // div.f32 step 2'))
 
                 elif op == 'prmt':
-                    from sass.encoding.sm_120_opcodes import encode_prmt
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
                     if isinstance(instr.srcs[1], ImmOp):
@@ -886,7 +859,6 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
 
                 elif op in ('cvt',):
                     # General CVT — handle common conversions
-                    from sass.encoding.sm_120_opcodes import encode_i2fp_u32, encode_f2i_u32
                     src_type = instr.types[-1] if len(instr.types) > 1 else 'u32'
                     dst_type = instr.types[0] if len(instr.types) > 0 else 'u32'
                     d = ctx.ra.r32(instr.dest.name)

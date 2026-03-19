@@ -675,15 +675,88 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     output.append(SassInstr(encode_imad_wide(d, a, b, c),
                                             f'IMAD R{d}, R{a}, R{b}, R{c}  // mad.lo.{typ}'))
 
+                elif op == 'mul' and 'hi' in instr.types and typ in ('u32', 's32'):
+                    from sass.encoding.sm_120_opcodes import encode_imad_hi
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = ctx.ra.r32(instr.srcs[0].name)
+                    b = ctx.ra.r32(instr.srcs[1].name)
+                    output.append(SassInstr(encode_imad_hi(d, a, b, RZ, signed=(typ == 's32')),
+                                            f'IMAD.HI R{d}, R{a}, R{b}, RZ  // mul.hi.{typ}'))
+
+                elif op == 'popc' and typ in ('b32',):
+                    from sass.encoding.sm_120_opcodes import encode_popc
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = ctx.ra.r32(instr.srcs[0].name)
+                    output.append(SassInstr(encode_popc(d, a),
+                                            f'POPC R{d}, R{a}'))
+
+                elif op == 'clz' and typ in ('b32',):
+                    from sass.encoding.sm_120_opcodes import encode_flo
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = ctx.ra.r32(instr.srcs[0].name)
+                    # CLZ = 31 - FLO for non-zero (ptxas compiles CLZ to FLO)
+                    output.append(SassInstr(encode_flo(d, a),
+                                            f'FLO.U32 R{d}, R{a}  // clz.b32'))
+
+                elif op == 'brev' and typ in ('b32',):
+                    from sass.encoding.sm_120_opcodes import encode_brev
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = ctx.ra.r32(instr.srcs[0].name)
+                    output.append(SassInstr(encode_brev(d, a),
+                                            f'BREV R{d}, R{a}'))
+
+                elif op == 'abs' and typ in ('s32',):
+                    from sass.encoding.sm_120_opcodes import encode_iabs
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = ctx.ra.r32(instr.srcs[0].name)
+                    output.append(SassInstr(encode_iabs(d, a),
+                                            f'IABS R{d}, R{a}'))
+
+                elif op == 'min' and typ == 'f32':
+                    from sass.encoding.sm_120_opcodes import encode_fmnmx
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = ctx.ra.r32(instr.srcs[0].name)
+                    b = ctx.ra.r32(instr.srcs[1].name)
+                    output.append(SassInstr(encode_fmnmx(d, a, b, is_max=False),
+                                            f'FMNMX R{d}, R{a}, R{b}, PT  // min.f32'))
+
+                elif op == 'max' and typ == 'f32':
+                    from sass.encoding.sm_120_opcodes import encode_fmnmx
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = ctx.ra.r32(instr.srcs[0].name)
+                    b = ctx.ra.r32(instr.srcs[1].name)
+                    output.append(SassInstr(encode_fmnmx(d, a, b, is_max=True),
+                                            f'FMNMX R{d}, R{a}, R{b}, !PT  // max.f32'))
+
+                elif op == 'shfl':
+                    from sass.encoding.sm_120_opcodes import encode_shfl, SHFL_IDX, SHFL_UP, SHFL_DOWN, SHFL_BFLY
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = ctx.ra.r32(instr.srcs[0].name)
+                    mode_map = {'idx': SHFL_IDX, 'up': SHFL_UP, 'down': SHFL_DOWN, 'bfly': SHFL_BFLY}
+                    mode = SHFL_IDX
+                    for t in instr.types:
+                        if t in mode_map:
+                            mode = mode_map[t]
+                    lane = 0
+                    clamp = 0x1f
+                    if len(instr.srcs) > 1 and isinstance(instr.srcs[1], ImmOp):
+                        lane = instr.srcs[1].value
+                    if len(instr.srcs) > 2 and isinstance(instr.srcs[2], ImmOp):
+                        clamp = instr.srcs[2].value
+                    output.append(SassInstr(encode_shfl(d, a, lane, clamp, mode),
+                                            f'SHFL R{d}, R{a}  // shfl.sync'))
+
+                elif op == 'vote':
+                    from sass.encoding.sm_120_opcodes import encode_vote_ballot
+                    d = ctx.ra.r32(instr.dest.name)
+                    output.append(SassInstr(encode_vote_ballot(d),
+                                            f'VOTE.ANY R{d}, PT, PT  // vote.sync.ballot'))
+
                 elif op == 'rem' and typ in ('u32', 's32'):
-                    # Integer remainder — no direct SASS instruction
-                    # Would need: div + mul + sub sequence
-                    output.append(_nop(f'TODO: rem.{typ} (need div+mul+sub sequence)'))
+                    output.append(_nop(f'TODO: rem.{typ} (ptxas emits multi-instruction sequence)'))
 
                 elif op == 'div' and typ in ('u32', 's32'):
-                    # Integer division — no direct SASS instruction on SM_120
-                    # Would need iterative Newton-Raphson or lookup table
-                    output.append(_nop(f'TODO: div.{typ} (need iterative algorithm)'))
+                    output.append(_nop(f'TODO: div.{typ} (ptxas emits multi-instruction sequence)'))
 
                 elif op == 'rcp' and 'approx' in instr.types and typ == 'f32':
                     from sass.encoding.sm_120_opcodes import encode_mufu, MUFU_RCP

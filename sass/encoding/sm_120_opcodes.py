@@ -1806,6 +1806,255 @@ def encode_atomg_u32(dest: int, addr_base: int, offset: int, data: int,
     return bytes(raw)
 
 
+# ---------------------------------------------------------------------------
+# POPC — Population Count (count set bits)
+# ---------------------------------------------------------------------------
+# Opcode: 0x09, 0x73.  Ground truth: POPC R13, R0 → 0x00000000000d7309
+def encode_popc(dest: int, src: int, ctrl: int = 0) -> bytes:
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0], raw[1] = 0x09, 0x73
+    raw[2], raw[3] = dest & 0xFF, src & 0xFF
+    raw[13], raw[14], raw[15] = b13, b14, b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# BREV — Bit Reverse
+# ---------------------------------------------------------------------------
+# Opcode: 0x01, 0x73.  Ground truth: BREV R15, R0 → 0x00000000000f7301
+def encode_brev(dest: int, src: int, ctrl: int = 0) -> bytes:
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0], raw[1] = 0x01, 0x73
+    raw[2], raw[3] = dest & 0xFF, src & 0xFF
+    raw[13], raw[14], raw[15] = b13, b14, b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# FLO — Find Leading One (CLZ = 31 - FLO for non-zero)
+# ---------------------------------------------------------------------------
+# Opcode: 0x00, 0x73.  Ground truth: FLO.U32 R6, R0 → 0x0000000000067300
+def encode_flo(dest: int, src: int, ctrl: int = 0) -> bytes:
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0], raw[1] = 0x00, 0x73
+    raw[2], raw[3] = dest & 0xFF, src & 0xFF
+    raw[13], raw[14], raw[15] = b13, b14, b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# IABS — Integer Absolute Value
+# ---------------------------------------------------------------------------
+# Opcode: 0x13, 0x72.  Ground truth: IABS R0, R0 → 0x0000000000007213
+def encode_iabs(dest: int, src: int, ctrl: int = 0) -> bytes:
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0], raw[1] = 0x13, 0x72
+    raw[2], raw[3] = dest & 0xFF, src & 0xFF
+    raw[13], raw[14], raw[15] = b13, b14, b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# IMAD.HI — Integer Multiply-Add High (upper 32 bits)
+# ---------------------------------------------------------------------------
+# Opcode: 0x27, 0x72.  Ground truth: IMAD.HI.U32 R9, R0, R7, RZ → 0x0000000700097227
+def encode_imad_hi(dest: int, src0: int, src1: int, src2: int,
+                   signed: bool = False, ctrl: int = 0) -> bytes:
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0], raw[1] = 0x27, 0x72
+    raw[2] = dest & 0xFF
+    raw[3] = src0 & 0xFF
+    raw[4] = src1 & 0xFF
+    raw[8] = src2 & 0xFF
+    raw[13], raw[14], raw[15] = b13, b14, b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# FMNMX — Float Min/Max
+# ---------------------------------------------------------------------------
+# Opcode: 0x09, 0x72.  Ground truth:
+#   FMNMX R9, R0, R7, PT (min):  0x0000000700097209 (PT selects min)
+#   FMNMX R7, R0, R7, !PT (max): 0x0000000700077209 (!PT selects max)
+def encode_fmnmx(dest: int, src0: int, src1: int, is_max: bool = False,
+                  ctrl: int = 0) -> bytes:
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0], raw[1] = 0x09, 0x72
+    raw[2] = dest & 0xFF
+    raw[3] = src0 & 0xFF
+    raw[4] = src1 & 0xFF
+    # PT (min) vs !PT (max) encoded in modifier bytes
+    raw[9] = 0xfe
+    raw[10] = 0x07 if is_max else 0x03
+    raw[13], raw[14], raw[15] = b13, b14, b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# FSETP — Float Set Predicate (comparison)
+# ---------------------------------------------------------------------------
+# Opcode: 0x0b, 0x72.  Ground truth:
+#   FSETP.GEU.AND P2, PT, R0, R7, PT → 0x000000070000720b
+FSETP_LT  = 0x01
+FSETP_EQ  = 0x02
+FSETP_LE  = 0x03
+FSETP_GT  = 0x04
+FSETP_NE  = 0x05
+FSETP_GE  = 0x06
+FSETP_GEU = 0x0e
+FSETP_NEU = 0x0d
+
+def encode_fsetp(pred_dest: int, src0: int, src1: int, cmp: int = FSETP_LT,
+                  ctrl: int = 0) -> bytes:
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0], raw[1] = 0x0b, 0x72
+    raw[2] = 0x00  # pred encoding in modifier bytes
+    raw[3] = src0 & 0xFF
+    raw[4] = src1 & 0xFF
+    raw[9] = 0xf0 | (pred_dest & 0x07)  # pred dest + PT
+    raw[10] = 0x03  # AND + PT
+    raw[11] = cmp & 0xFF
+    raw[13], raw[14], raw[15] = b13, b14, b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# SHFL — Warp Shuffle
+# ---------------------------------------------------------------------------
+# Opcode: 0x89, 0x75 (reg-reg) / 0x89, 0x7f (reg-imm) / 0x89, 0x79 (imm-imm).
+# Ground truth:
+#   SHFL.IDX PT, R5, R0, RZ, 0x1f:   0x00001fff00057589
+#   SHFL.UP PT, R7, R0, 0x1, RZ:     0x0420000000077989
+#   SHFL.DOWN PT, R9, R0, 0x1, 0x1f: 0x08201f0000097f89
+#   SHFL.BFLY PT, R11, R0, 0x1, 0x1f:0x0c201f00000b7f89
+SHFL_IDX  = 0x00
+SHFL_UP   = 0x04
+SHFL_DOWN = 0x08
+SHFL_BFLY = 0x0c
+
+def encode_shfl(dest: int, src: int, lane_or_delta: int, clamp: int,
+                mode: int = SHFL_IDX, ctrl: int = 0) -> bytes:
+    """Encode SHFL with immediate lane/delta and clamp."""
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0], raw[1] = 0x89, 0x7f  # imm-imm variant
+    raw[2] = dest & 0xFF
+    raw[3] = src & 0xFF
+    raw[4] = lane_or_delta & 0xFF
+    raw[5] = clamp & 0xFF
+    raw[6] = (clamp >> 8) & 0xFF
+    raw[7] = mode & 0xFF
+    raw[13], raw[14], raw[15] = b13, b14, b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# VOTE — Warp Vote
+# ---------------------------------------------------------------------------
+# Opcode: 0x06, 0x78.  Ground truth: VOTE.ANY R13, PT, PT → 0x00000000000d7806
+def encode_vote_ballot(dest: int, ctrl: int = 0) -> bytes:
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0], raw[1] = 0x06, 0x78
+    raw[2] = dest & 0xFF
+    raw[13], raw[14], raw[15] = b13, b14, b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# I2FP — Integer to Float (various formats)
+# ---------------------------------------------------------------------------
+# Already have I2FP.F32.S32. Add U32 variant.
+# Ground truth: I2FP.F32.U32 R11, R6 → 0x00000006000b7245 (same opcode, different modifier)
+# I2FP.F32.S32: modifier differs from U32 in b10 or b11.
+
+def encode_i2fp_u32(dest: int, src: int, ctrl: int = 0) -> bytes:
+    """Encode I2FP.F32.U32 — unsigned int to float."""
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0], raw[1] = 0x45, 0x72
+    raw[2] = dest & 0xFF
+    raw[3] = src & 0xFF
+    raw[9] = 0x00  # U32 variant
+    raw[13], raw[14], raw[15] = b13, b14, b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# F2I variants — Float to Integer
+# ---------------------------------------------------------------------------
+# F2I.U32.TRUNC.NTZ: 0x00000000000f7305 (unsigned)
+# F2I.TRUNC.NTZ:     0x0000000000117305 (signed, default)
+
+def encode_f2i_u32(dest: int, src: int, ctrl: int = 0) -> bytes:
+    """Encode F2I.U32.TRUNC.NTZ — float to unsigned int."""
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0], raw[1] = 0x05, 0x73
+    raw[2] = dest & 0xFF
+    raw[3] = src & 0xFF
+    raw[9] = 0x00  # U32 variant
+    raw[13], raw[14], raw[15] = b13, b14, b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# LDG.E width variants
+# ---------------------------------------------------------------------------
+# LDG.E.U8:  same opcode 0x81, 0x79 with width modifier in ctrl/mod bytes
+# LDG.E.U16: same opcode
+# LDG.E.128: already have
+# The width is encoded in the control word hi-byte region.
+
+
+# ---------------------------------------------------------------------------
+# ISETP comparison variants
+# ---------------------------------------------------------------------------
+# Already have ISETP.GE.AND. The comparison type is in the modifier bytes.
+# ISETP.LT: cmp=0x01, ISETP.EQ: cmp=0x02, ISETP.LE: cmp=0x03
+# ISETP.GT: cmp=0x04, ISETP.NE: cmp=0x05, ISETP.GE: cmp=0x06
+ISETP_LT = 0x01
+ISETP_EQ = 0x02
+ISETP_LE = 0x03
+ISETP_GT = 0x04
+ISETP_NE = 0x05
+ISETP_GE = 0x06
+
+def encode_isetp(pred_dest: int, src0: int, src1: int, cmp: int = ISETP_GE,
+                  signed: bool = True, ctrl: int = 0) -> bytes:
+    """Encode ISETP with variable comparison type."""
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0], raw[1] = 0x0c, 0x72
+    raw[2] = 0x00
+    raw[3] = src0 & 0xFF
+    raw[4] = src1 & 0xFF
+    raw[9] = 0xf0 | (pred_dest & 0x07)
+    raw[10] = 0x04 if signed else 0x00  # signed vs unsigned
+    raw[11] = cmp & 0xFF
+    raw[13], raw[14], raw[15] = b13, b14, b15
+    return bytes(raw)
+
+
 if __name__ == "__main__":
     ok = roundtrip_verify_opcodes(verbose=True)
     print()

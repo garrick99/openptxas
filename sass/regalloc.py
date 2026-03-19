@@ -126,69 +126,105 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120) -> AllocResult:
     # Find LDG coalescing opportunities (dest shares addr register)
     coalesces = _find_ldg_coalesces(fn)
 
-    # Find which registers are actually referenced in instructions
-    from ptx.ir import RegOp
+    # Liveness analysis: compute live ranges (first def, last use) per register
+    from ptx.ir import RegOp, MemOp
     used_regs: set[str] = set()
+    reg_first_def: dict[str, int] = {}  # name → instruction index of first write
+    reg_last_use: dict[str, int] = {}   # name → instruction index of last read
+
+    all_instrs = []
     for bb in fn.blocks:
-        for inst in bb.instructions:
-            if inst.dest and isinstance(inst.dest, RegOp):
-                used_regs.add(inst.dest.name)
-            for src in inst.srcs:
-                if isinstance(src, RegOp):
-                    used_regs.add(src.name)
+        all_instrs.extend(bb.instructions)
 
-    next_gpr = 2       # R0-R1 reserved (R0=return, R1=stack frame ptr)
-    next_pred = 0       # P0..P6
-    next_ur = 4         # UR0-UR3 reserved by driver; UR4+ for user
+    for idx, inst in enumerate(all_instrs):
+        if inst.dest and isinstance(inst.dest, RegOp):
+            name = inst.dest.name
+            used_regs.add(name)
+            if name not in reg_first_def:
+                reg_first_def[name] = idx
+        for src in inst.srcs:
+            if isinstance(src, RegOp):
+                name = src.name
+                used_regs.add(name)
+                reg_last_use[name] = idx
+            if isinstance(src, MemOp) and src.base:
+                bname = src.base if src.base.startswith('%') else f'%{src.base}'
+                used_regs.add(bname)
+                reg_last_use[bname] = idx
 
+    next_pred = 0
+    next_ur = 4
+
+    # Predicate allocation (simple sequential)
     for rd in fn.reg_decls:
-        is_64 = rd.type.width >= 64 and rd.type.kind != ScalarKind.PRED
-        is_pred = rd.type.kind == ScalarKind.PRED
-
-        if is_pred:
+        if rd.type.kind == ScalarKind.PRED:
             for name in rd.names:
                 if name in used_regs:
                     pred_regs[name] = next_pred
                     next_pred += 1
-        elif is_64:
-            for i in range(rd.count):
-                name = f"%{rd.name}{i}" if rd.count > 1 else f"%{rd.name}"
-                if name not in used_regs:
-                    continue  # skip unused registers
+
+    # Linear scan register allocation for GPRs
+    # Sort registers by first definition order
+    reg_info = []  # (name, is_64, first_def, last_use)
+    for rd in fn.reg_decls:
+        if rd.type.kind == ScalarKind.PRED:
+            continue
+        is_64 = rd.type.width >= 64
+        for i in range(rd.count):
+            name = f"%{rd.name}{i}" if rd.count > 1 else f"%{rd.name}"
+            if name not in used_regs:
+                continue
+            first = reg_first_def.get(name, 0)
+            last = reg_last_use.get(name, len(all_instrs))
+            reg_info.append((name, is_64, first, last))
+
+    # Sort by first definition
+    reg_info.sort(key=lambda x: x[2])
+
+    # Linear scan: assign physical registers, reclaiming dead ones
+    # active = [(name, phys_reg, last_use, is_64)]
+    active: list[tuple[str, int, int, bool]] = []
+    free_regs_64: list[int] = []  # available even-aligned register pairs
+    free_regs_32: list[int] = []  # available single registers
+    next_gpr = 2  # R0-R1 reserved
+
+    for name, is_64, first_def, last_use in reg_info:
+        # Expire old intervals: free registers whose last use is before this def
+        new_active = []
+        for aname, areg, alast, a64 in active:
+            if alast < first_def:
+                # This register is dead — reclaim it
+                if a64:
+                    free_regs_64.append(areg)
+                else:
+                    free_regs_32.append(areg)
+            else:
+                new_active.append((aname, areg, alast, a64))
+        active = new_active
+
+        # Allocate: prefer reusing a free register, else allocate new
+        if is_64:
+            if free_regs_64:
+                phys = free_regs_64.pop(0)
+            else:
                 if next_gpr % 2 != 0:
                     next_gpr += 1
-                int_regs[name] = next_gpr
+                phys = next_gpr
                 next_gpr += 2
+            int_regs[name] = phys
+            active.append((name, phys, last_use, True))
         else:
-            for i in range(rd.count):
-                name = f"%{rd.name}{i}" if rd.count > 1 else f"%{rd.name}"
-                if name not in used_regs:
-                    continue
-                int_regs[name] = next_gpr
+            if free_regs_32:
+                phys = free_regs_32.pop(0)
+            else:
+                phys = next_gpr
                 next_gpr += 1
+            int_regs[name] = phys
+            active.append((name, phys, last_use, False))
 
-    # Apply LDG coalescing: dest regs share the addr reg's physical register.
-    for dest_name, addr_name in coalesces.items():
-        if addr_name in int_regs and dest_name in int_regs:
-            int_regs[dest_name] = int_regs[addr_name]
-
-    # Compact allocation: pack register pairs tightly starting at R2
-    seen_regs = set()
-    remap = {}
-    next_r = 2
-    for name, reg in sorted(int_regs.items(), key=lambda x: x[1]):
-        if reg in remap:
-            int_regs[name] = remap[reg]
-        elif reg not in seen_regs:
-            if next_r % 2 != 0:
-                next_r += 1
-            remap[reg] = next_r
-            int_regs[name] = next_r
-            seen_regs.add(reg)
-            next_r += 2
-        else:
-            int_regs[name] = remap.get(reg, reg)
-    next_gpr = next_r if int_regs else next_gpr
+    # LDG coalescing disabled — causes live range conflicts when multiple loads
+    # are active simultaneously. The linear scan allocator handles register reuse.
+    # TODO: re-enable with interference graph check
 
     # Note: nv.info EIATTR_MAX_REG_COUNT limits available registers.
     # Default template uses 0x80 (8 GPR groups). For > 8 GPRs, the emitter

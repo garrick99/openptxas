@@ -304,7 +304,7 @@ def _select_sub_u64(instr: Instruction, ra: RegAlloc) -> list[SassInstr]:
 
 
 def _select_add_u64(instr: Instruction, ra: RegAlloc) -> list[SassInstr]:
-    """add.u64 dest, a, b → IADD.64 (single instruction, in-place to save regs)."""
+    """add.u64 dest, a, b → IADD3 (lo) + IADD3.X (hi with carry)."""
     dest = instr.dest
     a    = instr.srcs[0]
     b    = instr.srcs[1]
@@ -315,8 +315,10 @@ def _select_add_u64(instr: Instruction, ra: RegAlloc) -> list[SassInstr]:
     d_lo = a_lo  # in-place
     ra.int_regs[dest.name] = a_lo
     return [
-        SassInstr(encode_iadd64(d_lo, a_lo, b_lo, negate_src1=False),
-                  f'IADD.64 R{d_lo}, R{a_lo}, R{b_lo}  // add.u64'),
+        SassInstr(encode_iadd3(d_lo, a_lo, b_lo, RZ),
+                  f'IADD3 R{d_lo}, R{a_lo}, R{b_lo}, RZ  // add.u64 lo'),
+        SassInstr(encode_iadd3x(d_lo+1, a_lo+1, b_lo+1, RZ),
+                  f'IADD3.X R{d_lo+1}, R{a_lo+1}, R{b_lo+1}, RZ  // add.u64 hi'),
     ]
 
 

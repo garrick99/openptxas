@@ -382,9 +382,12 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
             ra.unif_regs[dest.name] = ctx._next_ur
             ur_idx = ctx._next_ur
             ctx._next_ur += 2  # 64-bit UR pairs: UR6/7, UR8/9, etc.
-        # Also track that this PTX register is in UR bank for IADD.64-UR dispatch
+        # Track that this PTX register is in UR bank, NOT GPR
         if ctx:
             ctx._ur_params[dest.name] = ur_idx
+        # Remove from int_regs so downstream code knows to use UR
+        if dest.name in ra.int_regs:
+            del ra.int_regs[dest.name]
         return [SassInstr(encode_ldcu_64(ur_idx, 0, byte_off),
                           f'LDCU.64 UR{ur_idx}, c[0][0x{byte_off:x}]  // {param_name}')]
     else:
@@ -394,7 +397,7 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
 
 
 def _select_ld_global(instr: Instruction, ra: RegAlloc,
-                      ur_desc: int) -> list[SassInstr]:
+                      ur_desc: int, ctx: 'ISelContext' = None) -> list[SassInstr]:
     """ld.global → LDG.E with appropriate width."""
     dest = instr.dest
     src  = instr.srcs[0]
@@ -406,20 +409,33 @@ def _select_ld_global(instr: Instruction, ra: RegAlloc,
 
     typ = instr.types[-1] if instr.types else 'u32'
     is_64 = typ in ('u64', 's64', 'b64', 'f64')
+
+    # Check if address register is in UR bank (loaded via LDCU)
+    base_name = src.base if src.base.startswith('%') else f'%{src.base}'
+    prefix = []
+    if ctx and base_name in ctx._ur_params and base_name not in ra.int_regs:
+        # Materialize UR pointer into a GPR: IADD.64 R, RZ, UR
+        ur_idx = ctx._ur_params[base_name]
+        # Use R2 as temp (will be overwritten)
+        d_tmp = 2
+        prefix.append(SassInstr(encode_iadd64_ur(d_tmp, RZ, ur_idx),
+                                f'IADD.64 R{d_tmp}, RZ, UR{ur_idx}  // materialize UR to GPR'))
+        ra.int_regs[base_name] = d_tmp
+
     addr = ra.lo(src.base) if src.base in ra.int_regs else RZ
 
     if is_64:
         d = ra.lo(dest.name)
-        return [SassInstr(encode_ldg_e_64(d, ur_desc, addr),
+        return prefix + [SassInstr(encode_ldg_e_64(d, ur_desc, addr),
                           f'LDG.E.64 R{d}, desc[UR{ur_desc}][R{addr}.64]')]
     else:
         d = ra.r32(dest.name)
-        return [SassInstr(encode_ldg_e(d, ur_desc, addr, width=32),
+        return prefix + [SassInstr(encode_ldg_e(d, ur_desc, addr, width=32),
                           f'LDG.E R{d}, desc[UR{ur_desc}][R{addr}.64]')]
 
 
 def _select_st_global(instr: Instruction, ra: RegAlloc,
-                      ur_desc: int) -> list[SassInstr]:
+                      ur_desc: int, ctx: 'ISelContext' = None) -> list[SassInstr]:
     """st.global → STG.E with appropriate width."""
     dest_op = instr.srcs[0]  # address
     src_op  = instr.srcs[1]  # data
@@ -431,15 +447,26 @@ def _select_st_global(instr: Instruction, ra: RegAlloc,
 
     typ = instr.types[-1] if instr.types else 'u32'
     is_64 = typ in ('u64', 's64', 'b64', 'f64')
+
+    # Materialize UR pointer to GPR if needed
+    base_name = dest_op.base if dest_op.base.startswith('%') else f'%{dest_op.base}'
+    prefix = []
+    if ctx and base_name in ctx._ur_params and base_name not in ra.int_regs:
+        ur_idx = ctx._ur_params[base_name]
+        d_tmp = 2
+        prefix.append(SassInstr(encode_iadd64_ur(d_tmp, RZ, ur_idx),
+                                f'IADD.64 R{d_tmp}, RZ, UR{ur_idx}  // materialize UR to GPR'))
+        ra.int_regs[base_name] = d_tmp
+
     addr = ra.lo(dest_op.base) if dest_op.base in ra.int_regs else RZ
 
     if is_64:
         data = ra.lo(src_op.name)
-        return [SassInstr(encode_stg_e_64(ur_desc, addr, data, ctrl=0xff1),
+        return prefix + [SassInstr(encode_stg_e_64(ur_desc, addr, data, ctrl=0xff1),
                           f'STG.E.64 desc[UR{ur_desc}][R{addr}.64], R{data}')]
     else:
         data = ra.r32(src_op.name)
-        return [SassInstr(encode_stg_e(ur_desc, addr, data, width=32, ctrl=0xff1),
+        return prefix + [SassInstr(encode_stg_e(ur_desc, addr, data, width=32, ctrl=0xff1),
                           f'STG.E desc[UR{ur_desc}][R{addr}.64], R{data}')]
 
 
@@ -615,10 +642,10 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     output.extend(_select_ld_param(instr, ctx.ra, ctx.param_offsets, ctx))
 
                 elif op == 'ld' and 'global' in instr.types:
-                    output.extend(_select_ld_global(instr, ctx.ra, ctx.ur_desc))
+                    output.extend(_select_ld_global(instr, ctx.ra, ctx.ur_desc, ctx))
 
                 elif op == 'st' and 'global' in instr.types:
-                    output.extend(_select_st_global(instr, ctx.ra, ctx.ur_desc))
+                    output.extend(_select_st_global(instr, ctx.ra, ctx.ur_desc, ctx))
 
                 elif op == 'ret':
                     output.append(SassInstr(encode_exit(ctrl=0x7f5), 'EXIT'))

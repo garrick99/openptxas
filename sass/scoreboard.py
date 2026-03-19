@@ -125,6 +125,8 @@ def _get_dest_regs(raw: bytes) -> set[int]:
 
 def _wdep_for_opcode(opcode: int) -> int:
     """Assign the scoreboard write-dependency slot for an opcode."""
+    if opcode == 0x7ac:  # LDCU: uses slot 0x33 (confirmed from ptxas)
+        return 0x33
     if opcode in _OPCODES_LDC:
         return 0x31
     if opcode in _OPCODES_LDS:
@@ -202,6 +204,11 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
         # STG needs rbar=0x03
         if opcode in _OPCODES_STG:
             rbar = max(rbar, 0x03)
+
+        # LDCU consumers: any instruction using UR operands needs rbar for LDCU
+        # IADD.64-UR (opcode 0xc35) reads a UR source — wait for any pending LDCU
+        if opcode == 0xc35:  # IADD.64 R-UR variant
+            rbar = max(rbar, 0x05)  # wait for LDCU slot (matches ptxas)
 
         # BAR.SYNC and EXIT get special ctrl
         if opcode in _OPCODES_BAR:

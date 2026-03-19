@@ -537,14 +537,18 @@ def encode_ldg_e(dest: int, ur_desc: int, src_addr: int,
 
 def encode_stg_e(ur_desc: int, src_addr: int, src_data: int,
                   width: int = 32, ctrl: int = 0) -> bytes:
-    """Encode STG.E desc[ur_desc][src_addr.64], src_data with variable width."""
+    """Encode STG.E desc[ur_desc][src_addr.64], src_data with variable width.
+
+    Field layout (from ptxas ground truth):
+      b2=0x00, b3=addr_reg, b4=data_reg, b8=ur_desc_idx
+    Note: b4 is DATA register (not UR desc!), b8 is UR descriptor.
+    """
     if ctrl == 0:
         ctrl = _CTRL_DEFAULT
     b9_map = {32: 0x19, 64: 0x1b, 128: 0x1d}
-    b10_map = {32: 0x10, 64: 0x10, 128: 0x10}
     return _build(0x86, 0x79,
-                  b2=0x00, b3=src_addr, b4=ur_desc & 0xFF,
-                  b8=src_data,
+                  b2=0x00, b3=src_addr, b4=src_data & 0xFF,
+                  b8=ur_desc & 0xFF,
                   b9=b9_map.get(width, 0x1b), b10=0x10, b11=0x0c,
                   ctrl=ctrl)
 
@@ -618,8 +622,8 @@ def encode_stg_e_64(ur_desc: int, src_addr: int, src_data: int,
     if ctrl == 0:
         ctrl = _CTRL_DEFAULT
     return _build(0x86, 0x79,
-                  b2=0x00, b3=src_addr, b4=ur_desc & 0xFF,
-                  b8=src_data,
+                  b2=0x00, b3=src_addr, b4=src_data & 0xFF,
+                  b8=ur_desc & 0xFF,
                   b9=0x1b, b10=0x10, b11=0x0c,
                   ctrl=ctrl)
 

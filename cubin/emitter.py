@@ -125,7 +125,8 @@ def _build_nv_info_global():
 
 
 def _build_nv_info_kernel(num_gprs: int = 8, num_params: int = 2,
-                          param_sizes: list[int] = None):
+                          param_sizes: list[int] = None,
+                          exit_instr_offset: int = 0x10):
     """Generate per-kernel .nv.info attributes dynamically.
 
     Builds the attribute stream based on actual kernel parameters
@@ -164,8 +165,10 @@ def _build_nv_info_kernel(num_gprs: int = 8, num_params: int = 2,
     # EIATTR_CBANK_PARAM_SIZE (0x1b): 0xFF (wildcard, matches ptxas behavior)
     buf.extend(bytes([0x03, 0x1b, 0xFF, 0x00]))
 
-    # EIATTR_EXIT_INSTR_OFFSETS (0x5f)
-    buf.extend(bytes([0x03, 0x5f, 0x01, 0x01]))
+    # EIATTR_EXIT_INSTR_OFFSETS (0x5f): format 0x03 = immediate value
+    # Encode EXIT instruction index (byte offset / 16) in the 16-bit value field
+    exit_idx = exit_instr_offset // 16
+    buf.extend(bytes([0x03, 0x5f, exit_idx & 0xFF, (exit_idx >> 8) & 0xFF]))
 
     # EIATTR_CTAID_DIMS (0x4a)
     buf.extend(bytes([0x02, 0x4a, 0x00, 0x00]))
@@ -247,6 +250,7 @@ class KernelDesc:
     param_offsets: dict[str, int]
     param_base: int = 0x380
     const0_size: int = 0x390  # default, overridden by pipeline based on params
+    exit_offset: int = 0x10  # byte offset of EXIT instruction in .text
     smem_size: int = 0           # static shared memory size in bytes (0 = none)
     sm_version: int = 120        # 89 (Ada) or 120 (Blackwell)
 
@@ -376,7 +380,7 @@ def emit_cubin(kernel: KernelDesc) -> bytes:
         _patch_cuinfo_sm(kernel.sm_version),  # 5
         _build_nv_info_global(),     # 6
         _build_nv_compat(),          # 7
-        _build_nv_info_kernel(num_gprs=kernel.num_gprs, num_params=kernel.num_params, param_sizes=kernel.param_sizes),
+        _build_nv_info_kernel(num_gprs=kernel.num_gprs, num_params=kernel.num_params, param_sizes=kernel.param_sizes, exit_instr_offset=kernel.exit_offset),
         _build_callgraph(),          # 9
         text_data,                   # 10
         shared_reserved,             # 11 (NOBITS)

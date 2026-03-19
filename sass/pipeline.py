@@ -138,6 +138,13 @@ def compile_function(fn: Function, verbose: bool = False) -> bytes:
     total_param_bytes = sum(param_sizes)
     const0_size = ((0x380 + total_param_bytes + 3) // 4) * 4  # 4-byte aligned
 
+    # Find EXIT instruction offset in the SASS byte stream
+    exit_offset = 0
+    for i in range(0, len(sass_bytes), 16):
+        if sass_bytes[i:i+2] == bytes([0x4d, 0x79]):  # EXIT opcode
+            exit_offset = i
+            break
+
     desc = KernelDesc(
         name=fn.name,
         sass_bytes=sass_bytes,
@@ -146,6 +153,7 @@ def compile_function(fn: Function, verbose: bool = False) -> bytes:
         param_sizes=param_sizes,
         param_offsets=alloc.param_offsets,
         const0_size=const0_size,
+        exit_offset=exit_offset,
     )
     return emit_cubin(desc)
 

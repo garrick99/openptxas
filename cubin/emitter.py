@@ -220,7 +220,8 @@ def _build_capmerc(num_gprs: int = 10):
     # For now: emit a minimal valid header that allows execution.
     # Capmerc byte[8] = register allocation: tells hardware how many GPRs to allocate.
     # Must use the full 130-byte template (16-byte minimal doesn't work).
-    reg_alloc = max(((num_gprs + 7) & ~7), 16)  # minimum 16, rounded to 8
+    # Allocate registers: round up to next multiple of 8, minimum 16
+    reg_alloc = max(((num_gprs + 7) & ~7), 16)
     buf = bytearray.fromhex(
         '0c000000010000c00800000050000000'
         '010b040af80004000000410000040000'

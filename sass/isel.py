@@ -592,24 +592,34 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             output.append(_nop(f'TODO: cvt {".".join(instr.types)}'))
 
                 elif op == 'setp':
-                    # setp comparison — emit ISETP with appropriate modifier
+                    from sass.encoding.sm_120_opcodes import (
+                        encode_isetp, encode_fsetp,
+                        ISETP_LT, ISETP_EQ, ISETP_LE, ISETP_GT, ISETP_NE, ISETP_GE,
+                        FSETP_LT, FSETP_EQ, FSETP_LE, FSETP_GT, FSETP_NE, FSETP_GE,
+                    )
                     pred = instr.dest
                     a    = instr.srcs[0]
                     b    = instr.srcs[1]
                     if isinstance(pred, RegOp) and isinstance(a, RegOp):
                         pd = ctx.ra.pred(pred.name) if pred.name in ctx.ra.pred_regs else 0
                         ar = ctx.ra.r32(a.name)
-                        # b can be register or immediate
-                        if isinstance(b, RegOp):
-                            br = ctx.ra.r32(b.name)
-                        elif isinstance(b, ImmOp):
-                            br = b.value
+                        br = ctx.ra.r32(b.name) if isinstance(b, RegOp) else (b.value if isinstance(b, ImmOp) else 0)
+                        # Determine comparison type and float vs int
+                        is_float = any(t in ('f32', 'f64') for t in instr.types)
+                        cmp_name = next((t for t in instr.types if t in ('lt','le','gt','ge','eq','ne')), 'ge')
+                        if is_float:
+                            cmp_map = {'lt': FSETP_LT, 'le': FSETP_LE, 'gt': FSETP_GT,
+                                       'ge': FSETP_GE, 'eq': FSETP_EQ, 'ne': FSETP_NE}
+                            output.append(SassInstr(
+                                encode_fsetp(pd, ar, br, cmp_map.get(cmp_name, FSETP_GE)),
+                                f'FSETP.{cmp_name.upper()} P{pd}, R{ar}, R{br}'))
                         else:
-                            br = 0
-                        # For now use ISETP.GE.AND for all comparisons
-                        # (the predicate sense is handled by the branch)
-                        output.append(SassInstr(encode_isetp_ge_and(pd, ar, br),
-                                                f'ISETP P{pd}, R{ar}, {br}  // setp.{".".join(instr.types)}'))
+                            cmp_map = {'lt': ISETP_LT, 'le': ISETP_LE, 'gt': ISETP_GT,
+                                       'ge': ISETP_GE, 'eq': ISETP_EQ, 'ne': ISETP_NE}
+                            is_signed = any(t in ('s32', 's64') for t in instr.types)
+                            output.append(SassInstr(
+                                encode_isetp(pd, ar, br, cmp_map.get(cmp_name, ISETP_GE), signed=is_signed),
+                                f'ISETP.{cmp_name.upper()} P{pd}, R{ar}, R{br}'))
                     else:
                         output.append(_nop(f'TODO: setp {instr}'))
 

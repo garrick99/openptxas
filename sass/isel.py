@@ -48,6 +48,7 @@ from sass.encoding.sm_120_opcodes import (
     encode_stg_e, encode_stg_e_64,
     encode_lds, encode_sts,
     encode_ldcu_64,
+    encode_iadd64_ur,
     encode_bar_sync,
     encode_isetp_ge_and,
     encode_isetp, ISETP_LT, ISETP_EQ, ISETP_LE, ISETP_GT, ISETP_NE, ISETP_GE,
@@ -303,39 +304,65 @@ def _select_sub_u64(instr: Instruction, ra: RegAlloc) -> list[SassInstr]:
     ]
 
 
-def _select_add_u64(instr: Instruction, ra: RegAlloc) -> list[SassInstr]:
-    """add.u64 dest, a, b → IADD3 (lo) + IADD3.X (hi with carry)."""
+def _select_add_u64(instr: Instruction, ra: RegAlloc,
+                    ctx: 'ISelContext' = None) -> list[SassInstr]:
+    """add.u64 dest, a, b → IADD.64 with UR source if one operand is in UR bank."""
+    from sass.encoding.sm_120_opcodes import encode_iadd64_ur
     dest = instr.dest
     a    = instr.srcs[0]
     b    = instr.srcs[1]
     if not isinstance(dest, RegOp) or not isinstance(a, RegOp) or not isinstance(b, RegOp):
         raise ISelError(f"add.u64: all operands must be registers")
-    a_lo = ra.lo(a.name)
-    b_lo = ra.lo(b.name)
-    d_lo = a_lo  # in-place
-    ra.int_regs[dest.name] = a_lo
-    return [
-        SassInstr(encode_iadd3(d_lo, a_lo, b_lo, RZ),
-                  f'IADD3 R{d_lo}, R{a_lo}, R{b_lo}, RZ  // add.u64 lo'),
-        SassInstr(encode_iadd3x(d_lo+1, a_lo+1, b_lo+1, RZ),
-                  f'IADD3.X R{d_lo+1}, R{a_lo+1}, R{b_lo+1}, RZ  // add.u64 hi'),
-    ]
+
+    # Check if either operand is a UR param (loaded via LDCU)
+    a_in_ur = ctx and a.name in ctx._ur_params
+    b_in_ur = ctx and b.name in ctx._ur_params
+
+    if a_in_ur or b_in_ur:
+        # Use IADD.64 R-UR variant: dest(R) = src_r(R) + src_ur(UR)
+        # IMPORTANT: dest must NOT be in-place on R operand if R is used later!
+        # Allocate a fresh destination register to avoid clobbering.
+        if a_in_ur:
+            ur_idx = ctx._ur_params[a.name]
+            r_lo = ra.lo(b.name)
+        else:
+            ur_idx = ctx._ur_params[b.name]
+            r_lo = ra.lo(a.name)
+        # Allocate fresh register pair for destination
+        d_lo = ra.lo(dest.name) if dest.name in ra.int_regs else r_lo
+        ra.int_regs[dest.name] = d_lo
+        return [
+            SassInstr(encode_iadd64_ur(d_lo, r_lo, ur_idx),
+                      f'IADD.64 R{d_lo}, R{r_lo}, UR{ur_idx}  // add.u64 (UR base)'),
+        ]
+    else:
+        # Both operands in R bank: use IADD3 + IADD3.X pair
+        a_lo = ra.lo(a.name)
+        b_lo = ra.lo(b.name)
+        d_lo = a_lo  # in-place
+        ra.int_regs[dest.name] = a_lo
+        return [
+            SassInstr(encode_iadd3(d_lo, a_lo, b_lo, RZ),
+                      f'IADD3 R{d_lo}, R{a_lo}, R{b_lo}, RZ  // add.u64 lo'),
+            SassInstr(encode_iadd3x(d_lo+1, a_lo+1, b_lo+1, RZ),
+                      f'IADD3.X R{d_lo+1}, R{a_lo+1}, R{b_lo+1}, RZ  // add.u64 hi'),
+        ]
 
 
 def _select_ld_param(instr: Instruction, ra: RegAlloc,
-                     param_offsets: dict[str, int]) -> list[SassInstr]:
+                     param_offsets: dict[str, int],
+                     ctx: 'ISelContext' = None) -> list[SassInstr]:
     """
-    ld.param.u64 or ld.param.u32 → LDC.64 or LDC.
+    ld.param.u64 → LDCU.64 (into uniform register for descriptor-based addressing).
+    ld.param.u32 → LDC (into general register).
 
-    param_offsets maps PTX parameter names to byte offsets in c[0][...].
-    These offsets are determined by the kernel's ABI (set by regalloc/layout).
+    SM_120 descriptor-based memory model requires pointer params in UR bank.
     """
     dest = instr.dest
-    src  = instr.srcs[0]  # MemOp or similar
+    src  = instr.srcs[0]
     if not isinstance(dest, RegOp):
         raise ISelError(f"ld.param dest must be register")
 
-    # Extract parameter name from src operand (MemOp.base is the param name)
     from ptx.ir import MemOp
     if not isinstance(src, MemOp):
         raise ISelError(f"ld.param src must be MemOp, got {src!r}")
@@ -346,17 +373,20 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
     else:
         byte_off = param_offsets.get(param_name, 0)
 
-    # Data type is the last element in types (e.g. ['param', 'u64'] → 'u64')
     typ = instr.types[-1] if instr.types else 'u32'
     if typ in ('u64', 's64', 'b64'):
-        d_lo = ra.lo(dest.name)
-        # If register is >= R8, remap to R2 (dead after LDG data consumed)
-        # This keeps all regs within R0-R7 for the default nv.info template.
-        if d_lo >= 8:
-            d_lo = 2
-            ra.int_regs[dest.name] = 2
-        return [SassInstr(encode_ldc_64(d_lo, 0, byte_off, ctrl=0x712),
-                          f'LDC.64 R{d_lo}, c[0][0x{byte_off:x}]  // {param_name}')]
+        # Load 64-bit param into UNIFORM register via LDCU.64
+        # This is critical for SM_120 descriptor-based LDG/STG addressing.
+        ur_idx = ra.ur(dest.name) if dest.name in ra.unif_regs else ctx._next_ur if ctx else 6
+        if ctx and not dest.name in ra.unif_regs:
+            ra.unif_regs[dest.name] = ctx._next_ur
+            ur_idx = ctx._next_ur
+            ctx._next_ur += 2  # 64-bit UR pairs: UR6/7, UR8/9, etc.
+        # Also track that this PTX register is in UR bank for IADD.64-UR dispatch
+        if ctx:
+            ctx._ur_params[dest.name] = ur_idx
+        return [SassInstr(encode_ldcu_64(ur_idx, 0, byte_off),
+                          f'LDCU.64 UR{ur_idx}, c[0][0x{byte_off:x}]  // {param_name}')]
     else:
         d = ra.r32(dest.name)
         return [SassInstr(encode_ldc(d, 0, byte_off, ctrl=0x7f1),
@@ -427,6 +457,10 @@ class ISelContext:
     ur_desc:       int = 4  # UR4 by default (matches ptxas convention)
     # Label → instruction index within output for branch fixup
     label_map:     dict[str, int] = field(default_factory=dict)
+    # Next available uniform register for LDCU param loading (UR6+)
+    _next_ur:      int = 6  # UR4 = mem desc, UR6+ for params
+    # Map PTX register name → UR index (for params loaded via LDCU)
+    _ur_params:    dict[str, int] = field(default_factory=dict)
 
 
 def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
@@ -488,7 +522,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     output.extend(_select_sub_u64(instr, ctx.ra))
 
                 elif op == 'add' and typ in ('u64', 's64'):
-                    output.extend(_select_add_u64(instr, ctx.ra))
+                    output.extend(_select_add_u64(instr, ctx.ra, ctx))
 
                 elif op == 'add' and typ in ('u32', 's32'):
                     d = ctx.ra.r32(instr.dest.name)
@@ -578,7 +612,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             f'FFMA R{d}, R{a}, R{b}, R{c}  // fma.f32'))
 
                 elif op == 'ld' and 'param' in instr.types:
-                    output.extend(_select_ld_param(instr, ctx.ra, ctx.param_offsets))
+                    output.extend(_select_ld_param(instr, ctx.ra, ctx.param_offsets, ctx))
 
                 elif op == 'ld' and 'global' in instr.types:
                     output.extend(_select_ld_global(instr, ctx.ra, ctx.ur_desc))

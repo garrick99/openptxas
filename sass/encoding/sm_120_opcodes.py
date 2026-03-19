@@ -1177,6 +1177,39 @@ def encode_ldcu_64(dest_ur: int, const_bank: int, const_offset_bytes: int,
 
 
 # ---------------------------------------------------------------------------
+# IADD.64 with Uniform Register source (R-UR variant)
+# ---------------------------------------------------------------------------
+# Ground truth: IADD.64 R4, R2, UR10 → 0x0000000a02047c35 / ctrl
+# Opcode: 0x35, 0x7c (vs 0x35, 0x72 for R-R variant)
+# byte2=dest(R), byte3=src0(R), byte4=src1(UR)
+
+def encode_iadd64_ur(dest: int, src_r: int, src_ur: int,
+                     ctrl: int = 0) -> bytes:
+    """Encode IADD.64 dest(R), src0(R), src1(UR) — uniform register variant."""
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0x35
+    raw[1] = 0x7c     # R-UR variant (vs 0x72 for R-R)
+    raw[2] = dest & 0xFF
+    raw[3] = src_r & 0xFF
+    raw[4] = src_ur & 0xFF
+    raw[5] = 0x00
+    raw[6] = 0x00
+    raw[7] = 0x00
+    raw[8] = 0x00
+    raw[9] = 0x02
+    raw[10] = 0x8e
+    raw[11] = 0x0f     # matches ptxas ground truth
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
 # IADD.64  (64-bit integer add/subtract in one instruction)
 # ---------------------------------------------------------------------------
 # Ground truth: "IADD.64 R6, R2, -R4" hex lo=0x8000000402067235 hi=0x004fcc00078e0200

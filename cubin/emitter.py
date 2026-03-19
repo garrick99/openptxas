@@ -140,15 +140,23 @@ def _build_nv_info_kernel(num_gprs: int = 8, num_params: int = 2,
     buf.extend(bytes([0x04, 0x37, 0x04, 0x00, 0x82, 0x00, 0x00, 0x00]))
 
     # EIATTR_PARAM_INFO (0x17): one entry per parameter
-    # ptxas emits in reverse order. Param 0 (first in decl, last emitted)
-    # has size=0 in the attribute (observed from ptxas ground truth).
+    # ptxas emits in reverse order with cumulative byte offsets from param base.
+    # Flags: 0xf021 for 64-bit params (u64, s64), 0xf011 for 32-bit params (u32, s32).
+    cumulative_offset = 0
+    param_offsets_list = []
+    for i in range(num_params):
+        param_offsets_list.append(cumulative_offset)
+        cumulative_offset += param_sizes[i]
     for i in range(num_params - 1, -1, -1):
         buf.extend(bytes([0x04, 0x17, 0x0c, 0x00]))
         buf.extend(bytes([0x00, 0x00, 0x00, 0x00]))  # padding
         buf.extend(bytes([i & 0xFF, 0x00]))  # param ordinal
-        psize = param_sizes[i] if i > 0 else 0  # param 0 size = 0 (ptxas convention)
-        buf.extend(bytes([psize & 0xFF, 0x00]))
-        buf.extend(bytes([0x00, 0xf0, 0x21, 0x00]))  # flags
+        off = param_offsets_list[i]
+        buf.extend(bytes([off & 0xFF, (off >> 8) & 0xFF]))  # cumulative offset
+        # Flags: 0x00, 0xf0, size_indicator, 0x00
+        # size_indicator: 0x11 for 32-bit params, 0x21 for 64-bit params
+        size_ind = 0x11 if param_sizes[i] <= 4 else 0x21
+        buf.extend(bytes([0x00, 0xf0, size_ind, 0x00]))
 
     # EIATTR_PARAM_CBANK (0x50)
     buf.extend(bytes([0x03, 0x50, 0x00, 0x00]))
@@ -162,12 +170,18 @@ def _build_nv_info_kernel(num_gprs: int = 8, num_params: int = 2,
     # EIATTR_CTAID_DIMS (0x4a)
     buf.extend(bytes([0x02, 0x4a, 0x00, 0x00]))
 
-    # EIATTR_MAX_REG_COUNT (0x1c): 0x80 for <=8 GPRs, 0x90 for more
-    max_reg = 0x90 if num_gprs > 8 else 0x80
-    buf.extend(bytes([0x04, 0x1c, 0x04, 0x00, max_reg, 0x00, 0x00, 0x00]))
+    # EIATTR_MAX_REG_COUNT (0x1c): ptxas format is size=8, payload=regcount + padding
+    # ptxas: 041c0800 70000000 40010000 (for ~36 GPRs)
+    # Register count byte: 0x70 means up to R112 allocated
+    # Scale: approx num_gprs rounded up to nearest 8, then encoded
+    reg_alloc = ((num_gprs + 7) & ~7)  # round up to multiple of 8
+    if reg_alloc < 16: reg_alloc = 16
+    buf.extend(bytes([0x04, 0x1c, 0x08, 0x00,
+                      reg_alloc & 0xFF, 0x00, 0x00, 0x00,
+                      0x40, 0x01, 0x00, 0x00]))
 
     # EIATTR_S2RCTAID (0x19)
-    s2r_val = 0x18 if num_gprs > 8 else 0x10
+    s2r_val = 0x1c if num_gprs > 16 else 0x18
     buf.extend(bytes([0x03, 0x19, s2r_val, 0x00]))
 
     # EIATTR_CRS_STACK (0x0a)

@@ -18,6 +18,7 @@ from ptx.ir import Module, Function
 from ptx.passes.rotate import run as rotate_run
 from sass.regalloc import allocate
 from sass.isel import ISelContext, select_function, SassInstr
+from sass.encoding.sm_120_opcodes import encode_bra
 from sass.schedule import schedule
 from sass.scoreboard import assign_ctrl
 from cubin.emitter import emit_cubin, KernelDesc
@@ -68,6 +69,51 @@ def compile_function(fn: Function, verbose: bool = False) -> bytes:
     preamble_instrs = reordered[:n_preamble]
     body_scheduled = assign_ctrl(reordered[n_preamble:])
     sass_instrs = preamble_instrs + body_scheduled
+
+    # 5. BRA offset fixup: resolve branch targets AFTER scheduling
+    # (scheduler may insert NOPs that shift instruction positions)
+    if hasattr(ctx, '_bra_fixups'):
+        # Rebuild label map: scan for BRA placeholder targets in comments
+        # and find the actual instruction index after scheduling
+        n_total = len(sass_instrs)
+        for i in range(n_total):
+            comment = sass_instrs[i].comment
+            # Labels are emitted as comments like "LABEL: <label_name>"
+            # But we don't have label markers in the output. Instead, recalculate
+            # offsets by mapping from old body indices to new post-schedule indices.
+        # Simple approach: find BRA instructions and recalculate based on scanning
+        # for the EXIT or target label pattern
+        for bra_idx, target_label in ctx._bra_fixups:
+            # Find the BRA instruction in the post-schedule output
+            # The bra_idx is body-relative, add preamble offset
+            abs_bra_idx = n_preamble + bra_idx
+            # Account for scheduler-inserted NOPs before this BRA
+            # Count NOPs inserted before bra_idx in the body
+            nops_before_bra = 0
+            for j in range(n_preamble, abs_bra_idx + nops_before_bra + 1):
+                if j < len(sass_instrs) and 'latency' in sass_instrs[j].comment.lower():
+                    if j <= abs_bra_idx + nops_before_bra:
+                        nops_before_bra += 1
+            actual_bra_idx = abs_bra_idx + nops_before_bra
+
+            # Find target: count NOPs before the target label's original position
+            if target_label in ctx.label_map:
+                orig_target_body_byte = ctx.label_map[target_label]
+                orig_target_body_idx = orig_target_body_byte // 16
+                abs_target_idx = n_preamble + orig_target_body_idx
+                nops_before_target = 0
+                for j in range(n_preamble, abs_target_idx + nops_before_target + 1):
+                    if j < len(sass_instrs) and 'latency' in sass_instrs[j].comment.lower():
+                        if j <= abs_target_idx + nops_before_target:
+                            nops_before_target += 1
+                actual_target_idx = abs_target_idx + nops_before_target
+                actual_target_byte = actual_target_idx * 16
+                actual_bra_byte = (actual_bra_idx + 1) * 16
+                rel_offset = actual_target_byte - actual_bra_byte
+                if actual_bra_idx < len(sass_instrs):
+                    sass_instrs[actual_bra_idx] = SassInstr(
+                        encode_bra(rel_offset),
+                        f'BRA {target_label} (offset={rel_offset})')
 
     if verbose:
         print(f"[pipeline] {len(sass_instrs)} SASS instructions:")

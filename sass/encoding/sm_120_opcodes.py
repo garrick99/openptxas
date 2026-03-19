@@ -1757,6 +1757,55 @@ def encode_fsel(dest: int, src0: int, src1: int, pred: int = 0,
     return bytes(raw)
 
 
+# ---------------------------------------------------------------------------
+# ATOMG — Atomic Global Memory Operations
+# ---------------------------------------------------------------------------
+# Opcode: 0xa8, 0x79 (integer), 0xa3, 0x79 (float).
+# Uses descriptor-based addressing (desc[UR4][Rsrc.64+offset]).
+# Ground truth from probe:
+#   ATOMG.E.ADD:  0x80000009020909a8 / ctrl  (ADD u32)
+#   ATOMG.E.MIN.S32:  0x80000408040b79a8 / ctrl
+#   ATOMG.E.MAX.S32:  0x80000c08040d79a8 / ctrl
+#   ATOMG.E.AND:  0x80001408040f79a8 / ctrl
+#   ATOMG.E.OR:   0x80001c08041179a8 / ctrl
+#   ATOMG.E.EXCH: 0x80002408041379a8 / ctrl
+#   ATOMG.E.ADD.F32: 0x80003407040779a3 / ctrl
+
+ATOMG_ADD  = 0x00
+ATOMG_MIN  = 0x01
+ATOMG_MAX  = 0x02
+ATOMG_AND  = 0x04
+ATOMG_OR   = 0x05
+ATOMG_XOR  = 0x06
+ATOMG_EXCH = 0x08
+
+def encode_atomg_u32(dest: int, addr_base: int, offset: int, data: int,
+                      atom_op: int = ATOMG_ADD, ctrl: int = 0) -> bytes:
+    """Encode ATOMG.E.{op}.STRONG.GPU for u32 atomic operations."""
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0]  = 0xa8
+    raw[1]  = 0x79
+    raw[2]  = dest & 0xFF
+    raw[3]  = addr_base & 0xFF
+    raw[4]  = data & 0xFF
+    # offset in bytes 5-7 (24-bit)
+    raw[5]  = offset & 0xFF
+    raw[6]  = (offset >> 8) & 0xFF
+    raw[7]  = 0x80 | ((offset >> 16) & 0x7F)  # high bit = descriptor flag
+    raw[8]  = 0x00
+    raw[9]  = 0x00
+    raw[10] = 0x00
+    raw[11] = atom_op & 0xFF
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
 if __name__ == "__main__":
     ok = roundtrip_verify_opcodes(verbose=True)
     print()

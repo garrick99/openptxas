@@ -456,10 +456,12 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             f'IADD3 R{d}, R{a}, R{b}, RZ  // add.{typ}'))
 
                 elif op == 'sub' and typ in ('u32', 's32'):
-                    # 32-bit sub: IADD3 with negated src
-                    # For now use IADD3(d, a, ~b, RZ) — needs negate modifier
-                    # TODO: proper IADD3 negation. For now emit as TODO.
-                    output.append(_nop(f'TODO: sub.{typ} (need IADD3 negate)'))
+                    # 32-bit sub: IADD3 with negated src1
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = ctx.ra.r32(instr.srcs[0].name)
+                    b = ctx.ra.r32(instr.srcs[1].name)
+                    output.append(SassInstr(encode_iadd3(d, a, b, RZ, negate_src1=True),
+                                            f'IADD3 R{d}, R{a}, -R{b}, RZ  // sub.{typ}'))
 
                 elif op in ('and', 'or', 'xor') and typ in ('b32', 'u32', 's32'):
                     from sass.encoding.sm_120_opcodes import encode_lop3, LOP3_AND, LOP3_OR, LOP3_XOR
@@ -610,6 +612,74 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                                 f'ISETP P{pd}, R{ar}, {br}  // setp.{".".join(instr.types)}'))
                     else:
                         output.append(_nop(f'TODO: setp {instr}'))
+
+                elif op == 'neg' and typ in ('s32', 'u32'):
+                    # neg: IADD3 with src0=RZ, src1=src, negate_src1
+                    # dest = 0 - src
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = ctx.ra.r32(instr.srcs[0].name)
+                    output.append(SassInstr(encode_iadd3(d, RZ, a, RZ, negate_src1=True),
+                                            f'IADD3 R{d}, RZ, -R{a}, RZ  // neg.{typ}'))
+
+                elif op == 'neg' and typ == 'f32':
+                    # neg.f32: FADD with negated src and zero
+                    from sass.encoding.sm_120_opcodes import encode_fadd
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = ctx.ra.r32(instr.srcs[0].name)
+                    output.append(SassInstr(encode_fadd(d, RZ, a, negate_src0=True),
+                                            f'FADD R{d}, -R{a}, RZ  // neg.f32'))
+
+                elif op == 'abs' and typ == 'f32':
+                    # abs.f32: FADD with abs modifier — use FMUL by 1.0? Or MOV with abs bit.
+                    # Simplest: FADD R{d}, |R{a}|, RZ (abs modifier on src)
+                    # For now emit MOV (abs requires modifier we may not have)
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = ctx.ra.r32(instr.srcs[0].name)
+                    output.append(_nop(f'TODO: abs.f32 (needs FADD abs modifier)'))
+
+                elif op == 'selp':
+                    # selp.TYPE dest, src_true, src_false, pred
+                    # On SM_120: SEL dest, src0, src1, pred (but we don't have encoder yet)
+                    # Fallback: emit conditional MOVs via predicated instructions
+                    output.append(_nop(f'TODO: selp (need SEL encoder)'))
+
+                elif op == 'min' and typ in ('u32', 's32'):
+                    # min.TYPE: compare + select
+                    # On SM_120 this would be IMNMX but we don't have the encoder
+                    output.append(_nop(f'TODO: min.{typ} (need IMNMX encoder)'))
+
+                elif op == 'max' and typ in ('u32', 's32'):
+                    output.append(_nop(f'TODO: max.{typ} (need IMNMX encoder)'))
+
+                elif op == 'mad' and 'lo' in instr.types:
+                    # mad.lo.s32 / mad.lo.u32 → IMAD
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = ctx.ra.r32(instr.srcs[0].name)
+                    b = ctx.ra.r32(instr.srcs[1].name)
+                    c = ctx.ra.r32(instr.srcs[2].name) if len(instr.srcs) > 2 else RZ
+                    output.append(SassInstr(encode_imad_wide(d, a, b, c),
+                                            f'IMAD R{d}, R{a}, R{b}, R{c}  // mad.lo.{typ}'))
+
+                elif op == 'rem' and typ in ('u32', 's32'):
+                    # Integer remainder — no direct SASS instruction
+                    # Would need: div + mul + sub sequence
+                    output.append(_nop(f'TODO: rem.{typ} (need div+mul+sub sequence)'))
+
+                elif op == 'div' and typ in ('u32', 's32'):
+                    # Integer division — no direct SASS instruction on SM_120
+                    # Would need iterative Newton-Raphson or lookup table
+                    output.append(_nop(f'TODO: div.{typ} (need iterative algorithm)'))
+
+                elif op == 'div' and typ == 'f32':
+                    # Float division: MUFU.RCP + FMUL
+                    # TODO: need MUFU encoder
+                    output.append(_nop(f'TODO: div.f32 (need MUFU.RCP encoder)'))
+
+                elif op == 'sqrt' and typ == 'f32':
+                    output.append(_nop(f'TODO: sqrt.f32 (need MUFU.SQRT encoder)'))
+
+                elif op == 'rcp' and typ == 'f32':
+                    output.append(_nop(f'TODO: rcp.f32 (need MUFU.RCP encoder)'))
 
                 else:
                     # Unsupported instruction: emit NOP with comment

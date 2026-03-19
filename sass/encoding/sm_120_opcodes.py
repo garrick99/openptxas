@@ -373,18 +373,20 @@ def encode_s2r(dest: int, sr_code: int, ctrl: int = 0) -> bytes:
 #   src2  -> b8  (third addend, often RZ)
 
 def encode_iadd3(dest: int, src0: int, src1: int, src2: int,
-                 ctrl: int = 0) -> bytes:
+                 negate_src1: bool = False, ctrl: int = 0) -> bytes:
     """
-    Encode IADD3 dest, P0, PT, src0, src1, src2 to 16 bytes.
+    Encode IADD3 dest, P0, PT, src0, [+-]src1, src2 to 16 bytes.
 
     Three-way integer add.  The predicate outputs (P0, PT) are fixed in the
     modifier bytes; only the four integer register operands are variable.
+    When negate_src1=True, computes dest = src0 - src1 + src2.
 
     Args:
         dest:  Destination register index (0..255, 255=RZ).
         src0:  First source register index (0..255, 255=RZ).
         src1:  Second source register index (0..255, 255=RZ).
         src2:  Third source register index (0..255, 255=RZ).
+        negate_src1: If True, negate src1 (subtraction).
         ctrl:  23-bit scheduling control word (0 = default 0x7e0).
 
     Returns:
@@ -396,10 +398,12 @@ def encode_iadd3(dest: int, src0: int, src1: int, src2: int,
     """
     if ctrl == 0:
         ctrl = _CTRL_DEFAULT
+    # Negate modifier: bit in b11 controls src1 negation
+    b11 = 0x0f if negate_src1 else 0x07
     return _build(0x10, 0x72,
                   b2=dest, b3=src0, b4=src1,
                   b8=src2,
-                  b9=0xe0, b10=0xf1, b11=0x07,
+                  b9=0xe0, b10=0xf1, b11=b11,
                   ctrl=ctrl)
 
 

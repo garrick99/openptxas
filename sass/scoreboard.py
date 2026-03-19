@@ -211,9 +211,10 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
             rbar = 0x01
             wdep = 0x3f
 
-        # Build ctrl
+        # Build ctrl — stall=0, rely on barriers only (matches ptxas pattern).
+        stall = 0
         misc = misc_counter & 0xF
-        ctrl = (rbar << 10) | (wdep << 4) | misc
+        ctrl = (stall << 17) | (rbar << 10) | (wdep << 4) | misc
         misc_counter += 1
 
         # Track this instruction's writes for future consumers.

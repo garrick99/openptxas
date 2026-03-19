@@ -1227,7 +1227,7 @@ def encode_iadd64(dest: int, src0: int, src1: int,
     raw[8] = 0x00
     raw[9] = 0x02
     raw[10] = 0x8e
-    raw[11] = 0x07
+    raw[11] = 0x07  # Original value — 0x0f from ptxas might be context-dependent
     raw[12] = 0x00
     raw[13] = b13
     raw[14] = b14

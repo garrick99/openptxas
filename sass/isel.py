@@ -336,16 +336,15 @@ def _select_add_u64(instr: Instruction, ra: RegAlloc,
                       f'IADD.64 R{d_lo}, R{r_lo}, UR{ur_idx}  // add.u64 (UR base)'),
         ]
     else:
-        # Both operands in R bank: use IADD3 + IADD3.X pair
+        # Both operands in R bank: use IADD.64 single instruction
+        from sass.encoding.sm_120_opcodes import encode_iadd64
         a_lo = ra.lo(a.name)
         b_lo = ra.lo(b.name)
         d_lo = a_lo  # in-place
         ra.int_regs[dest.name] = a_lo
         return [
-            SassInstr(encode_iadd3(d_lo, a_lo, b_lo, RZ),
-                      f'IADD3 R{d_lo}, R{a_lo}, R{b_lo}, RZ  // add.u64 lo'),
-            SassInstr(encode_iadd3x(d_lo+1, a_lo+1, b_lo+1, RZ),
-                      f'IADD3.X R{d_lo+1}, R{a_lo+1}, R{b_lo+1}, RZ  // add.u64 hi'),
+            SassInstr(encode_iadd64(d_lo, a_lo, b_lo),
+                      f'IADD.64 R{d_lo}, R{a_lo}, R{b_lo}  // add.u64'),
         ]
 
 
@@ -375,21 +374,11 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
 
     typ = instr.types[-1] if instr.types else 'u32'
     if typ in ('u64', 's64', 'b64'):
-        # Load 64-bit param into UNIFORM register via LDCU.64
-        # This is critical for SM_120 descriptor-based LDG/STG addressing.
-        ur_idx = ra.ur(dest.name) if dest.name in ra.unif_regs else ctx._next_ur if ctx else 6
-        if ctx and not dest.name in ra.unif_regs:
-            ra.unif_regs[dest.name] = ctx._next_ur
-            ur_idx = ctx._next_ur
-            ctx._next_ur += 2  # 64-bit UR pairs: UR6/7, UR8/9, etc.
-        # Track that this PTX register is in UR bank, NOT GPR
-        if ctx:
-            ctx._ur_params[dest.name] = ur_idx
-        # Remove from int_regs so downstream code knows to use UR
-        if dest.name in ra.int_regs:
-            del ra.int_regs[dest.name]
-        return [SassInstr(encode_ldcu_64(ur_idx, 0, byte_off),
-                          f'LDCU.64 UR{ur_idx}, c[0][0x{byte_off:x}]  // {param_name}')]
+        # Load 64-bit param into GPR pair via LDC.64.
+        # Address computation uses IADD.64 R-R (same as ptxas for simple kernels).
+        d_lo = ra.lo(dest.name)
+        return [SassInstr(encode_ldc_64(d_lo, 0, byte_off),
+                          f'LDC.64 R{d_lo}, c[0][0x{byte_off:x}]  // {param_name}')]
     else:
         d = ra.r32(dest.name)
         return [SassInstr(encode_ldc(d, 0, byte_off, ctrl=0x7f1),

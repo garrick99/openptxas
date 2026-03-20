@@ -28,6 +28,26 @@ This cubin was not produced by ptxas or nvcc.
 
 ---
 
+## ptxas gets it wrong
+
+On RTX 5090, ptxas 13.0 miscompiles a PTX subtract pattern by emitting rotate/OR where subtraction is required.
+
+```
+Kernel:   (x << 8) - (x >> 56)
+Input:    0x0123456789ABCDEF
+
+ptxas 13.0    0x23456789ABCDEF01  WRONG
+OpenPTXas     0x23456789ABCDEEFF  CORRECT
+```
+
+Same kernel. Same GPU. Same input. Verified over 500,000 iterations.
+
+```bash
+python tests/gpu_killshot.py
+```
+
+---
+
 ## What this is
 
 An open-source PTX assembler that compiles PTX into executable cubins for **SM_120 Blackwell** GPUs. Full pipeline: parse → register allocate → instruction select → schedule → scoreboard → ELF emit → GPU execute.

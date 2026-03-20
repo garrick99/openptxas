@@ -36,6 +36,15 @@ import struct
 RZ = 255   # zero register index on SM_120
 PT = 7     # predicate "true" (always-true predicate register)
 
+# Predicate encoding: byte 1, bits 7:4 of the lo qword
+# 0x7 = PT (always), 0x0 = P0, 0x1 = P1, ..., 0x8 = !P0, 0x9 = !P1, ...
+def patch_pred(raw: bytes, pred: int = PT, neg: bool = False) -> bytes:
+    """Patch predicate guard on any instruction. pred=0..5 for P0-P5, 7=PT (always)."""
+    buf = bytearray(raw)
+    code = pred if not neg else (pred | 0x8)
+    buf[1] = (buf[1] & 0x0F) | (code << 4)
+    return bytes(buf)
+
 # SR codes for S2R
 SR_TID_X   = 0x21
 SR_TID_Y   = 0x22
@@ -508,6 +517,42 @@ def encode_imad_wide(dest: int, src0: int, src1_imm: int, src2: int,
                   ctrl=ctrl)
 
 
+def encode_imad_ur(dest: int, src0: int, ur_src: int, src2: int,
+                   ctrl: int = 0) -> bytes:
+    """
+    Encode IMAD R-UR: dest = src0 * UR[ur_src] + src2 (non-wide, single register write).
+
+    Ground truth: IMAD R13, R13, UR4, R0 → 247c0d0d0400000000028e0f00ca1f00
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    return _build(0x24, 0x7c,
+                  b2=dest, b3=src0, b4=ur_src & 0xFF,
+                  b8=src2,
+                  b9=0x02, b10=0x8e, b11=0x0f,
+                  ctrl=ctrl)
+
+
+def encode_imad(dest: int, src0: int, src1: int, src2: int,
+                ctrl: int = 0) -> bytes:
+    """
+    Encode IMAD dest, src0, src1, src2 (register-register multiply-add).
+
+    Non-wide: dest = (src0 * src1 + src2) & 0xFFFFFFFF (low 32 bits only).
+    All operands are registers. Uses opcode 0x224 (R-R variant).
+
+    Based on IMAD R-UR ground truth (opcode 0xc24, bytes 24 7c) with
+    b1 changed to 0x72 for R-R encoding.
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    return _build(0x24, 0x72,
+                  b2=dest, b3=src0, b4=src1 & 0xFF,
+                  b8=src2,
+                  b9=0x02, b10=0x8e, b11=0x07,
+                  ctrl=ctrl)
+
+
 # ---------------------------------------------------------------------------
 # LDG.E.64  (64-bit global memory load, descriptor-based)
 # ---------------------------------------------------------------------------
@@ -531,7 +576,7 @@ def encode_ldg_e(dest: int, ur_desc: int, src_addr: int,
     return _build(0x81, 0x79,
                   b2=dest, b3=src_addr, b4=ur_desc & 0xFF,
                   b8=0x00,
-                  b9=b9_map.get(width, 0x1b), b10=0x1e, b11=0x0c,
+                  b9=b9_map.get(width, 0x9b), b10=0x1e, b11=0x0c,
                   ctrl=ctrl)
 
 
@@ -667,10 +712,12 @@ def encode_isetp_ge_and(pred_dest: int, src_reg: int, ur_src: int,
     """
     if ctrl == 0:
         ctrl = _CTRL_DEFAULT
+    # b9 bit 1 depends on UR index parity: even=0x60, odd=0x62
+    b9_val = 0x62 if (ur_src & 1) else 0x60
     return _build(0x0c, 0x7c,
                   b2=pred_dest & 0xFF, b3=src_reg, b4=ur_src & 0xFF,
                   b8=0x70,
-                  b9=0x62, b10=0xf0, b11=0x0b,
+                  b9=b9_val, b10=0xf0, b11=0x0b,
                   ctrl=ctrl)
 
 
@@ -1088,17 +1135,18 @@ def encode_lop3(dest: int, src0: int, src1: int, src2: int,
 #   This computes: dest = src0 * imm16 + RZ = src0 << log2(imm16)
 
 def encode_imad_shl_u32(dest: int, src0: int, shift_amount: int,
-                         ctrl: int = 0) -> bytes:
+                         src2: int = RZ, ctrl: int = 0) -> bytes:
     """
-    Encode IMAD.SHL.U32 dest, src0, (1<<K), RZ — left shift via multiply.
+    Encode IMAD.SHL.U32 dest, src0, (1<<K), src2 — shift-multiply-add.
 
-    Uses the IMAD unit instead of SHF, avoiding SHF.L/SHF.R pipeline conflicts.
-    ptxas uses this for shl when shr is also needed in the same kernel.
+    dest = src0 * (1 << shift_amount) + src2.
+    WARNING: WIDE write — also writes dest+1 with the high word (b11=0x07).
 
     Args:
         dest:         Destination register (0..254).
         src0:         Source register (0..254).
-        shift_amount: Shift amount K (0..15, since imm16 = 1<<K must fit in 16 bits).
+        shift_amount: Shift amount K (0..15, imm16 = 1<<K fits in 16 bits).
+        src2:         Addend register (0..255, 255=RZ). Default RZ.
         ctrl:         23-bit scheduling control word.
     """
     if ctrl == 0:
@@ -1114,7 +1162,7 @@ def encode_imad_shl_u32(dest: int, src0: int, shift_amount: int,
     raw[5] = (imm16 >> 8) & 0xFF
     raw[6] = 0x00
     raw[7] = 0x00
-    raw[8] = RZ
+    raw[8] = src2 & 0xFF
     raw[9] = 0x00
     raw[10] = 0x8e
     raw[11] = 0x07
@@ -1174,6 +1222,61 @@ def encode_ldcu_64(dest_ur: int, const_bank: int, const_offset_bytes: int,
     raw[10] = 0x00
     raw[11] = 0x08   # LDCU-specific
     raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+def encode_imad_imm(dest: int, src0: int, imm: int, src2: int,
+                     ctrl: int = 0) -> bytes:
+    """
+    Encode IMAD.WIDE dest, src0, imm, src2 — multiply by immediate + add register.
+
+    dest = src0 * imm + src2. Writes dest AND dest+1 (WIDE).
+    imm is a 16-bit unsigned immediate.
+
+    Based on IMAD.WIDE ground truth (opcode 0x825).
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0x25
+    raw[1] = 0x78
+    raw[2] = dest & 0xFF
+    raw[3] = src0 & 0xFF
+    raw[4] = imm & 0xFF
+    raw[5] = (imm >> 8) & 0xFF
+    raw[6] = 0x00
+    raw[7] = 0x00
+    raw[8] = src2 & 0xFF
+    raw[9] = 0x02
+    raw[10] = 0x8e
+    raw[11] = 0x07
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+def encode_ldcu_32(dest_ur: int, const_bank: int, const_offset_bytes: int,
+                   ctrl: int = 0) -> bytes:
+    """Encode LDCU.32 dest_ur, c[bank][offset] — 32-bit constant to single UR."""
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    qword_offset = (const_offset_bytes // 8) & 0xFF
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0xac
+    raw[1] = 0x77
+    raw[2] = dest_ur & 0xFF
+    raw[3] = 0xFF
+    raw[4] = const_bank & 0xFF
+    raw[5] = qword_offset
+    raw[9] = 0x08    # 32-bit (vs 0x0a for 64-bit)
+    raw[11] = 0x08
     raw[13] = b13
     raw[14] = b14
     raw[15] = b15
@@ -2077,17 +2180,21 @@ ISETP_GE = 0x06
 
 def encode_isetp(pred_dest: int, src0: int, src1: int, cmp: int = ISETP_GE,
                   signed: bool = True, ctrl: int = 0) -> bytes:
-    """Encode ISETP with variable comparison type."""
+    """Encode ISETP R-R variant with variable comparison type.
+
+    Based on R-UR ground truth (0x7c0c) field layout, adapted to R-R (0x720c):
+      b2 = pred_dest, b3 = src0, b4 = src1
+      b8 = 0x70 (PT for secondary pred), b9 = 0x62 (AND combiner + flags)
+      b10 = 0xf0, b11 = comparison + GE/AND flags
+    """
     if ctrl == 0: ctrl = _CTRL_DEFAULT
-    b13, b14, b15 = _ctrl_to_bytes(ctrl)
-    raw = bytearray(16)
-    raw[0], raw[1] = 0x0c, 0x72
-    raw[2] = 0x00
-    raw[3] = src0 & 0xFF
-    raw[4] = src1 & 0xFF
-    raw[9] = 0xf0 | (pred_dest & 0x07)
-    raw[10] = 0x04 if signed else 0x00  # signed vs unsigned
-    raw[11] = cmp & 0xFF
+    # Use exact modifiers from R-UR ground truth (ISETP.GE.AND)
+    # b8=0x70 (PT secondary pred), b9=0x62, b10=0xf0, b11=0x0b
+    return _build(0x0c, 0x72,
+                  b2=pred_dest & 0xFF, b3=src0, b4=src1 & 0xFF,
+                  b8=0x70,
+                  b9=0x62, b10=0xf0, b11=0x0b,
+                  ctrl=ctrl)
     raw[13], raw[14], raw[15] = b13, b14, b15
     return bytes(raw)
 

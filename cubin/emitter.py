@@ -174,9 +174,7 @@ def _build_nv_info_kernel(num_gprs: int = 8, num_params: int = 2,
     # EIATTR_CTAID_DIMS (0x4a)
     buf.extend(bytes([0x02, 0x4a, 0x00, 0x00]))
 
-    # EIATTR_MAX_REG_COUNT (0x1c): ptxas uses 0x60 (96) as default for SM_120.
-    # This tells the hardware how many physical registers to allocate per thread.
-    # Higher = fewer concurrent warps. 0x60 is the ptxas default.
+    # EIATTR_MAX_REG_COUNT (0x1c): 4-byte format, 0x60 = 96 registers max
     buf.extend(bytes([0x04, 0x1c, 0x04, 0x00, 0x60, 0x00, 0x00, 0x00]))
 
     s2r_offset = s2r_instr_offset
@@ -226,19 +224,38 @@ def _build_capmerc(num_gprs: int = 10):
     # Capmerc byte[8] = register allocation: tells hardware how many GPRs to allocate.
     # Must use the full 130-byte template (16-byte minimal doesn't work).
     # Allocate registers: round up to next multiple of 8, minimum 16
-    # DO NOT modify byte[8] — it's always 0x08 in ptxas output.
-    # Register allocation is controlled by EIATTR_MAX_REG_COUNT in nv.info (0x60 = 96 regs).
-    buf = bytearray.fromhex(
-        '0c000000010000c00800000050000000'
-        '010b040af80004000000410000040000'
-        '010b040af80004000000410101020000'
-        '010b0e0afa0005000000030139040000'
-        '02220e06f80052000000830040000200'
-        '00000000000000000000000000000000'
-        '02380e32f80040110000000082000a00'
-        '00020140010000000000000000000000'
-        'd004'
-    )
+    # Byte[8] = register count. Must match kernel's actual GPR usage.
+    # Use a larger template (from ptxas vector_add) that supports 20+ GPRs.
+    reg_count = max(num_gprs, 8)  # minimum 8 GPRs
+    if reg_count <= 12:
+        # Small kernel: use 130-byte template
+        buf = bytearray.fromhex(
+            '0c000000010000c00800000050000000'
+            '010b040af80004000000410000040000'
+            '010b040af80004000000410101020000'
+            '010b0e0afa0005000000030139040000'
+            '02220e06f80052000000830040000200'
+            '00000000000000000000000000000000'
+            '02380e32f80040110000000082000a00'
+            '00020140010000000000000000000000'
+            'd004'
+        )
+    else:
+        # Large kernel: use 238-byte template (from ptxas vector_add)
+        buf = bytearray.fromhex(
+            '0c000000010000c016000000e0861500'
+            '010b040af80004000000410000040000'
+            '010b040af80004000000010001020000'
+            '010b060afa0004000000010104020000'
+            '02220806fa004200000041014000020000000000000000000000000018000000'
+            '010b040af80004000000c1000104000002220806fa00620000000702400002000000000000000000000000000000000002220806fa005200000083014000020000000000000000000000000010000000'
+            '010b0e0afa0005000000030139040000'
+            '410c5404410c5404410c5404'
+            '02380e32f80040110000000082000a00'
+            '00020140020000000000000000000000'
+            'd005'
+        )
+    buf[8] = reg_count  # patch register count
     return bytes(buf)
 
 

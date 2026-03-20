@@ -11,7 +11,7 @@ from ptx.parser import parse, parse_file
 from ptx.ir import ScalarKind
 
 
-PTXAS_BUG_DIR = Path(r"C:\Users\kraken\ptxas_bug")
+PTXAS_BUG_DIR = Path(r"ptxas_bug")
 REPRO_PTX     = PTXAS_BUG_DIR / "repro_sub_bug.ptx"
 
 

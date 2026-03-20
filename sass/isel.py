@@ -43,17 +43,18 @@ from sass.encoding.sm_120_opcodes import (
     encode_s2r,
     encode_iadd3, encode_iadd3x,
     encode_iadd64,
-    encode_imad_wide, encode_imad_hi, encode_imad_shl_u32,
+    encode_imad_wide, encode_imad, encode_imad_ur, encode_imad_hi, encode_imad_shl_u32,
+    encode_s2ur,
     encode_ldg_e, encode_ldg_e_64,
     encode_stg_e, encode_stg_e_64,
     encode_lds, encode_sts,
-    encode_ldcu_64,
+    encode_ldcu_64, encode_ldcu_32,
     encode_iadd64_ur,
     encode_bar_sync,
     encode_isetp_ge_and,
     encode_isetp, ISETP_LT, ISETP_EQ, ISETP_LE, ISETP_GT, ISETP_NE, ISETP_GE,
     encode_fsetp, FSETP_LT, FSETP_EQ, FSETP_LE, FSETP_GT, FSETP_NE, FSETP_GE,
-    encode_bra,
+    encode_bra, patch_pred,
     encode_fadd, encode_fmul, encode_ffma,
     encode_mufu, MUFU_RCP, MUFU_SQRT, MUFU_SIN, MUFU_COS, MUFU_EX2, MUFU_LG2,
     encode_sel, encode_fsel,
@@ -131,6 +132,9 @@ _SPECIAL_REGS = {
     '%ntid.x': 0x29,  # SR_NTID_X
 }
 
+# SM_120 constant bank offsets for system values (driver-populated)
+_CBANK_NTID_X = 0x360  # blockDim.x lives at c[0][0x360]
+
 
 def _select_mov(instr: Instruction, ra: RegAlloc) -> list[SassInstr]:
     """mov.u32 or mov.u64 (register-register or special register read)."""
@@ -145,6 +149,15 @@ def _select_mov(instr: Instruction, ra: RegAlloc) -> list[SassInstr]:
     if isinstance(src, RegOp) and src.name in _SPECIAL_REGS:
         d = ra.r32(dest.name)
         sr = _SPECIAL_REGS[src.name]
+
+        # ntid.x: load from constant bank c[0][0x360] instead of S2R.
+        # The driver populates this offset with blockDim.x. This avoids
+        # the SR bus and gives us a constant-bank source that the mad.lo
+        # handler can use with LDCU.32 + IMAD R-UR.
+        if src.name == '%ntid.x':
+            return [SassInstr(encode_ldc(d, 0, _CBANK_NTID_X),
+                              f'LDC R{d}, c[0][0x{_CBANK_NTID_X:x}]  // ntid.x')]
+
         return [SassInstr(encode_s2r(d, sr),
                           f'S2R R{d}, SR_{src.name}  // {dest.name} = {src.name}')]
 
@@ -292,11 +305,7 @@ def _select_sub_u64(instr: Instruction, ra: RegAlloc) -> list[SassInstr]:
 
     a_lo = ra.lo(a.name)
     b_lo = ra.lo(b.name)
-    # Write result to src0's register (in-place) to minimize register usage
-    d_lo = a_lo
-
-    # Also update the regalloc to know dest is at a_lo
-    ra.int_regs[dest.name] = a_lo
+    d_lo = ra.lo(dest.name)  # use allocator's assignment
 
     return [
         SassInstr(encode_iadd64(d_lo, a_lo, b_lo, negate_src1=True),
@@ -328,9 +337,7 @@ def _select_add_u64(instr: Instruction, ra: RegAlloc,
         else:
             ur_idx = ctx._ur_params[b.name]
             r_lo = ra.lo(a.name)
-        # Allocate fresh register pair for destination
         d_lo = ra.lo(dest.name) if dest.name in ra.int_regs else r_lo
-        ra.int_regs[dest.name] = d_lo
         return [
             SassInstr(encode_iadd64_ur(d_lo, r_lo, ur_idx),
                       f'IADD.64 R{d_lo}, R{r_lo}, UR{ur_idx}  // add.u64 (UR base)'),
@@ -340,8 +347,7 @@ def _select_add_u64(instr: Instruction, ra: RegAlloc,
         from sass.encoding.sm_120_opcodes import encode_iadd64
         a_lo = ra.lo(a.name)
         b_lo = ra.lo(b.name)
-        d_lo = a_lo  # in-place
-        ra.int_regs[dest.name] = a_lo
+        d_lo = ra.lo(dest.name)  # use allocator's assignment
         return [
             SassInstr(encode_iadd64(d_lo, a_lo, b_lo),
                       f'IADD.64 R{d_lo}, R{a_lo}, R{b_lo}  // add.u64'),
@@ -374,23 +380,24 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
 
     typ = instr.types[-1] if instr.types else 'u32'
     if typ in ('u64', 's64', 'b64'):
-        # Load 64-bit param into UNIFORM register via LDCU.64.
-        # SM_120 requires UR-based addressing for correct 64-bit pointer math.
-        # The IADD.64 R-UR variant (0x7c35) is the only instruction that
-        # correctly carries for 64-bit pointer arithmetic on Blackwell.
-        ur_idx = ra.ur(dest.name) if dest.name in ra.unif_regs else ctx._next_ur if ctx else 6
-        if ctx and dest.name not in ra.unif_regs:
-            ra.unif_regs[dest.name] = ctx._next_ur
-            ur_idx = ctx._next_ur
-            ctx._next_ur += 2
+        # Load 64-bit param into UR via LDCU.64 (ptxas pattern).
+        # Pointers stay in URs. Address math uses IADD.64-UR.
+        # Avoids GPR pressure and LDC.64 single-slot WAW hazards.
+        ur_idx = ctx._next_ur if ctx else 6
         if ctx:
+            ctx._next_ur += 2
             ctx._ur_params[dest.name] = ur_idx
-        if dest.name in ra.int_regs:
-            del ra.int_regs[dest.name]
-        return [SassInstr(encode_ldcu_64(ur_idx, 0, byte_off),
-                          f'LDCU.64 UR{ur_idx}, c[0][0x{byte_off:x}]  // {param_name}')]
+        d = ra.lo(dest.name)
+        return [
+            SassInstr(encode_ldcu_64(ur_idx, 0, byte_off),
+                      f'LDCU.64 UR{ur_idx}, c[0][0x{byte_off:x}]  // {param_name}'),
+            SassInstr(encode_iadd64_ur(d, RZ, ur_idx),
+                      f'IADD.64 R{d}, RZ, UR{ur_idx}  // materialize {param_name}'),
+        ]
     else:
         d = ra.r32(dest.name)
+        if ctx:
+            ctx._reg_param_off[dest.name] = byte_off
         return [SassInstr(encode_ldc(d, 0, byte_off, ctrl=0x7f1),
                           f'LDC R{d}, c[0][0x{byte_off:x}]  // {param_name}')]
 
@@ -409,27 +416,16 @@ def _select_ld_global(instr: Instruction, ra: RegAlloc,
     typ = instr.types[-1] if instr.types else 'u32'
     is_64 = typ in ('u64', 's64', 'b64', 'f64')
 
-    # Check if address register is in UR bank (loaded via LDCU)
     base_name = src.base if src.base.startswith('%') else f'%{src.base}'
-    prefix = []
-    if ctx and base_name in ctx._ur_params and base_name not in ra.int_regs:
-        # Materialize UR pointer into a GPR: IADD.64 R, RZ, UR
-        ur_idx = ctx._ur_params[base_name]
-        # Use R2 as temp (will be overwritten)
-        d_tmp = 2
-        prefix.append(SassInstr(encode_iadd64_ur(d_tmp, RZ, ur_idx),
-                                f'IADD.64 R{d_tmp}, RZ, UR{ur_idx}  // materialize UR to GPR'))
-        ra.int_regs[base_name] = d_tmp
-
     addr = ra.lo(src.base) if src.base in ra.int_regs else RZ
 
     if is_64:
         d = ra.lo(dest.name)
-        return prefix + [SassInstr(encode_ldg_e_64(d, ur_desc, addr),
+        return [SassInstr(encode_ldg_e_64(d, ur_desc, addr),
                           f'LDG.E.64 R{d}, desc[UR{ur_desc}][R{addr}.64]')]
     else:
         d = ra.r32(dest.name)
-        return prefix + [SassInstr(encode_ldg_e(d, ur_desc, addr, width=32),
+        return [SassInstr(encode_ldg_e(d, ur_desc, addr, width=32),
                           f'LDG.E R{d}, desc[UR{ur_desc}][R{addr}.64]')]
 
 
@@ -447,25 +443,16 @@ def _select_st_global(instr: Instruction, ra: RegAlloc,
     typ = instr.types[-1] if instr.types else 'u32'
     is_64 = typ in ('u64', 's64', 'b64', 'f64')
 
-    # Materialize UR pointer to GPR if needed
     base_name = dest_op.base if dest_op.base.startswith('%') else f'%{dest_op.base}'
-    prefix = []
-    if ctx and base_name in ctx._ur_params and base_name not in ra.int_regs:
-        ur_idx = ctx._ur_params[base_name]
-        d_tmp = 2
-        prefix.append(SassInstr(encode_iadd64_ur(d_tmp, RZ, ur_idx),
-                                f'IADD.64 R{d_tmp}, RZ, UR{ur_idx}  // materialize UR to GPR'))
-        ra.int_regs[base_name] = d_tmp
-
     addr = ra.lo(dest_op.base) if dest_op.base in ra.int_regs else RZ
 
     if is_64:
         data = ra.lo(src_op.name)
-        return prefix + [SassInstr(encode_stg_e_64(ur_desc, addr, data, ctrl=0xff1),
+        return [SassInstr(encode_stg_e_64(ur_desc, addr, data, ctrl=0xff1),
                           f'STG.E.64 desc[UR{ur_desc}][R{addr}.64], R{data}')]
     else:
         data = ra.r32(src_op.name)
-        return prefix + [SassInstr(encode_stg_e(ur_desc, addr, data, width=32, ctrl=0xff1),
+        return [SassInstr(encode_stg_e(ur_desc, addr, data, width=32, ctrl=0xff1),
                           f'STG.E desc[UR{ur_desc}][R{addr}.64], R{data}')]
 
 
@@ -487,6 +474,10 @@ class ISelContext:
     _next_ur:      int = 6  # UR4 = mem desc, UR6+ for params
     # Map PTX register name → UR index (for params loaded via LDCU)
     _ur_params:    dict[str, int] = field(default_factory=dict)
+    # Map PTX register name → param byte offset (for setp LDCU fallback)
+    _reg_param_off: dict[str, int] = field(default_factory=dict)
+    # Map PTX register name → SR code (for S2UR in mad.lo)
+    _reg_sr_source: dict[str, int] = field(default_factory=dict)
 
 
 def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
@@ -511,6 +502,15 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
 
             try:
                 if op == 'mov' and typ in ('u32', 's32', 'b32', 'u64', 's64', 'b64'):
+                    # Track special register sources
+                    if (isinstance(instr.srcs[0], RegOp) and
+                        instr.srcs[0].name in _SPECIAL_REGS and
+                        isinstance(instr.dest, RegOp)):
+                        ctx._reg_sr_source[instr.dest.name] = _SPECIAL_REGS[instr.srcs[0].name]
+                        # ntid.x loaded from constant bank — track as param-like source
+                        # so mad.lo can use LDCU.32 + IMAD R-UR
+                        if instr.srcs[0].name == '%ntid.x':
+                            ctx._reg_param_off[instr.dest.name] = _CBANK_NTID_X
                     output.extend(_select_mov(instr, ctx.ra))
 
                 elif op == 'shl' and typ in ('b64', 'u64'):
@@ -574,12 +574,32 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             f'LOP3.LUT R{d}, R{a}, R{b}, RZ, 0x{lut:02x}  // {op}.{typ}'))
 
                 elif op == 'mul' and 'lo' in instr.types and typ in ('u32', 's32'):
-                    # mul.lo.s32 → IMAD dest, src0, src1, RZ
+                    # mul.lo.s32 → IMAD R-UR or IMAD.WIDE with immediate
+                    # NOTE: IMAD R-R (0x224) is NOT valid on SM_120!
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
                     b = ctx.ra.r32(instr.srcs[1].name)
-                    output.append(SassInstr(encode_imad_wide(d, a, b, RZ),
-                                            f'IMAD R{d}, R{a}, R{b}, RZ  // mul.lo.{typ}'))
+                    # Check if either source is a param → use IMAD R-UR
+                    b_param = ctx._reg_param_off.get(
+                        instr.srcs[1].name if isinstance(instr.srcs[1], RegOp) else None)
+                    a_param = ctx._reg_param_off.get(
+                        instr.srcs[0].name if isinstance(instr.srcs[0], RegOp) else None)
+                    if b_param is not None:
+                        from sass.encoding.sm_120_opcodes import encode_ldcu_32
+                        ur_tmp = ctx._next_ur; ctx._next_ur += 1
+                        output.append(SassInstr(encode_ldcu_32(ur_tmp, 0, b_param),
+                            f'LDCU.32 UR{ur_tmp}, c[0][0x{b_param:x}]'))
+                        output.append(SassInstr(encode_imad_ur(d, a, ur_tmp, RZ),
+                            f'IMAD R{d}, R{a}, UR{ur_tmp}, RZ  // mul.lo.{typ}'))
+                    elif a_param is not None:
+                        from sass.encoding.sm_120_opcodes import encode_ldcu_32
+                        ur_tmp = ctx._next_ur; ctx._next_ur += 1
+                        output.append(SassInstr(encode_ldcu_32(ur_tmp, 0, a_param),
+                            f'LDCU.32 UR{ur_tmp}, c[0][0x{a_param:x}]'))
+                        output.append(SassInstr(encode_imad_ur(d, b, ur_tmp, RZ),
+                            f'IMAD R{d}, R{b}, UR{ur_tmp}, RZ  // mul.lo.{typ}'))
+                    else:
+                        output.append(_nop(f'TODO: mul.lo R{a}*R{b} (runtime multiply)'))
 
                 elif op == 'st' and 'shared' in instr.types:
                     from ptx.ir import MemOp
@@ -650,16 +670,41 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     output.append(SassInstr(encode_exit(ctrl=0x7f5), 'EXIT'))
 
                 elif op == 'bra':
-                    # Record BRA with target label for fixup after layout
+                    from ptx.ir import LabelOp
                     target = None
                     if instr.srcs:
-                        from ptx.ir import LabelOp
                         if isinstance(instr.srcs[0], LabelOp):
                             target = instr.srcs[0].name
+
+                    # Optimization: @%p bra LABEL where LABEL's block only
+                    # contains ret → emit predicated EXIT (matches ptxas)
+                    if instr.pred and target:
+                        # Check if the target label's block is just ret
+                        target_is_ret = False
+                        for tbb in fn.blocks:
+                            if tbb.label == target:
+                                if len(tbb.instructions) == 1 and tbb.instructions[0].op == 'ret':
+                                    target_is_ret = True
+                                break
+                        if target_is_ret:
+                            pd = ctx.ra.pred(instr.pred) if instr.pred in ctx.ra.pred_regs else 0
+                            exit_raw = patch_pred(encode_exit(), pred=pd, neg=instr.neg)
+                            pred_str = f'@{"!" if instr.neg else ""}P{pd} '
+                            output.append(SassInstr(exit_raw,
+                                                    f'{pred_str}EXIT  // early exit'))
+                            continue
+
+                    # General BRA with offset fixup
                     bra_idx = len(output)
-                    output.append(SassInstr(encode_bra(0),
-                                            f'BRA {target or "?"}'))
-                    # Store fixup info: (output_index, target_label)
+                    bra_raw = encode_bra(0)
+                    if instr.pred:
+                        pd = ctx.ra.pred(instr.pred) if instr.pred in ctx.ra.pred_regs else 0
+                        bra_raw = patch_pred(bra_raw, pred=pd, neg=instr.neg)
+                        pred_str = f'@{"!" if instr.neg else ""}P{pd} '
+                    else:
+                        pred_str = ''
+                    output.append(SassInstr(bra_raw,
+                                            f'{pred_str}BRA {target or "?"}'))
                     if target:
                         if not hasattr(ctx, '_bra_fixups'):
                             ctx._bra_fixups = []
@@ -692,23 +737,41 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     if isinstance(pred, RegOp) and isinstance(a, RegOp):
                         pd = ctx.ra.pred(pred.name) if pred.name in ctx.ra.pred_regs else 0
                         ar = ctx.ra.r32(a.name)
-                        br = ctx.ra.r32(b.name) if isinstance(b, RegOp) else (b.value if isinstance(b, ImmOp) else 0)
-                        # Determine comparison type and float vs int
                         is_float = any(t in ('f32', 'f64') for t in instr.types)
                         cmp_name = next((t for t in instr.types if t in ('lt','le','gt','ge','eq','ne')), 'ge')
                         if is_float:
+                            br = ctx.ra.r32(b.name) if isinstance(b, RegOp) else (b.value if isinstance(b, ImmOp) else 0)
                             cmp_map = {'lt': FSETP_LT, 'le': FSETP_LE, 'gt': FSETP_GT,
                                        'ge': FSETP_GE, 'eq': FSETP_EQ, 'ne': FSETP_NE}
                             output.append(SassInstr(
                                 encode_fsetp(pd, ar, br, cmp_map.get(cmp_name, FSETP_GE)),
                                 f'FSETP.{cmp_name.upper()} P{pd}, R{ar}, R{br}'))
                         else:
-                            cmp_map = {'lt': ISETP_LT, 'le': ISETP_LE, 'gt': ISETP_GT,
-                                       'ge': ISETP_GE, 'eq': ISETP_EQ, 'ne': ISETP_NE}
-                            is_signed = any(t in ('s32', 's64') for t in instr.types)
-                            output.append(SassInstr(
-                                encode_isetp(pd, ar, br, cmp_map.get(cmp_name, ISETP_GE), signed=is_signed),
-                                f'ISETP.{cmp_name.upper()} P{pd}, R{ar}, R{br}'))
+                            # Integer comparison: use R-UR ISETP (only proven encoding on SM_120)
+                            # Load src1 into a UR via LDCU if it's a param, else use UR4 temp
+                            if isinstance(b, RegOp):
+                                # Check if b was loaded from a param — find its param offset
+                                b_param_off = ctx._reg_param_off.get(b.name)
+                                # Emit LDCU to load comparison value into a temp UR
+                                ur_cmp = ctx._next_ur
+                                ctx._next_ur += 1  # single UR for LDCU.32
+                                if b_param_off is not None:
+                                    # Load 32-bit param into UR via LDCU.32
+                                    output.append(SassInstr(
+                                        encode_ldcu_32(ur_cmp, 0, b_param_off),
+                                        f'LDCU.32 UR{ur_cmp}, c[0][0x{b_param_off:x}]  // setp src1'))
+                                else:
+                                    # b is in a GPR but not directly from a param
+                                    # Use S2UR or UMOV to copy GPR→UR (not yet implemented)
+                                    # Fallback: use encode_isetp_ge_and with UR4 (won't be correct)
+                                    output.append(_nop(f'TODO: setp R-R without param src'))
+                                    continue
+                                output.append(SassInstr(
+                                    encode_isetp_ge_and(pd, ar, ur_cmp),
+                                    f'ISETP.GE.AND P{pd}, R{ar}, UR{ur_cmp}'))
+                            else:
+                                br = b.value if isinstance(b, ImmOp) else 0
+                                output.append(_nop(f'TODO: setp with immediate {br}'))
                     else:
                         output.append(_nop(f'TODO: setp {instr}'))
 
@@ -761,13 +824,41 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             f'VIMNMX.S32 R{d}, R{a}, R{b}, !PT  // max.{typ}'))
 
                 elif op == 'mad' and 'lo' in instr.types:
-                    # mad.lo.s32 / mad.lo.u32 → IMAD
+                    # mad.lo.s32 → dest = src0 * src1 + src2
+                    # Strategy: use IMAD R-UR (0xc24, non-wide) when possible,
+                    # fall back to IMAD.WIDE (0x825) + IADD3 decomposition.
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
                     b = ctx.ra.r32(instr.srcs[1].name)
                     c = ctx.ra.r32(instr.srcs[2].name) if len(instr.srcs) > 2 else RZ
-                    output.append(SassInstr(encode_imad_wide(d, a, b, c),
-                                            f'IMAD R{d}, R{a}, R{b}, R{c}  // mad.lo.{typ}'))
+                    # Check if either multiplicand is a param → LDCU.32 + IMAD R-UR
+                    b_param = ctx._reg_param_off.get(
+                        instr.srcs[1].name if isinstance(instr.srcs[1], RegOp) else None)
+                    a_param = ctx._reg_param_off.get(
+                        instr.srcs[0].name if isinstance(instr.srcs[0], RegOp) else None)
+                    if b_param is not None:
+                        from sass.encoding.sm_120_opcodes import encode_ldcu_32
+                        ur_tmp = ctx._next_ur; ctx._next_ur += 1
+                        output.append(SassInstr(encode_ldcu_32(ur_tmp, 0, b_param),
+                            f'LDCU.32 UR{ur_tmp}, c[0][0x{b_param:x}]'))
+                        output.append(SassInstr(encode_imad_ur(d, a, ur_tmp, c),
+                            f'IMAD R{d}, R{a}, UR{ur_tmp}, R{c}  // mad.lo.{typ}'))
+                    elif a_param is not None:
+                        from sass.encoding.sm_120_opcodes import encode_ldcu_32
+                        ur_tmp = ctx._next_ur; ctx._next_ur += 1
+                        output.append(SassInstr(encode_ldcu_32(ur_tmp, 0, a_param),
+                            f'LDCU.32 UR{ur_tmp}, c[0][0x{a_param:x}]'))
+                        output.append(SassInstr(encode_imad_ur(d, b, ur_tmp, c),
+                            f'IMAD R{d}, R{b}, UR{ur_tmp}, R{c}  // mad.lo.{typ}'))
+                    else:
+                        # Neither source is a param (e.g., both from S2R).
+                        # Use IMAD.WIDE (0x825) to safe temp, then IADD3.
+                        # IMAD.WIDE writes dest AND dest+1, so use a safe pair.
+                        from sass.encoding.sm_120_opcodes import encode_imad_imm
+                        # Can't use IMAD.WIDE with register operand — it treats b4 as immediate.
+                        # Fall back to IADD3 doubling chain for power-of-2 cases,
+                        # or emit a TODO for arbitrary runtime multiplies.
+                        output.append(_nop(f'TODO: mad.lo R{a}*R{b}+R{c} (runtime multiply)'))
 
                 elif op == 'mul' and 'hi' in instr.types and typ in ('u32', 's32'):
                     d = ctx.ra.r32(instr.dest.name)
@@ -987,8 +1078,14 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                 target_byte = ctx.label_map[target_label]
                 bra_byte = (bra_idx + 1) * 16  # offset from NEXT instruction
                 rel_offset = target_byte - bra_byte
+                # Preserve predicate from original BRA encoding
+                old_raw = output[bra_idx].raw
+                old_pred_byte = old_raw[1] & 0xF0  # predicate bits
+                new_raw = encode_bra(rel_offset)
+                new_raw = bytearray(new_raw)
+                new_raw[1] = (new_raw[1] & 0x0F) | old_pred_byte
                 output[bra_idx] = SassInstr(
-                    encode_bra(rel_offset),
-                    f'BRA {target_label} (offset={rel_offset})')
+                    bytes(new_raw),
+                    f'{output[bra_idx].comment.split("BRA")[0]}BRA {target_label} (offset={rel_offset})')
 
     return output

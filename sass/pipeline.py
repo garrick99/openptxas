@@ -48,19 +48,13 @@ def compile_function(fn: Function, verbose: bool = False) -> bytes:
         # LDC R1, c[0][0x37c] — frame pointer (first instruction)
         SassInstr(bytes.fromhex('827b01ff00df00000008000000e20f00'),
                   'LDC R1, c[0][0x37c]  // frame ptr'),
-        # NOTE: LDCU.64 UR4 (mem descriptor) is emitted AFTER param loads
-        # so it gets the LAST LDCU wdep slot (0x37), matching ptxas pattern.
-        # The scoreboard assigns wdep=0x37 to the last LDCU, and LDG uses
-        # rbar=0x11 to wait for it.
     ]
 
-    # The LDCU UR4 descriptor load will be appended after body param loads
     ur4_desc_instr = SassInstr(
-        encode_ldcu_64(4, 0, 0x358),
-        'LDCU.64 UR4, c[0][0x358]  // mem desc (after params)'
-    )
+        encode_ldcu_64(4, 0, 0x358, ctrl=0x717),
+        'LDCU.64 UR4, c[0][0x358]  // mem desc')
 
-    # 3. Instruction selection
+    # 3. Instruction selection — params loaded via LDC.64 to GPRs
     ctx = ISelContext(
         ra=alloc.ra,
         param_offsets=alloc.param_offsets,
@@ -68,15 +62,13 @@ def compile_function(fn: Function, verbose: bool = False) -> bytes:
     )
     body_instrs = select_function(fn, ctx)
 
-    # Insert LDCU.64 UR4 (mem descriptor) AFTER all param LDCUs, BEFORE first non-LDCU
-    # This ensures UR4 gets the LAST wdep slot (0x37), matching ptxas pattern.
+    # Insert LDCU UR4 (descriptor) AFTER all S2R instructions in the body.
+    # SM_120 requires S2R to be among the first instructions.
     insert_idx = 0
     for idx, si in enumerate(body_instrs):
         opcode = struct.unpack_from('<Q', si.raw, 0)[0] & 0xFFF
-        if opcode == 0x7ac:  # LDCU
+        if opcode in (0x919, 0x9c3):  # S2R, S2UR
             insert_idx = idx + 1
-        else:
-            break
     body_instrs.insert(insert_idx, ur4_desc_instr)
 
     # 4. Schedule: reorder for LDG latency, then assign ctrl via scoreboard
@@ -130,9 +122,16 @@ def compile_function(fn: Function, verbose: bool = False) -> bytes:
                 actual_bra_byte = (actual_bra_idx + 1) * 16
                 rel_offset = actual_target_byte - actual_bra_byte
                 if actual_bra_idx < len(sass_instrs):
+                    # Preserve predicate from original BRA encoding
+                    old_raw = sass_instrs[actual_bra_idx].raw
+                    old_pred_byte = old_raw[1] & 0xF0
+                    new_raw = bytearray(encode_bra(rel_offset))
+                    new_raw[1] = (new_raw[1] & 0x0F) | old_pred_byte
+                    old_comment = sass_instrs[actual_bra_idx].comment
+                    pred_prefix = old_comment.split('BRA')[0] if 'BRA' in old_comment else ''
                     sass_instrs[actual_bra_idx] = SassInstr(
-                        encode_bra(rel_offset),
-                        f'BRA {target_label} (offset={rel_offset})')
+                        bytes(new_raw),
+                        f'{pred_prefix}BRA {target_label} (offset={rel_offset})')
 
     if verbose:
         print(f"[pipeline] {len(sass_instrs)} SASS instructions:")
@@ -164,10 +163,18 @@ def compile_function(fn: Function, verbose: bool = False) -> bytes:
         if sass_bytes[i:i+2] == bytes([0x4d, 0x79]):  # EXIT opcode
             exit_offset = i
             break
+    # Find S2R that reads CTAID.X (SR code 0x25 in byte 9)
+    # Falls back to any S2R if no CTAID S2R is found
     for i in range(0, len(sass_bytes), 16):
-        if sass_bytes[i:i+2] == bytes([0x19, 0x79]):  # S2R opcode
+        if sass_bytes[i:i+2] == bytes([0x19, 0x79]) and sass_bytes[i+9] == 0x25:
             s2r_offset = i
             break
+    else:
+        # No CTAID S2R — find first S2R of any type
+        for i in range(0, len(sass_bytes), 16):
+            if sass_bytes[i:i+2] == bytes([0x19, 0x79]):
+                s2r_offset = i
+                break
 
     desc = KernelDesc(
         name=fn.name,

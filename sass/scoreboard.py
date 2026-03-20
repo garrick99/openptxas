@@ -34,15 +34,17 @@ from sass.isel import SassInstr
 
 # Opcode classification
 _OPCODES_LDG = {0x981}
-_OPCODES_LDC = {0xb82, 0x7ac}  # LDC, LDCU
+_OPCODES_LDC = {0xb82, 0x7ac, 0x919, 0x9c3}  # LDC, LDCU, S2R, S2UR
 _OPCODES_LDS = {0x984}
 _OPCODES_STG = {0x986}
 _OPCODES_STS = {0x988}
 _OPCODES_BAR = {0xb1d}
 _OPCODES_CTRL = {0x94d, 0x947, 0x918}  # EXIT, BRA, NOP
 _OPCODES_ALU = {0x819, 0x235, 0x210, 0x212, 0x221, 0x223, 0x202,
-                0x824, 0x825, 0x23c, 0x237, 0x431,
-                0xc35}  # + IADD.64-UR variant
+                0x824, 0x825, 0x224, 0x23c, 0x237, 0x431}
+# Note: IADD.64-UR (0xc35) uses wdep=0x3f (no tracking) + stall=1.
+# The 1-cycle stall ensures the result is ready for the subsequent LDG/STG.
+_OPCODES_IADD64_UR = {0xc35}
 _OPCODES_SMEM_SETUP = {0x9c3, 0x882, 0x291}  # S2UR, UMOV, ULEA
 
 
@@ -67,16 +69,19 @@ def _get_src_regs(raw: bytes) -> set[int]:
         # LDG: src_addr at b3
         if raw[3] < 255: regs |= {raw[3], raw[3]+1}
     elif opcode in _OPCODES_STG:
-        # STG: addr at b3, data at b8
+        # STG: addr at b3, data at b4 (NOT b8 — b8 is UR descriptor)
         if raw[3] < 255: regs |= {raw[3], raw[3]+1}
-        if raw[8] < 255: regs |= {raw[8], raw[8]+1}
+        if raw[4] < 255: regs.add(raw[4])
     elif opcode in _OPCODES_STS:
         # STS: data at b4
         if raw[4] < 255: regs.add(raw[4])
     elif opcode in _OPCODES_ALU:
-        # ALU: src0 at b3, src1/imm at b4 or b8
+        # ALU: src0 at b3, src1 at b4, src2 at b8 (varies by opcode)
         if raw[3] < 255: regs.add(raw[3])
-        if opcode == 0x235:  # IADD.64: src0=b3 pair, src1=b4 pair
+        if opcode == 0x210:  # IADD3: src0=b3, src1=b4, src2=b8
+            if raw[4] < 255: regs.add(raw[4])
+            if raw[8] < 255: regs.add(raw[8])
+        elif opcode == 0x235:  # IADD.64: src0=b3 pair, src1=b4 pair
             if raw[3] < 255: regs.add(raw[3]+1)
             if raw[4] < 255: regs |= {raw[4], raw[4]+1}
         elif opcode in (0x819,):  # SHF: src0=b3, src1=b8
@@ -88,6 +93,9 @@ def _get_src_regs(raw: bytes) -> set[int]:
         elif opcode in (0x221, 0x223):  # FADD/FFMA: src0=b3, src1=b4, src2=b8
             if raw[4] < 255: regs.add(raw[4])
             if raw[8] < 255 and opcode == 0x223: regs.add(raw[8])
+        elif opcode in (0x824, 0x825, 0x224):  # IMAD variants: src0=b3, src1=b4, src2=b8
+            if raw[4] < 255: regs.add(raw[4])
+            if raw[8] < 255: regs.add(raw[8])
     return regs
 
 
@@ -125,6 +133,7 @@ def _get_dest_regs(raw: bytes) -> set[int]:
 
 
 _ldcu_slot_counter = [0]  # mutable counter for rotating LDCU wdep slots
+_ldc_slot_counter = [0]   # mutable counter for rotating LDC wdep slots
 
 def _wdep_for_opcode(opcode: int) -> int:
     """Assign the scoreboard write-dependency slot for an opcode."""
@@ -139,6 +148,8 @@ def _wdep_for_opcode(opcode: int) -> int:
         return 0x33
     if opcode in _OPCODES_LDG:
         return 0x35
+    if opcode in _OPCODES_IADD64_UR:
+        return 0x3f  # No write tracking — stall=1 handles the dependency
     if opcode in _OPCODES_ALU | _OPCODES_SMEM_SETUP:
         return 0x3e
     # No write tracking for control flow, stores, barriers
@@ -179,8 +190,7 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
     misc_counter = 0
     ldg_count = 0
     _ldcu_slot_counter[0] = 0  # reset per kernel
-    if hasattr(assign_ctrl, '_desc_waited'):
-        assign_ctrl._desc_waited = False
+    _ldc_slot_counter[0] = 0   # reset per kernel
     result = []
 
     for i, si in enumerate(instrs):
@@ -218,24 +228,13 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
             rbar = max(rbar, 0x03)
 
         # LDCU consumers: any instruction using UR operands needs rbar for LDCU
-        # IADD.64-UR (opcode 0xc35) reads a UR source — wait for any pending LDCU
-        if opcode == 0xc35:  # IADD.64 R-UR variant
-            # Wait for the specific LDCU that produced the UR operand.
-            # The UR source is in byte 4 of the instruction.
+        # Check byte 4 for UR source in R-UR instructions
+        if opcode in (0xc35, 0xc0c, 0xc24):  # IADD.64-UR, ISETP R-UR, IMAD R-UR
             ur_src = si.raw[4]
             if ur_src in pending_ur_writes:
                 _, pw = pending_ur_writes[ur_src]
                 if pw in _WDEP_TO_RBAR:
-                    rbar = _WDEP_TO_RBAR[pw]
-
-        # LDG/STG use desc[UR4] — wait for descriptor LDCU (only on first LDG/STG)
-        if opcode in _OPCODES_LDG or opcode in _OPCODES_STG:
-            if not hasattr(assign_ctrl, '_desc_waited'):
-                assign_ctrl._desc_waited = False
-            if not assign_ctrl._desc_waited:
-                rbar = 0x11  # first LDG/STG: wait for descriptor (wdep=0x37)
-                assign_ctrl._desc_waited = True
-            # Don't OR in other bits — use clean rbar
+                    rbar = max(rbar, _WDEP_TO_RBAR[pw])
 
         # BAR.SYNC and EXIT get special ctrl
         if opcode in _OPCODES_BAR:
@@ -250,6 +249,17 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
         stall = 0
         if opcode == 0xc35:  # IADD.64-UR: add stall=1 for LDCU dependency
             stall = 1
+        if opcode == 0x224:  # IMAD R-R: needs stall=1 (multi-cycle, wide write)
+            stall = 1
+        if opcode == 0xb82:  # LDC/S2R: add stall=4 for WAW hazard
+            # SM_120 LDC.64 has delayed writes. When reusing the same
+            # register pair for multiple LDC.64s, the previous LDC's
+            # delayed write can overwrite the new value. Stall ensures
+            # the previous LDC completes before the new one starts.
+            src_regs_set = _get_src_regs(si.raw)
+            dest_r = si.raw[2]
+            if dest_r in pending_writes:
+                stall = max(stall, 4)
         misc = misc_counter & 0xF
         ctrl = (stall << 17) | (rbar << 10) | (wdep << 4) | misc
         misc_counter += 1
@@ -259,12 +269,15 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
         if wdep != 0x3f:
             for r in dest_regs:
                 pending_writes[r] = (i, wdep)
-        # Track LDCU writes to UR (dest is in byte 2 for LDCU)
+        # Track UR writes: LDCU (0x7ac) and S2UR (0x9c3)
         if opcode == 0x7ac:
             ur_dest = si.raw[2]  # UR destination index
             pending_ur_writes[ur_dest] = (i, wdep)
             # Also track UR+1 for 64-bit pairs
             pending_ur_writes[ur_dest + 1] = (i, wdep)
+        elif opcode == 0x9c3:  # S2UR: writes single UR (dest at byte 2)
+            ur_dest = si.raw[2]
+            pending_ur_writes[ur_dest] = (i, wdep)
         elif wdep == 0x3e:
             # ALU write: clear pending long-latency tracking for written regs
             # (the register now has a new value from a fast ALU op)

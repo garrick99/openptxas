@@ -57,13 +57,12 @@ def _get_src_regs(raw: bytes) -> set[int]:
         if src0 < 255:
             regs.add(src0)
             regs.add(src0 + 1)  # 64-bit pair
-    elif opcode == 0x986:  # STG: src0 = address, src1 = data
+    elif opcode == 0x986:  # STG: src0 = address (b3), data = b4 (NOT b8)
         if src0 < 255:
             regs.add(src0)
             regs.add(src0 + 1)
-        if src1 < 255:
-            regs.add(src1)
-            regs.add(src1 + 1)
+        if b4 < 255:
+            regs.add(b4)
     elif opcode == 0x819:  # SHF: src0=byte[3], src1=byte[8]
         if src0 < 255:
             regs.add(src0)
@@ -122,7 +121,8 @@ def _patch_ctrl(raw: bytes, ctrl: int) -> bytes:
 def _reorder_after_ldg(instrs: list[SassInstr]) -> list[SassInstr]:
     """Move independent LDC after LDG to hide latency.
 
-    Only moves an LDC if its destination doesn't conflict with the LDG output.
+    Only moves an LDC if its destination doesn't conflict with the LDG output
+    OR with any instruction between LDG and the LDC's original position.
     If no moveable LDC is found, insert a NOP to provide minimum latency gap.
     """
     from sass.encoding.sm_120_opcodes import encode_nop
@@ -137,6 +137,18 @@ def _reorder_after_ldg(instrs: list[SassInstr]) -> list[SassInstr]:
                     if _get_opcode(result[j].raw) == 0xb82:
                         ldc_dests = _get_dest_regs(result[j].raw)
                         if ldc_dests & ldg_dests:
+                            continue
+                        # Also check: LDC dest must not conflict with any
+                        # instruction between LDG+1 and LDC's original pos.
+                        # Those instructions may write to the same registers.
+                        conflict = False
+                        for k in range(i + 1, j):
+                            between_dests = _get_dest_regs(result[k].raw)
+                            between_srcs = _get_src_regs(result[k].raw)
+                            if ldc_dests & (between_dests | between_srcs):
+                                conflict = True
+                                break
+                        if conflict:
                             continue
                         m = result.pop(j)
                         result.insert(i + 1, m)

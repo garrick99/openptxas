@@ -45,7 +45,7 @@ MIXED_PTX = """\
 
 
 def test_alloc_basic():
-    """64-bit regs get pairs starting at R2, with LDG coalescing."""
+    """64-bit regs get pairs starting at R2, no coalescing."""
     mod = parse(PROBE_PTX)
     fn = mod.functions[0]
     result = allocate(fn)
@@ -54,9 +54,9 @@ def test_alloc_basic():
     assert result.ra.lo("%rd0") == 2
     assert result.ra.hi("%rd0") == 3
 
-    # %rd1 coalesced with %rd0 (ld.global %rd1, [%rd0]) → R2, R3
-    assert result.ra.lo("%rd1") == 2
-    assert result.ra.hi("%rd1") == 3
+    # %rd1 gets next available pair (no LDG coalescing)
+    assert result.ra.lo("%rd1") == 4
+    assert result.ra.hi("%rd1") == 5
 
 
 def test_alloc_param_offsets():
@@ -99,8 +99,9 @@ def test_num_gprs():
     fn = mod.functions[0]
     result = allocate(fn)
 
-    # 8 x b64 = 16 GPRs (R2..R17), plus 2 reserved = 18
-    assert result.num_gprs == 12  # 6 used regs (rd0-rd5) - 1 coalesced = 5 pairs * 2 + R0-R1
+    # Linear scan with reuse: rd0→R2, rd1→R4, rd2→R2(reuse), rd3→R6, rd4→R4(reuse), rd5→R2(reuse)
+    # Highest reg used = R7, so num_gprs = 8
+    assert result.num_gprs == 8
 
 
 def test_64bit_alignment():

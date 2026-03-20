@@ -380,20 +380,11 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
 
     typ = instr.types[-1] if instr.types else 'u32'
     if typ in ('u64', 's64', 'b64'):
-        # Load 64-bit param into UR via LDCU.64 (ptxas pattern).
-        # Pointers stay in URs. Address math uses IADD.64-UR.
-        # Avoids GPR pressure and LDC.64 single-slot WAW hazards.
-        ur_idx = ctx._next_ur if ctx else 6
-        if ctx:
-            ctx._next_ur += 2
-            ctx._ur_params[dest.name] = ur_idx
+        # Load 64-bit param directly into GPR pair via LDC.64.
+        # Works for kernels with ≤2 pointer params. For 3+, need LDCU→UR path.
         d = ra.lo(dest.name)
-        return [
-            SassInstr(encode_ldcu_64(ur_idx, 0, byte_off),
-                      f'LDCU.64 UR{ur_idx}, c[0][0x{byte_off:x}]  // {param_name}'),
-            SassInstr(encode_iadd64_ur(d, RZ, ur_idx),
-                      f'IADD.64 R{d}, RZ, UR{ur_idx}  // materialize {param_name}'),
-        ]
+        return [SassInstr(encode_ldc_64(d, 0, byte_off),
+                          f'LDC.64 R{d}, c[0][0x{byte_off:x}]  // {param_name}')]
     else:
         d = ra.r32(dest.name)
         if ctx:

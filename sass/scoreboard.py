@@ -235,6 +235,19 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
                 _, pw = pending_ur_writes[ur_src]
                 if pw in _WDEP_TO_RBAR:
                     rbar = max(rbar, _WDEP_TO_RBAR[pw])
+        # LDG/STG use descriptor from UR (LDG: b4=UR, STG: b8=UR)
+        if opcode in _OPCODES_LDG:
+            ur_desc = si.raw[4]
+            if ur_desc in pending_ur_writes:
+                _, pw = pending_ur_writes[ur_desc]
+                if pw in _WDEP_TO_RBAR:
+                    rbar = max(rbar, _WDEP_TO_RBAR[pw])
+        if opcode in _OPCODES_STG:
+            ur_desc = si.raw[8]
+            if ur_desc in pending_ur_writes:
+                _, pw = pending_ur_writes[ur_desc]
+                if pw in _WDEP_TO_RBAR:
+                    rbar = max(rbar, _WDEP_TO_RBAR[pw])
 
         # BAR.SYNC and EXIT get special ctrl
         if opcode in _OPCODES_BAR:

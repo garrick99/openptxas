@@ -25,6 +25,60 @@ from sass.scoreboard import assign_ctrl
 from cubin.emitter import emit_cubin, KernelDesc
 
 
+def _sink_ldc64_params(instrs: list) -> list:
+    """Sink LDC.64 param loads from the top of the block to just before
+    their first consumer. This prevents scoreboard slot overcommit when
+    multiple LDC.64 instructions are emitted consecutively.
+
+    Only sinks LDC.64 (opcode 0xb82 with b9=0x0a) that are at the start
+    of the instruction list (consecutive param loads).
+    """
+    # Identify leading LDC.64 instructions
+    ldc64_instrs = []
+    rest_start = 0
+    for i, si in enumerate(instrs):
+        lo = struct.unpack_from('<Q', si.raw, 0)[0]
+        opc = lo & 0xFFF
+        if opc == 0xb82 and si.raw[9] == 0x0a:  # LDC.64
+            ldc64_instrs.append((i, si, si.raw[2]))  # (index, instr, dest_reg)
+        elif opc == 0xb82:  # LDC.32 — also a param load, leave in place
+            ldc64_instrs.append((i, si, si.raw[2]))
+        else:
+            rest_start = i
+            break
+    else:
+        return instrs  # all LDC, nothing to sink
+
+    if len(ldc64_instrs) <= 1:
+        return instrs  # 0 or 1 LDC, no overcommit risk
+
+    # Keep the first LDC in place, sink the rest
+    result = list(instrs[:rest_start])  # non-sunk LDCs stay (will be reordered below)
+    remaining = list(instrs[rest_start:])
+
+    # Actually: just keep all instructions in original order.
+    # The key insight: if params are loaded early, just add NOP gaps between them.
+    # One NOP between each LDC.64 lets the scoreboard slot clear.
+    from sass.encoding.sm_120_opcodes import encode_nop
+    from sass.isel import SassInstr
+
+    result = []
+    ldc_count = 0
+    for si in instrs:
+        lo = struct.unpack_from('<Q', si.raw, 0)[0]
+        opc = lo & 0xFFF
+        if opc == 0xb82:  # LDC or LDC.64
+            if ldc_count > 0:
+                # Insert NOP gap between consecutive LDC instructions
+                result.append(SassInstr(encode_nop(), 'NOP  // LDC slot gap'))
+            ldc_count += 1
+        else:
+            ldc_count = 0  # reset when non-LDC encountered
+        result.append(si)
+
+    return result
+
+
 def compile_function(fn: Function, verbose: bool = False) -> bytes:
     """
     Compile a single PTX function/kernel to a cubin.

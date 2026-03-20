@@ -679,7 +679,10 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 break
                         if target_is_ret:
                             pd = ctx.ra.pred(instr.pred) if instr.pred in ctx.ra.pred_regs else 0
-                            exit_raw = patch_pred(encode_exit(), pred=pd, neg=instr.neg)
+                            neg = instr.neg
+                            if hasattr(ctx, '_negated_preds') and pd in ctx._negated_preds:
+                                neg = not neg
+                            exit_raw = patch_pred(encode_exit(), pred=pd, neg=neg)
                             pred_str = f'@{"!" if instr.neg else ""}P{pd} '
                             output.append(SassInstr(exit_raw,
                                                     f'{pred_str}EXIT  // early exit'))
@@ -690,8 +693,13 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     bra_raw = encode_bra(0)
                     if instr.pred:
                         pd = ctx.ra.pred(instr.pred) if instr.pred in ctx.ra.pred_regs else 0
-                        bra_raw = patch_pred(bra_raw, pred=pd, neg=instr.neg)
-                        pred_str = f'@{"!" if instr.neg else ""}P{pd} '
+                        # Check if the predicate was negated by the setp handler
+                        # (e.g., setp.lt emits GE + negate)
+                        neg = instr.neg
+                        if hasattr(ctx, '_negated_preds') and pd in ctx._negated_preds:
+                            neg = not neg  # flip the negation
+                        bra_raw = patch_pred(bra_raw, pred=pd, neg=neg)
+                        pred_str = f'@{"!" if neg else ""}P{pd} '
                     else:
                         pred_str = ''
                     output.append(SassInstr(bra_raw,
@@ -757,9 +765,27 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                     # Fallback: use encode_isetp_ge_and with UR4 (won't be correct)
                                     output.append(_nop(f'TODO: setp R-R without param src'))
                                     continue
-                                output.append(SassInstr(
-                                    encode_isetp_ge_and(pd, ar, ur_cmp),
-                                    f'ISETP.GE.AND P{pd}, R{ar}, UR{ur_cmp}'))
+                                # encode_isetp_ge_and only supports GE comparison.
+                                # For other comparisons, invert the logic:
+                                #   lt  → GE + negate predicate
+                                #   le  → GT + negate (swap operands of GE)
+                                #   gt  → swap operands, use GE
+                                #   ne  → EQ + negate (use GE as approx)
+                                #   eq  → (a >= b) AND (b >= a) — complex
+                                # For now: lt → negate, ge → direct
+                                if cmp_name == 'lt':
+                                    # P = !(a >= b) = (a < b)
+                                    output.append(SassInstr(
+                                        encode_isetp_ge_and(pd, ar, ur_cmp),
+                                        f'ISETP.GE.AND P{pd}, R{ar}, UR{ur_cmp}  // negated for lt'))
+                                    # Mark predicate as negated for branch consumers
+                                    if not hasattr(ctx, '_negated_preds'):
+                                        ctx._negated_preds = set()
+                                    ctx._negated_preds.add(pd)
+                                else:
+                                    output.append(SassInstr(
+                                        encode_isetp_ge_and(pd, ar, ur_cmp),
+                                        f'ISETP.GE.AND P{pd}, R{ar}, UR{ur_cmp}'))
                             else:
                                 br = b.value if isinstance(b, ImmOp) else 0
                                 output.append(_nop(f'TODO: setp with immediate {br}'))

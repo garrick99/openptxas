@@ -3,19 +3,7 @@
 **PTX → OpenPTXas → cubin → RTX 5090 → correct output.**
 **No ptxas. No nvcc.**
 
-Compiles PTX directly into executable cubins for **RTX 5090 (SM_120 Blackwell)** — entirely outside NVIDIA's compiler toolchain.
-
-## What this proves
-
-- Generate valid cubins for Blackwell GPUs
-- Execute multi-block kernels on real hardware
-- Pass 71/71 unit tests
-- Bit-exact correctness (rotate, memory, arithmetic)
-- Full pipeline: PTX → parse → regalloc → isel → schedule → scoreboard → cubin → GPU
-
-This is not a simulator. This is real machine code running on a real RTX 5090.
-
-## 30-second proof
+## Proof (runs on RTX 5090, no NVIDIA compiler)
 
 ```bash
 git clone https://github.com/garrick99/openptxas
@@ -23,7 +11,6 @@ cd openptxas
 python demo.py
 ```
 
-Output:
 ```
 Compiling: examples/vector_add.ptx
 Output:    examples/vector_add.cubin (4432 bytes)
@@ -37,7 +24,15 @@ Launch: 32 blocks x 32 threads = 1024 elements
 Our code. Their GPU.
 ```
 
-No ptxas. No nvcc. Just OpenPTXas.
+This cubin was not produced by ptxas or nvcc.
+
+---
+
+## What this is
+
+An open-source PTX assembler that compiles PTX into executable cubins for **SM_120 Blackwell** GPUs. Full pipeline: parse → register allocate → instruction select → schedule → scoreboard → ELF emit → GPU execute.
+
+Pure Python. 71/71 tests passing. Hardware-verified on RTX 5090.
 
 ## What's inside
 
@@ -50,11 +45,9 @@ No ptxas. No nvcc. Just OpenPTXas.
 | **Scoreboard** | Automated rbar/wdep barrier generation |
 | **Emitter** | Full ELF cubin with .nv.info, .nv.capmerc |
 
-Pure Python 3.11+. No dependencies beyond pytest.
-
 ## Instruction coverage (60+ SASS encoders)
 
-All encoders are byte-verified against ptxas 13.0 output on SM_120.
+All encoders byte-verified against ptxas 13.0 on SM_120.
 
 | Category | Instructions |
 |---|---|
@@ -88,7 +81,7 @@ Reverse-engineered during development — not documented publicly elsewhere:
 
 ## ptxas bug detection
 
-OpenPTXas detects and correctly compiles a pattern that NVIDIA's ptxas has miscompiled since SM_50 (~2014):
+Detects and correctly compiles a pattern that NVIDIA's ptxas has miscompiled since SM_50 (~2014):
 
 ```
 shl.b64  %lo, %a, K

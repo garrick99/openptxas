@@ -1264,7 +1264,7 @@ def encode_iadd64(dest: int, src0: int, src1: int,
     raw[8] = 0x00
     raw[9] = 0x02
     raw[10] = 0x8e
-    raw[11] = 0x07  # Use 0x07 for now — 0x0f matched ptxas but causes 715 in some contexts
+    raw[11] = 0x07  # R-R variant: 32-bit add (no carry). Use R-UR for 64-bit pointer math.
     raw[12] = 0x00
     raw[13] = b13
     raw[14] = b14

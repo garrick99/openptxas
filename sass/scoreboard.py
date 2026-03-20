@@ -166,7 +166,7 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
         0x37: 0x05,   # 2nd LDG slot → rbar=0x05
         0x31: 0x03,   # LDC slot → rbar=0x03
         0x33: 0x05,   # LDCU slot → rbar=0x05
-        0x3e: 0x09,   # ALU slot → rbar=0x09 (wait for ALU result)
+        0x3e: 0x03,   # ALU slot → rbar=0x03 (matches ptxas for IADD.64 consumers)
     }
 
     misc_counter = 0

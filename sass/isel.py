@@ -374,11 +374,21 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
 
     typ = instr.types[-1] if instr.types else 'u32'
     if typ in ('u64', 's64', 'b64'):
-        # Load 64-bit param into GPR pair via LDC.64.
-        # Address computation uses IADD.64 R-R (same as ptxas for simple kernels).
-        d_lo = ra.lo(dest.name)
-        return [SassInstr(encode_ldc_64(d_lo, 0, byte_off),
-                          f'LDC.64 R{d_lo}, c[0][0x{byte_off:x}]  // {param_name}')]
+        # Load 64-bit param into UNIFORM register via LDCU.64.
+        # SM_120 requires UR-based addressing for correct 64-bit pointer math.
+        # The IADD.64 R-UR variant (0x7c35) is the only instruction that
+        # correctly carries for 64-bit pointer arithmetic on Blackwell.
+        ur_idx = ra.ur(dest.name) if dest.name in ra.unif_regs else ctx._next_ur if ctx else 6
+        if ctx and dest.name not in ra.unif_regs:
+            ra.unif_regs[dest.name] = ctx._next_ur
+            ur_idx = ctx._next_ur
+            ctx._next_ur += 2
+        if ctx:
+            ctx._ur_params[dest.name] = ur_idx
+        if dest.name in ra.int_regs:
+            del ra.int_regs[dest.name]
+        return [SassInstr(encode_ldcu_64(ur_idx, 0, byte_off),
+                          f'LDCU.64 UR{ur_idx}, c[0][0x{byte_off:x}]  // {param_name}')]
     else:
         d = ra.r32(dest.name)
         return [SassInstr(encode_ldc(d, 0, byte_off, ctrl=0x7f1),

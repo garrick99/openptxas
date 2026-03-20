@@ -124,10 +124,15 @@ def _get_dest_regs(raw: bytes) -> set[int]:
     return regs
 
 
+_ldcu_slot_counter = [0]  # mutable counter for rotating LDCU wdep slots
+
 def _wdep_for_opcode(opcode: int) -> int:
     """Assign the scoreboard write-dependency slot for an opcode."""
-    if opcode == 0x7ac:  # LDCU: uses slot 0x33 (confirmed from ptxas)
-        return 0x33
+    if opcode == 0x7ac:  # LDCU: rotating slots 0x31, 0x33, 0x35, 0x37
+        slots = [0x31, 0x33, 0x35, 0x37]
+        slot = slots[_ldcu_slot_counter[0] % len(slots)]
+        _ldcu_slot_counter[0] += 1
+        return slot
     if opcode in _OPCODES_LDC:
         return 0x31
     if opcode in _OPCODES_LDS:
@@ -159,18 +164,23 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
     # Track which registers have pending long-latency writes
     # Maps reg_index → (slot_index, wdep_slot) for pending writes
     pending_writes: dict[int, tuple[int, int]] = {}
+    # Track UR writes separately (LDCU destinations)
+    pending_ur_writes: dict[int, tuple[int, int]] = {}  # ur_index → (slot_index, wdep)
 
     # rbar encoding: maps wdep_slot → rbar bit pattern
     _WDEP_TO_RBAR = {
-        0x35: 0x03,   # LDG slot → rbar=0x03
-        0x37: 0x05,   # 2nd LDG slot → rbar=0x05
-        0x31: 0x03,   # LDC slot → rbar=0x03
-        0x33: 0x05,   # LDCU slot → rbar=0x05
-        0x3e: 0x03,   # ALU slot → rbar=0x03 (matches ptxas for IADD.64 consumers)
+        0x31: 0x03,   # Slot 0 → rbar=0x03 (bit 1+0)
+        0x33: 0x05,   # Slot 1 → rbar=0x05 (bit 2+0)
+        0x35: 0x09,   # Slot 2 → rbar=0x09 (bit 3+0)
+        0x37: 0x11,   # Slot 3 → rbar=0x11 (bit 4+0) - used for UR4 descriptor
+        0x3e: 0x03,   # ALU → rbar=0x03
     }
 
     misc_counter = 0
     ldg_count = 0
+    _ldcu_slot_counter[0] = 0  # reset per kernel
+    if hasattr(assign_ctrl, '_desc_waited'):
+        assign_ctrl._desc_waited = False
     result = []
 
     for i, si in enumerate(instrs):
@@ -210,11 +220,22 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
         # LDCU consumers: any instruction using UR operands needs rbar for LDCU
         # IADD.64-UR (opcode 0xc35) reads a UR source — wait for any pending LDCU
         if opcode == 0xc35:  # IADD.64 R-UR variant
-            rbar = rbar | 0x05  # wait for LDCU slot (OR bits)
+            # Wait for the specific LDCU that produced the UR operand.
+            # The UR source is in byte 4 of the instruction.
+            ur_src = si.raw[4]
+            if ur_src in pending_ur_writes:
+                _, pw = pending_ur_writes[ur_src]
+                if pw in _WDEP_TO_RBAR:
+                    rbar = _WDEP_TO_RBAR[pw]
 
-        # LDG/STG use desc[UR4] — need to wait for UR4 descriptor to be loaded
+        # LDG/STG use desc[UR4] — wait for descriptor LDCU (only on first LDG/STG)
         if opcode in _OPCODES_LDG or opcode in _OPCODES_STG:
-            rbar = rbar | 0x03  # OR in descriptor LDCU wait bits
+            if not hasattr(assign_ctrl, '_desc_waited'):
+                assign_ctrl._desc_waited = False
+            if not assign_ctrl._desc_waited:
+                rbar = 0x11  # first LDG/STG: wait for descriptor (wdep=0x37)
+                assign_ctrl._desc_waited = True
+            # Don't OR in other bits — use clean rbar
 
         # BAR.SYNC and EXIT get special ctrl
         if opcode in _OPCODES_BAR:
@@ -224,8 +245,11 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
             rbar = 0x01
             wdep = 0x3f
 
-        # Build ctrl — stall=0, rely on barriers only (matches ptxas pattern).
+        # Build ctrl — mostly stall=0, barrier-based scheduling.
+        # Exception: first IADD.64-UR after LDCU gets stall=1 (ptxas pattern).
         stall = 0
+        if opcode == 0xc35:  # IADD.64-UR: add stall=1 for LDCU dependency
+            stall = 1
         misc = misc_counter & 0xF
         ctrl = (stall << 17) | (rbar << 10) | (wdep << 4) | misc
         misc_counter += 1
@@ -233,10 +257,14 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
         # Track this instruction's writes for future consumers.
         dest_regs = _get_dest_regs(si.raw)
         if wdep != 0x3f:
-            # Track ALL writes (including ALU) for barrier-based scheduling.
-            # With stall=0, the hardware relies on rbar to know when results are ready.
             for r in dest_regs:
                 pending_writes[r] = (i, wdep)
+        # Track LDCU writes to UR (dest is in byte 2 for LDCU)
+        if opcode == 0x7ac:
+            ur_dest = si.raw[2]  # UR destination index
+            pending_ur_writes[ur_dest] = (i, wdep)
+            # Also track UR+1 for 64-bit pairs
+            pending_ur_writes[ur_dest + 1] = (i, wdep)
         elif wdep == 0x3e:
             # ALU write: clear pending long-latency tracking for written regs
             # (the register now has a new value from a fast ALU op)

@@ -226,7 +226,8 @@ def _build_capmerc(num_gprs: int = 10):
     # Capmerc byte[8] = register allocation: tells hardware how many GPRs to allocate.
     # Must use the full 130-byte template (16-byte minimal doesn't work).
     # Allocate registers: round up to next multiple of 8, minimum 16
-    reg_alloc = max(((num_gprs + 7) & ~7), 16)
+    # DO NOT modify byte[8] — it's always 0x08 in ptxas output.
+    # Register allocation is controlled by EIATTR_MAX_REG_COUNT in nv.info (0x60 = 96 regs).
     buf = bytearray.fromhex(
         '0c000000010000c00800000050000000'
         '010b040af80004000000410000040000'
@@ -238,7 +239,6 @@ def _build_capmerc(num_gprs: int = 10):
         '00020140010000000000000000000000'
         'd004'
     )
-    buf[8] = reg_alloc & 0xFF
     return bytes(buf)
 
 

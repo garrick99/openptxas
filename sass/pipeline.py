@@ -11,6 +11,7 @@ Usage:
 """
 
 from __future__ import annotations
+import struct
 from pathlib import Path
 
 from ptx.parser import parse, parse_file
@@ -18,7 +19,7 @@ from ptx.ir import Module, Function
 from ptx.passes.rotate import run as rotate_run
 from sass.regalloc import allocate
 from sass.isel import ISelContext, select_function, SassInstr
-from sass.encoding.sm_120_opcodes import encode_bra
+from sass.encoding.sm_120_opcodes import encode_bra, encode_ldcu_64
 from sass.schedule import schedule
 from sass.scoreboard import assign_ctrl
 from cubin.emitter import emit_cubin, KernelDesc
@@ -44,13 +45,20 @@ def compile_function(fn: Function, verbose: bool = False) -> bytes:
     # instructions that configure frame pointer and memory descriptors.
     # These ctrl/barrier values are critical for correct GPU execution.
     preamble = [
-        # LDC R1, c[0][0x37c] — exact ptxas bytes (ctrl=0x7f1)
+        # LDC R1, c[0][0x37c] — frame pointer (first instruction)
         SassInstr(bytes.fromhex('827b01ff00df00000008000000e20f00'),
                   'LDC R1, c[0][0x37c]  // frame ptr'),
-        # LDCU.64 UR4, c[0][0x358] — exact ptxas bytes (ctrl=0x717)
-        SassInstr(bytes.fromhex('ac7704ff006b0000000a0008002e0e00'),
-                  'LDCU.64 UR4, c[0][0x358]  // mem desc'),
+        # NOTE: LDCU.64 UR4 (mem descriptor) is emitted AFTER param loads
+        # so it gets the LAST LDCU wdep slot (0x37), matching ptxas pattern.
+        # The scoreboard assigns wdep=0x37 to the last LDCU, and LDG uses
+        # rbar=0x11 to wait for it.
     ]
+
+    # The LDCU UR4 descriptor load will be appended after body param loads
+    ur4_desc_instr = SassInstr(
+        encode_ldcu_64(4, 0, 0x358),
+        'LDCU.64 UR4, c[0][0x358]  // mem desc (after params)'
+    )
 
     # 3. Instruction selection
     ctx = ISelContext(
@@ -59,6 +67,17 @@ def compile_function(fn: Function, verbose: bool = False) -> bytes:
         ur_desc=4,  # UR4 for memory descriptors (ptxas convention)
     )
     body_instrs = select_function(fn, ctx)
+
+    # Insert LDCU.64 UR4 (mem descriptor) AFTER all param LDCUs, BEFORE first non-LDCU
+    # This ensures UR4 gets the LAST wdep slot (0x37), matching ptxas pattern.
+    insert_idx = 0
+    for idx, si in enumerate(body_instrs):
+        opcode = struct.unpack_from('<Q', si.raw, 0)[0] & 0xFFF
+        if opcode == 0x7ac:  # LDCU
+            insert_idx = idx + 1
+        else:
+            break
+    body_instrs.insert(insert_idx, ur4_desc_instr)
 
     # 4. Schedule: reorder for LDG latency, then assign ctrl via scoreboard
     raw_instrs = preamble + body_instrs

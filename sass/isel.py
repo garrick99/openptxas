@@ -380,11 +380,19 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
 
     typ = instr.types[-1] if instr.types else 'u32'
     if typ in ('u64', 's64', 'b64'):
-        # Load 64-bit param directly into GPR pair via LDC.64.
-        # Works for kernels with ≤2 pointer params. For 3+, need LDCU→UR path.
+        # Load 64-bit param into UR via LDCU.64, materialize to GPR via IADD.64-UR.
+        # This is the ptxas pattern: pointers in URs, addresses via IADD.64-UR.
+        ur_idx = ctx._next_ur if ctx else 6
+        if ctx:
+            ctx._next_ur += 2
+            ctx._ur_params[dest.name] = ur_idx
         d = ra.lo(dest.name)
-        return [SassInstr(encode_ldc_64(d, 0, byte_off),
-                          f'LDC.64 R{d}, c[0][0x{byte_off:x}]  // {param_name}')]
+        return [
+            SassInstr(encode_ldcu_64(ur_idx, 0, byte_off),
+                      f'LDCU.64 UR{ur_idx}, c[0][0x{byte_off:x}]  // {param_name}'),
+            SassInstr(encode_iadd64_ur(d, RZ, ur_idx),
+                      f'IADD.64 R{d}, RZ, UR{ur_idx}  // materialize {param_name}'),
+        ]
     else:
         d = ra.r32(dest.name)
         if ctx:
@@ -713,15 +721,24 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     output.append(_nop())
 
                 elif op == 'cvt':
-                    # Type conversion — for now handle u64.u32 (zero-extend)
-                    # This is a MOV + zero-extend. On SM_120, just MOV the 32-bit
-                    # value to the low register and zero the high register.
+                    # Type conversion — handle u64.u32 (zero-extend)
+                    # CSE: if same source was already converted, reuse the result
                     d = instr.dest
                     s = instr.srcs[0]
                     if isinstance(d, RegOp) and isinstance(s, RegOp):
                         if 'u64' in instr.types and 'u32' in instr.types:
-                            d_lo = ctx.ra.lo(d.name)
                             s_r = ctx.ra.r32(s.name)
+                            # CSE: check if we already converted this source register
+                            if not hasattr(ctx, '_cvt_cache'):
+                                ctx._cvt_cache = {}
+                            if s.name in ctx._cvt_cache:
+                                # Reuse previous conversion result
+                                prev_lo = ctx._cvt_cache[s.name]
+                                ctx.ra.int_regs[d.name] = prev_lo
+                                output.append(_nop(f'cvt.u64.u32 {d.name} = {s.name} (CSE reuse R{prev_lo})'))
+                                continue
+                            d_lo = ctx.ra.lo(d.name)
+                            ctx._cvt_cache[s.name] = d_lo
                             output.append(SassInstr(encode_iadd3(d_lo, s_r, RZ, RZ),
                                                     f'MOV R{d_lo}, R{s_r}  // cvt.u64.u32 lo'))
                             output.append(SassInstr(encode_iadd3(d_lo+1, RZ, RZ, RZ),

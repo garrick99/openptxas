@@ -143,12 +143,7 @@ def _wdep_for_opcode(opcode: int) -> int:
         _ldcu_slot_counter[0] += 1
         return slot
     if opcode in _OPCODES_LDC:
-        # Rotate LDC/S2R wdep slots to prevent overcommitting a single slot
-        # when multiple LDC.64 instructions are emitted consecutively.
-        slots = [0x31, 0x33, 0x35, 0x37]
-        slot = slots[_ldc_slot_counter[0] % len(slots)]
-        _ldc_slot_counter[0] += 1
-        return slot
+        return 0x31
     if opcode in _OPCODES_LDS:
         return 0x33
     if opcode in _OPCODES_LDG:

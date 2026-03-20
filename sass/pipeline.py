@@ -102,11 +102,11 @@ def compile_function(fn: Function, verbose: bool = False) -> bytes:
         # LDC R1, c[0][0x37c] — frame pointer (first instruction)
         SassInstr(bytes.fromhex('827b01ff00df00000008000000e20f00'),
                   'LDC R1, c[0][0x37c]  // frame ptr'),
-        # LDCU.64 UR4 — memory descriptor with ptxas-matched ctrl
-        # ctrl=0x717: wdep=0x31, rbar=0x01, misc=7
-        SassInstr(encode_ldcu_64(4, 0, 0x358, ctrl=0x717),
-                  'LDCU.64 UR4, c[0][0x358]  // mem desc'),
     ]
+
+    ur4_desc_instr = SassInstr(
+        encode_ldcu_64(4, 0, 0x358, ctrl=0x717),
+        'LDCU.64 UR4, c[0][0x358]  // mem desc')
 
     # 3. Instruction selection
     ctx = ISelContext(
@@ -115,6 +115,15 @@ def compile_function(fn: Function, verbose: bool = False) -> bytes:
         ur_desc=4,  # UR4 for memory descriptors (ptxas convention)
     )
     body_instrs = select_function(fn, ctx)
+
+    # Insert LDCU UR4 AFTER all S2R instructions in the body.
+    # SM_120 requires S2R to be among the first instructions.
+    insert_idx = 0
+    for idx, si in enumerate(body_instrs):
+        opcode = struct.unpack_from('<Q', si.raw, 0)[0] & 0xFFF
+        if opcode in (0x919, 0x9c3):  # S2R, S2UR
+            insert_idx = idx + 1
+    body_instrs.insert(insert_idx, ur4_desc_instr)
 
     # 4. Schedule: reorder for LDG latency, then assign ctrl via scoreboard
     raw_instrs = preamble + body_instrs

@@ -381,7 +381,7 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
     typ = instr.types[-1] if instr.types else 'u32'
     if typ in ('u64', 's64', 'b64'):
         # Load 64-bit param into UR via LDCU.64, materialize to GPR via IADD.64-UR.
-        # This is the ptxas pattern: pointers in URs, addresses via IADD.64-UR.
+        # Avoids LDC.64 single-slot scoreboard collision for 3+ pointer params.
         ur_idx = ctx._next_ur if ctx else 6
         if ctx:
             ctx._next_ur += 2

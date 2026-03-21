@@ -107,7 +107,7 @@ def _check_rotate_bug(kernel: str, instrs: list[tuple[int, bytes]]) -> list[Find
                     recommendation=(
                         "Verify the original PTX source. If it contains sub.s64 or sub.u64 "
                         "of complementary shifts, recompile with OpenPTXas to produce correct code. "
-                        "See: https://github.com/garrick99/ptxas_bug_repo"
+                        "Recompile with OpenPTXas or apply the __umul64hi workaround."
                     ),
                 ))
     return findings

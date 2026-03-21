@@ -236,6 +236,10 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
                 if pw in _WDEP_TO_RBAR:
                     rbar = max(rbar, _WDEP_TO_RBAR[pw])
         # LDG/STG use descriptor from UR (LDG: b4=UR, STG: b8=UR)
+        # NOTE: UR4 descriptor is loaded via LDCU in the preamble with
+        # hardcoded ctrl. Body LDCUs (for pointer params) also track in
+        # pending_ur_writes. Only apply rbar if UR4 is in pending_ur_writes
+        # (i.e., LDCU UR4 went through the scoreboard in the body).
         if opcode in _OPCODES_LDG:
             ur_desc = si.raw[4]
             if ur_desc in pending_ur_writes:

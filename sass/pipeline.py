@@ -23,6 +23,122 @@ from sass.encoding.sm_120_opcodes import encode_bra, encode_ldcu_64
 from sass.schedule import schedule
 from sass.scoreboard import assign_ctrl
 from cubin.emitter import emit_cubin, KernelDesc
+from ptx.ir import RegOp, Instruction
+
+
+def _sink_param_loads(fn: Function) -> None:
+    """Sink ld.param instructions from the entry block to first-use blocks.
+
+    When a frontend (like OpenCUDA) loads all params eagerly in the entry block,
+    the register allocator assigns unique GPRs for all of them simultaneously,
+    causing high register pressure. Sinking each ld.param to the block where
+    its dest is first used reduces the peak live register count.
+
+    Only sinks 64-bit param loads (u64) since those consume register PAIRS.
+    32-bit params (used for bounds checks) stay in the entry block.
+    """
+    if len(fn.blocks) < 2:
+        return  # single block — nothing to sink
+
+    entry = fn.blocks[0]
+
+    # Find ld.param.u64 instructions in the entry block whose dests
+    # are ONLY used in non-entry blocks (safe to sink).
+    # Collect all register names used in the entry block (excluding ld.param dests)
+    entry_uses = set()
+    for inst in entry.instructions:
+        if inst.op == 'ld' and 'param' in inst.types:
+            continue  # skip ld.param when collecting uses
+        for src in inst.srcs:
+            if isinstance(src, RegOp):
+                entry_uses.add(src.name)
+            elif hasattr(src, 'base') and isinstance(src.base, str):
+                entry_uses.add(src.base)
+
+    to_sink = []  # (instruction, dest_name)
+    keep = []
+    for inst in entry.instructions:
+        if (inst.op == 'ld' and 'param' in inst.types and 'u64' in inst.types
+                and isinstance(inst.dest, RegOp)
+                and inst.dest.name not in entry_uses):  # NOT used in entry block
+            to_sink.append((inst, inst.dest.name))
+        else:
+            keep.append(inst)
+
+    if not to_sink:
+        return
+
+    # For each sinkable ld.param, find the first block that uses the dest register
+    for inst, dest_name in to_sink:
+        sunk = False
+        for bb in fn.blocks[1:]:  # skip entry
+            for other_inst in bb.instructions:
+                # Check if any source operand references this dest
+                for src in other_inst.srcs:
+                    src_name = None
+                    if isinstance(src, RegOp):
+                        src_name = src.name
+                    elif hasattr(src, 'base'):  # MemOp
+                        src_name = src.base if isinstance(src.base, str) else None
+                    if src_name == dest_name:
+                        # Found first use — insert at the start of this block
+                        bb.instructions.insert(0, inst)
+                        sunk = True
+                        break
+                if sunk:
+                    break
+            if sunk:
+                break
+
+        if not sunk:
+            # Dest never used in other blocks — keep in entry
+            keep.append(inst)
+
+    entry.instructions = keep
+
+    # Second pass: within each block, move sunk ld.param to just before
+    # its first consumer (not at the block start). Exception: if the param
+    # is used for a store address (the store target), sink it to just before
+    # the store instruction to minimize live range of the address register.
+    for bb in fn.blocks[1:]:
+        ld_params = []
+        other = []
+        for inst in bb.instructions:
+            if inst.op == 'ld' and 'param' in inst.types:
+                ld_params.append(inst)
+            else:
+                other.append(inst)
+
+        if not ld_params:
+            continue
+
+        # Rebuild the block: for each non-param instruction, check if any
+        # pending ld.param's dest is needed, and insert it just before.
+        rebuilt = []
+        pending = list(ld_params)
+        for inst in other:
+            # Check if any pending param's dest is used by this instruction
+            needed = []
+            still_pending = []
+            for lp in pending:
+                lp_dest = lp.dest.name if isinstance(lp.dest, RegOp) else None
+                used_here = False
+                for src in inst.srcs:
+                    src_name = src.name if isinstance(src, RegOp) else (
+                        src.base if hasattr(src, 'base') and isinstance(src.base, str) else None)
+                    if src_name == lp_dest:
+                        used_here = True
+                        break
+                if used_here:
+                    needed.append(lp)
+                else:
+                    still_pending.append(lp)
+            rebuilt.extend(needed)
+            pending = still_pending
+            rebuilt.append(inst)
+        # Any remaining pending params go at the end (shouldn't happen)
+        rebuilt.extend(pending)
+        bb.instructions = rebuilt
 
 
 def _sink_ldc64_params(instrs: list) -> list:
@@ -85,6 +201,9 @@ def compile_function(fn: Function, verbose: bool = False) -> bytes:
 
     Returns raw cubin bytes ready for cuModuleLoad.
     """
+    # 0. Sink ld.param from entry block to first-use block (reduces GPR pressure)
+    _sink_param_loads(fn)
+
     # 1. Register allocation
     alloc = allocate(fn)
 

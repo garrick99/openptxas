@@ -235,8 +235,18 @@ def compile_function(fn: Function, verbose: bool = False) -> bytes:
     )
     body_instrs = select_function(fn, ctx)
 
+    # SM_120 requires at least one S2R before LDCU param loads.
+    # If the body has no S2R, insert a dummy S2R R0, SR_TID.X.
+    from sass.encoding.sm_120_opcodes import encode_s2r, SR_TID_X
+    has_s2r = any(
+        struct.unpack_from('<Q', si.raw, 0)[0] & 0xFFF in (0x919, 0x9c3)
+        for si in body_instrs
+    )
+    if not has_s2r:
+        body_instrs.insert(0, SassInstr(encode_s2r(0, SR_TID_X),
+                                         'S2R R0, SR_TID.X  // required for LDCU init'))
+
     # Insert LDCU UR4 AFTER all S2R instructions in the body.
-    # SM_120 requires S2R to be among the first instructions.
     insert_idx = 0
     for idx, si in enumerate(body_instrs):
         opcode = struct.unpack_from('<Q', si.raw, 0)[0] & 0xFFF

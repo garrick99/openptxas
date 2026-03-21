@@ -193,6 +193,7 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
     _ldc_slot_counter[0] = 0   # reset per kernel
     result = []
 
+
     for i, si in enumerate(instrs):
         opcode = _get_opcode(si.raw)
 

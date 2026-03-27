@@ -41,7 +41,7 @@ _OPCODES_STS = {0x988}
 _OPCODES_BAR = {0xb1d}
 _OPCODES_CTRL = {0x94d, 0x947, 0x918}  # EXIT, BRA, NOP
 _OPCODES_ALU = {0x819, 0x235, 0x210, 0x212, 0x221, 0x223, 0x202,
-                0x824, 0x825, 0x224, 0x23c, 0x237, 0x431}
+                0x824, 0x825, 0x224, 0xc24, 0x23c, 0x237, 0x431, 0xc0c, 0x20c}
 # Note: IADD.64-UR (0xc35) uses wdep=0x3f (no tracking) + stall=1.
 # The 1-cycle stall ensures the result is ready for the subsequent LDG/STG.
 _OPCODES_IADD64_UR = {0xc35}
@@ -96,12 +96,19 @@ def _get_src_regs(raw: bytes) -> set[int]:
         elif opcode in (0x824, 0x825, 0x224):  # IMAD variants: src0=b3, src1=b4, src2=b8
             if raw[4] < 255: regs.add(raw[4])
             if raw[8] < 255: regs.add(raw[8])
+        elif opcode == 0xc24:  # IMAD R-UR: src0=b3 (GPR), src1=b4 (UR, not GPR), src2=b8 (GPR)
+            if raw[8] < 255: regs.add(raw[8])
+        elif opcode == 0x20c:  # ISETP R-R: src0=b3, src1=b4
+            if raw[3] < 255: regs.add(raw[3])
+            if raw[4] < 255: regs.add(raw[4])
     return regs
 
 
 def _get_dest_regs(raw: bytes) -> set[int]:
     """Get destination register indices this instruction writes."""
     opcode = _get_opcode(raw)
+    if opcode in (0x7ac, 0x9c3):  # LDCU, S2UR: write UR bank, not GPR
+        return set()
     dest = raw[2]
     regs = set()
 
@@ -135,7 +142,7 @@ def _get_dest_regs(raw: bytes) -> set[int]:
 _ldcu_slot_counter = [0]  # mutable counter for rotating LDCU wdep slots
 _ldc_slot_counter = [0]   # mutable counter for rotating LDC wdep slots
 
-def _wdep_for_opcode(opcode: int) -> int:
+def _wdep_for_opcode(opcode: int, raw: bytes = None) -> int:
     """Assign the scoreboard write-dependency slot for an opcode."""
     if opcode == 0x7ac:  # LDCU: rotating slots 0x31, 0x33, 0x35, 0x37
         slots = [0x31, 0x33, 0x35, 0x37]
@@ -177,6 +184,8 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
     pending_writes: dict[int, tuple[int, int]] = {}
     # Track UR writes separately (LDCU destinations)
     pending_ur_writes: dict[int, tuple[int, int]] = {}  # ur_index → (slot_index, wdep)
+    # Track predicate writes from ISETP/SETP instructions
+    pending_pred_writes: dict[int, tuple[int, int]] = {}  # pred_reg → (slot_index, wdep)
 
     # rbar encoding: maps wdep_slot → rbar bit pattern
     _WDEP_TO_RBAR = {
@@ -198,7 +207,7 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
         opcode = _get_opcode(si.raw)
 
         # Determine wdep for this instruction
-        wdep = _wdep_for_opcode(opcode)
+        wdep = _wdep_for_opcode(opcode, si.raw)
 
         # For second LDG, use a different slot
         if opcode in _OPCODES_LDG:
@@ -254,31 +263,50 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
                 if pw in _WDEP_TO_RBAR:
                     rbar = max(rbar, _WDEP_TO_RBAR[pw])
 
+        # Check predicate-register hazards: any instruction guarded by @Px must
+        # wait for the instruction that wrote Px to complete.
+        guard = (si.raw[1] >> 4) & 0xF
+        if guard != 0x7:  # 0x7 = PT (unconditional)
+            if guard in pending_pred_writes:
+                _, pw = pending_pred_writes[guard]
+                candidate = _WDEP_TO_RBAR.get(pw, 0x01)
+                rbar = max(rbar, candidate)
+
         # BAR.SYNC and EXIT get special ctrl
         if opcode in _OPCODES_BAR:
             wdep = 0x3f
             rbar = 0x01
-        if opcode == 0x94d:  # EXIT
+        if opcode == 0x94d:  # EXIT — SM_120 auto-tracks predicate hazards
+            # Always use rbar=0x01 for EXIT (both conditional and unconditional).
+            # SM_120 hardware enforces predicate read-after-write automatically;
+            # ptxas uses rbar=1 for @Px EXIT. Using rbar=3 waits for the wrong
+            # barrier slot and may execute @P0 EXIT before P0 is ready.
             rbar = 0x01
             wdep = 0x3f
 
-        # Build ctrl — mostly stall=0, barrier-based scheduling.
-        # Exception: first IADD.64-UR after LDCU gets stall=1 (ptxas pattern).
+        # Build ctrl — stall=0 always for SM_120.
+        # SM_120 uses bits[22:17] as OPEX (instruction extension), NOT stall counters.
+        # ptxas never sets these bits non-zero. Predicate hazards are hardware-auto-enforced.
+        # GPR dependencies are tracked via wdep/rbar barriers only.
         stall = 0
-        if opcode == 0xc35:  # IADD.64-UR: add stall=1 for LDCU dependency
-            stall = 1
-        if opcode == 0x224:  # IMAD R-R: needs stall=1 (multi-cycle, wide write)
-            stall = 1
-        if opcode == 0xb82:  # LDC/S2R: add stall=4 for WAW hazard
-            # SM_120 LDC.64 has delayed writes. When reusing the same
-            # register pair for multiple LDC.64s, the previous LDC's
-            # delayed write can overwrite the new value. Stall ensures
-            # the previous LDC completes before the new one starts.
-            src_regs_set = _get_src_regs(si.raw)
-            dest_r = si.raw[2]
-            if dest_r in pending_writes:
-                stall = max(stall, 4)
-        misc = misc_counter & 0xF
+        if opcode == 0x94d:  # EXIT: if predicated (@Px EXIT)
+            guard = (si.raw[1] >> 4) & 0xF
+            if guard != 0x7:  # 0x7 = PT (unconditional); any other guard = @Px
+                # Predicated EXIT: reset LDCU slot counter so post-branch LDCU
+                # instructions start from slot 0 again, matching ptxas behavior.
+                _ldcu_slot_counter[0] = 0
+        # BRA (opcode 0x947) with a non-PT guard also resets the LDCU counter.
+        if opcode == 0x947:
+            guard = (si.raw[1] >> 4) & 0xF
+            if guard != 0x7:
+                _ldcu_slot_counter[0] = 0
+        # SM_120: ISETP R-UR (0xc0c) requires misc=0 or misc≥13 to produce correct
+        # predicate output. Sequential misc values 1-12 cause silent failure (P=FALSE).
+        # Force misc=0 for all ISETP R-UR instructions.
+        if opcode == 0xc0c:
+            misc = 0
+        else:
+            misc = misc_counter & 0xF
         ctrl = (stall << 17) | (rbar << 10) | (wdep << 4) | misc
         misc_counter += 1
 
@@ -301,6 +329,10 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
             # (the register now has a new value from a fast ALU op)
             for r in dest_regs:
                 pending_writes.pop(r, None)
+        # Track predicate writes from ISETP: pred dest at raw[2], wdep tells consumers when ready
+        if opcode in (0xc0c, 0x20c):  # ISETP R-UR, ISETP R-R
+            pred_dest = si.raw[2]  # destination predicate index (0..6)
+            pending_pred_writes[pred_dest] = (i, wdep)
         # Note: we do NOT clear pending_writes for consumed SOURCE registers.
         # Multiple instructions may read from the same LDG output, and each
         # needs the rbar wait independently.

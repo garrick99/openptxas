@@ -712,11 +712,41 @@ def encode_isetp_ge_and(pred_dest: int, src_reg: int, ur_src: int,
     """
     if ctrl == 0:
         ctrl = _CTRL_DEFAULT
-    # b9 bit 1 depends on UR index parity: even=0x60, odd=0x62
-    b9_val = 0x62 if (ur_src & 1) else 0x60
+    # b9 bit 1 depends on src_reg index parity: even=0x60, odd=0x62
+    # Verified: ptxas R0(even)+UR5 → 0x60; ptxas R13(odd)+UR5 → 0x62; R9(odd)+UR5 → 0x62
+    b9_val = 0x62 if (src_reg & 1) else 0x60
     return _build(0x0c, 0x7c,
                   b2=pred_dest & 0xFF, b3=src_reg, b4=ur_src & 0xFF,
                   b8=0x70,
+                  b9=b9_val, b10=0xf0, b11=0x0b,
+                  ctrl=ctrl)
+
+
+def encode_isetp_ur(pred_dest: int, src_reg: int, ur_src: int,
+                    cmp: int = 0x06, ctrl: int = 0) -> bytes:  # 0x06 = ISETP_GE
+    """
+    Encode ISETP.<cmp>.U32.AND pred_dest, PT, src_reg, ur_src, PT (R-UR variant).
+
+    SM_120 only: uses opcode 0xc0c (R-UR). The R-R variant (0x20c) silently
+    produces P=FALSE on SM_120 hardware.
+
+    b9 parity: bit 1 of b9 reflects src_reg index parity (odd→0x62, even→0x60).
+    This is a hardware encoding artefact; it does NOT flip the comparison direction.
+
+    The ctrl misc field must be 0 or ≥13 for this instruction to produce correct
+    results on SM_120. The scoreboard forces misc=0 for all ISETP R-UR instructions.
+
+    Ground truth (GE, ctrl=0x17ed):
+        encode_isetp_ur(0, 13, 5) -> bytes.fromhex('0c7c000d050000007062f00b00da2f00')
+        encode_isetp_ur(0, 9, 5)  -> bytes.fromhex('0c7c0009050000007062f00b00da2f00')
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    b9_val = 0x62 if (src_reg & 1) else 0x60
+    b8_val = (cmp << 4) | 0x10  # same cmp encoding as R-R variant
+    return _build(0x0c, 0x7c,
+                  b2=pred_dest & 0xFF, b3=src_reg, b4=ur_src & 0xFF,
+                  b8=b8_val,
                   b9=b9_val, b10=0xf0, b11=0x0b,
                   ctrl=ctrl)
 
@@ -2182,20 +2212,32 @@ def encode_isetp(pred_dest: int, src0: int, src1: int, cmp: int = ISETP_GE,
                   signed: bool = True, ctrl: int = 0) -> bytes:
     """Encode ISETP R-R variant with variable comparison type.
 
-    Based on R-UR ground truth (0x7c0c) field layout, adapted to R-R (0x720c):
-      b2 = pred_dest, b3 = src0, b4 = src1
-      b8 = 0x70 (PT for secondary pred), b9 = 0x62 (AND combiner + flags)
-      b10 = 0xf0, b11 = comparison + GE/AND flags
+    Ground truth from ptxas (ISETP.GE.U32.AND P0, PT, R2, R3, PT):
+      lo=0x000000030200720c, hi=0x001fcc0003f06070
+      bytes: 0c 72 00 02 03 00 00 00 | 70 60 f0 03 00 cc 1f 00
+      b8=0x70 (GE cmp), b9=0x60 (R-R, always 0x60 regardless of src parity),
+      b11=0x03 (NOT 0x0b — bit 3 encodes UR operand presence, 0=GPR src1),
+      b12=0x00 (boolean source PT = no predicate gate = always-true; 0x03 would AND with P3)
     """
     if ctrl == 0: ctrl = _CTRL_DEFAULT
-    # Use exact modifiers from R-UR ground truth (ISETP.GE.AND)
-    # b8=0x70 (PT secondary pred), b9=0x62, b10=0xf0, b11=0x0b
-    return _build(0x0c, 0x72,
-                  b2=pred_dest & 0xFF, b3=src0, b4=src1 & 0xFF,
-                  b8=0x70,
-                  b9=0x62, b10=0xf0, b11=0x0b,
-                  ctrl=ctrl)
-    raw[13], raw[14], raw[15] = b13, b14, b15
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0]  = 0x0c
+    raw[1]  = 0x72
+    raw[2]  = pred_dest & 0xFF
+    raw[3]  = src0 & 0xFF
+    raw[4]  = src1 & 0xFF
+    raw[5]  = 0x00
+    raw[6]  = 0x00
+    raw[7]  = 0x00
+    raw[8]  = (cmp << 4) | 0x10   # comparison type: GE=0x70, LT=0x20, etc.
+    raw[9]  = 0x60
+    raw[10] = 0xf0
+    raw[11] = 0x03
+    raw[12] = 0x00                 # boolean source = PT (always-true); 0x03 would AND with P3 (wrong)
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
     return bytes(raw)
 
 

@@ -246,18 +246,46 @@ def compile_function(fn: Function, verbose: bool = False) -> bytes:
         body_instrs.insert(0, SassInstr(encode_s2r(0, SR_TID_X),
                                          'S2R R0, SR_TID.X  // required for LDCU init'))
 
-    # Insert LDCU UR4 AFTER all S2R instructions in the body.
+    # Insert LDCU.64 UR4 (mem descriptor) so it is the THIRD LDCU overall
+    # (counter=2 → wdep=0x35).  SM_120 requires LDG to wait with rbar=0x09
+    # (slot 0x35) for the descriptor; other rbar values do not correctly
+    # synchronize descriptor loads.
+    #
+    # Strategy (matching ptxas's opencuda_vecadd arrangement):
+    #   • u32 params (n) use LDC → GPR (no LDCU counter slot consumed).
+    #   • u64 pointer params use LDCU.64, each consuming one counter slot.
+    #   • UR4 is inserted after the 2nd pointer-param LDCU so the counter
+    #     sequence is:  ptr1(0) ptr2(1) UR4(2=0x35)  ptr3(3) ...
+    #   • Any pointer param LDCU after UR4 has 8+ instructions of warm-up
+    #     before it, satisfying SM_120's constant-bank warm-up constraint.
+    #   • Fallback: if fewer than 2 LDCUs found post-branch, insert after
+    #     all S2R/S2UR instructions (for kernels without a predicated branch).
+    #
+    # Predicated branch: opcode=0x94d (EXIT) or 0x947 (BRA) with a non-PT
+    # guard predicate (byte[1] upper nibble ≠ 0x7).
     insert_idx = 0
+    found_pred_branch = False
+    ldcu_count_post = 0
     for idx, si in enumerate(body_instrs):
         opcode = struct.unpack_from('<Q', si.raw, 0)[0] & 0xFFF
-        if opcode in (0x919, 0x9c3):  # S2R, S2UR
+        if opcode in (0x94d, 0x947):  # EXIT or BRA
+            guard_nibble = (si.raw[1] >> 4) & 0xF
+            if guard_nibble != 0x7:  # predicated (not PT/unconditional)
+                found_pred_branch = True
+                insert_idx = idx + 1  # fallback: just after the branch
+        elif found_pred_branch and opcode == 0x7ac:  # LDCU after branch
+            ldcu_count_post += 1
+            insert_idx = idx + 1   # tentative: after this LDCU
+            if ldcu_count_post >= 2:
+                break              # stop after 2nd LDCU (UR4 goes here)
+        elif not found_pred_branch and opcode in (0x919, 0x9c3):  # S2R/S2UR fallback
             insert_idx = idx + 1
     body_instrs.insert(insert_idx, ur4_desc_instr)
 
     # 4. Schedule: reorder for LDG latency, then assign ctrl via scoreboard
     raw_instrs = preamble + body_instrs
     reordered = schedule(raw_instrs)
-    # The preamble instructions (LDC R1, LDCU UR4) have hardcoded ctrl from ptxas.
+    # The preamble (LDC R1) has hardcoded ctrl from ptxas.
     # Only assign scoreboard ctrl to body instructions (after preamble).
     n_preamble = len(preamble)
     preamble_instrs = reordered[:n_preamble]
@@ -290,30 +318,61 @@ def compile_function(fn: Function, verbose: bool = False) -> bytes:
                         nops_before_bra += 1
             actual_bra_idx = abs_bra_idx + nops_before_bra
 
-            # Find target: count NOPs before the target label's original position
+            # Find target: scan actual sass_instrs for the target EXIT instruction.
+            # The label_map position is pre-UR4-insertion and unreliable here;
+            # scanning the final stream is accurate and handles all shifts.
             if target_label in ctx.label_map:
-                orig_target_body_byte = ctx.label_map[target_label]
-                orig_target_body_idx = orig_target_body_byte // 16
-                abs_target_idx = n_preamble + orig_target_body_idx
-                nops_before_target = 0
-                for j in range(n_preamble, abs_target_idx + nops_before_target + 1):
-                    if j < len(sass_instrs) and 'latency' in sass_instrs[j].comment.lower():
-                        if j <= abs_target_idx + nops_before_target:
-                            nops_before_target += 1
-                actual_target_idx = abs_target_idx + nops_before_target
-                actual_target_byte = actual_target_idx * 16
+                # Determine the expected instruction at the target (byte from label_map).
+                # Strategy: scan sass_instrs for the last unconditional EXIT (0x4d 0x79),
+                # which is always the target for ret-only branch targets (the common case).
+                # For other targets, fall back to the heuristic with NOP adjustment.
+                target_is_exit = False
+                if target_label in ctx.label_map:
+                    # Check if the target label's block emits an EXIT as its first instr
+                    # by seeing if any block with this label has only `ret`.
+                    for tbb in fn.blocks:
+                        if tbb.label == target_label:
+                            if (len(tbb.instructions) == 1
+                                    and tbb.instructions[0].op == 'ret'):
+                                target_is_exit = True
+                            break
+
+                if target_is_exit:
+                    # Scan backward for the last unconditional EXIT in the stream.
+                    actual_target_byte = None
+                    for si_idx in range(len(sass_instrs) - 1, -1, -1):
+                        if sass_instrs[si_idx].raw[:2] == bytes([0x4d, 0x79]):
+                            actual_target_byte = si_idx * 16
+                            break
+                else:
+                    orig_target_body_byte = ctx.label_map[target_label]
+                    orig_target_body_idx = orig_target_body_byte // 16
+                    abs_target_idx = n_preamble + orig_target_body_idx
+                    nops_before_target = 0
+                    for j in range(n_preamble, abs_target_idx + nops_before_target + 1):
+                        if j < len(sass_instrs) and 'latency' in sass_instrs[j].comment.lower():
+                            if j <= abs_target_idx + nops_before_target:
+                                nops_before_target += 1
+                    actual_target_byte = (abs_target_idx + nops_before_target) * 16
+                if actual_target_byte is None:
+                    continue  # target not found, skip this fixup
                 actual_bra_byte = (actual_bra_idx + 1) * 16
                 rel_offset = actual_target_byte - actual_bra_byte
                 if actual_bra_idx < len(sass_instrs):
-                    # Preserve predicate from original BRA encoding
-                    old_raw = sass_instrs[actual_bra_idx].raw
-                    old_pred_byte = old_raw[1] & 0xF0
-                    new_raw = bytearray(encode_bra(rel_offset))
-                    new_raw[1] = (new_raw[1] & 0x0F) | old_pred_byte
+                    # Patch BRA offset in-place, preserving predicate and ctrl.
+                    # Do NOT use encode_bra() here — it resets ctrl to default,
+                    # discarding the scoreboard-computed ctrl from assign_ctrl.
+                    old_raw = bytearray(sass_instrs[actual_bra_idx].raw)
+                    signed_insns = rel_offset // 16
+                    offset18 = signed_insns & 0x3FFFF
+                    old_raw[8]  = offset18 & 0xFF
+                    old_raw[9]  = (offset18 >> 8) & 0xFF
+                    old_raw[10] = 0x80 | ((offset18 >> 16) & 0x03)
+                    old_raw[11] = 0x03
                     old_comment = sass_instrs[actual_bra_idx].comment
                     pred_prefix = old_comment.split('BRA')[0] if 'BRA' in old_comment else ''
                     sass_instrs[actual_bra_idx] = SassInstr(
-                        bytes(new_raw),
+                        bytes(old_raw),
                         f'{pred_prefix}BRA {target_label} (offset={rel_offset})')
 
     if verbose:

@@ -752,3 +752,68 @@ def test_mad_wide_compiles():
     last_real = max(i for i, op in enumerate(opcodes) if op != 0x918)
     sched_nops = opcodes[:last_real].count(0x918)
     assert sched_nops <= 4, f"Too many scheduling NOPs ({sched_nops}) in mad_wide_kernel"
+
+
+NOT_B32_KERNEL = """\
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry not_b32_kernel(
+    .param .u64 out_ptr,
+    .param .u32 a_param)
+{
+    .reg .b32 %r<2>;
+    .reg .u64 %rd<2>;
+    ld.param.u32 %r0, [a_param];
+    not.b32      %r1, %r0;
+    ld.param.u64 %rd0, [out_ptr];
+    st.global.u32 [%rd0], %r1;
+    ret;
+}
+"""
+
+AND_B64_KERNEL = """\
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry and_b64_kernel(
+    .param .u64 out_ptr,
+    .param .u64 a_param,
+    .param .u64 b_param)
+{
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd0, [a_param];
+    ld.param.u64 %rd1, [b_param];
+    and.b64      %rd2, %rd0, %rd1;
+    ld.param.u64 %rd3, [out_ptr];
+    st.global.u64 [%rd3], %rd2;
+    ret;
+}
+"""
+
+
+def test_not_b32_compiles():
+    """not.b32 emits LOP3.LUT with ~a LUT (0x0F)."""
+    results = compile_ptx_source(NOT_B32_KERNEL)
+    cubin = results['not_b32_kernel']
+    assert cubin[:4] == b'\x7fELF'
+    elf = ELF64(cubin)
+    text = elf.section_data('.text.not_b32_kernel')
+    opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
+               for off in range(0, len(text), 16)]
+    assert 0x212 in opcodes, "LOP3.LUT not found in not_b32_kernel"
+
+
+def test_and_b64_compiles():
+    """and.b64 emits two LOP3.LUT instructions (lo and hi words)."""
+    results = compile_ptx_source(AND_B64_KERNEL)
+    cubin = results['and_b64_kernel']
+    assert cubin[:4] == b'\x7fELF'
+    elf = ELF64(cubin)
+    text = elf.section_data('.text.and_b64_kernel')
+    opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
+               for off in range(0, len(text), 16)]
+    lop3_count = opcodes.count(0x212)
+    assert lop3_count >= 2, f"Expected ≥2 LOP3.LUT for and.b64, got {lop3_count}"

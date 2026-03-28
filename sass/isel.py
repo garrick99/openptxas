@@ -668,6 +668,49 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         output.append(SassInstr(encode_lop3(d, a, b, RZ, lut),
                                                 f'LOP3.LUT R{d}, R{a}, R{b}, RZ, 0x{lut:02x}  // {op}.{typ}'))
 
+                elif op in ('and', 'or', 'xor') and typ in ('b64', 'u64', 's64'):
+                    # 64-bit logic: apply LOP3 to lo and hi words separately.
+                    d_lo = ctx.ra.lo(instr.dest.name)
+                    a_lo = ctx.ra.lo(instr.srcs[0].name)
+                    lut = {'and': LOP3_AND, 'or': LOP3_OR, 'xor': LOP3_XOR}[op]
+                    if isinstance(instr.srcs[1], ImmOp):
+                        imm = instr.srcs[1].value & 0xFFFF_FFFF_FFFF_FFFF
+                        imm_lo = imm & 0xFFFFFFFF
+                        imm_hi = (imm >> 32) & 0xFFFFFFFF
+                        t = ctx._next_gpr; ctx._next_gpr += 1
+                        lit_lo = ctx._alloc_literal(imm_lo)
+                        output.append(SassInstr(encode_ldc(t, 0, lit_lo),
+                                                f'LDC R{t}, c[0][0x{lit_lo:x}]  // {op}.b64 imm_lo'))
+                        output.append(SassInstr(encode_lop3(d_lo, a_lo, t, RZ, lut),
+                                                f'LOP3.LUT R{d_lo}, R{a_lo}, R{t}, RZ, 0x{lut:02x}  // {op}.b64 lo'))
+                        lit_hi = ctx._alloc_literal(imm_hi)
+                        output.append(SassInstr(encode_ldc(t, 0, lit_hi),
+                                                f'LDC R{t}, c[0][0x{lit_hi:x}]  // {op}.b64 imm_hi'))
+                        output.append(SassInstr(encode_lop3(d_lo+1, a_lo+1, t, RZ, lut),
+                                                f'LOP3.LUT R{d_lo+1}, R{a_lo+1}, R{t}, RZ, 0x{lut:02x}  // {op}.b64 hi'))
+                    else:
+                        b_lo = ctx.ra.lo(instr.srcs[1].name)
+                        output.append(SassInstr(encode_lop3(d_lo, a_lo, b_lo, RZ, lut),
+                                                f'LOP3.LUT R{d_lo}, R{a_lo}, R{b_lo}, RZ, 0x{lut:02x}  // {op}.b64 lo'))
+                        output.append(SassInstr(encode_lop3(d_lo+1, a_lo+1, b_lo+1, RZ, lut),
+                                                f'LOP3.LUT R{d_lo+1}, R{a_lo+1}, R{b_lo+1}, RZ, 0x{lut:02x}  // {op}.b64 hi'))
+
+                elif op == 'not' and typ in ('b32', 'u32', 's32'):
+                    # not.b32 d, a  →  LOP3.LUT d, a, RZ, RZ, 0x0F  (~a)
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = ctx.ra.r32(instr.srcs[0].name)
+                    output.append(SassInstr(encode_lop3(d, a, RZ, RZ, 0x0F),
+                                            f'LOP3.LUT R{d}, R{a}, RZ, RZ, 0x0f  // not.{typ}'))
+
+                elif op == 'not' and typ in ('b64', 'u64', 's64'):
+                    # not.b64 d, a  →  two LOP3.LUT on lo and hi words
+                    d_lo = ctx.ra.lo(instr.dest.name)
+                    a_lo = ctx.ra.lo(instr.srcs[0].name)
+                    output.append(SassInstr(encode_lop3(d_lo, a_lo, RZ, RZ, 0x0F),
+                                            f'LOP3.LUT R{d_lo}, R{a_lo}, RZ, RZ, 0x0f  // not.{typ} lo'))
+                    output.append(SassInstr(encode_lop3(d_lo+1, a_lo+1, RZ, RZ, 0x0F),
+                                            f'LOP3.LUT R{d_lo+1}, R{a_lo+1}, RZ, RZ, 0x0f  // not.{typ} hi'))
+
                 elif op == 'mul' and 'lo' in instr.types and typ in ('u32', 's32'):
                     # mul.lo.s32 → IMAD R-UR or IMAD.WIDE with immediate
                     # NOTE: IMAD R-R (0x224) is NOT valid on SM_120!

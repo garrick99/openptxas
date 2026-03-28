@@ -280,3 +280,60 @@ def test_bfe_u32_bakes_mask():
     elf = ELF64(cubin)
     const0 = elf.section_data('.nv.constant0.bfe_kernel')
     assert b'\xff\x00\x00\x00' in const0, "Mask 0xFF not found in constant bank"
+
+
+# ---------------------------------------------------------------------------
+# bfi.b32 tests
+# ---------------------------------------------------------------------------
+
+BFI_KERNEL = """\
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry bfi_kernel(
+    .param .u64 out,
+    .param .u32 val)
+{
+    .reg .b32   %r<4>;
+    .reg .b64   %rd<2>;
+    ld.param.u32 %r0, [val];
+    mov.u32     %r1, 0;
+    bfi.b32     %r2, %r0, %r1, 4, 8;
+    ld.param.u64 %rd0, [out];
+    ret;
+}
+"""
+
+
+def test_bfi_b32_compiles():
+    """bfi.b32 with constant start/count compiles to real instructions."""
+    results = compile_ptx_source(BFI_KERNEL)
+    cubin = results["bfi_kernel"]
+    assert cubin[:4] == b'\x7fELF'
+
+
+def test_bfi_b32_has_lop3():
+    """bfi.b32 emits multiple LOP3 instructions for mask/merge logic."""
+    results = compile_ptx_source(BFI_KERNEL)
+    cubin = results["bfi_kernel"]
+    elf = ELF64(cubin)
+    text = elf.section_data('.text.bfi_kernel')
+    opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
+               for off in range(0, len(text), 16)]
+    lop3_count = opcodes.count(0x212)
+    assert lop3_count >= 3, f"Expected >=3 LOP3 instructions for bfi, got {lop3_count}"
+
+
+def test_bfi_b32_bakes_masks():
+    """.nv.constant0 contains both shifted_mask and ~shifted_mask for bfi."""
+    results = compile_ptx_source(BFI_KERNEL)
+    cubin = results["bfi_kernel"]
+    elf = ELF64(cubin)
+    const0 = elf.section_data('.nv.constant0.bfi_kernel')
+    import struct as _s
+    # start=4, count=8 → raw_mask=0xFF, shifted_mask=0xFF0, not_shifted_mask=0xFFFFF00F
+    shifted_mask = 0xFF0
+    not_shifted_mask = (~shifted_mask) & 0xFFFFFFFF
+    assert _s.pack('<I', shifted_mask) in const0, "shifted_mask not in constant bank"
+    assert _s.pack('<I', not_shifted_mask) in const0, "~shifted_mask not in constant bank"

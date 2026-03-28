@@ -1166,7 +1166,42 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             f'LOP3.LUT R{d}, R{d}, R{t}, RZ, 0xC0  // bfe.u32 &mask'))
 
                 elif op == 'bfi' and typ in ('b32',):
-                    output.append(_nop(f'TODO: bfi.b32 decomposition (LOP3.LUT with mask)'))
+                    # bfi.b32 d, a, b, start, len
+                    #   d = (b & ~shifted_mask) | ((a << start) & shifted_mask)
+                    # Requires constant start and len (most common case).
+                    d  = ctx.ra.r32(instr.dest.name)
+                    a  = ctx.ra.r32(instr.srcs[0].name) if isinstance(instr.srcs[0], RegOp) else RZ
+                    b  = ctx.ra.r32(instr.srcs[1].name) if isinstance(instr.srcs[1], RegOp) else RZ
+                    start = instr.srcs[2].value if len(instr.srcs) > 2 and isinstance(instr.srcs[2], ImmOp) else 0
+                    count = instr.srcs[3].value if len(instr.srcs) > 3 and isinstance(instr.srcs[3], ImmOp) else 32
+                    raw_mask  = (1 << count) - 1 if count < 32 else 0xFFFFFFFF
+                    shifted_mask     = (raw_mask << start) & 0xFFFFFFFF
+                    not_shifted_mask = (~shifted_mask) & 0xFFFFFFFF
+                    t1 = ctx._next_gpr; ctx._next_gpr += 1
+                    t2 = ctx._next_gpr; ctx._next_gpr += 1
+                    # t1 = (a << start) & shifted_mask
+                    output.append(SassInstr(
+                        encode_shf_l_u32(t1, a, start),
+                        f'SHF.L.U32 R{t1}, R{a}, 0x{start:x}, RZ  // bfi shift'))
+                    lit_sm = ctx._alloc_literal(shifted_mask)
+                    output.append(SassInstr(
+                        encode_ldc(t2, 0, lit_sm),
+                        f'LDC R{t2}, c[0][0x{lit_sm:x}]  // bfi shifted_mask'))
+                    output.append(SassInstr(
+                        encode_lop3(t1, t1, t2, RZ, LOP3_AND),
+                        f'LOP3.LUT R{t1}, R{t1}, R{t2}, RZ, 0xC0  // bfi a&mask'))
+                    # t2 = b & ~shifted_mask
+                    lit_nsm = ctx._alloc_literal(not_shifted_mask)
+                    output.append(SassInstr(
+                        encode_ldc(t2, 0, lit_nsm),
+                        f'LDC R{t2}, c[0][0x{lit_nsm:x}]  // bfi ~shifted_mask'))
+                    output.append(SassInstr(
+                        encode_lop3(t2, b, t2, RZ, LOP3_AND),
+                        f'LOP3.LUT R{t2}, R{b}, R{t2}, RZ, 0xC0  // bfi b&~mask'))
+                    # d = t1 | t2
+                    output.append(SassInstr(
+                        encode_lop3(d, t1, t2, RZ, LOP3_OR),
+                        f'LOP3.LUT R{d}, R{t1}, R{t2}, RZ, 0xFC  // bfi insert'))
 
                 elif op in ('cvt',):
                     # General CVT — handle common conversions

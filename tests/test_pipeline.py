@@ -714,3 +714,41 @@ def test_rem_s32_compiles():
     assert 0x227 in opcodes, "IMAD.HI not found in rem.s32"
     nop_count = opcodes.count(0x918)
     assert nop_count <= 10, f"Too many NOPs ({nop_count}) in rem.s32"
+
+
+MAD_WIDE_KERNEL = """\
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry mad_wide_kernel(
+    .param .u64 out_ptr,
+    .param .u32 idx_param,
+    .param .u64 base_param)
+{
+    .reg .u32 %r<2>;
+    .reg .u64 %rd<4>;
+    ld.param.u32 %r0, [idx_param];
+    ld.param.u64 %rd0, [base_param];
+    mad.wide.u32 %rd1, %r0, 4, %rd0;
+    ld.param.u64 %rd2, [out_ptr];
+    st.global.u64 [%rd2], %rd1;
+    ret;
+}
+"""
+
+
+def test_mad_wide_compiles():
+    """mad.wide.u32 with small immediate emits IMAD.WIDE (opcode 0x825)."""
+    results = compile_ptx_source(MAD_WIDE_KERNEL)
+    cubin = results['mad_wide_kernel']
+    assert cubin[:4] == b'\x7fELF'
+    elf = ELF64(cubin)
+    text = elf.section_data('.text.mad_wide_kernel')
+    opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
+               for off in range(0, len(text), 16)]
+    assert 0x825 in opcodes, f"IMAD.WIDE not found in mad_wide_kernel; opcodes={[hex(o) for o in set(opcodes)]}"
+    # Count only non-trailing NOPs (trailing ones are ELF alignment padding)
+    last_real = max(i for i, op in enumerate(opcodes) if op != 0x918)
+    sched_nops = opcodes[:last_real].count(0x918)
+    assert sched_nops <= 4, f"Too many scheduling NOPs ({sched_nops}) in mad_wide_kernel"

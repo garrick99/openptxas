@@ -43,7 +43,7 @@ from sass.encoding.sm_120_opcodes import (
     encode_s2r,
     encode_iadd3, encode_iadd3x,
     encode_iadd64,
-    encode_imad_wide, encode_imad, encode_imad_rr, encode_imad_ur, encode_imad_hi, encode_imad_shl_u32,
+    encode_imad_wide, encode_imad_wide_rr, encode_imad, encode_imad_rr, encode_imad_ur, encode_imad_hi, encode_imad_shl_u32,
     encode_s2ur,
     encode_ldg_e, encode_ldg_e_64,
     encode_stg_e, encode_stg_e_64,
@@ -1122,6 +1122,36 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         # Both src0 and src1 are computed GPRs — use R-R IMAD (0x2a4).
                         output.append(SassInstr(encode_imad_rr(d, a, b, c),
                             f'IMAD R{d}, R{a}, R{b}, R{c}  // mad.lo.{typ} R-R'))
+
+                elif op == 'mad' and 'wide' in instr.types and typ in ('u32', 's32'):
+                    # mad.wide.u32/s32 d64, a32, b32_or_imm, c64
+                    # Result pair: (dest_lo, dest_hi) = a * b + c64
+                    # IMAD.WIDE writes dest and dest+1 atomically.
+                    d_lo = ctx.ra.lo(instr.dest.name)
+                    a    = ctx.ra.r32(instr.srcs[0].name)
+                    c_lo = ctx.ra.lo(instr.srcs[2].name) if len(instr.srcs) > 2 else RZ
+                    if isinstance(instr.srcs[1], ImmOp):
+                        imm = instr.srcs[1].value & 0xFFFF_FFFF
+                        if imm <= 0xFF:
+                            output.append(SassInstr(
+                                encode_imad_wide(d_lo, a, imm, c_lo),
+                                f'IMAD.WIDE R{d_lo}, R{a}, 0x{imm:x}, R{c_lo}  // mad.wide.{typ}'))
+                        else:
+                            # Large immediate: load via literal pool into UR, then R-UR IMAD.WIDE
+                            lit_off = ctx._alloc_literal(imm)
+                            ur_tmp = ctx._next_ur; ctx._next_ur += 1
+                            output.append(SassInstr(
+                                encode_ldcu_32(ur_tmp, 0, lit_off),
+                                f'LDCU.32 UR{ur_tmp}, c[0][0x{lit_off:x}]  // mad.wide imm={imm:#x}'))
+                            # Use R-imm form with UR treated as immediate slot
+                            output.append(SassInstr(
+                                encode_imad_wide(d_lo, a, ur_tmp, c_lo),
+                                f'IMAD.WIDE R{d_lo}, R{a}, UR{ur_tmp}, R{c_lo}  // mad.wide large imm'))
+                    else:
+                        b = ctx.ra.r32(instr.srcs[1].name)
+                        output.append(SassInstr(
+                            encode_imad_wide_rr(d_lo, a, b, c_lo),
+                            f'IMAD.WIDE R{d_lo}, R{a}, R{b}, R{c_lo}  // mad.wide.{typ} R-R'))
 
                 elif op == 'mul' and 'hi' in instr.types and typ in ('u32', 's32'):
                     d = ctx.ra.r32(instr.dest.name)

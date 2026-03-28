@@ -48,7 +48,8 @@ _OPCODE_META: dict[int, _OpMeta] = {
     0x224: _OpMeta('IMAD.32',    1, 0x3e, 1),
     0x2a4: _OpMeta('IMAD.RR',   1, 0x3e, 1),   # R-R-R multiply (opcode 0x2a4, SM_120 validated)
     0x824: _OpMeta('IMAD',       1, 0x3e, 1),
-    0x825: _OpMeta('IMAD.HI',    1, 0x3e, 1),
+    0x825: _OpMeta('IMAD.WIDE',  1, 0x3e, 1),   # IMAD.WIDE R-imm (64-bit result)
+    0x225: _OpMeta('IMAD.WIDE.RR', 1, 0x3e, 1),  # IMAD.WIDE R-R
     0x819: _OpMeta('SHF',        1, 0x3e, 1),
     0x299: _OpMeta('SHF.VAR',   1, 0x3e, 1),   # variable-shift SHF (opcode 0x7299)
     0x219: _OpMeta('SHF.R.S32.HI.VAR', 1, 0x3e, 1),  # SHF.R.S32.HI variable-shift (shr.s32)
@@ -80,7 +81,7 @@ _OPCODES_ALU = {
     0x235,        # IADD.64
     0x202,        # IADD3.X (with carry)
     0x224, 0x2a4, 0xc24,  # IMAD R-R (old), IMAD R-R (validated), IMAD R-UR
-    0x824, 0x825, # IMAD.SHL.U32, IMAD.WIDE (imm)
+    0x824, 0x825, 0x225, # IMAD.SHL.U32, IMAD.WIDE (imm), IMAD.WIDE (R-R)
     0x227,        # IMAD.HI.U32
     0x213,        # IABS
     0x248, 0x848, # VIMNMX R-R, R-imm (integer min/max)
@@ -173,7 +174,10 @@ def _get_src_regs(raw: bytes) -> set[int]:
         elif opcode in (0x221, 0x223):  # FADD/FFMA: src0=b3, src1=b4, src2=b8
             if raw[4] < 255: regs.add(raw[4])
             if raw[8] < 255 and opcode == 0x223: regs.add(raw[8])
-        elif opcode in (0x824, 0x825, 0x224, 0x2a4):  # IMAD variants: src0=b3, src1=b4, src2=b8
+        elif opcode in (0x825, 0x225):  # IMAD.WIDE (R-imm 0x825, R-R 0x225): src2 is 64-bit pair
+            if raw[4] < 255: regs.add(raw[4])
+            if raw[8] < 255: regs |= {raw[8], raw[8]+1}
+        elif opcode in (0x824, 0x224, 0x2a4):  # IMAD non-wide variants: src0=b3, src1=b4, src2=b8
             if raw[4] < 255: regs.add(raw[4])
             if raw[8] < 255: regs.add(raw[8])
         elif opcode == 0xc24:  # IMAD R-UR: src0=b3 (GPR), src1=b4 (UR, not GPR), src2=b8 (GPR)
@@ -214,6 +218,8 @@ def _get_dest_regs(raw: bytes) -> set[int]:
         if dest < 255: regs |= {dest, dest+1}
     elif opcode in (0x23c, 0x237):  # HMMA/IMMA: writes 4 regs
         if dest < 255: regs |= {dest, dest+1, dest+2, dest+3}
+    elif opcode in (0x825, 0x225):  # IMAD.WIDE: writes dest pair
+        if dest < 255: regs |= {dest, dest+1}
     elif opcode in _OPCODES_ALU:
         if dest < 255: regs.add(dest)
     return regs

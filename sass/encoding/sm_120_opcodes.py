@@ -517,6 +517,28 @@ def encode_imad_wide(dest: int, src0: int, src1_imm: int, src2: int,
                   ctrl=ctrl)
 
 
+def encode_imad_wide_rr(dest: int, src0: int, src1: int, src2: int,
+                        ctrl: int = 0) -> bytes:
+    """
+    Encode IMAD.WIDE R-R: (dest, dest+1) = src0 * src1 + (src2, src2+1).
+
+    R-R form: b0=0x25 (WIDE), b1=0x72 (R-R form bits).
+    Follows the consistent R-imm→R-R pattern across SM_120 instructions
+    (IMAD.WIDE R-imm uses b1=0x78; R-R uses b1=0x72).
+
+    Note: This encoding is derived by analogy from IMAD R-R (confirmed opcode
+    0x2a4 / encode_imad_rr) and the IMAD.WIDE R-imm ground truth. Verify
+    against cuobjdump output for any hardware-running workload.
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    return _build(0x25, 0x72,
+                  b2=dest, b3=src0, b4=src1 & 0xFF,
+                  b8=src2,
+                  b9=0x02, b10=0x8e, b11=0x07,
+                  ctrl=ctrl)
+
+
 def encode_imad_ur(dest: int, src0: int, ur_src: int, src2: int,
                    ctrl: int = 0) -> bytes:
     """

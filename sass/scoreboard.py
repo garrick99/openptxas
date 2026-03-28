@@ -49,6 +49,7 @@ _OPCODE_META: dict[int, _OpMeta] = {
     0x824: _OpMeta('IMAD',       1, 0x3e, 1),
     0x825: _OpMeta('IMAD.HI',    1, 0x3e, 1),
     0x819: _OpMeta('SHF',        1, 0x3e, 1),
+    0x299: _OpMeta('SHF.VAR',   1, 0x3e, 1),   # variable-shift SHF (opcode 0x7299)
     0x221: _OpMeta('FADD',       1, 0x3e, 1),
     0x223: _OpMeta('FFMA',       1, 0x3e, 1),
     0x235: _OpMeta('IADD.64',    1, 0x3e, 1),
@@ -90,7 +91,8 @@ _OPCODES_ALU = {
     0x305,        # F2I.U32
     # Logic
     0x212,        # LOP3.LUT
-    0x819,        # SHF (all variants: L/R, U32/U64/S32, HI/LO/W)
+    0x819,        # SHF (all variants: L/R, U32/U64/S32, HI/LO/W, constant shift)
+    0x299,        # SHF.VAR (variable-shift SHF, shift amount in register)
     # Select / predicate
     0x207,        # SEL
     0x208,        # FSEL
@@ -149,7 +151,10 @@ def _get_src_regs(raw: bytes) -> set[int]:
         elif opcode == 0x235:  # IADD.64: src0=b3 pair, src1=b4 pair
             if raw[3] < 255: regs.add(raw[3]+1)
             if raw[4] < 255: regs |= {raw[4], raw[4]+1}
-        elif opcode in (0x819,):  # SHF: src0=b3, src1=b8
+        elif opcode in (0x819,):  # SHF (const): src0=b3, K=b4(imm), src1=b8
+            if raw[8] < 255: regs.add(raw[8])
+        elif opcode in (0x299,):  # SHF.VAR: src0=b3, k_reg=b4(reg), src1=b8
+            if raw[4] < 255: regs.add(raw[4])   # shift-amount register
             if raw[8] < 255: regs.add(raw[8])
         elif opcode in (0x23c, 0x237):  # HMMA/IMMA: a=b3(4 regs), b=b4(2), c=b8(4)
             for r in range(4): regs.add(raw[3]+r)

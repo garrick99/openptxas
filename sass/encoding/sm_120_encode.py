@@ -377,6 +377,85 @@ def encode_shf_r_u32_hi(dest: int, src0: int, k: int,
 
 
 # ---------------------------------------------------------------------------
+# Variable-shift SHF variants (shift amount from a register, not immediate)
+# ---------------------------------------------------------------------------
+#
+# Ground truth (ptxas 13.0, sm_120), from var_shl probe:
+#   SHF.L.U32 R6, R4, R5, RZ  (shl.b32 %r2, %r0, %r1 where %r1 is runtime):
+#     bytes: 9972060405000000ff06000800e21f00
+#   SHF.R.U32.HI R4, RZ, R5, R4  (shr.u32 %r3, %r0, %r1 where %r1 is runtime):
+#     bytes: 997204ff050000000416010800ca0f00
+#
+# Key differences from constant-shift SHF (opcode 0x7819):
+#   - opcode bytes: 0x99, 0x72  (vs 0x19, 0x78 for constant)
+#   - byte[4] = k_reg (register index) instead of immediate K
+#   - byte[12] = 0x08 (vs 0x00 for constant)
+#   - modifier bytes (b9, b10) are IDENTICAL to the constant variants
+#   - ctrl word (bytes 13-15) works the same way
+
+
+def _build_shf_var(dest: int, src0: int, k_reg: int, src1: int,
+                   mod_byte9: int, mod_byte10: int,
+                   ctrl: int) -> bytes:
+    """Build a variable-shift SHF instruction (shift amount in a register)."""
+    if ctrl == 0:
+        ctrl = _CTRL_MAX_STALL
+    b13, b14, b15_ctrl = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0x99   # opcode low byte (variable-shift variant)
+    raw[1] = 0x72   # opcode high byte (variable-shift variant)
+    raw[2] = dest  & 0xFF
+    raw[3] = src0  & 0xFF
+    raw[4] = k_reg & 0xFF   # shift-amount register (was immediate K for constant)
+    raw[5] = 0x00
+    raw[6] = 0x00
+    raw[7] = 0x00
+    raw[8]  = src1 & 0xFF
+    raw[9]  = mod_byte9
+    raw[10] = mod_byte10
+    raw[11] = 0x08   # register-source flag (vs 0x00 for constant-shift SHF)
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15_ctrl
+    return bytes(raw)
+
+
+def encode_shf_l_u32_var(dest: int, src0: int, k_reg: int,
+                          ctrl: int = 0) -> bytes:
+    """
+    Encode SHF.L.U32 dest, src0, k_reg, RZ (variable left shift) to 16 bytes.
+
+    k_reg is a GPR holding the shift amount (0-based register index).
+    Used for shl.b32 with a runtime shift amount.
+
+    Ground truth:
+        SHF.L.U32 R6, R4, R5, RZ → 9972060405000000ff06000800e21f00
+    """
+    return _build_shf_var(dest, src0, k_reg, RZ,
+                          _MODIFIER_SHF_L_U32[0],
+                          _MODIFIER_SHF_L_U32[1],
+                          ctrl)
+
+
+def encode_shf_r_u32_hi_var(dest: int, src_hi: int, k_reg: int,
+                              ctrl: int = 0) -> bytes:
+    """
+    Encode SHF.R.U32.HI dest, RZ, k_reg, src_hi (variable right shift) to 16 bytes.
+
+    src_hi holds the data to shift; k_reg holds the shift amount.
+    Used for shr.u32 with a runtime shift amount.
+
+    Ground truth:
+        SHF.R.U32.HI R4, RZ, R5, R4 → 997204ff050000000416010800ca0f00
+    """
+    return _build_shf_var(dest, RZ, k_reg, src_hi,
+                          _MODIFIER_SHF_R_U32_HI[0],
+                          _MODIFIER_SHF_R_U32_HI[1],
+                          ctrl)
+
+
+# ---------------------------------------------------------------------------
 # Round-trip verification against ground truth
 # ---------------------------------------------------------------------------
 

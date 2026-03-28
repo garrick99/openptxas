@@ -74,6 +74,7 @@ from sass.encoding.sm_120_encode import (
     encode_shf_l_u32,
     encode_shf_l_u64_hi,
     encode_shf_r_u32, encode_shf_r_u32_hi,
+    encode_shf_l_u32_var, encode_shf_r_u32_hi_var,
 )
 from sass.regalloc import RegAlloc
 
@@ -564,7 +565,8 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     output.extend(_select_shl_b64(instr, ctx.ra))
 
                 elif op == 'shl' and typ in ('b32', 'u32', 's32'):
-                    # 32-bit shift left: SHF.L.U32 or IMAD.SHL for small constants
+                    # 32-bit shift left: IMAD.SHL or SHF.L.U32 for constants,
+                    # SHF.L.U32.VAR (opcode 0x7299) for runtime register shifts.
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
                     if isinstance(instr.srcs[1], ImmOp):
@@ -576,7 +578,9 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             output.append(SassInstr(encode_shf_l_u32(d, a, k, RZ),
                                                     f'SHF.L.U32 R{d}, R{a}, 0x{k:x}, RZ  // shl.{typ} {k}'))
                     else:
-                        output.append(_nop(f'TODO: shl.{typ} with register shift amount'))
+                        k_reg = ctx.ra.r32(instr.srcs[1].name)
+                        output.append(SassInstr(encode_shf_l_u32_var(d, a, k_reg),
+                                                f'SHF.L.U32 R{d}, R{a}, R{k_reg}, RZ  // shl.{typ} (var)'))
 
                 elif op == 'shr' and typ in ('b32', 'u32', 's32'):
                     d = ctx.ra.r32(instr.dest.name)
@@ -586,7 +590,11 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         output.append(SassInstr(encode_shf_r_u32_hi(d, a, k),
                                                 f'SHF.R.U32.HI R{d}, RZ, 0x{k:x}, R{a}  // shr.{typ} {k}'))
                     else:
-                        output.append(_nop(f'TODO: shr.{typ} with register shift amount'))
+                        k_reg = ctx.ra.r32(instr.srcs[1].name)
+                        output.append(SassInstr(encode_shf_r_u32_hi_var(d, a, k_reg),
+                                                f'SHF.R.U32.HI R{d}, RZ, R{k_reg}, R{a}  // shr.{typ} (var)'))
+                    # Note: shr.s32 (arithmetic right shift) would need SHF.R.S32.HI
+                    # which has different modifier bytes — not implemented yet.
 
                 elif op == 'shr' and typ in ('u64',):
                     output.extend(_select_shr_u64(instr, ctx.ra))

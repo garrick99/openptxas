@@ -169,6 +169,46 @@ def test_program_headers():
 
 
 # ---------------------------------------------------------------------------
+# Variable-shift tests
+# ---------------------------------------------------------------------------
+
+VAR_SHIFT_KERNEL = """\
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry var_shift(
+    .param .u64 out,
+    .param .u32 val,
+    .param .u32 shift)
+{
+    .reg .b32   %r<8>;
+    .reg .b64   %rd<4>;
+    ld.param.u32 %r0, [val];
+    ld.param.u32 %r1, [shift];
+    shl.b32      %r2, %r0, %r1;
+    shr.u32      %r3, %r0, %r1;
+    cvt.u64.u32  %rd1, %r2;
+    ld.param.u64 %rd0, [out];
+    st.global.u64 [%rd0], %rd1;
+    ret;
+}
+"""
+
+
+def test_var_shift_compiles():
+    """shl/shr with register shift amount compiles to SHF.VAR (0x299), not NOP."""
+    results = compile_ptx_source(VAR_SHIFT_KERNEL)
+    cubin = results["var_shift"]
+    assert cubin[:4] == b'\x7fELF'
+    elf = ELF64(cubin)
+    text = elf.section_data('.text.var_shift')
+    opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
+               for off in range(0, len(text), 16)]
+    assert 0x299 in opcodes, "SHF.VAR (0x299) not found — variable-shift shl/shr emitted NOP"
+
+
+# ---------------------------------------------------------------------------
 # Literal pool tests
 # ---------------------------------------------------------------------------
 

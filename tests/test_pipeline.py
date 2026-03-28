@@ -563,3 +563,43 @@ def test_shr_s32_var_compiles():
     opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
                for off in range(0, len(text), 16)]
     assert 0x219 in opcodes, "SHF.R.S32.HI.VAR not found — shr.s32 emitted NOP"
+
+DIV_U32_KERNEL = """\
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry div_u32_kernel(
+    .param .u64 out_ptr,
+    .param .u32 a_param,
+    .param .u32 b_param)
+{
+    .reg .u32 %r<4>;
+    .reg .u64 %rd<2>;
+    ld.param.u32 %r0, [a_param];
+    ld.param.u32 %r1, [b_param];
+    div.u32      %r2, %r0, %r1;
+    ld.param.u64 %rd0, [out_ptr];
+    st.global.u32 [%rd0], %r2;
+    ret;
+}
+"""
+
+
+def test_div_u32_compiles():
+    """div.u32 emits full Newton-Raphson sequence (no TODO NOPs)."""
+    results = compile_ptx_source(DIV_U32_KERNEL)
+    cubin = results['div_u32_kernel']
+    assert cubin[:4] == b'\x7fELF'
+    elf = ELF64(cubin)
+    text = elf.section_data('.text.div_u32_kernel')
+    opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
+               for off in range(0, len(text), 16)]
+    # Must have Newton-Raphson key opcodes
+    assert 0x306 in opcodes, "I2F.U32.RP not found — div.u32 NR not emitted"
+    assert 0x308 in opcodes, "MUFU.RCP not found — div.u32 NR not emitted"
+    assert 0x305 in opcodes, "F2I.FTZ.U32 not found — div.u32 NR not emitted"
+    assert 0x227 in opcodes, "IMAD.HI.U32 not found — div.u32 NR not emitted"
+    # Verify NOPs are scheduling-only (not TODO NOPs from unimplemented instrs).
+    nop_count = opcodes.count(0x918)
+    assert nop_count <= 6, "Too many NOPs in div.u32 (likely unimplemented instruction)"

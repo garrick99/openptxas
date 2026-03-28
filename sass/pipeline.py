@@ -388,6 +388,7 @@ def compile_function(fn: Function, verbose: bool = False) -> bytes:
         ur_desc=4,  # UR4 for memory descriptors (ptxas convention)
         _const_pool_base=lit_pool_base,
         _next_gpr=alloc.num_gprs,
+        _next_pred=alloc.num_pred,
     )
     body_instrs = select_function(fn, ctx)
 

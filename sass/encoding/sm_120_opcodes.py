@@ -1786,7 +1786,17 @@ MUFU_EX2  = 0x08
 MUFU_LG2  = 0x0c
 
 def encode_mufu(dest: int, src: int, func: int, ctrl: int = 0) -> bytes:
-    """Encode MUFU dest, src with function selector."""
+    """Encode MUFU dest, src with function selector.
+
+    Ground truth (ptxas sm_120):
+      MUFU.SQRT R4, R0: lo=0x0000000000047308, hi=0x000e240000002000
+        bytes: 08 73 04 00 00 00 00 00 | 00 20 00 00 00 24 0e 00
+        b2=dest(R4), b4=src(R0), b9=0x20(SQRT func)
+      MUFU.LG2 R5, R4:  lo=0x0000000400057308, hi=0x000e240000000c00
+        bytes: 08 73 05 00 04 00 00 00 | 00 0c 00 00 00 24 0e 00
+        b2=dest(R5), b4=src(R4), b9=0x0c(LG2 func)
+    Func codes: RCP=0x10, SQRT=0x20, SIN=0x04, EX2=0x08, LG2=0x0c
+    """
     if ctrl == 0:
         ctrl = _CTRL_DEFAULT
     b13, b14, b15 = _ctrl_to_bytes(ctrl)
@@ -1794,12 +1804,12 @@ def encode_mufu(dest: int, src: int, func: int, ctrl: int = 0) -> bytes:
     raw[0]  = 0x08
     raw[1]  = 0x73
     raw[2]  = dest & 0xFF
-    raw[3]  = src & 0xFF
-    raw[4]  = 0x00
+    raw[3]  = 0x00
+    raw[4]  = src & 0xFF
     # bytes 5-7 = 0
     raw[8]  = 0x00
-    raw[9]  = 0x00
-    raw[10] = func & 0xFF
+    raw[9]  = func & 0xFF
+    raw[10] = 0x00
     raw[11] = 0x00
     raw[12] = 0x00
     raw[13] = b13
@@ -2109,7 +2119,11 @@ def encode_iabs(dest: int, src: int, ctrl: int = 0) -> bytes:
 # ---------------------------------------------------------------------------
 # IMAD.HI — Integer Multiply-Add High (upper 32 bits)
 # ---------------------------------------------------------------------------
-# Opcode: 0x27, 0x72.  Ground truth: IMAD.HI.U32 R9, R0, R7, RZ → 0x0000000700097227
+# Opcode: 0x227.
+# Ground truth (ptxas div.u32 sequence, sm_120):
+#   IMAD.HI.U32 R3, R3, R5, R2: 27 72 03 03 05 00 00 00 | 02 00 8e 07 00 cc 0f 00
+#   IMAD.HI.U32 R5, R3, R6, RZ: 27 72 05 03 06 00 00 00 | ff 00 8e 07 00 e4 0f 00
+#   b2=dest, b3=src0, b4=src1, b8=src2, b9=0x00, b10=0x8e, b11=0x07
 def encode_imad_hi(dest: int, src0: int, src1: int, src2: int,
                    signed: bool = False, ctrl: int = 0) -> bytes:
     if ctrl == 0: ctrl = _CTRL_DEFAULT
@@ -2120,6 +2134,9 @@ def encode_imad_hi(dest: int, src0: int, src1: int, src2: int,
     raw[3] = src0 & 0xFF
     raw[4] = src1 & 0xFF
     raw[8] = src2 & 0xFF
+    raw[9]  = 0x00
+    raw[10] = 0x8e
+    raw[11] = 0x07
     raw[13], raw[14], raw[15] = b13, b14, b15
     return bytes(raw)
 
@@ -2286,32 +2303,275 @@ def encode_isetp(pred_dest: int, src0: int, src1: int, cmp: int = ISETP_GE,
                   signed: bool = True, ctrl: int = 0) -> bytes:
     """Encode ISETP R-R variant with variable comparison type.
 
-    Ground truth from ptxas (ISETP.GE.U32.AND P0, PT, R2, R3, PT):
-      lo=0x000000030200720c, hi=0x001fcc0003f06070
-      bytes: 0c 72 00 02 03 00 00 00 | 70 60 f0 03 00 cc 1f 00
-      b8=0x70 (GE cmp), b9=0x60 (R-R, always 0x60 regardless of src parity),
-      b11=0x03 (NOT 0x0b — bit 3 encodes UR operand presence, 0=GPR src1),
-      b12=0x00 (boolean source PT = no predicate gate = always-true; 0x03 would AND with P3)
+    Ground truth from ptxas (ISETP.GE.U32.AND P0, PT, R4, R7, PT):
+      bytes: 0c 72 00 04 07 00 00 00 | 70 60 f0 03 00 da 0f 00
+      b2=0x00 (always zero — pred_dest goes in b10, not b2)
+      b8=0x70 (fixed for U32 R-R comparisons)
+      b9=cmp<<4 (GE=0x60, NE=0x50, LT=0x10, EQ=0x20, LE=0x30, GT=0x40)
+      b10=0xf0|(pred_dest<<1): P0→0xf0, P1→0xf2, P2→0xf4, P3→0xf6
+      b11=0x03 (R-R GPR operand flag)
+    Verified with div.u32 sequence: NE→b9=0x50, GE→b9=0x60, P2→b10=0xf4.
     """
     if ctrl == 0: ctrl = _CTRL_DEFAULT
     b13, b14, b15 = _ctrl_to_bytes(ctrl)
     raw = bytearray(16)
     raw[0]  = 0x0c
     raw[1]  = 0x72
-    raw[2]  = pred_dest & 0xFF
+    raw[2]  = 0x00
     raw[3]  = src0 & 0xFF
     raw[4]  = src1 & 0xFF
     raw[5]  = 0x00
     raw[6]  = 0x00
     raw[7]  = 0x00
-    raw[8]  = (cmp << 4) | 0x10   # comparison type: GE=0x70, LT=0x20, etc.
-    raw[9]  = 0x60
-    raw[10] = 0xf0
+    raw[8]  = 0x70                          # fixed for U32 R-R
+    raw[9]  = (cmp & 0x0F) << 4             # comparison type in b9
+    raw[10] = 0xf0 | ((pred_dest & 0x07) << 1)
     raw[11] = 0x03
-    raw[12] = 0x00                 # boolean source = PT (always-true); 0x03 would AND with P3 (wrong)
+    raw[12] = 0x00
     raw[13] = b13
     raw[14] = b14
     raw[15] = b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# I2F.U32.RP — Integer to Float, unsigned 32-bit, round toward +infinity
+# ---------------------------------------------------------------------------
+# Used in Newton-Raphson division (div.u32) to convert divisor to float.
+# Ground truth (ptxas div.u32, sm_120):
+#   I2F.U32.RP R0, R7: lo=0x0000000700007306, hi=0x001e220000209000
+#   bytes: 06 73 00 00 07 00 00 00 | 00 90 20 00 00 22 1e 00
+#   b0=0x06, b1=0x73, b2=dest, b4=src, b9=0x90(RP+U32), b10=0x20
+def encode_i2f_u32_rp(dest: int, src: int, ctrl: int = 0) -> bytes:
+    """Encode I2F.U32.RP dest, src — unsigned 32-bit int to float, round toward +inf."""
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0], raw[1] = 0x06, 0x73
+    raw[2] = dest & 0xFF
+    raw[4] = src & 0xFF
+    raw[9]  = 0x90
+    raw[10] = 0x20
+    raw[13], raw[14], raw[15] = b13, b14, b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# F2I.FTZ.U32.TRUNC — Float to unsigned 32-bit integer, truncate (floor)
+# ---------------------------------------------------------------------------
+# Used in Newton-Raphson division (div.u32) to convert reciprocal float back to int.
+# Ground truth (ptxas div.u32, sm_120):
+#   F2I.FTZ.U32.TRUNC.NTZ R3, R2: lo=0x0000000200037305, hi=0x0000a4000021f000
+#   bytes: 05 73 03 00 02 00 00 00 | 00 f0 21 00 00 a4 00 00
+#   b0=0x05, b1=0x73, b2=dest, b4=src, b9=0xf0, b10=0x21
+def encode_f2i_ftz_u32_trunc(dest: int, src: int, ctrl: int = 0) -> bytes:
+    """Encode F2I.FTZ.U32.TRUNC.NTZ dest, src — float to unsigned 32-bit, truncate."""
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0], raw[1] = 0x05, 0x73
+    raw[2] = dest & 0xFF
+    raw[4] = src & 0xFF
+    raw[9]  = 0xf0
+    raw[10] = 0x21
+    raw[13], raw[14], raw[15] = b13, b14, b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# HFMA2 — Half-precision FMA2 (used as zero-init trick in div.u32)
+# ---------------------------------------------------------------------------
+# HFMA2 R2, -RZ, RZ, 0, 0 computes (-0.0)*0.0 + 0.0 = 0.0 and zero-extends to int.
+# Used in the Newton-Raphson div.u32 sequence to zero a register without a NOP stall.
+# Ground truth (ptxas div.u32, sm_120):
+#   HFMA2 R2, -RZ, RZ, 0, 0: lo=0x00000000ff027431, hi=0x001fe200000001ff
+#   bytes: 31 74 02 ff 00 00 00 00 | ff 01 00 00 00 e2 1f 00
+#   b0=0x31, b1=0x74, b2=dest, b3=0xff(RZ neg), b4=0x00(RZ), b8=0xff, b9=0x01
+def encode_hfma2_zero(dest: int, ctrl: int = 0) -> bytes:
+    """Encode HFMA2 dest, -RZ, RZ, 0, 0 — zero-initialise dest register."""
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0], raw[1] = 0x31, 0x74
+    raw[2] = dest & 0xFF
+    raw[3] = 0xff   # -RZ (negated zero = still zero in FP16)
+    raw[4] = 0x00   # RZ
+    raw[8] = 0xff
+    raw[9] = 0x01
+    raw[13], raw[14], raw[15] = b13, b14, b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# IADD3 variants for Newton-Raphson division
+# ---------------------------------------------------------------------------
+# Several IADD3 encodings are needed for div.u32: large immediate, negated sources,
+# and predicated forms. All have opcode 0x10 in b0; b1 encodes predication and form.
+#
+# b1 encoding:
+#   unpred R-R-R:    0x72   (pred=PT=7, form=R-R-R)
+#   unpred R-imm:    0x78   (pred=PT=7, form=R-imm)
+#   @Pn R-R-R:   (n<<4)|0x02   (n=pred_idx, form=R-R-R)
+#   @Pn R-imm:   (n<<4)|0x08   (n=pred_idx, form=R-imm)
+#   @!Pn R-R-R:  0x80|(n<<4)|0x02
+#   @!Pn R-imm:  0x80|(n<<4)|0x08
+#
+# Negation encoding:
+#   negate b4 src: b7=0x80
+#   negate b3 src: b9 bit[0] = 1 (b9=0xe1 vs normal b9=0xe0)
+#
+# Modifier bytes for register form: b9=0xe0, b10=0xff, b11=0x07
+# Modifier bytes for imm form:      b9=0xe0, b10=0xff, b11=0x07 (same)
+
+def encode_iadd3_imm32(dest: int, src0: int, imm32: int, src2: int,
+                       ctrl: int = 0) -> bytes:
+    """Encode IADD3 dest, src0, imm32, src2 with 32-bit immediate.
+
+    Ground truth: IADD3 R2, R0, 0xffffffe, RZ
+      bytes: 10 78 02 00 fe ff ff 0f | ff e0 ff 07 00 c8 1f 00
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0], raw[1] = 0x10, 0x78
+    raw[2] = dest & 0xFF
+    raw[3] = src0 & 0xFF
+    imm32 = imm32 & 0xFFFFFFFF
+    raw[4] = imm32 & 0xFF
+    raw[5] = (imm32 >> 8) & 0xFF
+    raw[6] = (imm32 >> 16) & 0xFF
+    raw[7] = (imm32 >> 24) & 0xFF
+    raw[8]  = src2 & 0xFF
+    raw[9]  = 0xe0
+    raw[10] = 0xff
+    raw[11] = 0x07
+    raw[13], raw[14], raw[15] = b13, b14, b15
+    return bytes(raw)
+
+
+def encode_iadd3_neg_b4(dest: int, src0: int, neg_src1: int, src2: int,
+                        ctrl: int = 0) -> bytes:
+    """Encode IADD3 dest, src0, -neg_src1, src2 (negate second operand).
+
+    Ground truth: IADD3 R4, RZ, -R3, RZ
+      bytes: 10 72 04 ff 03 00 00 80 | ff e0 ff 07 00 ca 4f 00
+      b7=0x80 encodes the negation of b4.
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0], raw[1] = 0x10, 0x72
+    raw[2] = dest & 0xFF
+    raw[3] = src0 & 0xFF
+    raw[4] = neg_src1 & 0xFF
+    raw[7] = 0x80
+    raw[8]  = src2 & 0xFF
+    raw[9]  = 0xe0
+    raw[10] = 0xff
+    raw[11] = 0x07
+    raw[13], raw[14], raw[15] = b13, b14, b15
+    return bytes(raw)
+
+
+def encode_iadd3_neg_b3(dest: int, neg_src0: int, src1: int, src2: int,
+                        ctrl: int = 0) -> bytes:
+    """Encode IADD3 dest, -neg_src0, src1, src2 (negate first operand).
+
+    Ground truth: IADD3 R4, -R5, RZ, RZ
+      bytes: 10 72 04 05 ff 00 00 00 | ff e1 ff 07 00 ca 0f 00
+      b9=0xe1 (bit[0]=1) encodes the negation of b3.
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0], raw[1] = 0x10, 0x72
+    raw[2] = dest & 0xFF
+    raw[3] = neg_src0 & 0xFF
+    raw[4] = src1 & 0xFF
+    raw[8]  = src2 & 0xFF
+    raw[9]  = 0xe1
+    raw[10] = 0xff
+    raw[11] = 0x07
+    raw[13], raw[14], raw[15] = b13, b14, b15
+    return bytes(raw)
+
+
+def encode_iadd3_pred_neg_b4(dest: int, src0: int, neg_src1: int, src2: int,
+                              pred_idx: int, ctrl: int = 0) -> bytes:
+    """Encode @Ppred_idx IADD3 dest, src0, -neg_src1, src2.
+
+    Ground truth: @P0 IADD3 R4, R4, -R7, RZ
+      bytes: 10 02 04 04 07 00 00 80 | ff e0 ff 07 00 e4 0f 00
+      b1=(pred_idx<<4)|0x02, b7=0x80 for negation.
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0x10
+    raw[1] = ((pred_idx & 0x07) << 4) | 0x02
+    raw[2] = dest & 0xFF
+    raw[3] = src0 & 0xFF
+    raw[4] = neg_src1 & 0xFF
+    raw[7] = 0x80
+    raw[8]  = src2 & 0xFF
+    raw[9]  = 0xe0
+    raw[10] = 0xff
+    raw[11] = 0x07
+    raw[13], raw[14], raw[15] = b13, b14, b15
+    return bytes(raw)
+
+
+def encode_iadd3_pred_small_imm(dest: int, src0: int, imm_byte: int, src2: int,
+                                 pred_idx: int, ctrl: int = 0) -> bytes:
+    """Encode @Ppred_idx IADD3 dest, src0, imm_byte, src2 with small immediate.
+
+    Ground truth: @P0 IADD3 R5, R5, 0x1, RZ  (b1=0x08 for P0)
+      bytes: 10 08 05 05 01 00 00 00 | ff e0 ff 07 00 c6 0f 00
+             @P1 IADD3 R5, R5, 0x1, RZ  (b1=0x18 for P1)
+      bytes: 10 18 05 05 01 00 00 00 | ff e0 ff 07 00 e4 0f 00
+    b1=(pred_idx<<4)|0x08, imm fits in b4 (1 byte).
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0x10
+    raw[1] = ((pred_idx & 0x07) << 4) | 0x08
+    raw[2] = dest & 0xFF
+    raw[3] = src0 & 0xFF
+    raw[4] = imm_byte & 0xFF
+    raw[8]  = src2 & 0xFF
+    raw[9]  = 0xe0
+    raw[10] = 0xff
+    raw[11] = 0x07
+    raw[13], raw[14], raw[15] = b13, b14, b15
+    return bytes(raw)
+
+
+def encode_lop3_pred(dest: int, src0: int, src1: int, src2: int,
+                     lut: int, pred_idx: int, inverted: bool = False,
+                     ctrl: int = 0) -> bytes:
+    """Encode @[!]Ppred_idx LOP3.LUT dest, src0, src1, src2, lut.
+
+    Ground truth: @!P2 LOP3.LUT R5, RZ, R7, RZ, 0x33
+      bytes: 12 a2 05 ff 07 00 00 00 | ff 33 8e 07 00 ca 0f 00
+      b1 = 0x80|(pred_idx<<4)|0x02 for inverted, (pred_idx<<4)|0x02 for normal.
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0x12
+    pred_b1 = ((pred_idx & 0x07) << 4) | 0x02
+    if inverted:
+        pred_b1 |= 0x80
+    raw[1] = pred_b1
+    raw[2] = dest & 0xFF
+    raw[3] = src0 & 0xFF
+    raw[4] = src1 & 0xFF
+    raw[8]  = src2 & 0xFF
+    raw[9]  = lut & 0xFF
+    raw[10] = 0x8e
+    raw[11] = 0x07
+    raw[13], raw[14], raw[15] = b13, b14, b15
     return bytes(raw)
 
 

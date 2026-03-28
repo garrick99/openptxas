@@ -65,6 +65,9 @@ from sass.encoding.sm_120_opcodes import (
     encode_shfl, SHFL_IDX, SHFL_UP, SHFL_DOWN, SHFL_BFLY,
     encode_vote_ballot,
     encode_i2fp_u32, encode_f2i_u32,
+    encode_i2f_u32_rp, encode_f2i_ftz_u32_trunc, encode_hfma2_zero,
+    encode_iadd3_imm32, encode_iadd3_neg_b4, encode_iadd3_neg_b3,
+    encode_iadd3_pred_neg_b4, encode_iadd3_pred_small_imm, encode_lop3_pred,
     encode_lop3, LOP3_AND, LOP3_OR, LOP3_XOR,
     RZ, PT, SR_TID_X, SR_TID_Y,
     SR_CTAID_X,
@@ -492,6 +495,9 @@ class ISelContext:
     # Next available scratch GPR (for isel-internal temporaries, e.g. bfe mask)
     # Initialized from alloc.num_gprs by the pipeline; may grow during isel.
     _next_gpr: int = 0
+    # Next available scratch predicate register (for isel-internal use, e.g. div.u32)
+    # Initialized from alloc.num_pred by the pipeline; may grow during isel.
+    _next_pred: int = 0
 
     def _alloc_literal(self, value: int) -> int:
         """Return the c[0] byte offset for a 32-bit literal constant.
@@ -1185,24 +1191,62 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             f'VOTE.ANY R{d}, PT, PT  // vote.sync.ballot'))
 
                 elif op == 'div' and typ == 'u32':
-                    # Unsigned integer division via Newton-Raphson reciprocal.
-                    # Same sequence ptxas emits: I2F → RCP → F2I → correction loop.
-                    d = ctx.ra.r32(instr.dest.name)
-                    a = ctx.ra.r32(instr.srcs[0].name)
-                    b = ctx.ra.r32(instr.srcs[1].name)
-                    # We need 3 temp registers. Use d as temp since we overwrite it.
-                    # This is a simplified version — full ptxas sequence has ~20 instructions.
-                    # For now emit the RCP-based approximation (correct for most inputs).
-                    # Step 1: float_b = I2FP(b)
-                    output.append(SassInstr(encode_i2fp_u32(d, b),
-                                            f'I2FP.F32.U32 R{d}, R{b}  // div.u32: float(divisor)'))
-                    output.append(SassInstr(encode_mufu(d, d, MUFU_RCP),
-                                            f'MUFU.RCP R{d}, R{d}  // div.u32: 1/divisor'))
-                    output.append(SassInstr(encode_i2fp_u32(d, a),  # reuse d for numerator float
-                                            f'I2FP.F32.U32 temp, R{a}  // div.u32: float(numerator)'))
-                    # This simplified version won't be bit-exact with ptxas but handles most cases.
-                    # Full implementation needs the correction loop with IMAD.HI + predicated adds.
-                    output.append(_nop(f'NOTE: div.u32 simplified — full Newton-Raphson needs 20 instructions'))
+                    # Full Newton-Raphson unsigned 32-bit division.
+                    # Matches the exact sequence ptxas emits for div.u32 (sm_120).
+                    # Ground truth: cuobjdump verified against ptxas 13.0 output.
+                    d  = ctx.ra.r32(instr.dest.name)
+                    a  = ctx.ra.r32(instr.srcs[0].name)   # dividend
+                    b  = ctx.ra.r32(instr.srcs[1].name)   # divisor
+                    # Allocate 4 scratch GPRs and 3 scratch predicate registers
+                    t0 = ctx._next_gpr; ctx._next_gpr += 1
+                    t1 = ctx._next_gpr; ctx._next_gpr += 1
+                    t2 = ctx._next_gpr; ctx._next_gpr += 1
+                    t3 = ctx._next_gpr; ctx._next_gpr += 1
+                    pnz  = ctx._next_pred; ctx._next_pred += 1  # divisor != 0
+                    pge1 = ctx._next_pred; ctx._next_pred += 1  # first correction
+                    pge2 = ctx._next_pred; ctx._next_pred += 1  # second correction
+                    # Step 1: float approximation of reciprocal (round-up for conservative estimate)
+                    output.append(SassInstr(encode_i2f_u32_rp(t0, b),
+                        f'I2F.U32.RP R{t0}, R{b}  // div.u32 step 1: float(divisor)'))
+                    output.append(SassInstr(encode_isetp(pnz, b, RZ, ISETP_NE),
+                        f'ISETP.NE.U32 P{pnz}, PT, R{b}, RZ, PT  // P{pnz}=(divisor!=0)'))
+                    output.append(SassInstr(encode_mufu(t0, t0, MUFU_RCP),
+                        f'MUFU.RCP R{t0}, R{t0}  // t0 = 1/float(divisor)'))
+                    # Step 2: bias the reciprocal approximation toward the correct int
+                    output.append(SassInstr(encode_iadd3_imm32(t1, t0, 0x0ffffffe, RZ),
+                        f'IADD3 R{t1}, R{t0}, 0xffffffe, RZ  // bias rcp approx'))
+                    output.append(SassInstr(encode_f2i_ftz_u32_trunc(t2, t1),
+                        f'F2I.FTZ.U32.TRUNC R{t2}, R{t1}  // int approx of rcp'))
+                    output.append(SassInstr(encode_hfma2_zero(t1),
+                        f'HFMA2 R{t1}, -RZ, RZ, 0, 0  // zero R{t1}'))
+                    # Step 3: Newton-Raphson refinement via multiply-high
+                    output.append(SassInstr(encode_iadd3_neg_b4(t3, RZ, t2, RZ),
+                        f'IADD3 R{t3}, RZ, -R{t2}, RZ  // negate approx'))
+                    output.append(SassInstr(encode_imad(t3, t3, b, RZ),
+                        f'IMAD R{t3}, R{t3}, R{b}, RZ  // error term'))
+                    output.append(SassInstr(encode_imad_hi(t2, t2, t3, t1),
+                        f'IMAD.HI.U32 R{t2}, R{t2}, R{t3}, R{t1}  // refine estimate'))
+                    # Step 4: compute quotient approximation
+                    output.append(SassInstr(encode_imad_hi(d, t2, a, RZ),
+                        f'IMAD.HI.U32 R{d}, R{t2}, R{a}, RZ  // quotient approx'))
+                    # Step 5: compute remainder and apply correction(s)
+                    output.append(SassInstr(encode_iadd3_neg_b3(t3, d, RZ, RZ),
+                        f'IADD3 R{t3}, -R{d}, RZ, RZ  // negate quotient'))
+                    output.append(SassInstr(encode_imad(t3, b, t3, a),
+                        f'IMAD R{t3}, R{b}, R{t3}, R{a}  // remainder = a - d*b'))
+                    output.append(SassInstr(encode_isetp(pge1, t3, b, ISETP_GE),
+                        f'ISETP.GE.U32 P{pge1}, PT, R{t3}, R{b}, PT'))
+                    output.append(SassInstr(encode_iadd3_pred_neg_b4(t3, t3, b, RZ, pge1),
+                        f'@P{pge1} IADD3 R{t3}, R{t3}, -R{b}, RZ  // correction 1'))
+                    output.append(SassInstr(encode_iadd3_pred_small_imm(d, d, 1, RZ, pge1),
+                        f'@P{pge1} IADD3 R{d}, R{d}, 0x1, RZ  // correction 1'))
+                    output.append(SassInstr(encode_isetp(pge2, t3, b, ISETP_GE),
+                        f'ISETP.GE.U32 P{pge2}, PT, R{t3}, R{b}, PT'))
+                    output.append(SassInstr(encode_iadd3_pred_small_imm(d, d, 1, RZ, pge2),
+                        f'@P{pge2} IADD3 R{d}, R{d}, 0x1, RZ  // correction 2'))
+                    # Step 6: handle division by zero (result = 0xFFFFFFFF per CUDA spec)
+                    output.append(SassInstr(encode_lop3_pred(d, RZ, b, RZ, 0x33, pnz, inverted=True),
+                        f'@!P{pnz} LOP3.LUT R{d}, RZ, R{b}, RZ, 0x33  // div-by-zero: result=0xFFFFFFFF'))
 
                 elif op == 'div' and typ == 's32':
                     output.append(_nop(f'TODO: div.s32 (signed Newton-Raphson sequence, ~25 instructions)'))

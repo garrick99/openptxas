@@ -59,7 +59,10 @@ _OPCODE_META: dict[int, _OpMeta] = {
     0x202: _OpMeta('MOV',        0, 0x3e, 1),
     0x20c: _OpMeta('ISETP.RR',   0, 0x3e, 0),  # ISETP R-R: misc=0 (SM_120 predicate)
     0xc0c: _OpMeta('ISETP.RU',   0, 0x3e, 0),  # ISETP R-UR: misc=0 on SM_120
-    0x431: _OpMeta('S2R',        0, 0x31, 1),  # S2R opcode is 0x919; 0x431 entry kept for compat
+    0x431: _OpMeta('HFMA2',      1, 0x3e, 1),  # HFMA2 (half-precision FMA2, used as zero-init in div.u32)
+    0x810: _OpMeta('IADD3.IMM',  1, 0x3e, 1),  # IADD3 with 32-bit immediate operand
+    0x306: _OpMeta('I2F.U32.RP', 1, 0x3e, 1),  # I2F unsigned int to float, round toward +inf
+    0x305: _OpMeta('F2I.FTZ.U32',1, 0x3e, 1),  # F2I float to unsigned int, truncate
 }
 
 
@@ -109,8 +112,11 @@ _OPCODES_ALU = {
     0x806,        # VOTE.ANY
     # Matrix multiply (HMMA, IMMA)
     0x23c, 0x237,
-    # Miscellaneous
-    0x431,        # (existing, keep)
+    # Miscellaneous / div.u32 helpers
+    0x431,        # HFMA2 (zero-init trick)
+    0x810,        # IADD3 immediate form
+    0x306,        # I2F.U32.RP
+    0x305,        # F2I.FTZ.U32.TRUNC
 }
 # Note: IADD.64-UR (0xc35) uses wdep=0x3f (no tracking) + stall=1.
 # The 1-cycle stall ensures the result is ready for the subsequent LDG/STG.

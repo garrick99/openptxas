@@ -2116,6 +2116,37 @@ def encode_atomg_u32(dest: int, addr_base: int, offset: int, data: int,
 
 
 # ---------------------------------------------------------------------------
+# ATOMG.CAS — Atomic Compare-And-Swap (Global Memory)
+# ---------------------------------------------------------------------------
+# Opcode: 0xa9, 0x73  (opcode word = 0x3a9).
+# Ground truth probe (RTX 5090):
+#   atom.cas.b32 R5, [R4], R6, R7
+#   lo=a9 73 05 04 06 00 00 00  hi=07 e1 1e 00 00 a8 4e 00
+#   b2=dest(R5), b3=addr(R4), b4=compare(R6), b8=new_val(R7)
+#   b9=0xe1, b10=0x1e, b11=0x00 — fixed CAS modifiers
+#   ctrl=0x2754 → wdep=0x35(LDG slot), rbar=0x09, misc=4
+
+def encode_atomg_cas_b32(dest: int, addr: int, compare: int, new_val: int,
+                          ctrl: int = 0) -> bytes:
+    """Encode ATOMG.E.CAS.b32: atomic compare-and-swap on global memory.
+
+    Reads old = *addr; if old == compare: *addr = new_val; returns old.
+
+    Args:
+        dest:    Destination GPR (receives old value read from memory).
+        addr:    Address register (lo of 64-bit pair).
+        compare: Compare value register.
+        new_val: New value register (written if compare matches).
+        ctrl:    23-bit scheduling control word (0 = default).
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0xa9, 0x73,
+                  b2=dest, b3=addr, b4=compare,
+                  b8=new_val, b9=0xe1, b10=0x1e, b11=0x00,
+                  ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
 # POPC — Population Count (count set bits)
 # ---------------------------------------------------------------------------
 # Opcode: 0x09, 0x73.  Ground truth: POPC R13, R0 → 0x00000000000d7309

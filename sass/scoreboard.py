@@ -73,6 +73,7 @@ _OPCODE_META: dict[int, _OpMeta] = {
 
 # Opcode classification
 _OPCODES_LDG = {0x981}
+_OPCODES_ATOMG = {0x3a9}  # ATOMG.CAS (and future ATOMG variants with opcode 0x3a9)
 _OPCODES_LDC = {0xb82, 0x7ac, 0x919, 0x9c3}  # LDC, LDCU, S2R, S2UR
 _OPCODES_LDS = {0x984}
 _OPCODES_STG = {0x986}
@@ -156,6 +157,11 @@ def _get_src_regs(raw: bytes) -> set[int]:
     if opcode in _OPCODES_LDG:
         # LDG: src_addr at b3
         if raw[3] < 255: regs |= {raw[3], raw[3]+1}
+    elif opcode in _OPCODES_ATOMG:
+        # ATOMG.CAS: addr(b3, 64-bit pair), compare(b4), new_val(b8)
+        if raw[3] < 255: regs |= {raw[3], raw[3]+1}
+        if raw[4] < 255: regs.add(raw[4])
+        if raw[8] < 255: regs.add(raw[8])
     elif opcode in _OPCODES_STG:
         # STG: addr at b3, data at b4 (NOT b8 — b8 is UR descriptor)
         if raw[3] < 255: regs |= {raw[3], raw[3]+1}
@@ -217,6 +223,9 @@ def _get_dest_regs(raw: bytes) -> set[int]:
                 regs |= {dest+1, dest+2, dest+3}
             else:
                 regs.add(dest+1)  # default to 64-bit
+    elif opcode in _OPCODES_ATOMG:
+        # ATOMG.CAS: writes single dest (b2) — the old value read from memory
+        if dest < 255: regs.add(dest)
     elif opcode in _OPCODES_LDC:
         if dest < 255:
             regs.add(dest)
@@ -258,7 +267,7 @@ def _wdep_for_opcode(opcode: int, raw: bytes = None) -> int:
         return 0x31
     if opcode in _OPCODES_LDS:
         return 0x33
-    if opcode in _OPCODES_LDG:
+    if opcode in _OPCODES_LDG | _OPCODES_ATOMG:
         return 0x35
     if opcode in _OPCODES_IADD64_UR:
         return 0x3e  # ALU slot — consumer LDG/STG gets rbar via pending_writes
@@ -275,6 +284,7 @@ _OPCODE_MISC: dict[int, int] = {
     0x947: 0,   # BRA: misc=0
     0x94d: 5,   # EXIT: misc=5
     0x981: 6,   # LDG.E: misc=6
+    0x3a9: 4,   # ATOMG.CAS: misc=4 (from RTX 5090 probe 2026-03-27)
     0xc35: 5,   # IADD.64-UR: misc=5 (wide ALU result)
     0xc0c: 0,   # ISETP R-UR: misc=0 (SM_120: misc 1-12 → wrong predicate)
     0x20c: 0,   # ISETP R-R: misc=0 (same SM_120 predicate correctness requirement)
@@ -285,7 +295,7 @@ _ALL_KNOWN_OPCODES: frozenset = frozenset(
     _OPCODES_LDG | _OPCODES_LDC | _OPCODES_LDS |
     _OPCODES_STG | _OPCODES_STS | _OPCODES_BAR |
     _OPCODES_CTRL | _OPCODES_ALU | _OPCODES_IADD64_UR |
-    _OPCODES_SMEM_SETUP
+    _OPCODES_SMEM_SETUP | _OPCODES_ATOMG
 )
 
 
@@ -362,6 +372,10 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
 
         # STG needs rbar=0x03
         if opcode in _OPCODES_STG:
+            rbar = max(rbar, 0x03)
+
+        # ATOMG needs rbar=0x03 (memory ordering, same as STG)
+        if opcode in _OPCODES_ATOMG:
             rbar = max(rbar, 0x03)
 
         # LDCU consumers: any instruction using UR operands needs rbar for LDCU

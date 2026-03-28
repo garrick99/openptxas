@@ -1182,3 +1182,40 @@ def test_sad_u32_compiles():
                for off in range(0, len(text), 16)]
     assert 0x248 in opcodes, "VIMNMX (0x248) not found in sad.u32"
     assert 0x210 in opcodes, "IADD3 (0x210) not found in sad.u32"
+
+
+ATOM_CAS_KERNEL = """\
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry atom_cas_kernel(
+    .param .u64 ptr_param,
+    .param .u32 cmp_param,
+    .param .u32 val_param)
+{
+    .reg .u64 %rd<2>;
+    .reg .u32 %r<4>;
+    ld.param.u64 %rd0, [ptr_param];
+    ld.param.u32 %r0, [cmp_param+8];
+    ld.param.u32 %r1, [val_param+16];
+    atom.cas.b32 %r2, [%rd0], %r0, %r1;
+    st.global.u32 [%rd0], %r2;
+    ret;
+}
+"""
+
+
+def test_atom_cas_b32_compiles():
+    """atom.cas.b32 emits ATOMG.E.CAS (opcode 0x3a9); no TODO NOPs."""
+    results = compile_ptx_source(ATOM_CAS_KERNEL)
+    cubin = results['atom_cas_kernel']
+    assert cubin[:4] == b'\x7fELF'
+    elf = ELF64(cubin)
+    text = elf.section_data('.text.atom_cas_kernel')
+    opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
+               for off in range(0, len(text), 16)]
+    assert 0x3a9 in opcodes, f"ATOMG.CAS (0x3a9) not found; opcodes={[hex(o) for o in set(opcodes)]}"
+    last_real = max(i for i, op in enumerate(opcodes) if op != 0x918)
+    sched_nops = opcodes[:last_real].count(0x918)
+    assert sched_nops == 0, f"Scheduling NOPs ({sched_nops}) in atom.cas kernel (trailing padding is OK)"

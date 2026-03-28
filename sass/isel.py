@@ -65,6 +65,7 @@ from sass.encoding.sm_120_opcodes import (
     encode_popc, encode_brev, encode_flo, encode_iabs, encode_bfe_sext,
     encode_shfl, SHFL_IDX, SHFL_UP, SHFL_DOWN, SHFL_BFLY,
     encode_vote_ballot,
+    encode_atomg_cas_b32,
     encode_i2fp_u32, encode_f2i_u32,
     encode_f2f_f32_f64, encode_f2f_f64_f32,
     encode_f2i_s32_f64, encode_f2i_u32_f64, encode_i2f_f64_s32,
@@ -439,6 +440,24 @@ def _select_ld_global(instr: Instruction, ra: RegAlloc,
         d = ra.r32(dest.name)
         return [SassInstr(encode_ldg_e(d, ur_desc, addr, width=32),
                           f'LDG.E R{d}, desc[UR{ur_desc}][R{addr}.64]')]
+
+
+def _select_atom_cas(instr: Instruction, ra: RegAlloc,
+                     ctx: 'ISelContext' = None) -> list[SassInstr]:
+    """atom.cas.b32 → ATOMG.E.CAS.b32."""
+    from ptx.ir import MemOp
+    dest_op = instr.dest
+    addr_op = instr.srcs[0]
+    cmp_op  = instr.srcs[1]
+    new_op  = instr.srcs[2]
+    if not isinstance(addr_op, MemOp):
+        raise ISelError("atom.cas addr must be MemOp")
+    d   = ra.r32(dest_op.name)
+    addr = ra.lo(addr_op.base) if addr_op.base in ra.int_regs else RZ
+    cmp = ra.r32(cmp_op.name)
+    nv  = ra.r32(new_op.name)
+    return [SassInstr(encode_atomg_cas_b32(d, addr, cmp, nv),
+                      f'ATOMG.E.CAS.b32 R{d}, [R{addr}], R{cmp}, R{nv}')]
 
 
 def _select_st_global(instr: Instruction, ra: RegAlloc,
@@ -869,6 +888,9 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
 
                 elif op == 'st' and 'global' in instr.types:
                     output.extend(_select_st_global(instr, ctx.ra, ctx.ur_desc, ctx))
+
+                elif op == 'atom' and 'cas' in instr.types and 'b32' in instr.types:
+                    output.extend(_select_atom_cas(instr, ctx.ra, ctx))
 
                 elif op == 'ret':
                     output.append(SassInstr(encode_exit(ctrl=0x7f5), 'EXIT'))

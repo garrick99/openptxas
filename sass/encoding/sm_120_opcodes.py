@@ -2517,6 +2517,68 @@ def encode_f2f_f64_f32(dest: int, src: int, ctrl: int = 0) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# F2I / I2F — Float-to-integer / Integer-to-float conversions (F64 forms)
+# ---------------------------------------------------------------------------
+# Ground truth (ptxas sm_120):
+#
+# F2I.S32.F64 R7, R2  (cvt.rzi.s32.f64):
+#   b0=0x11, b1=0x73, b2=dest_r32, b4=src_f64_lo, b9=0xd1, b10=0x30, b11=0x00
+#   opcode & 0xFFF = 0x311
+#
+# F2I.U32.F64 R7, R2  (cvt.rzi.u32.f64):
+#   b0=0x11, b1=0x73, b2=dest_r32, b4=src_f64_lo, b9=0xd0, b10=0x30, b11=0x00
+#   Same opcode 0x311; b9[0]=0 unsigned, b9[0]=1 signed
+#
+# I2F.F64.S32 R4, R2  (cvt.rn.f64.s32):
+#   b0=0x12, b1=0x73, b2=dest_f64_lo, b4=src_r32, b9=0x1c, b10=0x20, b11=0x00
+#   opcode & 0xFFF = 0x312; dest writes pair (dest, dest+1)
+
+def encode_f2i_s32_f64(dest: int, src_lo: int, ctrl: int = 0) -> bytes:
+    """Encode F2I.S32.F64 dest, src_lo — convert f64 pair to signed int32.
+
+    src_lo is the lo register of the f64 source pair (src_lo+1 read implicitly).
+    dest is a single s32 GPR.
+
+    Ground truth: F2I.S32.F64 R7, R2 → b9=0xd1, b10=0x30
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x11, 0x73,
+                  b2=dest, b3=0x00, b4=src_lo,
+                  b8=0x00, b9=0xd1, b10=0x30, b11=0x00,
+                  ctrl=ctrl)
+
+
+def encode_f2i_u32_f64(dest: int, src_lo: int, ctrl: int = 0) -> bytes:
+    """Encode F2I.U32.F64 dest, src_lo — convert f64 pair to unsigned int32.
+
+    src_lo is the lo register of the f64 source pair (src_lo+1 read implicitly).
+    dest is a single u32 GPR.
+
+    Ground truth: F2I.U32.F64 R7, R2 → b9=0xd0, b10=0x30
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x11, 0x73,
+                  b2=dest, b3=0x00, b4=src_lo,
+                  b8=0x00, b9=0xd0, b10=0x30, b11=0x00,
+                  ctrl=ctrl)
+
+
+def encode_i2f_f64_s32(dest_lo: int, src: int, ctrl: int = 0) -> bytes:
+    """Encode I2F.F64.S32 dest_lo, src — convert signed int32 to f64 pair.
+
+    src is a single s32 GPR.
+    dest_lo is the lo register of the f64 destination pair (dest_lo+1 written implicitly).
+
+    Ground truth: I2F.F64.S32 R4, R2 → b9=0x1c, b10=0x20
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x12, 0x73,
+                  b2=dest_lo, b3=0x00, b4=src,
+                  b8=0x00, b9=0x1c, b10=0x20, b11=0x00,
+                  ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
 # HFMA2 — Half-precision FMA2 (used as zero-init trick in div.u32)
 # ---------------------------------------------------------------------------
 # HFMA2 R2, -RZ, RZ, 0, 0 computes (-0.0)*0.0 + 0.0 = 0.0 and zero-extends to int.

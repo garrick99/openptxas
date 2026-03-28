@@ -953,3 +953,163 @@ def test_cvt_u8_u32_compiles():
     opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
                for off in range(0, len(text), 16)]
     assert 0x212 in opcodes, "LOP3.LUT (0x212) not found in cvt.u8.u32"
+
+
+SQRT_RN_KERNEL = """\
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry sqrt_rn_kernel(
+    .param .u64 out_ptr,
+    .param .f32 val)
+{
+    .reg .f32 %f<2>;
+    .reg .b64 %rd<2>;
+    ld.param.f32 %f0, [val];
+    sqrt.rn.f32 %f1, %f0;
+    ld.param.u64 %rd0, [out_ptr];
+    st.global.f32 [%rd0], %f1;
+    ret;
+}
+"""
+
+RCP_RN_KERNEL = """\
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry rcp_rn_kernel(
+    .param .u64 out_ptr,
+    .param .f32 val)
+{
+    .reg .f32 %f<2>;
+    .reg .b64 %rd<2>;
+    ld.param.f32 %f0, [val];
+    rcp.rn.f32 %f1, %f0;
+    ld.param.u64 %rd0, [out_ptr];
+    st.global.f32 [%rd0], %f1;
+    ret;
+}
+"""
+
+
+def test_sqrt_rn_f32_compiles():
+    """sqrt.rn.f32 emits MUFU.SQRT (opcode 0x308)."""
+    results = compile_ptx_source(SQRT_RN_KERNEL)
+    cubin = results['sqrt_rn_kernel']
+    assert cubin[:4] == b'\x7fELF'
+    elf = ELF64(cubin)
+    text = elf.section_data('.text.sqrt_rn_kernel')
+    opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
+               for off in range(0, len(text), 16)]
+    assert 0x308 in opcodes, f"MUFU (0x308) not found in sqrt.rn.f32; got {[hex(o) for o in opcodes]}"
+
+
+def test_rcp_rn_f32_compiles():
+    """rcp.rn.f32 emits MUFU.RCP (opcode 0x308)."""
+    results = compile_ptx_source(RCP_RN_KERNEL)
+    cubin = results['rcp_rn_kernel']
+    assert cubin[:4] == b'\x7fELF'
+    elf = ELF64(cubin)
+    text = elf.section_data('.text.rcp_rn_kernel')
+    opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
+               for off in range(0, len(text), 16)]
+    assert 0x308 in opcodes, f"MUFU (0x308) not found in rcp.rn.f32; got {[hex(o) for o in opcodes]}"
+
+
+CVT_S32_F64_KERNEL = """\
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry cvt_s32_f64_kernel(
+    .param .u64 out_ptr,
+    .param .f64 val)
+{
+    .reg .s32 %r<2>;
+    .reg .f64 %fd<2>;
+    .reg .b64 %rd<2>;
+    ld.param.f64 %fd0, [val];
+    cvt.rzi.s32.f64 %r0, %fd0;
+    ld.param.u64 %rd0, [out_ptr];
+    st.global.s32 [%rd0], %r0;
+    ret;
+}
+"""
+
+CVT_U32_F64_KERNEL = """\
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry cvt_u32_f64_kernel(
+    .param .u64 out_ptr,
+    .param .f64 val)
+{
+    .reg .u32 %r<2>;
+    .reg .f64 %fd<2>;
+    .reg .b64 %rd<2>;
+    ld.param.f64 %fd0, [val];
+    cvt.rzi.u32.f64 %r0, %fd0;
+    ld.param.u64 %rd0, [out_ptr];
+    st.global.u32 [%rd0], %r0;
+    ret;
+}
+"""
+
+CVT_F64_S32_KERNEL = """\
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry cvt_f64_s32_kernel(
+    .param .u64 out_ptr,
+    .param .s32 val)
+{
+    .reg .s32 %r<2>;
+    .reg .f64 %fd<2>;
+    .reg .b64 %rd<2>;
+    ld.param.s32 %r0, [val];
+    cvt.rn.f64.s32 %fd0, %r0;
+    ld.param.u64 %rd0, [out_ptr];
+    st.global.f64 [%rd0], %fd0;
+    ret;
+}
+"""
+
+
+def test_cvt_s32_f64_compiles():
+    """cvt.rzi.s32.f64 emits F2I.S32.F64 (opcode 0x311)."""
+    results = compile_ptx_source(CVT_S32_F64_KERNEL)
+    cubin = results['cvt_s32_f64_kernel']
+    assert cubin[:4] == b'\x7fELF'
+    elf = ELF64(cubin)
+    text = elf.section_data('.text.cvt_s32_f64_kernel')
+    opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
+               for off in range(0, len(text), 16)]
+    assert 0x311 in opcodes, f"F2I.F64 (0x311) not found in cvt.rzi.s32.f64"
+
+
+def test_cvt_u32_f64_compiles():
+    """cvt.rzi.u32.f64 emits F2I.U32.F64 (opcode 0x311)."""
+    results = compile_ptx_source(CVT_U32_F64_KERNEL)
+    cubin = results['cvt_u32_f64_kernel']
+    assert cubin[:4] == b'\x7fELF'
+    elf = ELF64(cubin)
+    text = elf.section_data('.text.cvt_u32_f64_kernel')
+    opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
+               for off in range(0, len(text), 16)]
+    assert 0x311 in opcodes, f"F2I.F64 (0x311) not found in cvt.rzi.u32.f64"
+
+
+def test_cvt_f64_s32_compiles():
+    """cvt.rn.f64.s32 emits I2F.F64.S32 (opcode 0x312)."""
+    results = compile_ptx_source(CVT_F64_S32_KERNEL)
+    cubin = results['cvt_f64_s32_kernel']
+    assert cubin[:4] == b'\x7fELF'
+    elf = ELF64(cubin)
+    text = elf.section_data('.text.cvt_f64_s32_kernel')
+    opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
+               for off in range(0, len(text), 16)]
+    assert 0x312 in opcodes, f"I2F.F64 (0x312) not found in cvt.rn.f64.s32"

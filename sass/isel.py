@@ -67,6 +67,7 @@ from sass.encoding.sm_120_opcodes import (
     encode_vote_ballot,
     encode_i2fp_u32, encode_f2i_u32,
     encode_f2f_f32_f64, encode_f2f_f64_f32,
+    encode_f2i_s32_f64, encode_f2i_u32_f64, encode_i2f_f64_s32,
     encode_i2f_u32_rp, encode_i2f_s32_rp, encode_f2i_ftz_u32_trunc, encode_hfma2_zero,
     encode_iadd3_imm32, encode_iadd3_neg_b4, encode_iadd3_neg_b3,
     encode_iadd3_pred_neg_b4, encode_iadd3_pred_small_imm,
@@ -974,7 +975,8 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                     f'MOV R{d_lo}, R{s_r}  // cvt.s64.s32 lo'))
                         else:
                             # General 32-bit and float conversions
-                            _core = [t for t in instr.types if t not in ('rn','rz','rm','rp')]
+                            _ROUNDING = {'rn','rz','rm','rp','rni','rzi','rmi','rpi'}
+                            _core = [t for t in instr.types if t not in _ROUNDING]
                             _dst_t = _core[0] if _core else 'u32'
                             _src_t = _core[1] if len(_core) > 1 else 'u32'
                             _32B = {'u32', 's32', 'b32', 'f32'}
@@ -991,6 +993,24 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 a_r  = ctx.ra.r32(s.name)
                                 output.append(SassInstr(encode_f2f_f64_f32(d_lo, a_r),
                                                         f'F2F.F64.F32 R{d_lo}, R{a_r}'))
+                            elif _dst_t == 's32' and _src_t == 'f64':
+                                # cvt.rzi.s32.f64: double → signed int32
+                                d_r  = ctx.ra.r32(d.name)
+                                a_lo = ctx.ra.lo(s.name)
+                                output.append(SassInstr(encode_f2i_s32_f64(d_r, a_lo),
+                                                        f'F2I.S32.F64 R{d_r}, R{a_lo}'))
+                            elif _dst_t == 'u32' and _src_t == 'f64':
+                                # cvt.rzi.u32.f64: double → unsigned int32
+                                d_r  = ctx.ra.r32(d.name)
+                                a_lo = ctx.ra.lo(s.name)
+                                output.append(SassInstr(encode_f2i_u32_f64(d_r, a_lo),
+                                                        f'F2I.U32.F64 R{d_r}, R{a_lo}'))
+                            elif _dst_t == 'f64' and _src_t == 's32':
+                                # cvt.rn.f64.s32: signed int32 → double
+                                d_lo = ctx.ra.lo(d.name)
+                                a_r  = ctx.ra.r32(s.name)
+                                output.append(SassInstr(encode_i2f_f64_s32(d_lo, a_r),
+                                                        f'I2F.F64.S32 R{d_lo}, R{a_r}'))
                             elif 'f32' in _types_set and ('u32' in _types_set or 's32' in _types_set):
                                 d_r = ctx.ra.r32(d.name)
                                 a_r = ctx.ra.r32(s.name)
@@ -1717,13 +1737,13 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         encode_lop3_pred(d, RZ, b, RZ, 0x33, pnz, inverted=True),
                         f'@!P{pnz} LOP3.LUT R{d}, RZ, R{b}, RZ, 0x33  // rem-by-zero'))
 
-                elif op == 'rcp' and 'approx' in instr.types and typ == 'f32':
+                elif op == 'rcp' and any(m in instr.types for m in ('approx','rn','rz','rm','rp')) and typ == 'f32':
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
                     output.append(SassInstr(encode_mufu(d, a, MUFU_RCP),
                                             f'MUFU.RCP R{d}, R{a}'))
 
-                elif op == 'sqrt' and 'approx' in instr.types and typ == 'f32':
+                elif op == 'sqrt' and any(m in instr.types for m in ('approx','rn','rz','rm','rp')) and typ == 'f32':
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
                     output.append(SassInstr(encode_mufu(d, a, MUFU_SQRT),

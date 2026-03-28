@@ -68,8 +68,44 @@ _OPCODES_STG = {0x986}
 _OPCODES_STS = {0x988}
 _OPCODES_BAR = {0xb1d}
 _OPCODES_CTRL = {0x94d, 0x947, 0x918}  # EXIT, BRA, NOP
-_OPCODES_ALU = {0x819, 0x235, 0x210, 0x212, 0x221, 0x223, 0x202,
-                0x824, 0x825, 0x224, 0xc24, 0x23c, 0x237, 0x431, 0xc0c, 0x20c}
+_OPCODES_ALU = {
+    # Integer arithmetic
+    0x210,        # IADD3
+    0x235,        # IADD.64
+    0x202,        # IADD3.X (with carry)
+    0x224, 0xc24, # IMAD R-R, IMAD R-UR
+    0x824, 0x825, # IMAD.SHL.U32, IMAD.WIDE (imm)
+    0x227,        # IMAD.HI.U32
+    0x213,        # IABS
+    0x248, 0x848, # VIMNMX R-R, R-imm (integer min/max)
+    0x309, 0x301, # POPC, BREV
+    0x300,        # FLO
+    # Float arithmetic
+    0x221,        # FADD
+    0x223,        # FMUL / FFMA
+    0x209,        # FMNMX (float min/max)
+    0x308,        # MUFU (RCP, SQRT, SIN, COS, EX2, LG2)
+    # Type conversion
+    0x245,        # I2FP.F32.U32
+    0x305,        # F2I.U32
+    # Logic
+    0x212,        # LOP3.LUT
+    0x819,        # SHF (all variants: L/R, U32/U64/S32, HI/LO/W)
+    # Select / predicate
+    0x207,        # SEL
+    0x208,        # FSEL
+    0x20b,        # FSETP
+    0x20c,        # ISETP R-R
+    0xc0c,        # ISETP R-UR
+    # Permute / misc
+    0x816,        # PRMT
+    0x589, 0xf89, 0x989,  # SHFL (reg-reg, reg-imm, imm-imm)
+    0x806,        # VOTE.ANY
+    # Matrix multiply (HMMA, IMMA)
+    0x23c, 0x237,
+    # Miscellaneous
+    0x431,        # (existing, keep)
+}
 # Note: IADD.64-UR (0xc35) uses wdep=0x3f (no tracking) + stall=1.
 # The 1-cycle stall ensures the result is ready for the subsequent LDG/STG.
 _OPCODES_IADD64_UR = {0xc35}

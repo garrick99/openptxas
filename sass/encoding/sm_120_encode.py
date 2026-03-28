@@ -322,8 +322,10 @@ def encode_shf_l_u64_hi(dest: int, src0: int, k: int, src1: int,
 # Modifier bytes for right-shift variants:
 #   SHF.R.U64:     byte9=0x12, byte10=0x00   (SHF.L.U64.HI byte9 | 0x10)
 #   SHF.R.U32.HI:  byte9=0x16, byte10=0x01   (SHF.L.U32 byte9 | 0x10)
+#   SHF.R.S32.HI:  byte9=0x14, byte10=0x01   (arithmetic right shift; S32 type)
 _MODIFIER_SHF_R_U64      = (0x12, 0x00)
 _MODIFIER_SHF_R_U32_HI   = (0x16, 0x01)
+_MODIFIER_SHF_R_S32_HI   = (0x14, 0x01)
 
 
 def encode_shf_r_u32(dest: int, src0: int, k: int, src1: int,
@@ -453,6 +455,60 @@ def encode_shf_r_u32_hi_var(dest: int, src_hi: int, k_reg: int,
                           _MODIFIER_SHF_R_U32_HI[0],
                           _MODIFIER_SHF_R_U32_HI[1],
                           ctrl)
+
+
+def encode_shf_r_s32_hi(dest: int, src0: int, k: int,
+                         ctrl: int = 0) -> bytes:
+    """
+    Encode SHF.R.S32.HI dest, RZ, k, src0 (arithmetic right shift, constant) to 16 bytes.
+
+    Like SHF.R.U32.HI but sign-extends from the MSB (S32 type).
+    Used for shr.s32 with a constant shift amount.
+
+    Ground truth (ptxas 13.0, sm_120):
+        SHF.R.S32.HI R5, RZ, 4, R5 → 197805ff040000000514010000ca1f00
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_MAX_STALL
+    return _build_shf(dest, RZ, k, src0,
+                      _MODIFIER_SHF_R_S32_HI[0],
+                      _MODIFIER_SHF_R_S32_HI[1],
+                      0x00,
+                      ctrl)
+
+
+def encode_shf_r_s32_hi_var(dest: int, src_hi: int, k_reg: int,
+                              ctrl: int = 0) -> bytes:
+    """
+    Encode SHF.R.S32.HI dest, RZ, k_reg, src_hi (arithmetic right shift, variable) to 16 bytes.
+
+    NOTE: SHF.R.S32.HI var uses byte[0]=0x19 (not 0x99) and byte[11]=0x00 (not 0x08).
+    This differs from SHF.L.U32 var and SHF.R.U32.HI var.
+
+    Ground truth (ptxas 13.0, sm_120):
+        SHF.R.S32.HI R5, RZ, R5, R4 → 197205ff050000000414010000ca1f00
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_MAX_STALL
+    b13, b14, b15_ctrl = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0x19   # opcode low byte (same as constant-shift SHF)
+    raw[1] = 0x72   # opcode high byte (variable-shift variant, not 0x78)
+    raw[2] = dest   & 0xFF
+    raw[3] = RZ     & 0xFF   # src0 = RZ (lo word is zero for arithmetic shift)
+    raw[4] = k_reg  & 0xFF   # shift-amount register
+    raw[5] = 0x00
+    raw[6] = 0x00
+    raw[7] = 0x00
+    raw[8]  = src_hi & 0xFF  # the value being shifted
+    raw[9]  = _MODIFIER_SHF_R_S32_HI[0]   # 0x14
+    raw[10] = _MODIFIER_SHF_R_S32_HI[1]   # 0x01
+    raw[11] = 0x00   # no register-source flag (differs from U32 var which uses 0x08)
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15_ctrl
+    return bytes(raw)
 
 
 # ---------------------------------------------------------------------------

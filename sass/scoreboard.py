@@ -51,6 +51,7 @@ _OPCODE_META: dict[int, _OpMeta] = {
     0x825: _OpMeta('IMAD.HI',    1, 0x3e, 1),
     0x819: _OpMeta('SHF',        1, 0x3e, 1),
     0x299: _OpMeta('SHF.VAR',   1, 0x3e, 1),   # variable-shift SHF (opcode 0x7299)
+    0x219: _OpMeta('SHF.R.S32.HI.VAR', 1, 0x3e, 1),  # SHF.R.S32.HI variable-shift (shr.s32)
     0x221: _OpMeta('FADD',       1, 0x3e, 1),
     0x223: _OpMeta('FFMA',       1, 0x3e, 1),
     0x235: _OpMeta('IADD.64',    1, 0x3e, 1),
@@ -94,6 +95,7 @@ _OPCODES_ALU = {
     0x212,        # LOP3.LUT
     0x819,        # SHF (all variants: L/R, U32/U64/S32, HI/LO/W, constant shift)
     0x299,        # SHF.VAR (variable-shift SHF, shift amount in register)
+    0x219,        # SHF.R.S32.HI.VAR (arithmetic right shift, variable amount)
     # Select / predicate
     0x207,        # SEL
     0x208,        # FSEL

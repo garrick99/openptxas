@@ -75,6 +75,7 @@ from sass.encoding.sm_120_encode import (
     encode_shf_l_u64_hi,
     encode_shf_r_u32, encode_shf_r_u32_hi,
     encode_shf_l_u32_var, encode_shf_r_u32_hi_var,
+    encode_shf_r_s32_hi, encode_shf_r_s32_hi_var,
 )
 from sass.regalloc import RegAlloc
 
@@ -585,16 +586,23 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                 elif op == 'shr' and typ in ('b32', 'u32', 's32'):
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
+                    is_signed = (typ == 's32')
                     if isinstance(instr.srcs[1], ImmOp):
                         k = instr.srcs[1].value
-                        output.append(SassInstr(encode_shf_r_u32_hi(d, a, k),
-                                                f'SHF.R.U32.HI R{d}, RZ, 0x{k:x}, R{a}  // shr.{typ} {k}'))
+                        if is_signed:
+                            output.append(SassInstr(encode_shf_r_s32_hi(d, a, k),
+                                                    f'SHF.R.S32.HI R{d}, RZ, 0x{k:x}, R{a}  // shr.s32 {k}'))
+                        else:
+                            output.append(SassInstr(encode_shf_r_u32_hi(d, a, k),
+                                                    f'SHF.R.U32.HI R{d}, RZ, 0x{k:x}, R{a}  // shr.{typ} {k}'))
                     else:
                         k_reg = ctx.ra.r32(instr.srcs[1].name)
-                        output.append(SassInstr(encode_shf_r_u32_hi_var(d, a, k_reg),
-                                                f'SHF.R.U32.HI R{d}, RZ, R{k_reg}, R{a}  // shr.{typ} (var)'))
-                    # Note: shr.s32 (arithmetic right shift) would need SHF.R.S32.HI
-                    # which has different modifier bytes — not implemented yet.
+                        if is_signed:
+                            output.append(SassInstr(encode_shf_r_s32_hi_var(d, a, k_reg),
+                                                    f'SHF.R.S32.HI R{d}, RZ, R{k_reg}, R{a}  // shr.s32 (var)'))
+                        else:
+                            output.append(SassInstr(encode_shf_r_u32_hi_var(d, a, k_reg),
+                                                    f'SHF.R.U32.HI R{d}, RZ, R{k_reg}, R{a}  // shr.{typ} (var)'))
 
                 elif op == 'shr' and typ in ('u64',):
                     output.extend(_select_shr_u64(instr, ctx.ra))

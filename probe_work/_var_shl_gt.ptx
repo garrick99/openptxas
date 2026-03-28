@@ -1,0 +1,22 @@
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry var_shl(
+    .param .u64 out,
+    .param .u32 val,
+    .param .u32 shift)
+{
+    .reg .b32   %r<8>;
+    .reg .b64   %rd<4>;
+    ld.param.u32  %r0, [val];
+    ld.param.u32  %r1, [shift];
+    shl.b32       %r2, %r0, %r1;
+    shr.u32       %r3, %r0, %r1;
+    ld.param.u64  %rd0, [out];
+    cvt.u64.u32   %rd1, %r2;
+    cvt.u64.u32   %rd2, %r3;
+    st.global.u64 [%rd0], %rd1;
+    st.global.u64 [%rd0+8], %rd2;
+    ret;
+}

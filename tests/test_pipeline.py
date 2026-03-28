@@ -492,3 +492,38 @@ def test_cvt_s64_s32_compiles():
                for off in range(0, len(text), 16)]
     # SHF.R.U32.HI (0x819) must appear for sign-bit extraction
     assert 0x819 in opcodes, "SHF not found — cvt.s64.s32 sign-extend missing"
+
+
+SHR_S32_KERNEL = """\
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry shr_s32_kernel(
+    .param .s32 a,
+    .param .u32 shift,
+    .param .u64 out)
+{
+    .reg .s32   %r<4>;
+    .reg .u32   %r4;
+    .reg .u64   %rd<2>;
+    ld.param.s32    %r0, [a];
+    ld.param.u32    %r4, [shift];
+    shr.s32         %r1, %r0, %r4;
+    ld.param.u64    %rd0, [out];
+    st.global.s32   [%rd0], %r1;
+    ret;
+}
+"""
+
+
+def test_shr_s32_var_compiles():
+    """shr.s32 with register shift uses SHF.R.S32.HI (opcode 0x219), not TODO NOP."""
+    results = compile_ptx_source(SHR_S32_KERNEL)
+    cubin = results['shr_s32_kernel']
+    assert cubin[:4] == b'\x7fELF'
+    elf = ELF64(cubin)
+    text = elf.section_data('.text.shr_s32_kernel')
+    opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
+               for off in range(0, len(text), 16)]
+    assert 0x219 in opcodes, "SHF.R.S32.HI.VAR not found — shr.s32 emitted NOP"

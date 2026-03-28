@@ -1176,6 +1176,40 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     else:
                         output.append(_nop(f'TODO: setp {instr}'))
 
+                elif op == 'testp' and 'finite' in instr.types and 'f32' in instr.types:
+                    # testp.finite.f32 p, f:
+                    #   p = isfinite(f) = (f_bits & 0x7F800000) < 0x7F800000
+                    # Lowering (4 instructions):
+                    #   R_mask = 0x7F800000         (IADD3_IMM)
+                    #   R_abs  = f_bits & R_mask    (LOP3.AND)
+                    #   UR_thr = 0x7F800000         (LDCU.32 from literal pool)
+                    #   p      = (R_abs < UR_thr)   (ISETP.LT.U32.AND R-UR)
+                    pred   = instr.dest
+                    f_op   = instr.srcs[0]
+                    pd = ctx.ra.pred(pred.name) if pred.name in ctx.ra.pred_regs else 0
+                    emit_pd = pd
+                    if pd > 0 and ctx:
+                        emit_pd = 0
+                        ctx.ra.pred_regs[pred.name] = 0
+                    f_reg = ctx.ra.r32(f_op.name)
+                    R_mask = ctx._next_gpr; ctx._next_gpr += 1
+                    R_abs  = ctx._next_gpr; ctx._next_gpr += 1
+                    FINITE_MASK = 0x7F800000
+                    output.append(SassInstr(
+                        encode_iadd3_imm32(R_mask, RZ, FINITE_MASK, RZ),
+                        f'MOV R{R_mask}, 0x7f800000  // testp.finite mask'))
+                    output.append(SassInstr(
+                        encode_lop3(R_abs, f_reg, R_mask, RZ, LOP3_AND),
+                        f'LOP3.AND R{R_abs}, R{f_reg}, R{R_mask}, RZ  // testp.finite & exp mask'))
+                    lit_off = ctx._alloc_literal(FINITE_MASK)
+                    ur_thr  = ctx._next_ur; ctx._next_ur += 1
+                    output.append(SassInstr(
+                        encode_ldcu_32(ur_thr, 0, lit_off),
+                        f'LDCU.32 UR{ur_thr}, c[0][0x{lit_off:x}]  // testp.finite threshold'))
+                    output.append(SassInstr(
+                        encode_isetp_ur(emit_pd, R_abs, ur_thr, cmp=ISETP_LT),
+                        f'ISETP.LT.U32.AND P{emit_pd}, PT, R{R_abs}, UR{ur_thr}, PT  // testp.finite'))
+
                 elif op == 'neg' and typ in ('s32', 'u32'):
                     # neg: IADD3 with src0=RZ, src1=src, negate_src1
                     # dest = 0 - src
@@ -1209,11 +1243,20 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
 
                 elif op == 'selp':
                     d = ctx.ra.r32(instr.dest.name)
-                    a = ctx.ra.r32(instr.srcs[0].name)
-                    b = ctx.ra.r32(instr.srcs[1].name)
                     pd = 0
                     if len(instr.srcs) > 2 and isinstance(instr.srcs[2], RegOp):
                         pd = ctx.ra.pred(instr.srcs[2].name) if instr.srcs[2].name in ctx.ra.pred_regs else 0
+                    def _sel_src(src_op, out):
+                        if isinstance(src_op, RegOp):
+                            return ctx.ra.r32(src_op.name)
+                        elif isinstance(src_op, ImmOp):
+                            t = ctx._next_gpr; ctx._next_gpr += 1
+                            out.append(SassInstr(encode_iadd3_imm32(t, RZ, src_op.value & 0xFFFFFFFF, RZ),
+                                                 f'MOV R{t}, {src_op.value}  // selp imm'))
+                            return t
+                        return RZ
+                    a = _sel_src(instr.srcs[0], output)
+                    b = _sel_src(instr.srcs[1], output)
                     output.append(SassInstr(encode_sel(d, a, b, pd),
                                             f'SEL R{d}, R{a}, R{b}, P{pd}  // selp'))
 

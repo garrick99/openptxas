@@ -1219,3 +1219,78 @@ def test_atom_cas_b32_compiles():
     last_real = max(i for i, op in enumerate(opcodes) if op != 0x918)
     sched_nops = opcodes[:last_real].count(0x918)
     assert sched_nops == 0, f"Scheduling NOPs ({sched_nops}) in atom.cas kernel (trailing padding is OK)"
+
+
+SELP_IMM_KERNEL = """\
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry selp_imm_kernel(
+    .param .u64 out_ptr,
+    .param .u32 thresh)
+{
+    .reg .u32 %r<4>;
+    .reg .u64 %rd<2>;
+    .reg .pred %p<1>;
+    ld.param.u32 %r0, [thresh];
+    setp.lt.u32 %p0, %r0, 100;
+    selp.u32 %r1, 1, 0, %p0;
+    ld.param.u64 %rd0, [out_ptr+8];
+    st.global.u32 [%rd0], %r1;
+    ret;
+}
+"""
+
+
+def test_selp_imm_compiles():
+    """selp with immediate sources materializes via IADD3_IMM; emits SEL (0x207)."""
+    results = compile_ptx_source(SELP_IMM_KERNEL)
+    cubin = results['selp_imm_kernel']
+    assert cubin[:4] == b'\x7fELF'
+    elf = ELF64(cubin)
+    text = elf.section_data('.text.selp_imm_kernel')
+    opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
+               for off in range(0, len(text), 16)]
+    assert 0x207 in opcodes, f"SEL (0x207) not found; opcodes={[hex(o) for o in set(opcodes)]}"
+    assert 0x810 in opcodes, f"IADD3_IMM (0x810) not found (immediate materialization)"
+
+
+TESTP_FINITE_KERNEL = """\
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry testp_finite_kernel(
+    .param .u64 out_ptr,
+    .param .f32 val)
+{
+    .reg .f32 %f<2>;
+    .reg .u32 %r<2>;
+    .reg .u64 %rd<2>;
+    .reg .pred %p<1>;
+    ld.param.f32 %f0, [val];
+    testp.finite.f32 %p0, %f0;
+    selp.u32 %r0, 1, 0, %p0;
+    ld.param.u64 %rd0, [out_ptr+8];
+    st.global.u32 [%rd0], %r0;
+    ret;
+}
+"""
+
+
+def test_testp_finite_f32_compiles():
+    """testp.finite.f32 emits IADD3_IMM+LOP3+LDCU+ISETP; no TODO NOPs."""
+    results = compile_ptx_source(TESTP_FINITE_KERNEL)
+    cubin = results['testp_finite_kernel']
+    assert cubin[:4] == b'\x7fELF'
+    elf = ELF64(cubin)
+    text = elf.section_data('.text.testp_finite_kernel')
+    opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
+               for off in range(0, len(text), 16)]
+    assert 0x810 in opcodes, "IADD3_IMM (0x810) not found in testp.finite"
+    assert 0x212 in opcodes, "LOP3 (0x212) not found in testp.finite"
+    assert 0xc0c in opcodes, "ISETP.R-UR (0xc0c) not found in testp.finite"
+    last_real = max(i for i, op in enumerate(opcodes) if op != 0x918)
+    sched_nops = opcodes[:last_real].count(0x918)
+    assert sched_nops <= 2, f"Too many scheduling NOPs ({sched_nops}) in testp.finite kernel"

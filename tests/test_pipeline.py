@@ -166,3 +166,65 @@ def test_program_headers():
     cubin = results["simple_add"]
     e_phnum = struct.unpack_from('<H', cubin, 56)[0]
     assert e_phnum >= 2, f"Expected >=2 program headers, got {e_phnum}"
+
+
+# ---------------------------------------------------------------------------
+# Literal pool tests
+# ---------------------------------------------------------------------------
+
+IMM_KERNEL = """\
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry imm_kernel(
+    .param .u64 out,
+    .param .u32 n)
+{
+    .reg .b32   %r<4>;
+    .reg .b64   %rd<2>;
+    .reg .pred  %p0;
+    mov.u32     %r0, 42;
+    setp.lt.u32 %p0, %r0, 100;
+    ld.param.u64 %rd0, [out];
+    @!%p0 st.global.u32 [%rd0], %r0;
+    ret;
+}
+"""
+
+
+def test_mov_immediate_compiles():
+    """mov.u32 with immediate literal compiles to LDC (not a TODO NOP)."""
+    results = compile_ptx_source(IMM_KERNEL)
+    cubin = results["imm_kernel"]
+    elf = ELF64(cubin)
+    text = elf.section_data('.text.imm_kernel')
+    opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
+               for off in range(0, len(text), 16)]
+    # LDC opcode 0xb82 must appear in body (beyond preamble LDC at offset 0)
+    ldc_count = opcodes.count(0xb82)
+    assert ldc_count >= 2, f"Expected >=2 LDC instructions (preamble + literal), got {ldc_count}"
+
+
+def test_mov_immediate_bakes_constant():
+    """.nv.constant0 contains the literal 42 (0x2a) at the pool offset."""
+    results = compile_ptx_source(IMM_KERNEL)
+    cubin = results["imm_kernel"]
+    elf = ELF64(cubin)
+    const0 = elf.section_data('.nv.constant0.imm_kernel')
+    # 42 should appear as a 4-byte LE word somewhere in the constant bank
+    assert b'\x2a\x00\x00\x00' in const0, "Literal 42 not found in constant bank"
+
+
+def test_setp_immediate_compiles():
+    """setp.lt.u32 with immediate 100 compiles to LDCU.32 + ISETP R-UR."""
+    results = compile_ptx_source(IMM_KERNEL)
+    cubin = results["imm_kernel"]
+    elf = ELF64(cubin)
+    text = elf.section_data('.text.imm_kernel')
+    opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
+               for off in range(0, len(text), 16)]
+    # ISETP R-UR opcode 0xc0c must appear
+    assert 0xc0c in opcodes, "ISETP R-UR (0xc0c) not found — setp with immediate failed"
+    # LDCU.32 opcode 0x7ac must appear (at least one for setp imm, possibly more for params)
+    assert 0x7ac in opcodes, "LDCU.32 (0x7ac) not found — setp immediate literal load missing"

@@ -370,10 +370,23 @@ def compile_function(fn: Function, verbose: bool = False) -> bytes:
         'LDCU.64 UR4, c[0][0x358]  // mem desc')
 
     # 3. Instruction selection
+    # Compute literal pool base: after the last param in c[0], 4-byte aligned.
+    if alloc.param_offsets:
+        # Build a name→size map from fn.params, then find the highest param end.
+        param_size_map = {p.name: (8 if p.type.width >= 64 else 4) for p in fn.params}
+        last_param_end = max(
+            off + param_size_map.get(name, 4)
+            for name, off in alloc.param_offsets.items()
+        )
+    else:
+        last_param_end = 0x380
+    lit_pool_base = (last_param_end + 3) & ~3  # 4-byte align
+
     ctx = ISelContext(
         ra=alloc.ra,
         param_offsets=alloc.param_offsets,
         ur_desc=4,  # UR4 for memory descriptors (ptxas convention)
+        _const_pool_base=lit_pool_base,
     )
     body_instrs = select_function(fn, ctx)
 
@@ -525,9 +538,21 @@ def compile_function(fn: Function, verbose: bool = False) -> bytes:
             param_sizes.append(p.type.width // 8)
 
     # 5. Emit cubin
-    # Compute constant bank size: param_base + sum of all param sizes, rounded up to 4
+    # Compute constant bank size: param area + literal pool
     total_param_bytes = sum(param_sizes)
-    const0_size = ((0x380 + total_param_bytes + 3) // 4) * 4  # 4-byte aligned
+    param_area_end = ((0x380 + total_param_bytes + 3) // 4) * 4
+    # Add literal pool entries (4 bytes each)
+    lit_pool_bytes = len(ctx._const_pool) * 4
+    const0_size = ((param_area_end + lit_pool_bytes + 3) // 4) * 4
+
+    # Build const0 init data: zeros throughout, literal values at pool offsets
+    const0_init: bytearray | None = None
+    if ctx._const_pool:
+        import struct as _struct
+        const0_init = bytearray(const0_size)
+        for value, offset in ctx._const_pool.items():
+            _struct.pack_into('<I', const0_init, offset, value & 0xFFFFFFFF)
+        const0_init = bytes(const0_init)
 
     # Find EXIT and S2R instruction offsets in the SASS byte stream
     exit_offset = 0
@@ -557,6 +582,7 @@ def compile_function(fn: Function, verbose: bool = False) -> bytes:
         param_sizes=param_sizes,
         param_offsets=alloc.param_offsets,
         const0_size=const0_size,
+        const0_init_data=const0_init,
         exit_offset=exit_offset,
         s2r_offset=s2r_offset,
     )

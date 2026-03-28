@@ -483,6 +483,22 @@ class ISelContext:
     _reg_sr_source: dict[str, int] = field(default_factory=dict)
     # Map PTX register name → UR index (u32 params loaded via LDCU.32 for ISETP R-UR)
     _ur_for_param:  dict[str, int] = field(default_factory=dict)
+    # Literal constant pool: value → c[0] byte offset (baked into .nv.constant0)
+    # Base offset is set by the pipeline after regalloc (after the param area ends).
+    _const_pool_base: int = 0
+    _const_pool:      dict[int, int] = field(default_factory=dict)
+
+    def _alloc_literal(self, value: int) -> int:
+        """Return the c[0] byte offset for a 32-bit literal constant.
+
+        Allocates a new slot in the literal pool if the value has not been
+        seen before.  Slots are 4 bytes each.
+        """
+        value = value & 0xFFFFFFFF  # normalise to u32 bit pattern
+        if value not in self._const_pool:
+            offset = self._const_pool_base + len(self._const_pool) * 4
+            self._const_pool[value] = offset
+        return self._const_pool[value]
 
 
 def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
@@ -511,6 +527,14 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
 
             try:
                 if op == 'mov' and typ in ('u32', 's32', 'b32', 'u64', 's64', 'b64'):
+                    # Immediate source: load from literal pool in constant bank
+                    if isinstance(instr.srcs[0], ImmOp) and typ in ('u32', 's32', 'b32'):
+                        d = ctx.ra.r32(instr.dest.name)
+                        imm = instr.srcs[0].value & 0xFFFFFFFF
+                        lit_off = ctx._alloc_literal(imm)
+                        output.append(SassInstr(encode_ldc(d, 0, lit_off),
+                                                f'LDC R{d}, c[0][0x{lit_off:x}]  // mov imm={imm:#x}'))
+                        continue
                     # Track special register sources
                     if (isinstance(instr.srcs[0], RegOp) and
                         instr.srcs[0].name in _SPECIAL_REGS and
@@ -820,9 +844,25 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                     output.append(SassInstr(
                                         encode_isetp(pd, ar, br, cmp=isetp_cmp),
                                         f'ISETP.{cmp_name.upper()}.U32.AND P{pd}, PT, R{ar}, R{br}, PT'))
+                            elif isinstance(b, ImmOp):
+                                # Immediate src1: load via literal pool into UR,
+                                # then use ISETP R-UR (verified path on SM_120).
+                                imm_val = b.value & 0xFFFFFFFF
+                                lit_off = ctx._alloc_literal(imm_val)
+                                emit_pd = pd
+                                if pd > 0 and ctx:
+                                    emit_pd = 0
+                                    ctx.ra.pred_regs[pred.name] = 0
+                                ur_tmp = ctx._next_ur
+                                ctx._next_ur += 1
+                                output.append(SassInstr(
+                                    encode_ldcu_32(ur_tmp, 0, lit_off),
+                                    f'LDCU.32 UR{ur_tmp}, c[0][0x{lit_off:x}]  // setp imm={imm_val:#x}'))
+                                output.append(SassInstr(
+                                    encode_isetp_ur(emit_pd, ar, ur_tmp, cmp=isetp_cmp),
+                                    f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, UR{ur_tmp}, PT'))
                             else:
-                                br = b.value if isinstance(b, ImmOp) else 0
-                                output.append(_nop(f'TODO: setp with immediate {br}'))
+                                output.append(_nop(f'TODO: setp with non-register src1'))
                     else:
                         output.append(_nop(f'TODO: setp {instr}'))
 
@@ -1093,15 +1133,6 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                                     f'F2I.U32 R{d}, R{a}  // cvt'))
                     else:
                         output.append(_nop(f'TODO: cvt {".".join(instr.types)}'))
-
-                elif op == 'mov' and typ in ('u32', 's32', 'b32'):
-                    d = ctx.ra.r32(instr.dest.name)
-                    if isinstance(instr.srcs[0], RegOp):
-                        a = ctx.ra.r32(instr.srcs[0].name)
-                        output.append(SassInstr(encode_iadd3(d, a, RZ, RZ),
-                                                f'MOV R{d}, R{a}'))
-                    else:
-                        output.append(_nop(f'TODO: mov with immediate'))
 
                 else:
                     # Unsupported instruction: emit NOP with comment

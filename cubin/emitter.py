@@ -274,6 +274,7 @@ class KernelDesc:
     param_offsets: dict[str, int]
     param_base: int = 0x380
     const0_size: int = 0x390  # default, overridden by pipeline based on params
+    const0_init_data: bytes | None = None  # if set, used verbatim for .nv.constant0; else zeros
     exit_offset: int = 0x10  # byte offset of EXIT instruction in .text
     s2r_offset: int = 0x10  # byte offset of first S2R instruction in .text
     smem_size: int = 0           # static shared memory size in bytes (0 = none)
@@ -307,7 +308,13 @@ def emit_cubin(kernel: KernelDesc) -> bytes:
     if not exit_offsets:
         exit_offsets = [kernel.exit_offset]  # fallback
 
-    const0_data = b'\x00' * kernel.const0_size
+    if kernel.const0_init_data is not None:
+        # Literal pool baked in; pad/trim to the declared size
+        raw = bytearray(kernel.const0_size)
+        raw[:len(kernel.const0_init_data)] = kernel.const0_init_data[:kernel.const0_size]
+        const0_data = bytes(raw)
+    else:
+        const0_data = b'\x00' * kernel.const0_size
     shared_reserved = b''  # NOBITS: no file content, but 64 bytes virtual
 
     # Section data

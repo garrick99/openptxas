@@ -517,6 +517,42 @@ SHR_S32_KERNEL = """\
 """
 
 
+PRMT_REG_KERNEL = """\
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry prmt_reg_kernel(
+    .param .u32 a,
+    .param .u32 b,
+    .param .u32 sel,
+    .param .u64 out)
+{
+    .reg .u32   %r<8>;
+    .reg .u64   %rd<2>;
+    ld.param.u32    %r0, [a];
+    ld.param.u32    %r1, [b];
+    ld.param.u32    %r2, [sel];
+    prmt.b32        %r3, %r0, %r1, %r2;
+    ld.param.u64    %rd0, [out];
+    st.global.u32   [%rd0], %r3;
+    ret;
+}
+"""
+
+
+def test_prmt_reg_sel_compiles():
+    """prmt.b32 with register selector uses PRMT.REG (opcode 0x216), not TODO NOP."""
+    results = compile_ptx_source(PRMT_REG_KERNEL)
+    cubin = results['prmt_reg_kernel']
+    assert cubin[:4] == b'\x7fELF'
+    elf = ELF64(cubin)
+    text = elf.section_data('.text.prmt_reg_kernel')
+    opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
+               for off in range(0, len(text), 16)]
+    assert 0x216 in opcodes, "PRMT.REG not found — prmt with register selector emitted NOP"
+
+
 def test_shr_s32_var_compiles():
     """shr.s32 with register shift uses SHF.R.S32.HI (opcode 0x219), not TODO NOP."""
     results = compile_ptx_source(SHR_S32_KERNEL)

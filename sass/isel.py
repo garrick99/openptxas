@@ -60,7 +60,7 @@ from sass.encoding.sm_120_opcodes import (
     encode_sel, encode_fsel,
     encode_vimnmx_s32, encode_vimnmx_u32,
     encode_fmnmx,
-    encode_prmt,
+    encode_prmt, encode_prmt_reg,
     encode_popc, encode_brev, encode_flo, encode_iabs,
     encode_shfl, SHFL_IDX, SHFL_UP, SHFL_DOWN, SHFL_BFLY,
     encode_vote_ballot,
@@ -1260,12 +1260,25 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
                     if isinstance(instr.srcs[1], ImmOp):
+                        # prmt d, a, sel_imm, c  (selector is 2nd arg, immediate)
                         sel = instr.srcs[1].value
                         c = ctx.ra.r32(instr.srcs[2].name) if len(instr.srcs) > 2 else RZ
                         output.append(SassInstr(encode_prmt(d, a, sel, c),
                                                 f'PRMT R{d}, R{a}, 0x{sel:04x}, R{c}'))
+                    elif len(instr.srcs) >= 3 and isinstance(instr.srcs[2], ImmOp):
+                        # prmt d, a, b, sel_imm  (selector is last arg, immediate)
+                        b = ctx.ra.r32(instr.srcs[1].name)
+                        sel = instr.srcs[2].value
+                        output.append(SassInstr(encode_prmt(d, a, sel, b),
+                                                f'PRMT R{d}, R{a}, 0x{sel:04x}, R{b}'))
+                    elif len(instr.srcs) >= 3:
+                        # prmt d, a, b, sel_reg  (all register operands)
+                        b = ctx.ra.r32(instr.srcs[1].name)
+                        sel_r = ctx.ra.r32(instr.srcs[2].name)
+                        output.append(SassInstr(encode_prmt_reg(d, a, b, sel_r),
+                                                f'PRMT.REG R{d}, R{a}, R{b}, R{sel_r}'))
                     else:
-                        output.append(_nop(f'TODO: prmt with register selector'))
+                        output.append(_nop(f'TODO: prmt with unsupported operands'))
 
                 elif op == 'bfe' and typ == 'u32':
                     # Bit field extract: dest = (src >> start) & ((1<<length)-1)

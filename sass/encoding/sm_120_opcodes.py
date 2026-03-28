@@ -1900,19 +1900,26 @@ def encode_sel(dest: int, src0: int, src1: int, pred: int = 0,
 # ---------------------------------------------------------------------------
 # PRMT — Byte Permute
 # ---------------------------------------------------------------------------
-# Opcode: 0x16, 0x78 (immediate selector).
-# Ground truth: PRMT R21, R4, 0x3210, R5 → 0x0000321004157816 / 0x040fe20000000005
-# b2=dest, b3=src0, b4-b7=immediate selector, b8=src1.
+# Immediate-selector PRMT: opcode 0x16, 0x74 → opc=0x416
+# Register-selector PRMT:  opcode 0x16, 0x72 → opc=0x216
+#
+# Field layout (immediate): b2=dest, b3=src0(a), b4-b7=selector_imm, b8=src1(b)
+# Field layout (register):  b2=dest, b3=src1(b), b4=sel_reg, b8=src0(a)
+#   (a and b swap positions between immediate and register variants)
+#
+# Ground truth (ptxas 13.0, sm_120):
+#   PRMT R5, R4, 0x3210, R5 → 16740504103200000500000000ca1f00  (opc=0x416)
+#   PRMT R5, R4, R0, R5     → 16720504000000000500000000ca1f00  (opc=0x216)
 
 def encode_prmt(dest: int, src0: int, selector: int, src1: int,
                 ctrl: int = 0) -> bytes:
-    """Encode PRMT dest, src0, selector_imm, src1."""
+    """Encode PRMT dest, src0, selector_imm, src1 (immediate selector, opc=0x416)."""
     if ctrl == 0:
         ctrl = _CTRL_DEFAULT
     b13, b14, b15 = _ctrl_to_bytes(ctrl)
     raw = bytearray(16)
     raw[0]  = 0x16
-    raw[1]  = 0x78
+    raw[1]  = 0x74   # constant-selector variant (not 0x78 which is for SHF)
     raw[2]  = dest & 0xFF
     raw[3]  = src0 & 0xFF
     raw[4]  = selector & 0xFF
@@ -1920,6 +1927,41 @@ def encode_prmt(dest: int, src0: int, selector: int, src1: int,
     raw[6]  = (selector >> 16) & 0xFF
     raw[7]  = (selector >> 24) & 0xFF
     raw[8]  = src1 & 0xFF
+    raw[9]  = 0x00
+    raw[10] = 0x00
+    raw[11] = 0x00
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+def encode_prmt_reg(dest: int, src0: int, src1: int, sel_reg: int,
+                    ctrl: int = 0) -> bytes:
+    """Encode PRMT dest, src0, src1, sel_reg (register selector, opc=0x216).
+
+    NOTE: src0 and src1 swap positions relative to immediate-selector PRMT:
+      byte[3] = src1 (second data source)
+      byte[4] = sel_reg (selector register)
+      byte[8] = src0 (first data source)
+
+    Ground truth:
+      PRMT R5, R4, R5, R0 → 16720504000000000500000000ca1f00
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0]  = 0x16
+    raw[1]  = 0x72   # register-selector variant
+    raw[2]  = dest   & 0xFF
+    raw[3]  = src1   & 0xFF   # second data source (swapped!)
+    raw[4]  = sel_reg & 0xFF  # selector register
+    raw[5]  = 0x00
+    raw[6]  = 0x00
+    raw[7]  = 0x00
+    raw[8]  = src0   & 0xFF   # first data source (swapped!)
     raw[9]  = 0x00
     raw[10] = 0x00
     raw[11] = 0x00

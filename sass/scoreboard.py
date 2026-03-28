@@ -103,7 +103,8 @@ _OPCODES_ALU = {
     0x20c,        # ISETP R-R
     0xc0c,        # ISETP R-UR
     # Permute / misc
-    0x816,        # PRMT
+    0x416,        # PRMT (immediate selector, opc=0x416)
+    0x216,        # PRMT.REG (register selector, opc=0x216)
     0x589, 0xf89, 0x989,  # SHFL (reg-reg, reg-imm, imm-imm)
     0x806,        # VOTE.ANY
     # Matrix multiply (HMMA, IMMA)

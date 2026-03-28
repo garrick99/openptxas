@@ -62,7 +62,7 @@ from sass.encoding.sm_120_opcodes import (
     encode_vimnmx_s32, encode_vimnmx_u32,
     encode_fmnmx,
     encode_prmt, encode_prmt_reg,
-    encode_popc, encode_brev, encode_flo, encode_iabs,
+    encode_popc, encode_brev, encode_flo, encode_iabs, encode_bfe_sext,
     encode_shfl, SHFL_IDX, SHFL_UP, SHFL_DOWN, SHFL_BFLY,
     encode_vote_ballot,
     encode_i2fp_u32, encode_f2i_u32,
@@ -1219,6 +1219,25 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         output.append(SassInstr(encode_vimnmx_s32(d, a, b, is_max=True),
                             f'VIMNMX.S32 R{d}, R{a}, R{b}, !PT  // max.{typ}'))
 
+                elif op == 'sad' and typ in ('u32', 's32'):
+                    # sad.u32 d, a, b, c  →  d = |a - b| + c
+                    # VIMNMX.MAX t0, a, b
+                    # VIMNMX.MIN t1, a, b
+                    # IADD3 d, t0, -t1, c  (d = max - min + c = |a-b| + c)
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = ctx.ra.r32(instr.srcs[0].name)
+                    b = ctx.ra.r32(instr.srcs[1].name)
+                    c = ctx.ra.r32(instr.srcs[2].name) if len(instr.srcs) > 2 and isinstance(instr.srcs[2], RegOp) else RZ
+                    t_max = ctx._next_gpr; ctx._next_gpr += 1
+                    t_min = ctx._next_gpr; ctx._next_gpr += 1
+                    is_signed = typ == 's32'
+                    output.append(SassInstr(encode_vimnmx_s32(t_max, a, b, is_max=True) if is_signed else encode_vimnmx_u32(t_max, a, b, is_max=True),
+                                            f'VIMNMX.{"S" if is_signed else "U"}32 R{t_max}, R{a}, R{b}  // sad max'))
+                    output.append(SassInstr(encode_vimnmx_s32(t_min, a, b, is_max=False) if is_signed else encode_vimnmx_u32(t_min, a, b, is_max=False),
+                                            f'VIMNMX.{"S" if is_signed else "U"}32 R{t_min}, R{a}, R{b}  // sad min'))
+                    output.append(SassInstr(encode_iadd3_neg_b4(d, t_max, t_min, c),
+                                            f'IADD3 R{d}, R{t_max}, -R{t_min}, R{c}  // sad |a-b|+c'))
+
                 elif op == 'mad' and 'lo' in instr.types:
                     # mad.lo.s32 → dest = src0 * src1 + src2
                     d = ctx.ra.r32(instr.dest.name)
@@ -1851,6 +1870,28 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         output.append(SassInstr(
                             encode_lop3(d, d, t, RZ, LOP3_AND),
                             f'LOP3.LUT R{d}, R{d}, R{t}, RZ, 0xC0  // bfe.u32 &mask'))
+
+                elif op == 'bfe' and typ == 's32':
+                    # bfe.s32 dest, src, pos, len: sign-extend bits [pos+len-1:pos]
+                    # Two-instruction sequence (ptxas ground truth):
+                    #   If pos > 0: SHF.R.S32.HI dest, RZ, pos, src
+                    #   Then:       BFE_SEXT dest, src_or_dest, len
+                    from sass.encoding.sm_120_encode import encode_shf_r_s32_hi
+                    d   = ctx.ra.r32(instr.dest.name)
+                    a   = ctx.ra.r32(instr.srcs[0].name)
+                    pos = instr.srcs[1].value if isinstance(instr.srcs[1], ImmOp) else 0
+                    length = instr.srcs[2].value if (len(instr.srcs) > 2 and isinstance(instr.srcs[2], ImmOp)) else 32
+                    if pos > 0:
+                        output.append(SassInstr(
+                            encode_shf_r_s32_hi(d, a, pos),
+                            f'SHF.R.S32.HI R{d}, RZ, {pos}, R{a}  // bfe.s32 pos={pos}'))
+                        output.append(SassInstr(
+                            encode_bfe_sext(d, d, length),
+                            f'BFE_SEXT R{d}, R{d}, {length}  // bfe.s32 len={length}'))
+                    else:
+                        output.append(SassInstr(
+                            encode_bfe_sext(d, a, length),
+                            f'BFE_SEXT R{d}, R{a}, {length}  // bfe.s32 len={length}'))
 
                 elif op == 'bfi' and typ in ('b32',):
                     # bfi.b32 d, a, b, start, len

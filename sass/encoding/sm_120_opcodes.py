@@ -1900,51 +1900,36 @@ def encode_mufu(dest: int, src: int, func: int, ctrl: int = 0) -> bytes:
 
 def encode_vimnmx_s32(dest: int, src0: int, src1: int, is_max: bool = False,
                        ctrl: int = 0) -> bytes:
-    """Encode VIMNMX.S32 for min (is_max=False) or max (is_max=True)."""
+    """Encode VIMNMX.S32 for min (is_max=False) or max (is_max=True).
+
+    Ground truth (ptxas sm_120):
+        min.s32: b9=0x01, b10=0xfe, b11=0x03
+        max.s32: b9=0x01, b10=0xfe, b11=0x07
+    """
     if ctrl == 0:
         ctrl = _CTRL_DEFAULT
-    b13, b14, b15 = _ctrl_to_bytes(ctrl)
-    raw = bytearray(16)
-    raw[0]  = 0x48
-    raw[1]  = 0x72
-    raw[2]  = dest & 0xFF
-    raw[3]  = src0 & 0xFF
-    raw[4]  = src1 & 0xFF
-    raw[8]  = 0x00
-    raw[9]  = 0xfe  # predicate field
-    raw[10] = 0x07 if is_max else 0x03  # !PT for max, PT for min
-    raw[11] = 0x01  # .S32 modifier
-    raw[12] = 0x00
-    raw[13] = b13
-    raw[14] = b14
-    raw[15] = b15
-    return bytes(raw)
+    return _build(0x48, 0x72,
+                  b2=dest, b3=src0, b4=src1,
+                  b8=0x00, b9=0x01, b10=0xfe,
+                  b11=0x07 if is_max else 0x03,
+                  ctrl=ctrl)
 
 
-def encode_vimnmx_u32(dest: int, src0: int, src1_imm: int, is_max: bool = False,
+def encode_vimnmx_u32(dest: int, src0: int, src1: int, is_max: bool = False,
                        ctrl: int = 0) -> bytes:
-    """Encode VIMNMX.U32 with immediate src1."""
+    """Encode VIMNMX.U32 register-register variant.
+
+    Ground truth (ptxas sm_120, sad.u32):
+        min.u32: b9=0x00, b10=0xfe, b11=0x03
+        max.u32: b9=0x00, b10=0xfe, b11=0x07
+    """
     if ctrl == 0:
         ctrl = _CTRL_DEFAULT
-    b13, b14, b15 = _ctrl_to_bytes(ctrl)
-    raw = bytearray(16)
-    raw[0]  = 0x48
-    raw[1]  = 0x78  # immediate variant
-    raw[2]  = dest & 0xFF
-    raw[3]  = src0 & 0xFF
-    raw[4]  = src1_imm & 0xFF
-    raw[5]  = (src1_imm >> 8) & 0xFF
-    raw[6]  = (src1_imm >> 16) & 0xFF
-    raw[7]  = (src1_imm >> 24) & 0xFF
-    raw[8]  = 0x00
-    raw[9]  = 0xfe
-    raw[10] = 0x07 if is_max else 0x03
-    raw[11] = 0x00  # .U32
-    raw[12] = 0x00
-    raw[13] = b13
-    raw[14] = b14
-    raw[15] = b15
-    return bytes(raw)
+    return _build(0x48, 0x72,
+                  b2=dest, b3=src0, b4=src1,
+                  b8=0x00, b9=0x00, b10=0xfe,
+                  b11=0x07 if is_max else 0x03,
+                  ctrl=ctrl)
 
 
 # ---------------------------------------------------------------------------
@@ -2184,6 +2169,37 @@ def encode_iabs(dest: int, src: int, ctrl: int = 0) -> bytes:
     raw[2], raw[3] = dest & 0xFF, src & 0xFF
     raw[13], raw[14], raw[15] = b13, b14, b15
     return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# BFE sign-extension helper (opcode 0x81a)
+# ---------------------------------------------------------------------------
+# Used as the second step of bfe.s32: sign-extends the low `len` bits of src.
+# dest = sign_extend(src[len-1:0], 32) = arithmetic ((src << (32-len)) >> (32-len))
+#
+# Ground truth (ptxas sm_120, bfe.s32 pos=0 len=16):
+#   lo=1a 78 07 02 10 00 00 00  hi=00 02 00 00 ...
+#   b0=0x1a, b1=0x78, b2=dest, b3=src, b4=len, b8=RZ(0x00), b9=0x02, b10=0x00
+#
+# bfe.s32 implementation (2 instructions):
+#   If pos > 0: SHF.R.S32.HI dest, RZ, pos, src  (arithmetic right-shift by pos)
+#   Then:       BFE_SEXT dest, dest_or_src, len   (sign-extend low len bits)
+
+def encode_bfe_sext(dest: int, src: int, length: int, ctrl: int = 0) -> bytes:
+    """Encode BFE sign-extension step: dest = sign_extend(src[length-1:0], 32).
+
+    This is the 0x81a instruction used as the second step in bfe.s32 lowering.
+    b0=0x1a, b1=0x78, b2=dest, b3=src, b4=length, b8=0x00, b9=0x02, b10=0x00
+
+    Ground truth:
+        BFE_SEXT R7, R2, 16  →  1a 78 07 02 10 00 00 00 | 00 02 00 00 ...
+        BFE_SEXT R7, R7, 8   →  1a 78 07 07 08 00 00 00 | 00 02 00 00 ...
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x1a, 0x78,
+                  b2=dest, b3=src, b4=length & 0xFF,
+                  b8=0x00, b9=0x02, b10=0x00, b11=0x00,
+                  ctrl=ctrl)
 
 
 # ---------------------------------------------------------------------------

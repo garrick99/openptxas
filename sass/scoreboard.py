@@ -67,6 +67,7 @@ _OPCODE_META: dict[int, _OpMeta] = {
     0x310: _OpMeta('F2F',        1, 0x3e, 1),  # F2F float-to-float precision conversion (F32↔F64)
     0x311: _OpMeta('F2I.F64',   1, 0x3e, 1),  # F2I.F64 float64-to-int32 conversion
     0x312: _OpMeta('I2F.F64',   1, 0x3e, 1),  # I2F.F64 int32-to-float64 conversion (writes pair)
+    0x81a: _OpMeta('BFE_SEXT',  1, 0x3e, 1),  # BFE sign-extension step (bfe.s32 lowering)
 }
 
 
@@ -125,6 +126,8 @@ _OPCODES_ALU = {
     0x310,        # F2F (F32↔F64)
     0x311,        # F2I.F64 (F64→int32)
     0x312,        # I2F.F64 (int32→F64)
+    # BFE helpers
+    0x81a,        # BFE_SEXT (bfe.s32 sign-extend step)
 }
 # Note: IADD.64-UR (0xc35) uses wdep=0x3f (no tracking) + stall=1.
 # The 1-cycle stall ensures the result is ready for the subsequent LDG/STG.

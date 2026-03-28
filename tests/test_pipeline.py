@@ -1113,3 +1113,72 @@ def test_cvt_f64_s32_compiles():
     opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
                for off in range(0, len(text), 16)]
     assert 0x312 in opcodes, f"I2F.F64 (0x312) not found in cvt.rn.f64.s32"
+
+
+BFE_S32_KERNEL = """\
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry bfe_s32_kernel(
+    .param .u64 out_ptr,
+    .param .s32 val)
+{
+    .reg .s32 %r<3>;
+    .reg .b64 %rd<2>;
+    ld.param.s32 %r0, [val];
+    bfe.s32 %r1, %r0, 2, 8;
+    ld.param.u64 %rd0, [out_ptr];
+    st.global.s32 [%rd0], %r1;
+    ret;
+}
+"""
+
+SAD_U32_KERNEL = """\
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry sad_u32_kernel(
+    .param .u64 out_ptr,
+    .param .u32 a,
+    .param .u32 b,
+    .param .u32 c)
+{
+    .reg .u32 %r<5>;
+    .reg .b64 %rd<2>;
+    ld.param.u32 %r0, [a];
+    ld.param.u32 %r1, [b];
+    ld.param.u32 %r2, [c];
+    sad.u32 %r3, %r0, %r1, %r2;
+    ld.param.u64 %rd0, [out_ptr];
+    st.global.u32 [%rd0], %r3;
+    ret;
+}
+"""
+
+
+def test_bfe_s32_compiles():
+    """bfe.s32 emits SHF.R.S32.HI (0x819) + BFE_SEXT (0x81a)."""
+    results = compile_ptx_source(BFE_S32_KERNEL)
+    cubin = results['bfe_s32_kernel']
+    assert cubin[:4] == b'\x7fELF'
+    elf = ELF64(cubin)
+    text = elf.section_data('.text.bfe_s32_kernel')
+    opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
+               for off in range(0, len(text), 16)]
+    assert 0x819 in opcodes, "SHF.R.S32.HI (0x819) not found in bfe.s32"
+    assert 0x81a in opcodes, "BFE_SEXT (0x81a) not found in bfe.s32"
+
+
+def test_sad_u32_compiles():
+    """sad.u32 emits VIMNMX (0x248) + IADD3 (0x210)."""
+    results = compile_ptx_source(SAD_U32_KERNEL)
+    cubin = results['sad_u32_kernel']
+    assert cubin[:4] == b'\x7fELF'
+    elf = ELF64(cubin)
+    text = elf.section_data('.text.sad_u32_kernel')
+    opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
+               for off in range(0, len(text), 16)]
+    assert 0x248 in opcodes, "VIMNMX (0x248) not found in sad.u32"
+    assert 0x210 in opcodes, "IADD3 (0x210) not found in sad.u32"

@@ -363,7 +363,6 @@ class TestMultiBlock:
 
 class TestAluCorrectness:
     @gpu
-    @pytest.mark.xfail(reason="IMAD chain kernel crashes (GPU error 715) — IMAD R-R stall=1 insufficient or ctrl encoding issue", strict=True)
     def test_imad_chain(self, cuda_ctx):
         """alu_chain kernel: out[i] = a[i] * mul + b[i] — tests IMAD R-UR with register operands."""
         cubins = _compile(_PTX_ALU_CHAIN)

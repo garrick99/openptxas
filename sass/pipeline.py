@@ -195,13 +195,155 @@ def _sink_ldc64_params(instrs: list) -> list:
     return result
 
 
+def _if_convert(fn: Function) -> None:
+    """Convert short if-else diamonds to predicated instructions.
+
+    Handles two patterns:
+
+    Pattern A — conditional BRA embedded mid-block (common when front-end emits
+    the then-path inline before an unconditional jump to merge):
+        block B: ... ; @Px BRA label_else ; then_instrs... ; BRA label_merge
+        block E (label_else): else_instrs...  (falls through to merge)
+        block M (label_merge): ...
+    Converts to:
+        block B: ... ; @!Px then_instrs... ; @Px else_instrs...
+        block M: ...
+    (block E is removed; fall-through from B now goes directly to M)
+
+    Pattern B — separate then/else blocks (traditional diamond):
+        block B: ... ; @Px BRA label_else
+        block T (fall-through): then_instrs... ; BRA label_merge
+        block E (label_else): else_instrs...
+        block M (label_merge): ...
+    Converts to:
+        block B: ... ; @!Px then_instrs... ; @Px else_instrs...
+        block M: ...
+    (blocks T and E are removed)
+
+    This matches ptxas's behaviour for short divergent branches on SM_120
+    where predicated execution is preferred over actual warp divergence.
+    """
+    from ptx.ir import LabelOp
+    import copy
+
+    def _bra_target(instr):
+        for s in instr.srcs:
+            if isinstance(s, LabelOp):
+                return s.name
+            if isinstance(s, str):
+                return s
+        return None
+
+    def _guard(inst_list, pred_n, negated):
+        result = []
+        for inst in inst_list:
+            new_inst = copy.copy(inst)
+            new_inst.pred = pred_n
+            new_inst.neg = negated
+            result.append(new_inst)
+        return result
+
+    changed = True
+    while changed:
+        changed = False
+        blocks = fn.blocks
+        for i, bb in enumerate(blocks):
+            instrs = bb.instructions
+            if not instrs:
+                continue
+
+            # --- Pattern A: block ends with unconditional BRA (merge jump),
+            #     and somewhere inside has a conditional BRA to the else-block ---
+            last = instrs[-1]
+            if last.op == 'bra' and not last.pred:
+                label_merge = _bra_target(last)
+                if label_merge is not None:
+                    bb_merge = next((b for b in blocks if b.label == label_merge), None)
+                    if bb_merge is not None:
+                        idx_merge = blocks.index(bb_merge)
+                        # Scan for embedded conditional BRA
+                        for bra_idx in range(len(instrs) - 1):
+                            cond = instrs[bra_idx]
+                            if cond.op != 'bra' or not cond.pred:
+                                continue
+                            label_else = _bra_target(cond)
+                            if label_else is None or label_else == label_merge:
+                                continue
+                            bb_else = next((b for b in blocks if b.label == label_else), None)
+                            if bb_else is None:
+                                continue
+                            idx_else = blocks.index(bb_else)
+                            # Else block must immediately precede merge block
+                            if idx_else != idx_merge - 1:
+                                continue
+                            # Else block must fall through (no unconditional BRA at end)
+                            if bb_else.instructions:
+                                el = bb_else.instructions[-1]
+                                if el.op == 'bra' and not el.pred:
+                                    continue
+                            # Found Pattern A diamond
+                            pred_name = cond.pred
+                            neg_bra = cond.neg
+                            then_instrs = instrs[bra_idx + 1 : -1]
+                            else_instrs = list(bb_else.instructions)
+                            guarded_then = _guard(then_instrs, pred_name, not neg_bra)
+                            guarded_else = _guard(else_instrs, pred_name, neg_bra)
+                            bb.instructions = instrs[:bra_idx] + guarded_then + guarded_else
+                            fn.blocks = [b for b in blocks if b is not bb_else]
+                            changed = True
+                            break
+
+            if changed:
+                break
+
+            # --- Pattern B: block ends with conditional BRA (fall-through = then-block) ---
+            if last.op == 'bra' and last.pred:
+                label_else = _bra_target(last)
+                if label_else is None:
+                    continue
+                if i + 1 >= len(blocks):
+                    continue
+                bb_then = blocks[i + 1]
+                if not bb_then.instructions:
+                    continue
+                last_then = bb_then.instructions[-1]
+                if last_then.op != 'bra' or last_then.pred:
+                    continue
+                label_merge = _bra_target(last_then)
+                if label_merge is None:
+                    continue
+                bb_else = next((b for b in blocks if b.label == label_else), None)
+                bb_merge = next((b for b in blocks if b.label == label_merge), None)
+                if bb_else is None or bb_merge is None:
+                    continue
+                idx_else = blocks.index(bb_else)
+                idx_merge = blocks.index(bb_merge)
+                idx_then = i + 1
+                if idx_else != idx_then + 1:
+                    continue
+                pred_name = last.pred
+                neg_bra = last.neg
+                then_instrs = bb_then.instructions[:-1]
+                else_instrs = list(bb_else.instructions)
+                guarded_then = _guard(then_instrs, pred_name, not neg_bra)
+                guarded_else = _guard(else_instrs, pred_name, neg_bra)
+                bb.instructions = bb.instructions[:-1] + guarded_then + guarded_else
+                fn.blocks = [b for b in blocks if b is not bb_then and b is not bb_else]
+                changed = True
+                break
+
+
 def compile_function(fn: Function, verbose: bool = False) -> bytes:
     """
     Compile a single PTX function/kernel to a cubin.
 
     Returns raw cubin bytes ready for cuModuleLoad.
     """
-    # 0. Sink ld.param from entry block to first-use block (reduces GPR pressure)
+    # 0a. If-conversion: convert short if-else diamonds to predicated instructions,
+    # matching ptxas behaviour for divergent branches on SM_120.
+    _if_convert(fn)
+
+    # 0b. Sink ld.param from entry block to first-use block (reduces GPR pressure)
     _sink_param_loads(fn)
 
     # 1. Register allocation
@@ -264,23 +406,43 @@ def compile_function(fn: Function, verbose: bool = False) -> bytes:
     # Predicated branch: opcode=0x94d (EXIT) or 0x947 (BRA) with a non-PT
     # guard predicate (byte[1] upper nibble ≠ 0x7).
     insert_idx = 0
-    found_pred_branch = False
+    found_exit = False      # True once we've seen the bounds-check predicated EXIT
     ldcu_count_post = 0
     for idx, si in enumerate(body_instrs):
         opcode = struct.unpack_from('<Q', si.raw, 0)[0] & 0xFFF
-        if opcode in (0x94d, 0x947):  # EXIT or BRA
-            guard_nibble = (si.raw[1] >> 4) & 0xF
-            if guard_nibble != 0x7:  # predicated (not PT/unconditional)
-                found_pred_branch = True
-                insert_idx = idx + 1  # fallback: just after the branch
-        elif found_pred_branch and opcode == 0x7ac:  # LDCU after branch
+        guard_nibble = (si.raw[1] >> 4) & 0xF
+        is_predicated = guard_nibble != 0x7
+
+        if opcode == 0x94d and is_predicated:  # predicated EXIT (bounds check)
+            found_exit = True
+            insert_idx = idx + 1  # fallback: just after the EXIT
+        elif opcode == 0x947 and is_predicated and found_exit:
+            # Predicated BRA after EXIT = intra-warp divergent branch.
+            # UR4 descriptor MUST be inserted before this branch so that
+            # both divergent paths have the descriptor loaded for LDG/STG.
+            # Stop here without updating insert_idx past this point.
+            break
+        elif found_exit and opcode == 0x7ac:  # LDCU after EXIT
             ldcu_count_post += 1
             insert_idx = idx + 1   # tentative: after this LDCU
             if ldcu_count_post >= 2:
-                break              # stop after 2nd LDCU (UR4 goes here)
-        elif not found_pred_branch and opcode in (0x919, 0x9c3):  # S2R/S2UR fallback
+                break              # 2 LDCUs consumed — stop (UR4 goes here)
+        elif not found_exit and opcode in (0x919, 0x9c3):  # S2R/S2UR fallback
             insert_idx = idx + 1
     body_instrs.insert(insert_idx, ur4_desc_instr)
+
+    # Update ctx.label_map and _bra_fixups to reflect the UR4 insertion.
+    # Any label or BRA index that was at or after insert_idx has shifted by 1.
+    for label in list(ctx.label_map):
+        body_byte = ctx.label_map[label]
+        body_idx = body_byte // 16
+        if body_idx >= insert_idx:
+            ctx.label_map[label] = body_byte + 16
+    if hasattr(ctx, '_bra_fixups'):
+        ctx._bra_fixups = [
+            (bra_idx + 1 if bra_idx >= insert_idx else bra_idx, target_label)
+            for bra_idx, target_label in ctx._bra_fixups
+        ]
 
     # 4. Schedule: reorder for LDG latency, then assign ctrl via scoreboard
     raw_instrs = preamble + body_instrs
@@ -292,88 +454,76 @@ def compile_function(fn: Function, verbose: bool = False) -> bytes:
     body_scheduled = assign_ctrl(reordered[n_preamble:])
     sass_instrs = preamble_instrs + body_scheduled
 
-    # 5. BRA offset fixup: resolve branch targets AFTER scheduling
-    # (scheduler may insert NOPs that shift instruction positions)
+    # 5. BRA offset fixup: resolve branch targets AFTER scheduling.
+    # ctx.label_map and ctx._bra_fixups have been updated for UR4 insertion
+    # (step above). Here we also account for latency NOPs inserted by schedule().
+    #
+    # Strategy: map body instruction indices to final sass_instrs positions by
+    # iterating the stream and counting non-latency-NOP instructions. Latency
+    # NOPs have 'latency' in their comment and are transparent to label positions.
     if hasattr(ctx, '_bra_fixups'):
-        # Rebuild label map: scan for BRA placeholder targets in comments
-        # and find the actual instruction index after scheduling
-        n_total = len(sass_instrs)
-        for i in range(n_total):
-            comment = sass_instrs[i].comment
-            # Labels are emitted as comments like "LABEL: <label_name>"
-            # But we don't have label markers in the output. Instead, recalculate
-            # offsets by mapping from old body indices to new post-schedule indices.
-        # Simple approach: find BRA instructions and recalculate based on scanning
-        # for the EXIT or target label pattern
+
+        def _body_idx_to_abs(sass_instrs, n_preamble, body_idx):
+            """Return the abs sass_instrs index for the n-th body instruction
+            (0-based, after preamble), skipping scheduler-inserted latency NOPs."""
+            count = 0
+            for j in range(n_preamble, len(sass_instrs)):
+                if 'latency' in sass_instrs[j].comment.lower():
+                    continue
+                if count == body_idx:
+                    return j
+                count += 1
+            return n_preamble + body_idx  # fallback
+
         for bra_idx, target_label in ctx._bra_fixups:
-            # Find the BRA instruction in the post-schedule output
-            # The bra_idx is body-relative, add preamble offset
-            abs_bra_idx = n_preamble + bra_idx
-            # Account for scheduler-inserted NOPs before this BRA
-            # Count NOPs inserted before bra_idx in the body
-            nops_before_bra = 0
-            for j in range(n_preamble, abs_bra_idx + nops_before_bra + 1):
-                if j < len(sass_instrs) and 'latency' in sass_instrs[j].comment.lower():
-                    if j <= abs_bra_idx + nops_before_bra:
-                        nops_before_bra += 1
-            actual_bra_idx = abs_bra_idx + nops_before_bra
+            # bra_idx is body-relative (after preamble, after UR4 update).
+            actual_bra_idx = _body_idx_to_abs(sass_instrs, n_preamble, bra_idx)
 
-            # Find target: scan actual sass_instrs for the target EXIT instruction.
-            # The label_map position is pre-UR4-insertion and unreliable here;
-            # scanning the final stream is accurate and handles all shifts.
-            if target_label in ctx.label_map:
-                # Determine the expected instruction at the target (byte from label_map).
-                # Strategy: scan sass_instrs for the last unconditional EXIT (0x4d 0x79),
-                # which is always the target for ret-only branch targets (the common case).
-                # For other targets, fall back to the heuristic with NOP adjustment.
-                target_is_exit = False
-                if target_label in ctx.label_map:
-                    # Check if the target label's block emits an EXIT as its first instr
-                    # by seeing if any block with this label has only `ret`.
-                    for tbb in fn.blocks:
-                        if tbb.label == target_label:
-                            if (len(tbb.instructions) == 1
-                                    and tbb.instructions[0].op == 'ret'):
-                                target_is_exit = True
-                            break
+            if target_label not in ctx.label_map:
+                continue
 
-                if target_is_exit:
-                    # Scan backward for the last unconditional EXIT in the stream.
-                    actual_target_byte = None
-                    for si_idx in range(len(sass_instrs) - 1, -1, -1):
-                        if sass_instrs[si_idx].raw[:2] == bytes([0x4d, 0x79]):
-                            actual_target_byte = si_idx * 16
-                            break
-                else:
-                    orig_target_body_byte = ctx.label_map[target_label]
-                    orig_target_body_idx = orig_target_body_byte // 16
-                    abs_target_idx = n_preamble + orig_target_body_idx
-                    nops_before_target = 0
-                    for j in range(n_preamble, abs_target_idx + nops_before_target + 1):
-                        if j < len(sass_instrs) and 'latency' in sass_instrs[j].comment.lower():
-                            if j <= abs_target_idx + nops_before_target:
-                                nops_before_target += 1
-                    actual_target_byte = (abs_target_idx + nops_before_target) * 16
-                if actual_target_byte is None:
-                    continue  # target not found, skip this fixup
-                actual_bra_byte = (actual_bra_idx + 1) * 16
-                rel_offset = actual_target_byte - actual_bra_byte
-                if actual_bra_idx < len(sass_instrs):
-                    # Patch BRA offset in-place, preserving predicate and ctrl.
-                    # Do NOT use encode_bra() here — it resets ctrl to default,
-                    # discarding the scoreboard-computed ctrl from assign_ctrl.
-                    old_raw = bytearray(sass_instrs[actual_bra_idx].raw)
-                    signed_insns = rel_offset // 16
-                    offset18 = signed_insns & 0x3FFFF
-                    old_raw[8]  = offset18 & 0xFF
-                    old_raw[9]  = (offset18 >> 8) & 0xFF
-                    old_raw[10] = 0x80 | ((offset18 >> 16) & 0x03)
-                    old_raw[11] = 0x03
-                    old_comment = sass_instrs[actual_bra_idx].comment
-                    pred_prefix = old_comment.split('BRA')[0] if 'BRA' in old_comment else ''
-                    sass_instrs[actual_bra_idx] = SassInstr(
-                        bytes(old_raw),
-                        f'{pred_prefix}BRA {target_label} (offset={rel_offset})')
+            # Check if target block is a ret-only block (maps to EXIT).
+            target_is_exit = any(
+                tbb.label == target_label
+                and len(tbb.instructions) == 1
+                and tbb.instructions[0].op == 'ret'
+                for tbb in fn.blocks
+            )
+
+            if target_is_exit:
+                # Scan backward for the last unconditional EXIT.
+                actual_target_byte = None
+                for si_idx in range(len(sass_instrs) - 1, -1, -1):
+                    if sass_instrs[si_idx].raw[:2] == bytes([0x4d, 0x79]):
+                        actual_target_byte = si_idx * 16
+                        break
+            else:
+                # body_idx of target (post-UR4, label_map is updated).
+                target_body_idx = ctx.label_map[target_label] // 16
+                actual_target_abs = _body_idx_to_abs(
+                    sass_instrs, n_preamble, target_body_idx)
+                actual_target_byte = actual_target_abs * 16
+
+            if actual_target_byte is None:
+                continue
+
+            actual_bra_byte = (actual_bra_idx + 1) * 16
+            rel_offset = actual_target_byte - actual_bra_byte
+
+            if actual_bra_idx < len(sass_instrs):
+                # Patch BRA offset in-place, preserving predicate and ctrl.
+                old_raw = bytearray(sass_instrs[actual_bra_idx].raw)
+                signed_insns = rel_offset // 16
+                offset18 = signed_insns & 0x3FFFF
+                old_raw[8]  = offset18 & 0xFF
+                old_raw[9]  = (offset18 >> 8) & 0xFF
+                old_raw[10] = 0x80 | ((offset18 >> 16) & 0x03)
+                old_raw[11] = 0x03
+                old_comment = sass_instrs[actual_bra_idx].comment
+                pred_prefix = old_comment.split('BRA')[0] if 'BRA' in old_comment else ''
+                sass_instrs[actual_bra_idx] = SassInstr(
+                    bytes(old_raw),
+                    f'{pred_prefix}BRA {target_label} (offset={rel_offset})')
 
     if verbose:
         print(f"[pipeline] {len(sass_instrs)} SASS instructions:")

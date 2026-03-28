@@ -1293,18 +1293,28 @@ def encode_imad_imm(dest: int, src0: int, imm: int, src2: int,
 
 def encode_ldcu_32(dest_ur: int, const_bank: int, const_offset_bytes: int,
                    ctrl: int = 0) -> bytes:
-    """Encode LDCU.32 dest_ur, c[bank][offset] — 32-bit constant to single UR."""
+    """Encode LDCU.32 dest_ur, c[bank][offset] — 32-bit constant to single UR.
+
+    LDCU uses a split dword-offset encoding: the dword offset (byte_off//4) is
+    stored with bits[8:1] in b5 and bit[0] in b4 bit[7].
+
+    Ground truth from ptxas:
+        LDCU UR5, c[0][0x39c]  ->  b4=0x80, b5=0x73  (dword=0xe7, 0xe7>>1=0x73, 0xe7&1=1)
+        LDCU UR4, c[0][0x398]  ->  b4=0x00, b5=0x73  (dword=0xe6, 0xe6>>1=0x73, 0xe6&1=0)
+    """
     if ctrl == 0:
         ctrl = _CTRL_DEFAULT
-    qword_offset = (const_offset_bytes // 8) & 0xFF
+    dword_offset = const_offset_bytes // 4
+    b5 = (dword_offset >> 1) & 0xFF
+    b4_lsb = (dword_offset & 1) << 7
     b13, b14, b15 = _ctrl_to_bytes(ctrl)
     raw = bytearray(16)
     raw[0] = 0xac
     raw[1] = 0x77
     raw[2] = dest_ur & 0xFF
     raw[3] = 0xFF
-    raw[4] = const_bank & 0xFF
-    raw[5] = qword_offset
+    raw[4] = b4_lsb | (const_bank & 0x7F)
+    raw[5] = b5
     raw[9] = 0x08    # 32-bit (vs 0x0a for 64-bit)
     raw[11] = 0x08
     raw[13] = b13
@@ -1397,7 +1407,7 @@ def encode_iadd64(dest: int, src0: int, src1: int,
     raw[8] = 0x00
     raw[9] = 0x02
     raw[10] = 0x8e
-    raw[11] = 0x07  # R-R variant: 32-bit add (no carry). Use R-UR for 64-bit pointer math.
+    raw[11] = 0x07  # R-R variant: correct encoding per ptxas ground truth
     raw[12] = 0x00
     raw[13] = b13
     raw[14] = b14

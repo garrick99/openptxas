@@ -329,8 +329,6 @@ def _select_add_u64(instr: Instruction, ra: RegAlloc,
 
     if a_in_ur or b_in_ur:
         # Use IADD.64 R-UR variant: dest(R) = src_r(R) + src_ur(UR)
-        # IMPORTANT: dest must NOT be in-place on R operand if R is used later!
-        # Allocate a fresh destination register to avoid clobbering.
         if a_in_ur:
             ur_idx = ctx._ur_params[a.name]
             r_lo = ra.lo(b.name)
@@ -344,7 +342,6 @@ def _select_add_u64(instr: Instruction, ra: RegAlloc,
         ]
     else:
         # Both operands in R bank: use IADD.64 single instruction
-        from sass.encoding.sm_120_opcodes import encode_iadd64
         a_lo = ra.lo(a.name)
         b_lo = ra.lo(b.name)
         d_lo = ra.lo(dest.name)  # use allocator's assignment
@@ -508,6 +505,10 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
             # typ = last type qualifier (the data type). Earlier elements are modifiers (lo, hi, approx, etc.)
             typ = instr.types[-1].lower() if instr.types else ''
 
+            # Track output length before this instruction so we can apply
+            # predicates to all newly-generated SASS after the handler runs.
+            _pre_len = len(output)
+
             try:
                 if op == 'mov' and typ in ('u32', 's32', 'b32', 'u64', 's64', 'b64'):
                     # Track special register sources
@@ -520,13 +521,15 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         if instr.srcs[0].name == '%ntid.x':
                             ctx._reg_param_off[instr.dest.name] = _CBANK_NTID_X
                         elif instr.srcs[0].name == '%ctaid.x':
-                            # Put ctaid into UR4 via S2UR so mad.lo can use IMAD R-UR.
+                            # Put ctaid into a fresh UR via S2UR so mad.lo can use IMAD R-UR.
                             # IMAD R-R (0x224) is not validated on SM_120; IMAD R-UR (0xc24)
-                            # is confirmed by ptxas. UR4 is free before the predicated EXIT
-                            # (pipeline.py overwrites UR4 with the memory descriptor after).
-                            ctx._ur_for_param[instr.dest.name] = 4  # UR4 = ctaid.x
-                            output.append(SassInstr(encode_s2ur(4, SR_CTAID_X),
-                                                    f'S2UR UR4, SR_CTAID_X  // {instr.dest.name} = ctaid.x'))
+                            # is confirmed by ptxas. Must NOT use UR4 (reserved for mem
+                            # descriptor by pipeline.py) to avoid a WAR hazard where the
+                            # descriptor LDCU overwrites UR4 before IMAD finishes reading it.
+                            ur_ctaid = ctx._next_ur; ctx._next_ur += 1
+                            ctx._ur_for_param[instr.dest.name] = ur_ctaid
+                            output.append(SassInstr(encode_s2ur(ur_ctaid, SR_CTAID_X),
+                                                    f'S2UR UR{ur_ctaid}, SR_CTAID_X  // {instr.dest.name} = ctaid.x'))
                             continue
                     output.extend(_select_mov(instr, ctx.ra))
 
@@ -792,14 +795,23 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 if b_param_off is not None:
                                     # src1 came from ld.param.u32 — load via LDCU.32 into UR,
                                     # then compare R vs UR. This is the ptxas-verified path.
+                                    #
+                                    # SM_120 hardware: ISETP R-UR (0xc0c) silently produces
+                                    # P=FALSE when pred_dest > 0. Force pred_dest=0 (P0) and
+                                    # remap the PTX predicate so consumers use P0 with their
+                                    # original sign — no comparison inversion needed.
+                                    emit_pd = pd
+                                    if pd > 0 and ctx:
+                                        emit_pd = 0
+                                        ctx.ra.pred_regs[pred.name] = 0
                                     ur_tmp = ctx._next_ur
                                     ctx._next_ur += 1
                                     output.append(SassInstr(
                                         encode_ldcu_32(ur_tmp, 0, b_param_off),
                                         f'LDCU.32 UR{ur_tmp}, c[0][0x{b_param_off:x}]  // setp src'))
                                     output.append(SassInstr(
-                                        encode_isetp_ur(pd, ar, ur_tmp, cmp=isetp_cmp),
-                                        f'ISETP.{cmp_name.upper()}.U32.AND P{pd}, PT, R{ar}, UR{ur_tmp}, PT'))
+                                        encode_isetp_ur(emit_pd, ar, ur_tmp, cmp=isetp_cmp),
+                                        f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, UR{ur_tmp}, PT'))
                                 else:
                                     br = ctx.ra.r32(b.name)
                                     # R-R fallback; only works correctly if both operands are GPRs
@@ -1098,6 +1110,26 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
             except ISelError as e:
                 # Emit NOP with error comment rather than crashing
                 output.append(_nop(f'ISEL ERROR: {e}  [{instr.op}]'))
+
+            # Apply predicate guard to all SASS instructions generated for
+            # this PTX instruction (except bra/ret which handle it themselves).
+            # LDCU (0x7ac) and S2UR (0x9c3) write to warp-uniform UR registers
+            # and MUST NOT be predicated with divergent thread predicates —
+            # the hardware ignores or mishandles divergent predicates on UR writes.
+            _UR_WRITE_OPCODES = frozenset({0x7ac, 0x9c3})
+            if instr.pred and op not in ('bra', 'ret'):
+                pd = ctx.ra.pred(instr.pred) if instr.pred in ctx.ra.pred_regs else 0
+                neg = instr.neg
+                if hasattr(ctx, '_negated_preds') and pd in ctx._negated_preds:
+                    neg = not neg
+                pred_str = f'@{"!" if neg else ""}P{pd} '
+                for si_idx in range(_pre_len, len(output)):
+                    old = output[si_idx]
+                    opcode = (old.raw[0] | (old.raw[1] << 8)) & 0xFFF
+                    if opcode in _UR_WRITE_OPCODES:
+                        continue  # UR-write instrs must be unconditional
+                    new_raw = patch_pred(old.raw, pred=pd, neg=neg)
+                    output[si_idx] = SassInstr(new_raw, pred_str + old.comment)
 
     # BRA offset fixup pass
     if hasattr(ctx, '_bra_fixups'):

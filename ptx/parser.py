@@ -449,9 +449,9 @@ class _Parser:
 
             # .reg declaration
             if tok.kind == "IDENT" and tok.value == ".reg":
-                rd = self._parse_reg_decl()
-                if rd:
-                    reg_decls.append(rd)
+                rds = self._parse_reg_decl()
+                if rds:
+                    reg_decls.extend(rds)
                 continue
 
             # .local / .shared / other body-level directives
@@ -477,34 +477,43 @@ class _Parser:
         blocks = [b for b in blocks if b.label or b.instructions]
         return reg_decls, blocks
 
-    def _parse_reg_decl(self) -> Optional[RegDecl]:
+    def _parse_reg_decl(self) -> Optional[list]:
+        """Parse a .reg declaration, returning a list of RegDecl (handles comma lists)."""
         self._expect("IDENT", ".reg")
         type_spec = self._parse_type_spec()
         if type_spec is None:
             self._consume_to_semicolon()
             return None
 
-        tok = self._peek()
-        if tok is None:
-            return None
+        results = []
+        while True:
+            tok = self._peek()
+            if tok is None:
+                break
 
-        # register name: %rd<10> or %rd0 etc.
-        if tok.kind != "REGNAME":
-            self._consume_to_semicolon()
-            return None
+            # register name: %rd<10> or %rd0 or %p0
+            if tok.kind != "REGNAME":
+                self._consume_to_semicolon()
+                break
 
-        reg_tok = self._advance()
-        reg_name = reg_tok.value.lstrip("%")
-        count = 1
+            reg_tok = self._advance()
+            reg_name = reg_tok.value.lstrip("%")
+            count = 1
 
-        # optional <N>
-        if self._match("PUNCT", "<"):
-            count_tok = self._expect("INT")
-            count = int(count_tok.value)
-            self._expect("PUNCT", ">")
+            # optional <N>
+            if self._match("PUNCT", "<"):
+                count_tok = self._expect("INT")
+                count = int(count_tok.value)
+                self._expect("PUNCT", ">")
+
+            results.append(RegDecl(type=type_spec, name=reg_name, count=count))
+
+            # comma-separated list: .reg .pred %p0, %p1;
+            if not self._match("PUNCT", ","):
+                break
 
         self._match("PUNCT", ";")
-        return RegDecl(type=type_spec, name=reg_name, count=count)
+        return results if results else None
 
     def _parse_statement(self) -> Optional[Instruction]:
         # Predicate guard: @%p0 or @!%p0

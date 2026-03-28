@@ -2860,6 +2860,48 @@ def encode_lop3_pred(dest: int, src0: int, src1: int, src2: int,
     return bytes(raw)
 
 
+# ---------------------------------------------------------------------------
+# F64 arithmetic — DADD, DMUL, DFMA
+# ---------------------------------------------------------------------------
+# Ground truth from RTX 5090 (sm_120) probe 2026-03-27:
+#   add.f64 R2, R2, R6 → lo=29 7e 02 02 06 00 00 00  hi=00 00 00 08 00 64 1e 00
+#   mul.f64 R2, R2, R6 → lo=28 7c 02 02 06 00 00 00  hi=00 00 00 08 00 64 1e 00
+#   fma.f64 R2, R2, R6, R6 → lo=2b 7c 02 02 06 00 00 00  hi=06 00 00 08 00 64 1e 00
+#
+# All use dest_lo=b2, src0_lo=b3, src1_lo=b4, src2_lo=b8 (DFMA only).
+# b11=0x08 is a fixed modifier (64-bit precision flag).
+# ctrl=0x0f32: rbar=0x03 (wait for LDC result), wdep=0x33 (slow ALU slot), misc=2
+#
+# Register pairs: DADD/DMUL/DFMA implicitly use dest_lo, dest_lo+1 (hi).
+
+def encode_dadd(dest_lo: int, src0_lo: int, src1_lo: int, ctrl: int = 0) -> bytes:
+    """Encode DADD (add.f64): dest = src0 + src1 (double precision)."""
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x29, 0x7e,
+                  b2=dest_lo, b3=src0_lo, b4=src1_lo,
+                  b8=0x00, b9=0x00, b10=0x00, b11=0x08,
+                  ctrl=ctrl)
+
+
+def encode_dmul(dest_lo: int, src0_lo: int, src1_lo: int, ctrl: int = 0) -> bytes:
+    """Encode DMUL (mul.f64): dest = src0 * src1 (double precision)."""
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x28, 0x7c,
+                  b2=dest_lo, b3=src0_lo, b4=src1_lo,
+                  b8=0x00, b9=0x00, b10=0x00, b11=0x08,
+                  ctrl=ctrl)
+
+
+def encode_dfma(dest_lo: int, src0_lo: int, src1_lo: int, src2_lo: int,
+                ctrl: int = 0) -> bytes:
+    """Encode DFMA (fma.rn.f64): dest = src0 * src1 + src2 (double precision FMA)."""
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x2b, 0x7c,
+                  b2=dest_lo, b3=src0_lo, b4=src1_lo,
+                  b8=src2_lo, b9=0x00, b10=0x00, b11=0x08,
+                  ctrl=ctrl)
+
+
 if __name__ == "__main__":
     ok = roundtrip_verify_opcodes(verbose=True)
     print()

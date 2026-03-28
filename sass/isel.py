@@ -66,6 +66,7 @@ from sass.encoding.sm_120_opcodes import (
     encode_shfl, SHFL_IDX, SHFL_UP, SHFL_DOWN, SHFL_BFLY,
     encode_vote_ballot,
     encode_atomg_cas_b32,
+    encode_dadd, encode_dmul, encode_dfma,
     encode_i2fp_u32, encode_f2i_u32,
     encode_f2f_f32_f64, encode_f2f_f64_f32,
     encode_f2i_s32_f64, encode_f2i_u32_f64, encode_i2f_f64_s32,
@@ -880,6 +881,28 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     output.append(SassInstr(encode_ffma(d, a, b, c),
                                             f'FFMA R{d}, R{a}, R{b}, R{c}  // fma.f32'))
 
+                elif op == 'add' and typ == 'f64':
+                    d = ctx.ra.lo(instr.dest.name)
+                    a = ctx.ra.lo(instr.srcs[0].name)
+                    b = ctx.ra.lo(instr.srcs[1].name)
+                    output.append(SassInstr(encode_dadd(d, a, b),
+                                            f'DADD R{d}, R{a}, R{b}  // add.f64'))
+
+                elif op == 'mul' and typ == 'f64':
+                    d = ctx.ra.lo(instr.dest.name)
+                    a = ctx.ra.lo(instr.srcs[0].name)
+                    b = ctx.ra.lo(instr.srcs[1].name)
+                    output.append(SassInstr(encode_dmul(d, a, b),
+                                            f'DMUL R{d}, R{a}, R{b}  // mul.f64'))
+
+                elif op == 'fma' and typ == 'f64':
+                    d = ctx.ra.lo(instr.dest.name)
+                    a = ctx.ra.lo(instr.srcs[0].name)
+                    b = ctx.ra.lo(instr.srcs[1].name)
+                    c = ctx.ra.lo(instr.srcs[2].name)
+                    output.append(SassInstr(encode_dfma(d, a, b, c),
+                                            f'DFMA R{d}, R{a}, R{b}, R{c}  // fma.f64'))
+
                 elif op == 'ld' and 'param' in instr.types:
                     output.extend(_select_ld_param(instr, ctx.ra, ctx.param_offsets, ctx))
 
@@ -1098,6 +1121,23 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                     output.append(SassInstr(encode_iadd3(d_lo+1, a_lo+1, RZ, RZ),
                                                             f'MOV R{d_lo+1}, R{a_lo+1}  // cvt.{_dst_t}.{_src_t} hi'))
                                 # else: same register, nothing to do (NOP omitted)
+                            elif _dst_t in _64B and _src_t in _32B:
+                                # 32→64 widening: zero-extend (u64.u32/b64.b32) or sign-extend (s64.s32)
+                                d_lo = ctx.ra.lo(d.name)
+                                a_r  = ctx.ra.r32(s.name)
+                                # lo = src
+                                if d_lo != a_r:
+                                    output.append(SassInstr(encode_iadd3(d_lo, a_r, RZ, RZ),
+                                                            f'MOV R{d_lo}, R{a_r}  // cvt.{_dst_t}.{_src_t} lo'))
+                                # hi = sign extension (s32) or 0 (u32/b32)
+                                if _src_t == 's32' and _dst_t == 's64':
+                                    from sass.encoding.sm_120_encode import encode_shf_r_s32_hi
+                                    output.append(SassInstr(
+                                        encode_shf_r_s32_hi(d_lo+1, a_r, 31),
+                                        f'SHF.R.S32.HI R{d_lo+1}, RZ, 31, R{a_r}  // cvt.s64.s32 sign'))
+                                else:
+                                    output.append(SassInstr(encode_iadd3(d_lo+1, RZ, RZ, RZ),
+                                                            f'MOV R{d_lo+1}, RZ  // cvt.{_dst_t}.{_src_t} zero-ext'))
                             else:
                                 output.append(_nop(f'TODO: cvt {".".join(instr.types)}'))
 

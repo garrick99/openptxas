@@ -1294,3 +1294,89 @@ def test_testp_finite_f32_compiles():
     last_real = max(i for i, op in enumerate(opcodes) if op != 0x918)
     sched_nops = opcodes[:last_real].count(0x918)
     assert sched_nops <= 2, f"Too many scheduling NOPs ({sched_nops}) in testp.finite kernel"
+
+
+CVT_WIDEN_KERNEL = """\
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry cvt_widen_kernel(
+    .param .u64 out_u64,
+    .param .u64 out_s64,
+    .param .u32 u_val,
+    .param .s32 s_val)
+{
+    .reg .u32 %r<2>;
+    .reg .s32 %rs<2>;
+    .reg .u64 %rd<4>;
+    .reg .s64 %rds<2>;
+    ld.param.u32 %r0, [u_val];
+    ld.param.s32 %rs0, [s_val+4];
+    cvt.u64.u32 %rd0, %r0;
+    cvt.s64.s32 %rds0, %rs0;
+    ld.param.u64 %rd2, [out_u64+16];
+    ld.param.u64 %rd3, [out_s64+24];
+    st.global.u64 [%rd2], %rd0;
+    st.global.s64 [%rd3], %rds0;
+    ret;
+}
+"""
+
+
+def test_cvt_widen_compiles():
+    """cvt.u64.u32 (zero-ext) and cvt.s64.s32 (sign-ext) lower without TODO NOPs."""
+    results = compile_ptx_source(CVT_WIDEN_KERNEL)
+    cubin = results['cvt_widen_kernel']
+    assert cubin[:4] == b'\x7fELF'
+    elf = ELF64(cubin)
+    text = elf.section_data('.text.cvt_widen_kernel')
+    opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
+               for off in range(0, len(text), 16)]
+    assert 0x819 in opcodes, "SHF.R.S32.HI (0x819) not found — sign extension for cvt.s64.s32"
+    last_real = max(i for i, op in enumerate(opcodes) if op != 0x918)
+    sched_nops = opcodes[:last_real].count(0x918)
+    assert sched_nops <= 4, f"Too many scheduling NOPs ({sched_nops}) in cvt_widen_kernel"
+
+
+F64_ARITH_KERNEL = """\
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry f64_arith_kernel(
+    .param .u64 out_ptr,
+    .param .f64 a,
+    .param .f64 b,
+    .param .f64 c)
+{
+    .reg .f64 %fd<6>;
+    .reg .u64 %rd<2>;
+    ld.param.f64 %fd0, [a];
+    ld.param.f64 %fd1, [b+8];
+    ld.param.f64 %fd2, [c+24];
+    add.f64 %fd3, %fd0, %fd1;
+    mul.f64 %fd4, %fd0, %fd1;
+    fma.rn.f64 %fd5, %fd0, %fd1, %fd2;
+    ld.param.u64 %rd0, [out_ptr+32];
+    st.global.f64 [%rd0], %fd5;
+    ret;
+}
+"""
+
+
+def test_f64_arith_compiles():
+    """add.f64/mul.f64/fma.rn.f64 emit DADD/DMUL/DFMA (no TODO NOPs)."""
+    results = compile_ptx_source(F64_ARITH_KERNEL)
+    cubin = results['f64_arith_kernel']
+    assert cubin[:4] == b'\x7fELF'
+    elf = ELF64(cubin)
+    text = elf.section_data('.text.f64_arith_kernel')
+    opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
+               for off in range(0, len(text), 16)]
+    assert 0xe29 in opcodes, f"DADD (0xe29) not found; opcodes={[hex(o) for o in set(opcodes)]}"
+    assert 0xc28 in opcodes, f"DMUL (0xc28) not found"
+    assert 0xc2b in opcodes, f"DFMA (0xc2b) not found"
+    last_real = max(i for i, op in enumerate(opcodes) if op != 0x918)
+    sched_nops = opcodes[:last_real].count(0x918)
+    assert sched_nops <= 3, f"Too many scheduling NOPs ({sched_nops}) in f64_arith_kernel"

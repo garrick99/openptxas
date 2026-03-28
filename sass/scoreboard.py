@@ -79,6 +79,7 @@ _OPCODES_LDS = {0x984}
 _OPCODES_STG = {0x986}
 _OPCODES_STS = {0x988}
 _OPCODES_BAR = {0xb1d}
+_OPCODES_DFPU = {0xe29, 0xc28, 0xc2b}  # DADD, DMUL, DFMA (double-precision, wdep=0x33)
 _OPCODES_CTRL = {0x94d, 0x947, 0x918}  # EXIT, BRA, NOP
 _OPCODES_ALU = {
     # Integer arithmetic
@@ -162,6 +163,11 @@ def _get_src_regs(raw: bytes) -> set[int]:
         if raw[3] < 255: regs |= {raw[3], raw[3]+1}
         if raw[4] < 255: regs.add(raw[4])
         if raw[8] < 255: regs.add(raw[8])
+    elif opcode in _OPCODES_DFPU:
+        # DADD/DMUL: src0(b3, pair), src1(b4, pair); DFMA also src2(b8, pair)
+        if raw[3] < 255: regs |= {raw[3], raw[3]+1}
+        if raw[4] < 255: regs |= {raw[4], raw[4]+1}
+        if opcode == 0xc2b and raw[8] < 255: regs |= {raw[8], raw[8]+1}  # DFMA src2
     elif opcode in _OPCODES_STG:
         # STG: addr at b3, data at b4 (NOT b8 — b8 is UR descriptor)
         if raw[3] < 255: regs |= {raw[3], raw[3]+1}
@@ -226,6 +232,9 @@ def _get_dest_regs(raw: bytes) -> set[int]:
     elif opcode in _OPCODES_ATOMG:
         # ATOMG.CAS: writes single dest (b2) — the old value read from memory
         if dest < 255: regs.add(dest)
+    elif opcode in _OPCODES_DFPU:
+        # DADD/DMUL/DFMA: writes 64-bit dest pair (b2, b2+1)
+        if dest < 255: regs |= {dest, dest+1}
     elif opcode in _OPCODES_LDC:
         if dest < 255:
             regs.add(dest)
@@ -265,7 +274,7 @@ def _wdep_for_opcode(opcode: int, raw: bytes = None) -> int:
         return 0x3e
     if opcode in _OPCODES_LDC:
         return 0x31
-    if opcode in _OPCODES_LDS:
+    if opcode in _OPCODES_LDS | _OPCODES_DFPU:
         return 0x33
     if opcode in _OPCODES_LDG | _OPCODES_ATOMG:
         return 0x35
@@ -285,6 +294,9 @@ _OPCODE_MISC: dict[int, int] = {
     0x94d: 5,   # EXIT: misc=5
     0x981: 6,   # LDG.E: misc=6
     0x3a9: 4,   # ATOMG.CAS: misc=4 (from RTX 5090 probe 2026-03-27)
+    0xe29: 2,   # DADD: misc=2 (from RTX 5090 probe 2026-03-27)
+    0xc28: 2,   # DMUL: misc=2
+    0xc2b: 2,   # DFMA: misc=2
     0xc35: 5,   # IADD.64-UR: misc=5 (wide ALU result)
     0xc0c: 0,   # ISETP R-UR: misc=0 (SM_120: misc 1-12 → wrong predicate)
     0x20c: 0,   # ISETP R-R: misc=0 (same SM_120 predicate correctness requirement)
@@ -295,7 +307,7 @@ _ALL_KNOWN_OPCODES: frozenset = frozenset(
     _OPCODES_LDG | _OPCODES_LDC | _OPCODES_LDS |
     _OPCODES_STG | _OPCODES_STS | _OPCODES_BAR |
     _OPCODES_CTRL | _OPCODES_ALU | _OPCODES_IADD64_UR |
-    _OPCODES_SMEM_SETUP | _OPCODES_ATOMG
+    _OPCODES_SMEM_SETUP | _OPCODES_ATOMG | _OPCODES_DFPU
 )
 
 

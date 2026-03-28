@@ -794,12 +794,17 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     output.append(_nop())
 
                 elif op == 'cvt':
-                    # Type conversion — handle u64.u32 (zero-extend)
+                    # Type conversion — handle widening to 64-bit
                     # CSE: if same source was already converted, reuse the result
                     d = instr.dest
                     s = instr.srcs[0]
                     if isinstance(d, RegOp) and isinstance(s, RegOp):
-                        if 'u64' in instr.types and 'u32' in instr.types:
+                        _types_set = set(instr.types)
+                        _is_64_dst = any(t in ('u64','s64','b64') for t in instr.types[:1])
+                        # Only zero-extend from unsigned 32-bit; signed widening needs
+                        # SHF.R.S32.HI (no encoder yet) for correct sign extension.
+                        _is_32_src = any(t in ('u32','b32') for t in instr.types[1:])
+                        if _is_64_dst and _is_32_src:
                             s_r = ctx.ra.r32(s.name)
                             # CSE: check if we already converted this source register
                             if not hasattr(ctx, '_cvt_cache'):
@@ -808,14 +813,14 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 # Reuse previous conversion result
                                 prev_lo = ctx._cvt_cache[s.name]
                                 ctx.ra.int_regs[d.name] = prev_lo
-                                output.append(_nop(f'cvt.u64.u32 {d.name} = {s.name} (CSE reuse R{prev_lo})'))
+                                output.append(_nop(f'cvt.64.32 {d.name}={s.name} (CSE reuse R{prev_lo})'))
                                 continue
                             d_lo = ctx.ra.lo(d.name)
                             ctx._cvt_cache[s.name] = d_lo
                             output.append(SassInstr(encode_iadd3(d_lo, s_r, RZ, RZ),
-                                                    f'MOV R{d_lo}, R{s_r}  // cvt.u64.u32 lo'))
+                                                    f'MOV R{d_lo}, R{s_r}  // cvt.64.32 lo'))
                             output.append(SassInstr(encode_iadd3(d_lo+1, RZ, RZ, RZ),
-                                                    f'MOV R{d_lo+1}, RZ  // cvt.u64.u32 hi=0'))
+                                                    f'MOV R{d_lo+1}, RZ  // cvt.64.32 hi=0'))
                         else:
                             output.append(_nop(f'TODO: cvt {".".join(instr.types)}'))
 
@@ -1205,19 +1210,39 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
 
                 elif op in ('cvt',):
                     # General CVT — handle common conversions
-                    src_type = instr.types[-1] if len(instr.types) > 1 else 'u32'
-                    dst_type = instr.types[0] if len(instr.types) > 0 else 'u32'
+                    types_set = set(instr.types)
+                    # Strip rounding-mode prefixes ('rn','rz','rm','rp') from type list
+                    core_types = [t for t in instr.types if t not in ('rn','rz','rm','rp')]
+                    dst_type = core_types[0] if core_types else 'u32'
+                    src_type = core_types[1] if len(core_types) > 1 else 'u32'
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name) if isinstance(instr.srcs[0], RegOp) else RZ
-                    if 'f32' in instr.types and ('u32' in instr.types or 's32' in instr.types):
-                        if instr.types.index('f32') < instr.types.index('u32') if 'u32' in instr.types else instr.types.index('s32'):
+                    _32BIT = {'u32', 's32', 'b32', 'f32'}
+                    _64BIT = {'u64', 's64', 'b64', 'f64'}
+                    if 'f32' in types_set and ('u32' in types_set or 's32' in types_set):
+                        if instr.types.index('f32') < (instr.types.index('u32') if 'u32' in instr.types else instr.types.index('s32')):
                             # int → float
                             output.append(SassInstr(encode_i2fp_u32(d, a),
-                                                    f'I2FP.F32 R{d}, R{a}  // cvt'))
+                                                    f'I2FP.F32 R{d}, R{a}  // cvt.f32.{src_type}'))
                         else:
                             # float → int
                             output.append(SassInstr(encode_f2i_u32(d, a),
-                                                    f'F2I.U32 R{d}, R{a}  // cvt'))
+                                                    f'F2I.U32 R{d}, R{a}  // cvt.{dst_type}.f32'))
+                    elif dst_type in _32BIT and src_type in _32BIT:
+                        # Same-width 32-bit reinterpretation / sign-change — just MOV
+                        if d != a:
+                            output.append(SassInstr(encode_iadd3(d, a, RZ, RZ),
+                                                    f'MOV R{d}, R{a}  // cvt.{dst_type}.{src_type}'))
+                        else:
+                            output.append(_nop(f'cvt.{dst_type}.{src_type} nop (d==a)'))
+                    elif dst_type in _32BIT and src_type in _64BIT:
+                        # Truncate 64→32: take the lo word (ignore hi)
+                        a_lo = ctx.ra.lo(instr.srcs[0].name) if isinstance(instr.srcs[0], RegOp) else RZ
+                        if d != a_lo:
+                            output.append(SassInstr(encode_iadd3(d, a_lo, RZ, RZ),
+                                                    f'MOV R{d}, R{a_lo}  // cvt.{dst_type}.{src_type} trunc'))
+                        else:
+                            output.append(_nop(f'cvt.{dst_type}.{src_type} nop (d==a_lo)'))
                     else:
                         output.append(_nop(f'TODO: cvt {".".join(instr.types)}'))
 

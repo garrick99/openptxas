@@ -337,3 +337,43 @@ def test_bfi_b32_bakes_masks():
     not_shifted_mask = (~shifted_mask) & 0xFFFFFFFF
     assert _s.pack('<I', shifted_mask) in const0, "shifted_mask not in constant bank"
     assert _s.pack('<I', not_shifted_mask) in const0, "~shifted_mask not in constant bank"
+
+
+# ---------------------------------------------------------------------------
+# cvt tests
+# ---------------------------------------------------------------------------
+
+CVT_KERNEL = """\
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry cvt_kernel(
+    .param .u64 out,
+    .param .u32 val)
+{
+    .reg .b32   %r<4>;
+    .reg .b64   %rd<4>;
+    ld.param.u32 %r0, [val];
+    cvt.s32.u32  %r1, %r0;
+    cvt.u64.u32  %rd1, %r0;
+    ld.param.u64 %rd0, [out];
+    ret;
+}
+"""
+
+
+def test_cvt_same_width_compiles():
+    """cvt.s32.u32 (same-width reinterpret) compiles to MOV, not TODO NOP."""
+    results = compile_ptx_source(CVT_KERNEL)
+    cubin = results["cvt_kernel"]
+    assert cubin[:4] == b'\x7fELF'
+
+
+def test_cvt_u64_u32_compiles():
+    """cvt.u64.u32 (zero-extend to 64-bit) compiles successfully."""
+    results = compile_ptx_source(CVT_KERNEL)
+    cubin = results["cvt_kernel"]
+    elf = ELF64(cubin)
+    text = elf.section_data('.text.cvt_kernel')
+    assert len(text) > 0 and len(text) % 128 == 0

@@ -918,6 +918,16 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                                             f'MOV R{d_r}, R{a_lo}  // cvt.{_dst_t}.{_src_t} trunc'))
                                 else:
                                     output.append(_nop(f'cvt.{_dst_t}.{_src_t} nop (d==a_lo)'))
+                            elif _dst_t in _64B and _src_t in _64B:
+                                # 64-bit reinterpret (u64↔s64, b64↔u64, etc.) — identity copy
+                                d_lo = ctx.ra.lo(d.name)
+                                a_lo = ctx.ra.lo(s.name)
+                                if d_lo != a_lo:
+                                    output.append(SassInstr(encode_iadd3(d_lo, a_lo, RZ, RZ),
+                                                            f'MOV R{d_lo}, R{a_lo}  // cvt.{_dst_t}.{_src_t} lo'))
+                                    output.append(SassInstr(encode_iadd3(d_lo+1, a_lo+1, RZ, RZ),
+                                                            f'MOV R{d_lo+1}, R{a_lo+1}  // cvt.{_dst_t}.{_src_t} hi'))
+                                # else: same register, nothing to do (NOP omitted)
                             else:
                                 output.append(_nop(f'TODO: cvt {".".join(instr.types)}'))
 

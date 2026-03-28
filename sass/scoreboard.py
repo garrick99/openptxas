@@ -29,7 +29,33 @@ Read barrier encoding:
 
 from __future__ import annotations
 import struct
+from typing import NamedTuple
 from sass.isel import SassInstr
+
+
+class _OpMeta(NamedTuple):
+    name: str
+    min_gpr_gap: int  # minimum instruction gap between write and immediate GPR reader (0 = no constraint)
+
+
+# SM_120 ALU instructions that require ≥1 instruction gap before a GPR consumer.
+# The stall field is ignored by hardware; rbar alone does not gate adjacent ALU reads.
+_OPCODE_META: dict[int, _OpMeta] = {
+    0x210: _OpMeta('IADD3',   1),   # add.s32, add.u32
+    0x212: _OpMeta('IADD3X',  1),   # add.u32 with carry
+    0x224: _OpMeta('IMAD.32', 1),   # imad 32-bit result
+    0x824: _OpMeta('IMAD',    1),   # imad wide
+    0x825: _OpMeta('IMAD.HI', 1),   # imad.hi
+    0x819: _OpMeta('SHF',     1),   # shl/shr 64-bit
+    0x221: _OpMeta('FADD',    1),   # fadd
+    0x223: _OpMeta('FFMA',    1),   # fma
+    0x235: _OpMeta('IADD.64', 1),   # iadd.64
+    0xc35: _OpMeta('IADD.64-UR', 1), # iadd.64 with UR operand — result needs 1-cycle gap before GPR consumer
+    0x202: _OpMeta('MOV',     0),   # mov (available next cycle)
+    0x20c: _OpMeta('ISETP.RR',0),   # isetp r-r (writes pred, not GPR)
+    0xc0c: _OpMeta('ISETP.RU',0),   # isetp r-ur (writes pred, not GPR)
+    0x431: _OpMeta('S2R',     0),   # s2r (hardware register, no forwarding needed)
+}
 
 
 # Opcode classification
@@ -130,7 +156,7 @@ def _get_dest_regs(raw: bytes) -> set[int]:
                 regs.add(dest+1)
     elif opcode in _OPCODES_LDS:
         if dest < 255: regs.add(dest)
-    elif opcode == 0x235:  # IADD.64
+    elif opcode in (0x235, 0xc35):  # IADD.64 / IADD.64-UR: writes GPR pair
         if dest < 255: regs |= {dest, dest+1}
     elif opcode in (0x23c, 0x237):  # HMMA/IMMA: writes 4 regs
         if dest < 255: regs |= {dest, dest+1, dest+2, dest+3}
@@ -144,8 +170,8 @@ _ldc_slot_counter = [0]   # mutable counter for rotating LDC wdep slots
 
 def _wdep_for_opcode(opcode: int, raw: bytes = None) -> int:
     """Assign the scoreboard write-dependency slot for an opcode."""
-    if opcode == 0x7ac:  # LDCU: rotating slots 0x31, 0x33, 0x35, 0x37
-        slots = [0x31, 0x33, 0x35, 0x37]
+    if opcode == 0x7ac:  # LDCU: rotate over 0x31, 0x33 only — 0x35/0x37 alias LDG slots
+        slots = [0x31, 0x33]
         slot = slots[_ldcu_slot_counter[0] % len(slots)]
         _ldcu_slot_counter[0] += 1
         return slot
@@ -304,7 +330,9 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
         # predicate output. Sequential misc values 1-12 cause silent failure (P=FALSE).
         # Force misc=0 for all ISETP R-UR instructions.
         if opcode == 0xc0c:
-            misc = 0
+            misc = 0   # ISETP R-UR requires misc=0 for correct predicate on SM_120
+        elif opcode == 0x7ac and si.raw[9] == 0x0a:
+            misc = 7   # LDCU.64 requires misc=0x7; misc=0x1 causes ILLEGAL_ADDRESS
         else:
             misc = misc_counter & 0xF
         ctrl = (stall << 17) | (rbar << 10) | (wdep << 4) | misc

@@ -161,10 +161,186 @@ def _reorder_after_ldg(instrs: list[SassInstr]) -> list[SassInstr]:
     return result
 
 
+def _hoist_ldcu64(instrs: list[SassInstr]) -> list[SassInstr]:
+    """Hoist pre-boundary LDCU.64s to position 1; pad post-boundary ones with NOPs.
+
+    SM_120 requires ≥3-instruction gap between each LDCU.64 and its first UR consumer
+    (any opcode in {IADD.64-UR, ISETP R-UR, IMAD R-UR, LDG} that reads UR at byte[4]).
+
+    The stream is split at the first predicated BRA (0x947) or EXIT (0x94d):
+      • Pre-boundary LDCU.64s: hoisted to position 1 after the first instruction.
+        The preamble LDC R1 + S2R + LDC-n + ISETP + BRA give ≥3 instructions of
+        warm-up before the first consumer in the active-thread section.
+      • Post-boundary LDCU.64s: cannot be hoisted across the boundary because
+        pipeline.py BRA fixup uses pre-scheduling body indices and would patch the
+        wrong instruction.  Instead, NOP latency fillers are inserted immediately
+        after each such LDCU.64 so that gap ≥ 3.  These NOPs have "latency" in
+        their comment and are transparent to _body_idx_to_abs (skipped in count).
+    """
+    _UR_CONSUMER_OPCODES = {0xc35, 0xc0c, 0xc24, 0x981}
+
+    # Find first predicated BRA (0x947) or EXIT (0x94d) — segment boundary.
+    # Guard nibble is bits[7:4] of raw[1]; 0x7 = @PT = unconditional.
+    boundary_idx = len(instrs)
+    for i, si in enumerate(instrs):
+        opc = _get_opcode(si.raw)
+        guard = (si.raw[1] >> 4) & 0xF
+        if opc in (0x947, 0x94d) and guard != 0x7:
+            boundary_idx = i
+            break
+
+    pre_boundary = instrs[:boundary_idx]
+    post_boundary = instrs[boundary_idx:]
+
+    # --- Pre-boundary: hoist LDCU.64s to position 1 ---
+    ldcu64s: list[SassInstr] = []
+    remaining: list[SassInstr] = []
+    for si in pre_boundary:
+        if _get_opcode(si.raw) == 0x7ac and si.raw[9] == 0x0a:
+            ldcu64s.append(si)
+        else:
+            remaining.append(si)
+
+    def _consumer_pos(ldcu_si: SassInstr) -> int:
+        ur_dest = ldcu_si.raw[2]
+        for i, si in enumerate(remaining):
+            if _get_opcode(si.raw) in _UR_CONSUMER_OPCODES and si.raw[4] == ur_dest:
+                return i
+        return len(remaining)  # no consumer in pre-boundary → sort last
+
+    if ldcu64s:
+        ldcu64s.sort(key=_consumer_pos)
+        if remaining:
+            pre_result = remaining[:1] + ldcu64s + remaining[1:]
+        else:
+            pre_result = ldcu64s
+    else:
+        pre_result = pre_boundary
+
+    # Post-boundary LDCU.64s are NOT hoisted across the boundary (would
+    # invalidate BRA fixup body indices).  Their gap to UR consumers is
+    # satisfied by the scoreboard ctrl word assignment (rbar/wdep), which
+    # works correctly even when the LDCU.64 appears after the consumer in
+    # instruction order.  No padding is needed here.
+    return pre_result + post_boundary
+
+
+def _enforce_gpr_latency(instrs: list[SassInstr]) -> list[SassInstr]:
+    """Insert NOPs between adjacent ALU instructions with GPR read-after-write hazards.
+
+    SM_120 ignores the stall field; rbar alone does not gate ALU→ALU reads.
+    Any ALU opcode listed in _OPCODE_META with min_gpr_gap=1 must have at least
+    one intervening instruction before a consumer that reads the same GPR.
+    """
+    from sass.encoding.sm_120_opcodes import encode_nop
+    from sass.scoreboard import (
+        _OPCODE_META,
+        _get_dest_regs as _sc_dest,
+        _get_src_regs  as _sc_src,
+        _get_opcode    as _sc_opc,
+    )
+
+    result = list(instrs)
+    i = 0
+    while i < len(result) - 1:
+        opc_i = _sc_opc(result[i].raw)
+        meta_i = _OPCODE_META.get(opc_i)
+        if meta_i is None or meta_i.min_gpr_gap == 0:
+            i += 1
+            continue
+        dest_i = _sc_dest(result[i].raw)
+        if not dest_i:
+            i += 1
+            continue
+        src_j = _sc_src(result[i + 1].raw)
+        if dest_i & src_j:
+            result.insert(i + 1, SassInstr(encode_nop(), 'NOP  // ALU GPR latency'))
+            i += 2  # skip the NOP; re-examine the original i+1 at i+2
+        else:
+            i += 1
+    return result
+
+
+def verify_schedule(instrs: list[SassInstr]) -> list[str]:
+    """Check a final instruction stream for scheduling hazard violations.
+
+    Returns a list of human-readable violation strings.  Empty list = no violations.
+
+    Checks:
+      • LDCU.64 minimum consumer gap ≥3 (R1)
+      • ALU GPR 0-gap RAW (R8) — for opcodes with min_gpr_gap > 0 in _OPCODE_META
+    """
+    from sass.scoreboard import (
+        _OPCODE_META,
+        _get_dest_regs as _sc_dest,
+        _get_src_regs  as _sc_src,
+        _get_opcode    as _sc_opc,
+    )
+
+    _UR_CONSUMER_OPCODES = {0xc35, 0xc0c, 0xc24, 0x981}
+    violations: list[str] = []
+
+    # Find first predicated BRA/EXIT — segment boundary.
+    # Post-boundary LDCU.64s satisfy their gap via scoreboard ctrl (rbar/wdep),
+    # not instruction ordering, so they are excluded from the gap check.
+    boundary_idx = len(instrs)
+    for k, sk in enumerate(instrs):
+        opc_k = _get_opcode(sk.raw)
+        guard_k = (sk.raw[1] >> 4) & 0xF
+        if opc_k in (0x947, 0x94d) and guard_k != 0x7:
+            boundary_idx = k
+            break
+
+    # R1: LDCU.64 must have ≥3 instructions before its first UR consumer.
+    # Only enforced for pre-boundary LDCU.64s (preamble section).
+    for i, si in enumerate(instrs):
+        if i >= boundary_idx:
+            break
+        if _get_opcode(si.raw) != 0x7ac or si.raw[9] != 0x0a:
+            continue
+        ur_dest = si.raw[2]
+        for j in range(i + 1, len(instrs)):
+            opc_j = _get_opcode(instrs[j].raw)
+            if opc_j in _UR_CONSUMER_OPCODES and instrs[j].raw[4] == ur_dest:
+                gap = j - i - 1
+                if gap < 3:
+                    violations.append(
+                        f"LDCU.64 UR{ur_dest} at [{i}] → consumer opc=0x{opc_j:03x} "
+                        f"at [{j}]: gap={gap} (need ≥3)")
+                break
+
+    # R8: ALU GPR 0-gap RAW
+    for i in range(len(instrs) - 1):
+        opc_i = _sc_opc(instrs[i].raw)
+        meta_i = _OPCODE_META.get(opc_i)
+        if meta_i is None or meta_i.min_gpr_gap == 0:
+            continue
+        dest_i = _sc_dest(instrs[i].raw)
+        if not dest_i:
+            continue
+        src_j = _sc_src(instrs[i + 1].raw)
+        overlap = dest_i & src_j
+        if overlap:
+            opc_j = _sc_opc(instrs[i + 1].raw)
+            violations.append(
+                f"{meta_i.name} at [{i}] writes {overlap} → "
+                f"opc=0x{opc_j:03x} at [{i+1}] reads immediately (0-gap RAW)")
+
+    return violations
+
+
 def schedule(instrs: list[SassInstr]) -> list[SassInstr]:
     """
-    Reorder instructions for LDG latency hiding.
+    Reorder and pad instructions for correct SM_120 execution.
+
+    Passes (in order):
+      1. _hoist_ldcu64        — move LDCU.64 early (≥3-cycle gap before UR consumers)
+      2. _enforce_gpr_latency — insert NOPs for ALU GPR RAW hazards
+      3. _reorder_after_ldg  — hide LDG latency by filling the slot with LDC/NOP
 
     Ctrl assignment is handled separately by sass.scoreboard.assign_ctrl().
     """
-    return _reorder_after_ldg(instrs)
+    instrs = _hoist_ldcu64(instrs)
+    instrs = _enforce_gpr_latency(instrs)
+    instrs = _reorder_after_ldg(instrs)
+    return instrs

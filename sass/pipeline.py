@@ -388,46 +388,27 @@ def compile_function(fn: Function, verbose: bool = False) -> bytes:
         body_instrs.insert(0, SassInstr(encode_s2r(0, SR_TID_X),
                                          'S2R R0, SR_TID.X  // required for LDCU init'))
 
-    # Insert LDCU.64 UR4 (mem descriptor) so it is the THIRD LDCU overall
-    # (counter=2 → wdep=0x35).  SM_120 requires LDG to wait with rbar=0x09
-    # (slot 0x35) for the descriptor; other rbar values do not correctly
-    # synchronize descriptor loads.
+    # Insert LDCU.64 UR4 (mem descriptor) right after the bounds-check predicated EXIT.
+    # SM_120 requires ≥3-instruction gap between LDCU.64 and its first UR consumer
+    # (LDG/STG/IADD.64-UR/ISETP-RU that read UR at byte[4]).  Placing UR4 immediately
+    # after the EXIT maximises the gap.  For kernels without a predicated EXIT,
+    # fall back to just after the last S2R/S2UR in the preamble.
     #
-    # Strategy (matching ptxas's opencuda_vecadd arrangement):
-    #   • u32 params (n) use LDC → GPR (no LDCU counter slot consumed).
-    #   • u64 pointer params use LDCU.64, each consuming one counter slot.
-    #   • UR4 is inserted after the 2nd pointer-param LDCU so the counter
-    #     sequence is:  ptr1(0) ptr2(1) UR4(2=0x35)  ptr3(3) ...
-    #   • Any pointer param LDCU after UR4 has 8+ instructions of warm-up
-    #     before it, satisfying SM_120's constant-bank warm-up constraint.
-    #   • Fallback: if fewer than 2 LDCUs found post-branch, insert after
-    #     all S2R/S2UR instructions (for kernels without a predicated branch).
-    #
-    # Predicated branch: opcode=0x94d (EXIT) or 0x947 (BRA) with a non-PT
-    # guard predicate (byte[1] upper nibble ≠ 0x7).
+    # Predicated EXIT: opcode=0x94d with guard nibble ≠ 0x7 (not @PT).
     insert_idx = 0
-    found_exit = False      # True once we've seen the bounds-check predicated EXIT
-    ldcu_count_post = 0
     for idx, si in enumerate(body_instrs):
         opcode = struct.unpack_from('<Q', si.raw, 0)[0] & 0xFFF
         guard_nibble = (si.raw[1] >> 4) & 0xF
         is_predicated = guard_nibble != 0x7
 
         if opcode == 0x94d and is_predicated:  # predicated EXIT (bounds check)
-            found_exit = True
-            insert_idx = idx + 1  # fallback: just after the EXIT
-        elif opcode == 0x947 and is_predicated and found_exit:
-            # Predicated BRA after EXIT = intra-warp divergent branch.
-            # UR4 descriptor MUST be inserted before this branch so that
-            # both divergent paths have the descriptor loaded for LDG/STG.
-            # Stop here without updating insert_idx past this point.
+            # Insert UR4 right after the EXIT so it has maximum instruction gap
+            # before any LDG/STG that uses UR4 as a descriptor.  SM_120 requires
+            # ≥3-instruction gap between LDCU.64 and its first UR consumer; placing
+            # UR4 after the bounds-check EXIT guarantees this gap for all kernels.
+            insert_idx = idx + 1
             break
-        elif found_exit and opcode == 0x7ac:  # LDCU after EXIT
-            ldcu_count_post += 1
-            insert_idx = idx + 1   # tentative: after this LDCU
-            if ldcu_count_post >= 2:
-                break              # 2 LDCUs consumed — stop (UR4 goes here)
-        elif not found_exit and opcode in (0x919, 0x9c3):  # S2R/S2UR fallback
+        elif opcode in (0x919, 0x9c3):  # S2R/S2UR fallback (no predicated EXIT)
             insert_idx = idx + 1
     body_instrs.insert(insert_idx, ur4_desc_instr)
 

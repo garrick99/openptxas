@@ -569,7 +569,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             continue
                     output.extend(_select_mov(instr, ctx.ra))
 
-                elif op == 'shl' and typ in ('b64', 'u64'):
+                elif op == 'shl' and typ in ('b64', 'u64', 's64'):
                     output.extend(_select_shl_b64(instr, ctx.ra))
 
                 elif op == 'shl' and typ in ('b32', 'u32', 's32'):
@@ -613,6 +613,27 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
 
                 elif op == 'shr' and typ in ('u64',):
                     output.extend(_select_shr_u64(instr, ctx.ra))
+
+                elif op == 'shr' and typ in ('s64',):
+                    # shr.s64: arithmetic 64-bit right shift (sign-extends).
+                    # K < 32: lo = SHF.R.U64(s_lo, k, s_hi) [pull in hi bits]
+                    #          hi = SHF.R.S32.HI(s_hi, k)   [arithmetic shift of hi]
+                    # K >= 32: lo = SHF.R.S32.HI(s_hi, k-32) [lo gets shifted hi]
+                    #           hi = SHF.R.S32.HI(s_hi, 31)  [hi = all sign bits]
+                    d_lo = ctx.ra.lo(instr.dest.name); d_hi = d_lo + 1
+                    s_lo = ctx.ra.lo(instr.srcs[0].name); s_hi = s_lo + 1
+                    k = _get_imm(instr.srcs[1])
+                    if k < 32:
+                        output.append(SassInstr(encode_shf_r_u32(d_lo, s_lo, k, s_hi),
+                            f'SHF.R.U64 R{d_lo}, R{s_lo}, 0x{k:x}, R{s_hi}  // shr.s64 lo'))
+                        output.append(SassInstr(encode_shf_r_s32_hi(d_hi, s_hi, k),
+                            f'SHF.R.S32.HI R{d_hi}, RZ, 0x{k:x}, R{s_hi}  // shr.s64 hi'))
+                    else:
+                        k32 = k - 32
+                        output.append(SassInstr(encode_shf_r_s32_hi(d_lo, s_hi, k32),
+                            f'SHF.R.S32.HI R{d_lo}, RZ, 0x{k32:x}, R{s_hi}  // shr.s64 lo (K>={k})'))
+                        output.append(SassInstr(encode_shf_r_s32_hi(d_hi, s_hi, 31),
+                            f'SHF.R.S32.HI R{d_hi}, RZ, 0x1f, R{s_hi}  // shr.s64 hi=sign'))
 
                 elif op == 'sub' and typ in ('u64', 's64'):
                     output.extend(_select_sub_u64(instr, ctx.ra))

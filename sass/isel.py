@@ -650,6 +650,31 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     # NOTE: IMAD R-R (0x224) is NOT valid on SM_120!
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
+                    if isinstance(instr.srcs[1], ImmOp):
+                        # Immediate multiplier: use IMAD.SHL.U32 if power-of-2 and ≤15,
+                        # else load into UR via literal pool and use IMAD R-UR.
+                        imm = instr.srcs[1].value & 0xFFFFFFFF
+                        if imm > 0 and (imm & (imm - 1)) == 0:
+                            # Power of two: IMAD.SHL.U32 dest, src, imm, RZ
+                            shift = imm.bit_length() - 1
+                            if shift <= 15:
+                                output.append(SassInstr(encode_imad_shl_u32(d, a, shift),
+                                    f'IMAD.SHL.U32 R{d}, R{a}, 0x{imm:x}, RZ  // mul.lo imm={imm}'))
+                            else:
+                                lit_off = ctx._alloc_literal(imm)
+                                ur_tmp = ctx._next_ur; ctx._next_ur += 1
+                                output.append(SassInstr(encode_ldcu_32(ur_tmp, 0, lit_off),
+                                    f'LDCU.32 UR{ur_tmp}, c[0][0x{lit_off:x}]  // mul.lo imm'))
+                                output.append(SassInstr(encode_imad_ur(d, a, ur_tmp, RZ),
+                                    f'IMAD R{d}, R{a}, UR{ur_tmp}, RZ  // mul.lo imm'))
+                        else:
+                            lit_off = ctx._alloc_literal(imm)
+                            ur_tmp = ctx._next_ur; ctx._next_ur += 1
+                            output.append(SassInstr(encode_ldcu_32(ur_tmp, 0, lit_off),
+                                f'LDCU.32 UR{ur_tmp}, c[0][0x{lit_off:x}]  // mul.lo imm'))
+                            output.append(SassInstr(encode_imad_ur(d, a, ur_tmp, RZ),
+                                f'IMAD R{d}, R{a}, UR{ur_tmp}, RZ  // mul.lo imm'))
+                        continue
                     b = ctx.ra.r32(instr.srcs[1].name)
                     # Check if either source is a param → use IMAD R-UR
                     b_param = ctx._reg_param_off.get(

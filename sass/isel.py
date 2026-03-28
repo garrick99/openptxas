@@ -43,7 +43,7 @@ from sass.encoding.sm_120_opcodes import (
     encode_s2r,
     encode_iadd3, encode_iadd3x,
     encode_iadd64,
-    encode_imad_wide, encode_imad, encode_imad_ur, encode_imad_hi, encode_imad_shl_u32,
+    encode_imad_wide, encode_imad, encode_imad_rr, encode_imad_ur, encode_imad_hi, encode_imad_shl_u32,
     encode_s2ur,
     encode_ldg_e, encode_ldg_e_64,
     encode_stg_e, encode_stg_e_64,
@@ -702,7 +702,10 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         output.append(SassInstr(encode_imad_ur(d, b, ur_tmp, RZ),
                             f'IMAD R{d}, R{b}, UR{ur_tmp}, RZ  // mul.lo.{typ}'))
                     else:
-                        output.append(_nop(f'TODO: mul.lo R{a}*R{b} (runtime multiply)'))
+                        # Both sources are computed GPRs — use R-R IMAD (opcode 0x2a4,
+                        # validated against ptxas 13.0 on SM_120).
+                        output.append(SassInstr(encode_imad_rr(d, a, b, RZ),
+                            f'IMAD R{d}, R{a}, R{b}, RZ  // mul.lo.{typ} R-R'))
 
                 elif op == 'st' and 'shared' in instr.types:
                     from ptx.ir import MemOp
@@ -1091,10 +1094,9 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         output.append(SassInstr(encode_imad_ur(d, a, ur_src, c),
                             f'IMAD R{d}, R{a}, UR{ur_src}, R{c}  // mad.lo.{typ}'))
                     else:
-                        # Fall back to IMAD R-R (0x224). Note: this opcode is not
-                        # validated on SM_120 — avoid if possible.
-                        output.append(SassInstr(encode_imad(d, a, b, c),
-                            f'IMAD R{d}, R{a}, R{b}, R{c}  // mad.lo.{typ}'))
+                        # Both src0 and src1 are computed GPRs — use R-R IMAD (0x2a4).
+                        output.append(SassInstr(encode_imad_rr(d, a, b, c),
+                            f'IMAD R{d}, R{a}, R{b}, R{c}  // mad.lo.{typ} R-R'))
 
                 elif op == 'mul' and 'hi' in instr.types and typ in ('u32', 's32'):
                     d = ctx.ra.r32(instr.dest.name)

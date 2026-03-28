@@ -209,6 +209,45 @@ def test_var_shift_compiles():
 
 
 # ---------------------------------------------------------------------------
+# mul.lo R-R tests
+# ---------------------------------------------------------------------------
+
+MUL_RR_KERNEL = """\
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry mul_rr(
+    .param .u64 out,
+    .param .u32 val)
+{
+    .reg .b32  %r<8>;
+    .reg .b64  %rd<4>;
+    ld.param.u32 %r0, [val];
+    add.u32      %r1, %r0, 1;
+    add.u32      %r2, %r0, 2;
+    mul.lo.u32   %r3, %r1, %r2;
+    cvt.u64.u32  %rd1, %r3;
+    ld.param.u64 %rd0, [out];
+    st.global.u64 [%rd0], %rd1;
+    ret;
+}
+"""
+
+
+def test_mul_rr_compiles():
+    """mul.lo with two computed GPRs compiles to IMAD.RR (0x2a4), not NOP."""
+    results = compile_ptx_source(MUL_RR_KERNEL)
+    cubin = results["mul_rr"]
+    assert cubin[:4] == b'\x7fELF'
+    elf = ELF64(cubin)
+    text = elf.section_data('.text.mul_rr')
+    opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
+               for off in range(0, len(text), 16)]
+    assert 0x2a4 in opcodes, "IMAD.RR (0x2a4) not found — mul.lo R-R emitted NOP"
+
+
+# ---------------------------------------------------------------------------
 # Literal pool tests
 # ---------------------------------------------------------------------------
 

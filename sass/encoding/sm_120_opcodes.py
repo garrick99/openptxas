@@ -553,6 +553,28 @@ def encode_imad(dest: int, src0: int, src1: int, src2: int,
                   ctrl=ctrl)
 
 
+def encode_imad_rr(dest: int, src0: int, src1: int, src2: int,
+                   ctrl: int = 0) -> bytes:
+    """
+    Encode IMAD dest, src0, src1, src2 (R-R-R multiply-add, SM_120 validated).
+
+    Uses opcode 0x2a4 (byte[0]=0xa4, byte[1]=0x72) — the ptxas-confirmed
+    encoding for multiply with both source operands in GPRs.  Differs from
+    encode_imad (0x224) in byte[0] bit[7] and byte[11] bit[3].
+
+    Ground truth (ptxas 13.0, sm_120):
+        mul.lo.u32 %r3, %r1, %r2 where %r1=R4, %r2=R5, %r3=R4, addend=RZ:
+          a472040405000000ff028e0f00cc0f00
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    return _build(0xa4, 0x72,
+                  b2=dest, b3=src0, b4=src1 & 0xFF,
+                  b8=src2,
+                  b9=0x02, b10=0x8e, b11=0x0f,
+                  ctrl=ctrl)
+
+
 # ---------------------------------------------------------------------------
 # LDG.E.64  (64-bit global memory load, descriptor-based)
 # ---------------------------------------------------------------------------

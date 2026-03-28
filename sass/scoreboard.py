@@ -46,6 +46,7 @@ _OPCODE_META: dict[int, _OpMeta] = {
     0x210: _OpMeta('IADD3',      1, 0x3e, 1),
     0x212: _OpMeta('IADD3X',     1, 0x3e, 1),
     0x224: _OpMeta('IMAD.32',    1, 0x3e, 1),
+    0x2a4: _OpMeta('IMAD.RR',   1, 0x3e, 1),   # R-R-R multiply (opcode 0x2a4, SM_120 validated)
     0x824: _OpMeta('IMAD',       1, 0x3e, 1),
     0x825: _OpMeta('IMAD.HI',    1, 0x3e, 1),
     0x819: _OpMeta('SHF',        1, 0x3e, 1),
@@ -74,7 +75,7 @@ _OPCODES_ALU = {
     0x210,        # IADD3
     0x235,        # IADD.64
     0x202,        # IADD3.X (with carry)
-    0x224, 0xc24, # IMAD R-R, IMAD R-UR
+    0x224, 0x2a4, 0xc24,  # IMAD R-R (old), IMAD R-R (validated), IMAD R-UR
     0x824, 0x825, # IMAD.SHL.U32, IMAD.WIDE (imm)
     0x227,        # IMAD.HI.U32
     0x213,        # IABS
@@ -163,7 +164,7 @@ def _get_src_regs(raw: bytes) -> set[int]:
         elif opcode in (0x221, 0x223):  # FADD/FFMA: src0=b3, src1=b4, src2=b8
             if raw[4] < 255: regs.add(raw[4])
             if raw[8] < 255 and opcode == 0x223: regs.add(raw[8])
-        elif opcode in (0x824, 0x825, 0x224):  # IMAD variants: src0=b3, src1=b4, src2=b8
+        elif opcode in (0x824, 0x825, 0x224, 0x2a4):  # IMAD variants: src0=b3, src1=b4, src2=b8
             if raw[4] < 255: regs.add(raw[4])
             if raw[8] < 255: regs.add(raw[8])
         elif opcode == 0xc24:  # IMAD R-UR: src0=b3 (GPR), src1=b4 (UR, not GPR), src2=b8 (GPR)

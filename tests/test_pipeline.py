@@ -362,12 +362,35 @@ CVT_KERNEL = """\
 }
 """
 
+CVT_SIGN_KERNEL = """\
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry cvt_sign_kernel(
+    .param .u64 out,
+    .param .s32 val)
+{
+    .reg .s32   %r<2>;
+    .reg .s64   %rd<4>;
+    ld.param.s32 %r0, [val];
+    cvt.s64.s32  %rd1, %r0;
+    ld.param.u64 %rd0, [out];
+    ret;
+}
+"""
+
 
 def test_cvt_same_width_compiles():
     """cvt.s32.u32 (same-width reinterpret) compiles to MOV, not TODO NOP."""
     results = compile_ptx_source(CVT_KERNEL)
     cubin = results["cvt_kernel"]
-    assert cubin[:4] == b'\x7fELF'
+    elf = ELF64(cubin)
+    text = elf.section_data('.text.cvt_kernel')
+    opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
+               for off in range(0, len(text), 16)]
+    # IADD3 (0x210) used as MOV — must appear (cvt.s32.u32 reinterpret)
+    assert 0x210 in opcodes, "IADD3/MOV not found — cvt.s32.u32 emitted NOP"
 
 
 def test_cvt_u64_u32_compiles():
@@ -377,3 +400,16 @@ def test_cvt_u64_u32_compiles():
     elf = ELF64(cubin)
     text = elf.section_data('.text.cvt_kernel')
     assert len(text) > 0 and len(text) % 128 == 0
+
+
+def test_cvt_s64_s32_compiles():
+    """cvt.s64.s32 (sign-extend to 64-bit) compiles to SHF+INEG sequence."""
+    results = compile_ptx_source(CVT_SIGN_KERNEL)
+    cubin = results["cvt_sign_kernel"]
+    assert cubin[:4] == b'\x7fELF'
+    elf = ELF64(cubin)
+    text = elf.section_data('.text.cvt_sign_kernel')
+    opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
+               for off in range(0, len(text), 16)]
+    # SHF.R.U32.HI (0x819) must appear for sign-bit extraction
+    assert 0x819 in opcodes, "SHF not found — cvt.s64.s32 sign-extend missing"

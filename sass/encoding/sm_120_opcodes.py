@@ -2323,8 +2323,8 @@ def encode_isetp(pred_dest: int, src0: int, src1: int, cmp: int = ISETP_GE,
     raw[5]  = 0x00
     raw[6]  = 0x00
     raw[7]  = 0x00
-    raw[8]  = 0x70                          # fixed for U32 R-R
-    raw[9]  = (cmp & 0x0F) << 4             # comparison type in b9
+    raw[8]  = 0x70                          # fixed for R-R comparisons
+    raw[9]  = ((cmp & 0x0F) << 4) | (0x02 if signed else 0x00)  # cmp type + signed bit
     raw[10] = 0xf0 | ((pred_dest & 0x07) << 1)
     raw[11] = 0x03
     raw[12] = 0x00
@@ -2342,6 +2342,26 @@ def encode_isetp(pred_dest: int, src0: int, src1: int, cmp: int = ISETP_GE,
 #   I2F.U32.RP R0, R7: lo=0x0000000700007306, hi=0x001e220000209000
 #   bytes: 06 73 00 00 07 00 00 00 | 00 90 20 00 00 22 1e 00
 #   b0=0x06, b1=0x73, b2=dest, b4=src, b9=0x90(RP+U32), b10=0x20
+def encode_i2f_s32_rp(dest: int, src: int, ctrl: int = 0) -> bytes:
+    """Encode I2F.S32.RP dest, src — signed 32-bit int to float, round toward +inf.
+
+    Ground truth (ptxas div.s32, sm_120):
+      I2F.RP R0, R7: lo=0x0000000700007306, hi=0x000e220000209400
+      bytes: 06 73 00 00 07 00 00 00 | 00 94 20 00 00 22 0e 00
+      b9=0x94 vs U32 b9=0x90 (signed bit in b9 bit[2])
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0], raw[1] = 0x06, 0x73
+    raw[2] = dest & 0xFF
+    raw[4] = src & 0xFF
+    raw[9]  = 0x94
+    raw[10] = 0x20
+    raw[13], raw[14], raw[15] = b13, b14, b15
+    return bytes(raw)
+
+
 def encode_i2f_u32_rp(dest: int, src: int, ctrl: int = 0) -> bytes:
     """Encode I2F.U32.RP dest, src — unsigned 32-bit int to float, round toward +inf."""
     if ctrl == 0: ctrl = _CTRL_DEFAULT
@@ -2497,18 +2517,23 @@ def encode_iadd3_neg_b3(dest: int, neg_src0: int, src1: int, src2: int,
 
 
 def encode_iadd3_pred_neg_b4(dest: int, src0: int, neg_src1: int, src2: int,
-                              pred_idx: int, ctrl: int = 0) -> bytes:
-    """Encode @Ppred_idx IADD3 dest, src0, -neg_src1, src2.
+                              pred_idx: int, inverted: bool = False,
+                              ctrl: int = 0) -> bytes:
+    """Encode @[!]Ppred_idx IADD3 dest, src0, -neg_src1, src2.
 
     Ground truth: @P0 IADD3 R4, R4, -R7, RZ
       bytes: 10 02 04 04 07 00 00 80 | ff e0 ff 07 00 e4 0f 00
       b1=(pred_idx<<4)|0x02, b7=0x80 for negation.
+    inverted=True: b1 |= 0x80 for @!Pn form.
     """
     if ctrl == 0: ctrl = _CTRL_DEFAULT
     b13, b14, b15 = _ctrl_to_bytes(ctrl)
     raw = bytearray(16)
     raw[0] = 0x10
-    raw[1] = ((pred_idx & 0x07) << 4) | 0x02
+    pred_b1 = ((pred_idx & 0x07) << 4) | 0x02
+    if inverted:
+        pred_b1 |= 0x80
+    raw[1] = pred_b1
     raw[2] = dest & 0xFF
     raw[3] = src0 & 0xFF
     raw[4] = neg_src1 & 0xFF
@@ -2522,25 +2547,58 @@ def encode_iadd3_pred_neg_b4(dest: int, src0: int, neg_src1: int, src2: int,
 
 
 def encode_iadd3_pred_small_imm(dest: int, src0: int, imm_byte: int, src2: int,
-                                 pred_idx: int, ctrl: int = 0) -> bytes:
-    """Encode @Ppred_idx IADD3 dest, src0, imm_byte, src2 with small immediate.
+                                 pred_idx: int, inverted: bool = False,
+                                 ctrl: int = 0) -> bytes:
+    """Encode @[!]Ppred_idx IADD3 dest, src0, imm_byte, src2 with small immediate.
 
     Ground truth: @P0 IADD3 R5, R5, 0x1, RZ  (b1=0x08 for P0)
       bytes: 10 08 05 05 01 00 00 00 | ff e0 ff 07 00 c6 0f 00
              @P1 IADD3 R5, R5, 0x1, RZ  (b1=0x18 for P1)
       bytes: 10 18 05 05 01 00 00 00 | ff e0 ff 07 00 e4 0f 00
     b1=(pred_idx<<4)|0x08, imm fits in b4 (1 byte).
+    inverted=True: b1 |= 0x80 for @!Pn form.
     """
     if ctrl == 0: ctrl = _CTRL_DEFAULT
     b13, b14, b15 = _ctrl_to_bytes(ctrl)
     raw = bytearray(16)
     raw[0] = 0x10
-    raw[1] = ((pred_idx & 0x07) << 4) | 0x08
+    pred_b1 = ((pred_idx & 0x07) << 4) | 0x08
+    if inverted:
+        pred_b1 |= 0x80
+    raw[1] = pred_b1
     raw[2] = dest & 0xFF
     raw[3] = src0 & 0xFF
     raw[4] = imm_byte & 0xFF
     raw[8]  = src2 & 0xFF
     raw[9]  = 0xe0
+    raw[10] = 0xff
+    raw[11] = 0x07
+    raw[13], raw[14], raw[15] = b13, b14, b15
+    return bytes(raw)
+
+
+def encode_iadd3_pred_neg_b3(dest: int, neg_src0: int, src1: int, src2: int,
+                              pred_idx: int, inverted: bool = False,
+                              ctrl: int = 0) -> bytes:
+    """Encode @[!]Ppred_idx IADD3 dest, -neg_src0, src1, src2 (negate b3 operand).
+
+    Ground truth: @!P0 IADD3 R7, -R7, RZ, RZ (from div.s32 sign correction)
+      bytes: 10 82 07 07 ff 00 00 00 | ff e1 ff 07 00 c8 0f 00
+      b1=0x82 = 0x80|(0<<4)|0x02 (@!P0), b3=neg_src0, b9=0xe1 (negate b3)
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0x10
+    pred_b1 = ((pred_idx & 0x07) << 4) | 0x02
+    if inverted:
+        pred_b1 |= 0x80
+    raw[1] = pred_b1
+    raw[2] = dest & 0xFF
+    raw[3] = neg_src0 & 0xFF
+    raw[4] = src1 & 0xFF
+    raw[8]  = src2 & 0xFF
+    raw[9]  = 0xe1
     raw[10] = 0xff
     raw[11] = 0x07
     raw[13], raw[14], raw[15] = b13, b14, b15

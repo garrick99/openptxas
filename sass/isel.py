@@ -65,9 +65,10 @@ from sass.encoding.sm_120_opcodes import (
     encode_shfl, SHFL_IDX, SHFL_UP, SHFL_DOWN, SHFL_BFLY,
     encode_vote_ballot,
     encode_i2fp_u32, encode_f2i_u32,
-    encode_i2f_u32_rp, encode_f2i_ftz_u32_trunc, encode_hfma2_zero,
+    encode_i2f_u32_rp, encode_i2f_s32_rp, encode_f2i_ftz_u32_trunc, encode_hfma2_zero,
     encode_iadd3_imm32, encode_iadd3_neg_b4, encode_iadd3_neg_b3,
-    encode_iadd3_pred_neg_b4, encode_iadd3_pred_small_imm, encode_lop3_pred,
+    encode_iadd3_pred_neg_b4, encode_iadd3_pred_small_imm,
+    encode_iadd3_pred_neg_b3, encode_lop3_pred,
     encode_lop3, LOP3_AND, LOP3_OR, LOP3_XOR,
     RZ, PT, SR_TID_X, SR_TID_Y,
     SR_CTAID_X,
@@ -1249,11 +1250,206 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         f'@!P{pnz} LOP3.LUT R{d}, RZ, R{b}, RZ, 0x33  // div-by-zero: result=0xFFFFFFFF'))
 
                 elif op == 'div' and typ == 's32':
-                    output.append(_nop(f'TODO: div.s32 (signed Newton-Raphson sequence, ~25 instructions)'))
+                    # Signed 32-bit division via Newton-Raphson on absolute values.
+                    # Matches ptxas sm_120 div.s32 sequence: IABS both operands,
+                    # LOP3.XOR to capture sign, NR on |a|/|b|, then sign-correct.
+                    # Ground truth: cuobjdump verified against ptxas 13.0 output.
+                    d  = ctx.ra.r32(instr.dest.name)
+                    a  = ctx.ra.r32(instr.srcs[0].name)   # dividend
+                    b  = ctx.ra.r32(instr.srcs[1].name)   # divisor
+                    t0 = ctx._next_gpr; ctx._next_gpr += 1
+                    t1 = ctx._next_gpr; ctx._next_gpr += 1
+                    t2 = ctx._next_gpr; ctx._next_gpr += 1
+                    t3 = ctx._next_gpr; ctx._next_gpr += 1
+                    ab_s = ctx._next_gpr; ctx._next_gpr += 1  # |a| temp / saved |a|
+                    sign = ctx._next_gpr; ctx._next_gpr += 1  # sign = a ^ b (bit 31)
+                    ppos  = ctx._next_pred; ctx._next_pred += 1  # result is positive
+                    pge1  = ctx._next_pred; ctx._next_pred += 1
+                    pge2  = ctx._next_pred; ctx._next_pred += 1
+                    pnz   = ctx._next_pred; ctx._next_pred += 1  # divisor != 0
+                    # Compute |b| in t2 (reuse t2 for NR), |a| saved in ab_s
+                    abs_b = ctx._next_gpr; ctx._next_gpr += 1  # |b| for NR
+                    output.append(SassInstr(encode_iabs(abs_b, b),
+                        f'IABS R{abs_b}, R{b}  // div.s32: |b|'))
+                    output.append(SassInstr(encode_iabs(ab_s, a),
+                        f'IABS R{ab_s}, R{a}  // div.s32: |a|'))
+                    output.append(SassInstr(encode_i2f_s32_rp(t0, abs_b),
+                        f'I2F.S32.RP R{t0}, R{abs_b}  // float(|b|) round-up'))
+                    output.append(SassInstr(encode_lop3(sign, a, b, RZ, LOP3_XOR),
+                        f'LOP3.XOR R{sign}, R{a}, R{b}, RZ  // sign = a^b'))
+                    output.append(SassInstr(encode_mufu(t0, t0, MUFU_RCP),
+                        f'MUFU.RCP R{t0}, R{t0}'))
+                    output.append(SassInstr(encode_iadd3_imm32(t1, t0, 0x0ffffffe, RZ),
+                        f'IADD3 R{t1}, R{t0}, 0xffffffe, RZ'))
+                    output.append(SassInstr(encode_f2i_ftz_u32_trunc(t2, t1),
+                        f'F2I.FTZ.U32.TRUNC R{t2}, R{t1}'))
+                    output.append(SassInstr(encode_hfma2_zero(t1),
+                        f'HFMA2 R{t1}, -RZ, RZ, 0, 0'))
+                    output.append(SassInstr(encode_iadd3_neg_b4(t3, RZ, t2, RZ),
+                        f'IADD3 R{t3}, RZ, -R{t2}, RZ'))
+                    output.append(SassInstr(encode_imad(t3, t3, abs_b, RZ),
+                        f'IMAD R{t3}, R{t3}, R{abs_b}, RZ'))
+                    # ab_s = |a| (saved), use as dividend for NR
+                    output.append(SassInstr(encode_imad_hi(t2, t2, t3, t1),
+                        f'IMAD.HI.U32 R{t2}, R{t2}, R{t3}, R{t1}'))
+                    output.append(SassInstr(encode_imad_hi(t2, t2, ab_s, RZ),
+                        f'IMAD.HI.U32 R{t2}, R{t2}, R{ab_s}, RZ  // quotient approx'))
+                    output.append(SassInstr(encode_iadd3_neg_b3(t3, t2, RZ, RZ),
+                        f'IADD3 R{t3}, -R{t2}, RZ, RZ  // negate q'))
+                    output.append(SassInstr(encode_imad(t3, abs_b, t3, ab_s),
+                        f'IMAD R{t3}, R{abs_b}, R{t3}, R{ab_s}  // remainder'))
+                    # Correction: if |b| > remainder, no correction needed
+                    output.append(SassInstr(encode_isetp(pge1, abs_b, t3, ISETP_GT),
+                        f'ISETP.GT.U32 P{pge1}, PT, R{abs_b}, R{t3}, PT'))
+                    output.append(SassInstr(
+                        encode_iadd3_pred_neg_b4(t3, t3, abs_b, RZ, pge1, inverted=True),
+                        f'@!P{pge1} IADD3 R{t3}, R{t3}, -R{abs_b}, RZ'))
+                    output.append(SassInstr(
+                        encode_iadd3_pred_small_imm(t2, t2, 1, RZ, pge1, inverted=True),
+                        f'@!P{pge1} IADD3 R{t2}, R{t2}, 0x1, RZ'))
+                    # Sign check: if sign_bit >= 0 (positive), keep quotient as-is
+                    output.append(SassInstr(encode_isetp(ppos, sign, RZ, ISETP_GE, signed=True),
+                        f'ISETP.GE.S32 P{ppos}, PT, R{sign}, RZ, PT'))
+                    output.append(SassInstr(encode_isetp(pge2, t3, abs_b, ISETP_GE),
+                        f'ISETP.GE.U32 P{pge2}, PT, R{t3}, R{abs_b}, PT'))
+                    output.append(SassInstr(
+                        encode_iadd3_pred_small_imm(t2, t2, 1, RZ, pge2),
+                        f'@P{pge2} IADD3 R{t2}, R{t2}, 0x1, RZ'))
+                    # Check if divisor is zero
+                    output.append(SassInstr(encode_isetp(pnz, b, RZ, ISETP_NE, signed=True),
+                        f'ISETP.NE.S32 P{pnz}, PT, R{b}, RZ, PT'))
+                    output.append(SassInstr(encode_mov(d, t2),
+                        f'MOV R{d}, R{t2}'))
+                    # Negate quotient if sign bit indicates negative result
+                    output.append(SassInstr(
+                        encode_iadd3_pred_neg_b3(d, d, RZ, RZ, ppos, inverted=True),
+                        f'@!P{ppos} IADD3 R{d}, -R{d}, RZ, RZ'))
+                    # Div-by-zero: result = 0xFFFFFFFF (CUDA signed div-by-zero behavior)
+                    output.append(SassInstr(
+                        encode_lop3_pred(d, RZ, b, RZ, 0x33, pnz, inverted=True),
+                        f'@!P{pnz} LOP3.LUT R{d}, RZ, R{b}, RZ, 0x33  // div-by-zero'))
 
-                elif op == 'rem' and typ in ('u32', 's32'):
-                    # rem = a - (a/b)*b — needs div first
-                    output.append(_nop(f'TODO: rem.{typ} (needs div.{typ} + IMAD sequence)'))
+                elif op == 'rem' and typ == 'u32':
+                    # rem.u32 d, a, b = a - (a/b)*b
+                    # Uses same Newton-Raphson setup as div.u32 but outputs remainder.
+                    # Ground truth: cuobjdump verified against ptxas 13.0 rem.u32 output.
+                    d  = ctx.ra.r32(instr.dest.name)
+                    a  = ctx.ra.r32(instr.srcs[0].name)
+                    b  = ctx.ra.r32(instr.srcs[1].name)
+                    t0 = ctx._next_gpr; ctx._next_gpr += 1
+                    t1 = ctx._next_gpr; ctx._next_gpr += 1
+                    t2 = ctx._next_gpr; ctx._next_gpr += 1
+                    t3 = ctx._next_gpr; ctx._next_gpr += 1
+                    pnz  = ctx._next_pred; ctx._next_pred += 1
+                    pge1 = ctx._next_pred; ctx._next_pred += 1
+                    pge2 = ctx._next_pred; ctx._next_pred += 1
+                    # NR setup (same as div.u32)
+                    output.append(SassInstr(encode_i2f_u32_rp(t0, b),
+                        f'I2F.U32.RP R{t0}, R{b}  // rem.u32: float(divisor)'))
+                    output.append(SassInstr(encode_isetp(pnz, b, RZ, ISETP_NE),
+                        f'ISETP.NE.U32 P{pnz}, PT, R{b}, RZ, PT'))
+                    output.append(SassInstr(encode_mufu(t0, t0, MUFU_RCP),
+                        f'MUFU.RCP R{t0}, R{t0}'))
+                    output.append(SassInstr(encode_iadd3_imm32(t1, t0, 0x0ffffffe, RZ),
+                        f'IADD3 R{t1}, R{t0}, 0xffffffe, RZ'))
+                    output.append(SassInstr(encode_f2i_ftz_u32_trunc(t2, t1),
+                        f'F2I.FTZ.U32.TRUNC R{t2}, R{t1}'))
+                    output.append(SassInstr(encode_hfma2_zero(t1),
+                        f'HFMA2 R{t1}, -RZ, RZ, 0, 0'))
+                    output.append(SassInstr(encode_iadd3_neg_b4(t3, RZ, t2, RZ),
+                        f'IADD3 R{t3}, RZ, -R{t2}, RZ'))
+                    output.append(SassInstr(encode_imad(t3, t3, b, RZ),
+                        f'IMAD R{t3}, R{t3}, R{b}, RZ'))
+                    output.append(SassInstr(encode_imad_hi(t2, t2, t3, t1),
+                        f'IMAD.HI.U32 R{t2}, R{t2}, R{t3}, R{t1}'))
+                    output.append(SassInstr(encode_imad_hi(t2, t2, a, RZ),
+                        f'IMAD.HI.U32 R{t2}, R{t2}, R{a}, RZ  // quotient approx in t2'))
+                    # Compute remainder: negate quotient in-place, then IMAD
+                    output.append(SassInstr(encode_iadd3_neg_b3(t2, t2, RZ, RZ),
+                        f'IADD3 R{t2}, -R{t2}, RZ, RZ  // negate quotient'))
+                    output.append(SassInstr(encode_imad(d, b, t2, a),
+                        f'IMAD R{d}, R{b}, R{t2}, R{a}  // d = a - q*b = remainder'))
+                    # Two correction loops (subtract divisor, not increment quotient)
+                    output.append(SassInstr(encode_isetp(pge1, d, b, ISETP_GE),
+                        f'ISETP.GE.U32 P{pge1}, PT, R{d}, R{b}, PT'))
+                    output.append(SassInstr(encode_iadd3_pred_neg_b4(d, d, b, RZ, pge1),
+                        f'@P{pge1} IADD3 R{d}, R{d}, -R{b}, RZ'))
+                    output.append(SassInstr(encode_isetp(pge2, d, b, ISETP_GE),
+                        f'ISETP.GE.U32 P{pge2}, PT, R{d}, R{b}, PT'))
+                    output.append(SassInstr(encode_iadd3_pred_neg_b4(d, d, b, RZ, pge2),
+                        f'@P{pge2} IADD3 R{d}, R{d}, -R{b}, RZ'))
+                    output.append(SassInstr(encode_lop3_pred(d, RZ, b, RZ, 0x33, pnz, inverted=True),
+                        f'@!P{pnz} LOP3.LUT R{d}, RZ, R{b}, RZ, 0x33  // rem of div-by-zero=0xFFFFFFFF'))
+
+                elif op == 'rem' and typ == 's32':
+                    # Signed 32-bit remainder via Newton-Raphson on absolute values.
+                    # Sign of remainder = sign of dividend (C semantics: a = (a/b)*b + rem).
+                    # Ground truth: cuobjdump verified against ptxas 13.0 rem.s32 output.
+                    d     = ctx.ra.r32(instr.dest.name)
+                    a     = ctx.ra.r32(instr.srcs[0].name)   # dividend (original, for sign)
+                    b     = ctx.ra.r32(instr.srcs[1].name)   # divisor (original, for NE check)
+                    abs_b = ctx._next_gpr; ctx._next_gpr += 1
+                    abs_a = ctx._next_gpr; ctx._next_gpr += 1
+                    t0    = ctx._next_gpr; ctx._next_gpr += 1
+                    t1    = ctx._next_gpr; ctx._next_gpr += 1
+                    t2    = ctx._next_gpr; ctx._next_gpr += 1
+                    t3    = ctx._next_gpr; ctx._next_gpr += 1
+                    pgt1  = ctx._next_pred; ctx._next_pred += 1  # |b| > rem (no correction)
+                    psign = ctx._next_pred; ctx._next_pred += 1  # a >= 0
+                    pgt2  = ctx._next_pred; ctx._next_pred += 1  # second correction check
+                    pnz   = ctx._next_pred; ctx._next_pred += 1  # b != 0
+                    output.append(SassInstr(encode_iabs(abs_b, b),
+                        f'IABS R{abs_b}, R{b}  // rem.s32: |b|'))
+                    output.append(SassInstr(encode_iabs(abs_a, a),
+                        f'IABS R{abs_a}, R{a}  // rem.s32: |a|'))
+                    output.append(SassInstr(encode_i2f_s32_rp(t0, abs_b),
+                        f'I2F.S32.RP R{t0}, R{abs_b}  // float(|b|) round-up'))
+                    output.append(SassInstr(encode_mufu(t0, t0, MUFU_RCP),
+                        f'MUFU.RCP R{t0}, R{t0}'))
+                    output.append(SassInstr(encode_iadd3_imm32(t1, t0, 0x0ffffffe, RZ),
+                        f'IADD3 R{t1}, R{t0}, 0xffffffe, RZ'))
+                    output.append(SassInstr(encode_f2i_ftz_u32_trunc(t2, t1),
+                        f'F2I.FTZ.U32.TRUNC R{t2}, R{t1}'))
+                    output.append(SassInstr(encode_hfma2_zero(t1),
+                        f'HFMA2 R{t1}, -RZ, RZ, 0, 0'))
+                    output.append(SassInstr(encode_iadd3_neg_b4(t3, RZ, t2, RZ),
+                        f'IADD3 R{t3}, RZ, -R{t2}, RZ'))
+                    output.append(SassInstr(encode_imad(t3, t3, abs_b, RZ),
+                        f'IMAD R{t3}, R{t3}, R{abs_b}, RZ'))
+                    output.append(SassInstr(encode_imad_hi(t2, t2, t3, t1),
+                        f'IMAD.HI.U32 R{t2}, R{t2}, R{t3}, R{t1}'))
+                    output.append(SassInstr(encode_imad_hi(t2, t2, abs_a, RZ),
+                        f'IMAD.HI.U32 R{t2}, R{t2}, R{abs_a}, RZ  // quotient approx'))
+                    output.append(SassInstr(encode_iadd3_neg_b3(t2, t2, RZ, RZ),
+                        f'IADD3 R{t2}, -R{t2}, RZ, RZ  // negate quotient'))
+                    output.append(SassInstr(encode_imad(d, abs_b, t2, abs_a),
+                        f'IMAD R{d}, R{abs_b}, R{t2}, R{abs_a}  // rem = |a| + |b|*(-q)'))
+                    # Correction 1: if |b| > rem, no subtract needed; else subtract |b|
+                    output.append(SassInstr(encode_isetp(pgt1, abs_b, d, ISETP_GT),
+                        f'ISETP.GT.U32 P{pgt1}, PT, R{abs_b}, R{d}, PT'))
+                    output.append(SassInstr(
+                        encode_iadd3_pred_neg_b4(d, d, abs_b, RZ, pgt1, inverted=True),
+                        f'@!P{pgt1} IADD3 R{d}, R{d}, -R{abs_b}, RZ'))
+                    # Sign check: P=1 if original dividend was non-negative
+                    output.append(SassInstr(encode_isetp(psign, a, RZ, ISETP_GE, signed=True),
+                        f'ISETP.GE.S32 P{psign}, PT, R{a}, RZ, PT'))
+                    # Correction 2: second overshoot check
+                    output.append(SassInstr(encode_isetp(pgt2, abs_b, d, ISETP_GT),
+                        f'ISETP.GT.U32 P{pgt2}, PT, R{abs_b}, R{d}, PT'))
+                    output.append(SassInstr(
+                        encode_iadd3_pred_neg_b4(d, d, abs_b, RZ, pgt2, inverted=True),
+                        f'@!P{pgt2} IADD3 R{d}, R{d}, -R{abs_b}, RZ'))
+                    # Div-by-zero predicate
+                    output.append(SassInstr(encode_isetp(pnz, b, RZ, ISETP_NE, signed=True),
+                        f'ISETP.NE.S32 P{pnz}, PT, R{b}, RZ, PT'))
+                    # Negate remainder if dividend was negative
+                    output.append(SassInstr(
+                        encode_iadd3_pred_neg_b3(d, d, RZ, RZ, psign, inverted=True),
+                        f'@!P{psign} IADD3 R{d}, -R{d}, RZ, RZ'))
+                    # Div-by-zero: result = 0xFFFFFFFF
+                    output.append(SassInstr(
+                        encode_lop3_pred(d, RZ, b, RZ, 0x33, pnz, inverted=True),
+                        f'@!P{pnz} LOP3.LUT R{d}, RZ, R{b}, RZ, 0x33  // rem-by-zero'))
 
                 elif op == 'rcp' and 'approx' in instr.types and typ == 'f32':
                     d = ctx.ra.r32(instr.dest.name)

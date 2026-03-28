@@ -603,3 +603,114 @@ def test_div_u32_compiles():
     # Verify NOPs are scheduling-only (not TODO NOPs from unimplemented instrs).
     nop_count = opcodes.count(0x918)
     assert nop_count <= 6, "Too many NOPs in div.u32 (likely unimplemented instruction)"
+
+REM_U32_KERNEL = """\
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry rem_u32_kernel(
+    .param .u64 out_ptr,
+    .param .u32 a_param,
+    .param .u32 b_param)
+{
+    .reg .u32 %r<4>;
+    .reg .u64 %rd<2>;
+    ld.param.u32 %r0, [a_param];
+    ld.param.u32 %r1, [b_param];
+    rem.u32      %r2, %r0, %r1;
+    ld.param.u64 %rd0, [out_ptr];
+    st.global.u32 [%rd0], %r2;
+    ret;
+}
+"""
+
+
+def test_rem_u32_compiles():
+    """rem.u32 emits Newton-Raphson sequence (no TODO NOPs)."""
+    results = compile_ptx_source(REM_U32_KERNEL)
+    cubin = results['rem_u32_kernel']
+    assert cubin[:4] == b'\x7fELF'
+    elf = ELF64(cubin)
+    text = elf.section_data('.text.rem_u32_kernel')
+    opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
+               for off in range(0, len(text), 16)]
+    assert 0x306 in opcodes, "I2F.U32.RP not found in rem.u32"
+    assert 0x227 in opcodes, "IMAD.HI.U32 not found in rem.u32"
+    nop_count = opcodes.count(0x918)
+    assert nop_count <= 6, f"Too many NOPs ({nop_count}) in rem.u32"
+
+DIV_S32_KERNEL = """\
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry div_s32_kernel(
+    .param .u64 out_ptr,
+    .param .s32 a_param,
+    .param .s32 b_param)
+{
+    .reg .s32 %r<4>;
+    .reg .u64 %rd<2>;
+    ld.param.s32 %r0, [a_param];
+    ld.param.s32 %r1, [b_param];
+    div.s32      %r2, %r0, %r1;
+    ld.param.u64 %rd0, [out_ptr];
+    st.global.s32 [%rd0], %r2;
+    ret;
+}
+"""
+
+
+def test_div_s32_compiles():
+    """div.s32 emits IABS+NR+sign-correction sequence (no TODO NOPs)."""
+    results = compile_ptx_source(DIV_S32_KERNEL)
+    cubin = results['div_s32_kernel']
+    assert cubin[:4] == b'\x7fELF'
+    elf = ELF64(cubin)
+    text = elf.section_data('.text.div_s32_kernel')
+    opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
+               for off in range(0, len(text), 16)]
+    assert 0x213 in opcodes, "IABS not found in div.s32"
+    assert 0x306 in opcodes, "I2F.RP not found in div.s32"
+    assert 0x227 in opcodes, "IMAD.HI not found in div.s32"
+    nop_count = opcodes.count(0x918)
+    assert nop_count <= 8, f"Too many NOPs ({nop_count}) in div.s32"
+
+
+REM_S32_KERNEL = """\
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry rem_s32_kernel(
+    .param .u64 out_ptr,
+    .param .s32 a_param,
+    .param .s32 b_param)
+{
+    .reg .s32 %r<4>;
+    .reg .u64 %rd<2>;
+    ld.param.s32 %r0, [a_param];
+    ld.param.s32 %r1, [b_param];
+    rem.s32      %r2, %r0, %r1;
+    ld.param.u64 %rd0, [out_ptr];
+    st.global.s32 [%rd0], %r2;
+    ret;
+}
+"""
+
+
+def test_rem_s32_compiles():
+    """rem.s32 emits IABS+NR+sign-correction sequence (no TODO NOPs)."""
+    results = compile_ptx_source(REM_S32_KERNEL)
+    cubin = results['rem_s32_kernel']
+    assert cubin[:4] == b'\x7fELF'
+    elf = ELF64(cubin)
+    text = elf.section_data('.text.rem_s32_kernel')
+    opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
+               for off in range(0, len(text), 16)]
+    assert 0x213 in opcodes, "IABS not found in rem.s32"
+    assert 0x306 in opcodes, "I2F.RP not found in rem.s32"
+    assert 0x227 in opcodes, "IMAD.HI not found in rem.s32"
+    nop_count = opcodes.count(0x918)
+    assert nop_count <= 10, f"Too many NOPs ({nop_count}) in rem.s32"

@@ -786,6 +786,22 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         output.append(SassInstr(encode_imad_rr(d, a, b, RZ),
                             f'IMAD R{d}, R{a}, R{b}, RZ  // mul.lo.{typ} R-R'))
 
+                elif op == 'mul' and 'lo' in instr.types and typ in ('u64', 's64', 'b64'):
+                    # mul.lo.u64 d, a, b = lower 64 bits of a * b
+                    # Decomposed into three IMAD operations:
+                    #   IMAD.WIDE d_lo, a_lo, b_lo, RZ  → d_lo:d_hi = a_lo × b_lo
+                    #   IMAD.RR   d_hi, a_lo, b_hi, d_hi → d_hi += a_lo × b_hi (lo bits only)
+                    #   IMAD.RR   d_hi, a_hi, b_lo, d_hi → d_hi += a_hi × b_lo
+                    d_lo = ctx.ra.lo(instr.dest.name)
+                    a_lo = ctx.ra.lo(instr.srcs[0].name)
+                    b_lo = ctx.ra.lo(instr.srcs[1].name)
+                    output.append(SassInstr(encode_imad_wide_rr(d_lo, a_lo, b_lo, RZ),
+                        f'IMAD.WIDE R{d_lo}, R{a_lo}, R{b_lo}, RZ  // mul.lo.{typ} wide'))
+                    output.append(SassInstr(encode_imad_rr(d_lo+1, a_lo, b_lo+1, d_lo+1),
+                        f'IMAD R{d_lo+1}, R{a_lo}, R{b_lo+1}, R{d_lo+1}  // mul.lo.{typ} cross a_lo*b_hi'))
+                    output.append(SassInstr(encode_imad_rr(d_lo+1, a_lo+1, b_lo, d_lo+1),
+                        f'IMAD R{d_lo+1}, R{a_lo+1}, R{b_lo}, R{d_lo+1}  // mul.lo.{typ} cross a_hi*b_lo'))
+
                 elif op == 'st' and 'shared' in instr.types:
                     from ptx.ir import MemOp
                     addr_op = instr.srcs[0]

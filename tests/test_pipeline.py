@@ -228,3 +228,55 @@ def test_setp_immediate_compiles():
     assert 0xc0c in opcodes, "ISETP R-UR (0xc0c) not found — setp with immediate failed"
     # LDCU.32 opcode 0x7ac must appear (at least one for setp imm, possibly more for params)
     assert 0x7ac in opcodes, "LDCU.32 (0x7ac) not found — setp immediate literal load missing"
+
+
+# ---------------------------------------------------------------------------
+# bfe.u32 tests
+# ---------------------------------------------------------------------------
+
+BFE_KERNEL = """\
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry bfe_kernel(
+    .param .u64 out,
+    .param .u32 val)
+{
+    .reg .b32   %r<4>;
+    .reg .b64   %rd<2>;
+    ld.param.u32 %r1, [val];
+    bfe.u32     %r0, %r1, 0, 8;
+    bfe.u32     %r2, %r1, 8, 8;
+    ld.param.u64 %rd0, [out];
+    ret;
+}
+"""
+
+
+def test_bfe_u32_compiles():
+    """bfe.u32 compiles without crashing (no TODO NOP for constant start/length)."""
+    results = compile_ptx_source(BFE_KERNEL)
+    cubin = results["bfe_kernel"]
+    assert cubin[:4] == b'\x7fELF'
+
+
+def test_bfe_u32_no_nop():
+    """bfe.u32 with constant immediates does not emit TODO NOP (0x918)."""
+    results = compile_ptx_source(BFE_KERNEL)
+    cubin = results["bfe_kernel"]
+    elf = ELF64(cubin)
+    text = elf.section_data('.text.bfe_kernel')
+    opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
+               for off in range(0, len(text), 16)]
+    # NOP opcode is 0x918; LDC is 0xb82; LOP3 is 0x212; SHF.R is 0x819
+    assert 0x212 in opcodes, "LOP3 (0x212) not found — bfe mask step missing"
+
+
+def test_bfe_u32_bakes_mask():
+    """.nv.constant0 contains the bfe mask (0xff) for an 8-bit extract."""
+    results = compile_ptx_source(BFE_KERNEL)
+    cubin = results["bfe_kernel"]
+    elf = ELF64(cubin)
+    const0 = elf.section_data('.nv.constant0.bfe_kernel')
+    assert b'\xff\x00\x00\x00' in const0, "Mask 0xFF not found in constant bank"

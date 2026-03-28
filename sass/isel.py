@@ -487,6 +487,9 @@ class ISelContext:
     # Base offset is set by the pipeline after regalloc (after the param area ends).
     _const_pool_base: int = 0
     _const_pool:      dict[int, int] = field(default_factory=dict)
+    # Next available scratch GPR (for isel-internal temporaries, e.g. bfe mask)
+    # Initialized from alloc.num_gprs by the pipeline; may grow during isel.
+    _next_gpr: int = 0
 
     def _alloc_literal(self, value: int) -> int:
         """Return the c[0] byte offset for a 32-bit literal constant.
@@ -1126,17 +1129,41 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     else:
                         output.append(_nop(f'TODO: prmt with register selector'))
 
-                elif op == 'bfe' and typ in ('u32', 's32'):
-                    # Bit field extract: shift right by start pos, mask with ((1<<len)-1)
-                    # ptxas compiles to SHF.R.U32.HI or SHF.R.S32.HI
-                    from sass.encoding.sm_120_encode import encode_shf_l_u32
+                elif op == 'bfe' and typ == 'u32':
+                    # Bit field extract: dest = (src >> start) & ((1<<length)-1)
+                    # Decomposed as: SHF.R.U32.HI + (optional LDC + LOP3 for masking)
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
-                    # Start and length are immediates
-                    start = instr.srcs[1].value if isinstance(instr.srcs[1], ImmOp) else 0
-                    length = instr.srcs[2].value if len(instr.srcs) > 2 and isinstance(instr.srcs[2], ImmOp) else 32
-                    # SHF.R to shift right, then AND with mask
-                    output.append(_nop(f'TODO: bfe.{typ} decomposition (SHF.R + AND mask)'))
+                    start  = instr.srcs[1].value if isinstance(instr.srcs[1], ImmOp) else 0
+                    length = instr.srcs[2].value if (len(instr.srcs) > 2 and isinstance(instr.srcs[2], ImmOp)) else 32
+                    mask = (1 << length) - 1 if length < 32 else 0xFFFFFFFF
+                    if length >= 32:
+                        # No masking needed — just shift
+                        output.append(SassInstr(
+                            encode_shf_r_u32_hi(d, a, start),
+                            f'SHF.R.U32.HI R{d}, RZ, 0x{start:x}, R{a}  // bfe.u32 len={length}'))
+                    elif start == 0:
+                        # Shift is 0 — just mask (LDC d=mask, LOP3 d=src&d)
+                        lit_off = ctx._alloc_literal(mask)
+                        output.append(SassInstr(
+                            encode_ldc(d, 0, lit_off),
+                            f'LDC R{d}, c[0][0x{lit_off:x}]  // bfe.u32 mask=0x{mask:x}'))
+                        output.append(SassInstr(
+                            encode_lop3(d, a, d, RZ, LOP3_AND),
+                            f'LOP3.LUT R{d}, R{a}, R{d}, RZ, 0xC0  // bfe.u32 &mask'))
+                    else:
+                        # General: SHF shift into d, load mask into temp, AND
+                        output.append(SassInstr(
+                            encode_shf_r_u32_hi(d, a, start),
+                            f'SHF.R.U32.HI R{d}, RZ, 0x{start:x}, R{a}  // bfe.u32 >>start'))
+                        lit_off = ctx._alloc_literal(mask)
+                        t = ctx._next_gpr; ctx._next_gpr += 1
+                        output.append(SassInstr(
+                            encode_ldc(t, 0, lit_off),
+                            f'LDC R{t}, c[0][0x{lit_off:x}]  // bfe.u32 mask=0x{mask:x}'))
+                        output.append(SassInstr(
+                            encode_lop3(d, d, t, RZ, LOP3_AND),
+                            f'LOP3.LUT R{d}, R{d}, R{t}, RZ, 0xC0  // bfe.u32 &mask'))
 
                 elif op == 'bfi' and typ in ('b32',):
                     output.append(_nop(f'TODO: bfi.b32 decomposition (LOP3.LUT with mask)'))

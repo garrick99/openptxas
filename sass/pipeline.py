@@ -387,6 +387,7 @@ def compile_function(fn: Function, verbose: bool = False) -> bytes:
         param_offsets=alloc.param_offsets,
         ur_desc=4,  # UR4 for memory descriptors (ptxas convention)
         _const_pool_base=lit_pool_base,
+        _next_gpr=alloc.num_gprs,
     )
     body_instrs = select_function(fn, ctx)
 
@@ -577,7 +578,7 @@ def compile_function(fn: Function, verbose: bool = False) -> bytes:
     desc = KernelDesc(
         name=fn.name,
         sass_bytes=sass_bytes,
-        num_gprs=alloc.num_gprs,
+        num_gprs=max(alloc.num_gprs, ctx._next_gpr),
         num_params=len(fn.params),
         param_sizes=param_sizes,
         param_offsets=alloc.param_offsets,

@@ -597,25 +597,50 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                 elif op == 'add' and typ in ('u32', 's32'):
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
-                    b = ctx.ra.r32(instr.srcs[1].name)
-                    output.append(SassInstr(encode_iadd3(d, a, b, RZ),
-                                            f'IADD3 R{d}, R{a}, R{b}, RZ  // add.{typ}'))
+                    if isinstance(instr.srcs[1], ImmOp):
+                        imm = instr.srcs[1].value & 0xFFFFFFFF
+                        lit_off = ctx._alloc_literal(imm)
+                        output.append(SassInstr(encode_ldc(d, 0, lit_off),
+                                                f'LDC R{d}, c[0][0x{lit_off:x}]  // add imm={imm:#x}'))
+                        output.append(SassInstr(encode_iadd3(d, a, d, RZ),
+                                                f'IADD3 R{d}, R{a}, R{d}, RZ  // add.{typ} imm'))
+                    else:
+                        b = ctx.ra.r32(instr.srcs[1].name)
+                        output.append(SassInstr(encode_iadd3(d, a, b, RZ),
+                                                f'IADD3 R{d}, R{a}, R{b}, RZ  // add.{typ}'))
 
                 elif op == 'sub' and typ in ('u32', 's32'):
-                    # 32-bit sub: IADD3 with negated src1
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
-                    b = ctx.ra.r32(instr.srcs[1].name)
-                    output.append(SassInstr(encode_iadd3(d, a, b, RZ, negate_src1=True),
-                                            f'IADD3 R{d}, R{a}, -R{b}, RZ  // sub.{typ}'))
+                    if isinstance(instr.srcs[1], ImmOp):
+                        imm = instr.srcs[1].value & 0xFFFFFFFF
+                        lit_off = ctx._alloc_literal(imm)
+                        output.append(SassInstr(encode_ldc(d, 0, lit_off),
+                                                f'LDC R{d}, c[0][0x{lit_off:x}]  // sub imm={imm:#x}'))
+                        output.append(SassInstr(encode_iadd3(d, a, d, RZ, negate_src1=True),
+                                                f'IADD3 R{d}, R{a}, -R{d}, RZ  // sub.{typ} imm'))
+                    else:
+                        b = ctx.ra.r32(instr.srcs[1].name)
+                        output.append(SassInstr(encode_iadd3(d, a, b, RZ, negate_src1=True),
+                                                f'IADD3 R{d}, R{a}, -R{b}, RZ  // sub.{typ}'))
 
                 elif op in ('and', 'or', 'xor') and typ in ('b32', 'u32', 's32'):
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
-                    b = ctx.ra.r32(instr.srcs[1].name)
                     lut = {'and': LOP3_AND, 'or': LOP3_OR, 'xor': LOP3_XOR}[op]
-                    output.append(SassInstr(encode_lop3(d, a, b, RZ, lut),
-                                            f'LOP3.LUT R{d}, R{a}, R{b}, RZ, 0x{lut:02x}  // {op}.{typ}'))
+                    if isinstance(instr.srcs[1], ImmOp):
+                        # Immediate src1: load from literal pool into dest, then LOP3.LUT.
+                        # LOP3.LUT reads old dest (= mask) and src as inputs → result correct.
+                        imm = instr.srcs[1].value & 0xFFFFFFFF
+                        lit_off = ctx._alloc_literal(imm)
+                        output.append(SassInstr(encode_ldc(d, 0, lit_off),
+                                                f'LDC R{d}, c[0][0x{lit_off:x}]  // {op} imm={imm:#x}'))
+                        output.append(SassInstr(encode_lop3(d, a, d, RZ, lut),
+                                                f'LOP3.LUT R{d}, R{a}, R{d}, RZ, 0x{lut:02x}  // {op}.{typ} imm'))
+                    else:
+                        b = ctx.ra.r32(instr.srcs[1].name)
+                        output.append(SassInstr(encode_lop3(d, a, b, RZ, lut),
+                                                f'LOP3.LUT R{d}, R{a}, R{b}, RZ, 0x{lut:02x}  // {op}.{typ}'))
 
                 elif op == 'mul' and 'lo' in instr.types and typ in ('u32', 's32'):
                     # mul.lo.s32 → IMAD R-UR or IMAD.WIDE with immediate

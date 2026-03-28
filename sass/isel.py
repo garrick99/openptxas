@@ -976,8 +976,35 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     # mad.lo.s32 → dest = src0 * src1 + src2
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
+                    c_op = instr.srcs[2] if len(instr.srcs) > 2 else None
+                    c = ctx.ra.r32(c_op.name) if isinstance(c_op, RegOp) else RZ
+                    if isinstance(instr.srcs[1], ImmOp):
+                        # Immediate multiplier: IMAD.SHL if power-of-2, else LDCU+IMAD R-UR
+                        imm = instr.srcs[1].value & 0xFFFFFFFF
+                        if imm > 0 and (imm & (imm - 1)) == 0:
+                            shift = imm.bit_length() - 1
+                            if shift <= 15:
+                                t = ctx._next_gpr; ctx._next_gpr += 1
+                                output.append(SassInstr(encode_imad_shl_u32(t, a, shift),
+                                    f'IMAD.SHL.U32 R{t}, R{a}, 0x{imm:x}, RZ  // mad.lo shift'))
+                                output.append(SassInstr(encode_iadd3(d, t, c, RZ),
+                                    f'IADD3 R{d}, R{t}, R{c}, RZ  // mad.lo add'))
+                            else:
+                                lit_off = ctx._alloc_literal(imm)
+                                ur_tmp = ctx._next_ur; ctx._next_ur += 1
+                                output.append(SassInstr(encode_ldcu_32(ur_tmp, 0, lit_off),
+                                    f'LDCU.32 UR{ur_tmp}, c[0][0x{lit_off:x}]'))
+                                output.append(SassInstr(encode_imad_ur(d, a, ur_tmp, c),
+                                    f'IMAD R{d}, R{a}, UR{ur_tmp}, R{c}  // mad.lo imm'))
+                        else:
+                            lit_off = ctx._alloc_literal(imm)
+                            ur_tmp = ctx._next_ur; ctx._next_ur += 1
+                            output.append(SassInstr(encode_ldcu_32(ur_tmp, 0, lit_off),
+                                f'LDCU.32 UR{ur_tmp}, c[0][0x{lit_off:x}]'))
+                            output.append(SassInstr(encode_imad_ur(d, a, ur_tmp, c),
+                                f'IMAD R{d}, R{a}, UR{ur_tmp}, R{c}  // mad.lo imm'))
+                        continue
                     b = ctx.ra.r32(instr.srcs[1].name)
-                    c = ctx.ra.r32(instr.srcs[2].name) if len(instr.srcs) > 2 else RZ
                     src0_name = instr.srcs[0].name if instr.srcs else ''
                     src1_name = instr.srcs[1].name if len(instr.srcs) > 1 else ''
                     ur_map = getattr(ctx, '_ur_for_param', {})

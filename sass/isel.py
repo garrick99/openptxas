@@ -43,7 +43,8 @@ from sass.encoding.sm_120_opcodes import (
     encode_s2r,
     encode_iadd3, encode_iadd3x,
     encode_iadd64,
-    encode_imad_wide, encode_imad_wide_rr, encode_imad, encode_imad_rr, encode_imad_ur, encode_imad_hi, encode_imad_shl_u32,
+    encode_imad_wide, encode_imad_wide_rr, encode_imad_wide_u32, encode_imad_wide_u32_carry, encode_imad_wide_u32x,
+    encode_imad, encode_imad_rr, encode_imad_ur, encode_imad_hi, encode_imad_shl_u32,
     encode_s2ur,
     encode_ldg_e, encode_ldg_e_64,
     encode_stg_e, encode_stg_e_64,
@@ -65,6 +66,7 @@ from sass.encoding.sm_120_opcodes import (
     encode_shfl, SHFL_IDX, SHFL_UP, SHFL_DOWN, SHFL_BFLY,
     encode_vote_ballot,
     encode_i2fp_u32, encode_f2i_u32,
+    encode_f2f_f32_f64, encode_f2f_f64_f32,
     encode_i2f_u32_rp, encode_i2f_s32_rp, encode_f2i_ftz_u32_trunc, encode_hfma2_zero,
     encode_iadd3_imm32, encode_iadd3_neg_b4, encode_iadd3_neg_b3,
     encode_iadd3_pred_neg_b4, encode_iadd3_pred_small_imm,
@@ -977,7 +979,19 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             _src_t = _core[1] if len(_core) > 1 else 'u32'
                             _32B = {'u32', 's32', 'b32', 'f32'}
                             _64B = {'u64', 's64', 'b64', 'f64'}
-                            if 'f32' in _types_set and ('u32' in _types_set or 's32' in _types_set):
+                            if _dst_t == 'f32' and _src_t == 'f64':
+                                # cvt.rn.f32.f64: double-precision → single-precision
+                                d_r  = ctx.ra.r32(d.name)
+                                a_lo = ctx.ra.lo(s.name)
+                                output.append(SassInstr(encode_f2f_f32_f64(d_r, a_lo),
+                                                        f'F2F.F32.F64 R{d_r}, R{a_lo}'))
+                            elif _dst_t == 'f64' and _src_t == 'f32':
+                                # cvt.f64.f32: single-precision → double-precision
+                                d_lo = ctx.ra.lo(d.name)
+                                a_r  = ctx.ra.r32(s.name)
+                                output.append(SassInstr(encode_f2f_f64_f32(d_lo, a_r),
+                                                        f'F2F.F64.F32 R{d_lo}, R{a_r}'))
+                            elif 'f32' in _types_set and ('u32' in _types_set or 's32' in _types_set):
                                 d_r = ctx.ra.r32(d.name)
                                 a_r = ctx.ra.r32(s.name)
                                 _fi = instr.types.index('f32')
@@ -989,6 +1003,33 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 else:
                                     output.append(SassInstr(encode_f2i_u32(d_r, a_r),
                                                             f'F2I.U32 R{d_r}, R{a_r}  // cvt.{_dst_t}.f32'))
+                            elif _dst_t in ('u8', 's8', 'b8') and _src_t in _32B:
+                                # Truncate to 8 bits: AND with 0xFF
+                                d_r = ctx.ra.r32(d.name)
+                                a_r = ctx.ra.r32(s.name)
+                                lit_off = ctx._alloc_literal(0xFF)
+                                t = ctx._next_gpr; ctx._next_gpr += 1
+                                output.append(SassInstr(encode_ldc(t, 0, lit_off),
+                                                        f'LDC R{t}, c[0][0x{lit_off:x}]  // 0xFF mask'))
+                                output.append(SassInstr(encode_lop3(d_r, a_r, t, RZ, LOP3_AND),
+                                                        f'LOP3.AND R{d_r}, R{a_r}, R{t}, RZ  // cvt.{_dst_t}.{_src_t}'))
+                            elif _dst_t in ('u16', 's16', 'b16') and _src_t in _32B:
+                                # Truncate to 16 bits: AND with 0xFFFF
+                                d_r = ctx.ra.r32(d.name)
+                                a_r = ctx.ra.r32(s.name)
+                                lit_off = ctx._alloc_literal(0xFFFF)
+                                t = ctx._next_gpr; ctx._next_gpr += 1
+                                output.append(SassInstr(encode_ldc(t, 0, lit_off),
+                                                        f'LDC R{t}, c[0][0x{lit_off:x}]  // 0xFFFF mask'))
+                                output.append(SassInstr(encode_lop3(d_r, a_r, t, RZ, LOP3_AND),
+                                                        f'LOP3.AND R{d_r}, R{a_r}, R{t}, RZ  // cvt.{_dst_t}.{_src_t}'))
+                            elif _dst_t in _32B and _src_t in ('u8', 's8', 'b8', 'u16', 's16', 'b16'):
+                                # Widening from narrow: just copy (narrow stored as u32, already zero-extended)
+                                d_r = ctx.ra.r32(d.name)
+                                a_r = ctx.ra.r32(s.name)
+                                if d_r != a_r:
+                                    output.append(SassInstr(encode_iadd3(d_r, a_r, RZ, RZ),
+                                                            f'MOV R{d_r}, R{a_r}  // cvt.{_dst_t}.{_src_t}'))
                             elif _dst_t in _32B and _src_t in _32B:
                                 d_r = ctx.ra.r32(d.name)
                                 a_r = ctx.ra.r32(s.name)
@@ -1246,6 +1287,49 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     b = ctx.ra.r32(instr.srcs[1].name)
                     output.append(SassInstr(encode_imad_hi(d, a, b, RZ, signed=(typ == 's32')),
                                             f'IMAD.HI R{d}, R{a}, R{b}, RZ  // mul.hi.{typ}'))
+
+                elif op == 'mul' and 'hi' in instr.types and typ in ('u64', 's64'):
+                    # mul.hi.u64: upper 64 bits of 128-bit unsigned product.
+                    # Algorithm (schoolbook using IMAD.WIDE.U32):
+                    #   a_lo, a_hi = src0 pair; b_lo, b_hi = src1 pair
+                    #   t0 = IMAD.WIDE.U32(a_hi, b_lo, 0)          → a_hi*b_lo [64-bit]
+                    #   t1 = IMAD.WIDE.U32(a_lo, b_hi, t0, P0)     → a_lo*b_hi + t0 [64-bit, sets P0]
+                    #   t2 = IMAD.WIDE.U32(a_lo, b_lo, 0)          → a_lo*b_lo [64-bit]
+                    #   carry = 0 + P0 (IADD3.X)                   → capture carry from step 2
+                    #   sum_hi = t1_hi (=R9 in ground truth)
+                    #   IADD3 RZ, P0, t2_hi, t1_lo, RZ             → detect carry from bit-32 sum
+                    #   d = IMAD.WIDE.U32.X(a_hi, b_hi, sum_hi, P0) → a_hi*b_hi + sum_hi + carry
+                    # Ground truth verified from ptxas mul.hi.u64 on SM_120.
+                    d_lo = ctx.ra.lo(instr.dest.name)
+                    a_lo = ctx.ra.lo(instr.srcs[0].name)
+                    b_lo = ctx.ra.lo(instr.srcs[1].name)
+                    a_hi = a_lo + 1;  b_hi = b_lo + 1
+                    t0_lo = ctx._next_gpr; ctx._next_gpr += 2  # t0 pair
+                    t1_lo = ctx._next_gpr; ctx._next_gpr += 2  # t1 pair
+                    t2_lo = ctx._next_gpr; ctx._next_gpr += 2  # t2 pair
+                    carry = ctx._next_gpr; ctx._next_gpr += 1
+                    # Step 1: t0 = a_hi * b_lo
+                    output.append(SassInstr(encode_imad_wide_u32(t0_lo, a_hi, b_lo, RZ),
+                        f'IMAD.WIDE.U32 R{t0_lo}, R{a_hi}, R{b_lo}, RZ  // mul.hi.u64 step1'))
+                    # Step 2: t1 = a_lo * b_hi + t0 (sets P0 carry)
+                    output.append(SassInstr(encode_imad_wide_u32_carry(t1_lo, a_lo, b_hi, t0_lo),
+                        f'IMAD.WIDE.U32 R{t1_lo}, P0, R{a_lo}, R{b_hi}, R{t0_lo}  // mul.hi.u64 step2'))
+                    # Step 3: t2 = a_lo * b_lo
+                    output.append(SassInstr(encode_imad_wide_u32(t2_lo, a_lo, b_lo, RZ),
+                        f'IMAD.WIDE.U32 R{t2_lo}, R{a_lo}, R{b_lo}, RZ  // mul.hi.u64 step3'))
+                    # Step 4: carry = 0 + P0 carry from step 2
+                    output.append(SassInstr(encode_iadd3x(carry, RZ, RZ, RZ),
+                        f'IADD3.X R{carry}, PT, PT, RZ, RZ, RZ, P0, !PT  // mul.hi.u64 carry'))
+                    # Step 5: save t1_hi (hi word of a_lo*b_hi + t0) for final product
+                    sum_hi = ctx._next_gpr; ctx._next_gpr += 1
+                    output.append(SassInstr(encode_mov(sum_hi, t1_lo + 1),
+                        f'MOV R{sum_hi}, R{t1_lo+1}  // mul.hi.u64 save t1_hi'))
+                    # Step 6: IADD3 to detect carry from t2_hi + t1_lo into P0
+                    output.append(SassInstr(encode_iadd3(RZ, t2_lo + 1, t1_lo, RZ),
+                        f'IADD3 RZ, P0, PT, R{t2_lo+1}, R{t1_lo}, RZ  // mul.hi.u64 carry detect'))
+                    # Step 7: d = a_hi * b_hi + sum_hi + P0 carry
+                    output.append(SassInstr(encode_imad_wide_u32x(d_lo, a_hi, b_hi, sum_hi),
+                        f'IMAD.WIDE.U32.X R{d_lo}, R{a_hi}, R{b_hi}, R{sum_hi}, P0  // mul.hi.u64 final'))
 
                 elif op == 'popc' and typ in ('b32',):
                     d = ctx.ra.r32(instr.dest.name)

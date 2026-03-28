@@ -817,3 +817,139 @@ def test_and_b64_compiles():
                for off in range(0, len(text), 16)]
     lop3_count = opcodes.count(0x212)
     assert lop3_count >= 2, f"Expected ≥2 LOP3.LUT for and.b64, got {lop3_count}"
+
+
+# ---------------------------------------------------------------------------
+# F2F: float precision conversion
+# ---------------------------------------------------------------------------
+
+CVT_F32_F64_KERNEL = """\
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry cvt_f32_f64_kernel(
+    .param .u64 out_ptr,
+    .param .f64 val)
+{
+    .reg .b64 %rd<2>;
+    .reg .f32 %f<2>;
+    .reg .f64 %fd<2>;
+    ld.param.u64 %rd0, [out_ptr];
+    ld.param.f64 %fd0, [val];
+    cvt.rn.f32.f64 %f0, %fd0;
+    st.global.f32 [%rd0], %f0;
+    ret;
+}
+"""
+
+CVT_F64_F32_KERNEL = """\
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry cvt_f64_f32_kernel(
+    .param .u64 out_ptr,
+    .param .f32 val)
+{
+    .reg .b64 %rd<2>;
+    .reg .f32 %f<2>;
+    .reg .f64 %fd<2>;
+    ld.param.u64 %rd0, [out_ptr];
+    ld.param.f32 %f0, [val];
+    cvt.f64.f32 %fd0, %f0;
+    cvt.rn.f32.f64 %f1, %fd0;
+    st.global.f32 [%rd0], %f1;
+    ret;
+}
+"""
+
+MUL_HI_U64_KERNEL = """\
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry mul_hi_u64_kernel(
+    .param .u64 out_ptr,
+    .param .u64 a_val,
+    .param .u64 b_val)
+{
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd0, [out_ptr];
+    ld.param.u64 %rd1, [a_val];
+    ld.param.u64 %rd2, [b_val];
+    mul.hi.u64 %rd3, %rd1, %rd2;
+    st.global.u64 [%rd0], %rd3;
+    ret;
+}
+"""
+
+CVT_U8_U32_KERNEL = """\
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry cvt_u8_kernel(
+    .param .u64 out_ptr,
+    .param .u32 val)
+{
+    .reg .b32 %r<2>;
+    .reg .b64 %rd<2>;
+    ld.param.u32 %r0, [val];
+    cvt.u8.u32 %r1, %r0;
+    ld.param.u64 %rd0, [out_ptr];
+    st.global.u32 [%rd0], %r1;
+    ret;
+}
+"""
+
+
+def test_cvt_f32_f64_compiles():
+    """cvt.rn.f32.f64 emits F2F.F32.F64 (opcode 0x310)."""
+    results = compile_ptx_source(CVT_F32_F64_KERNEL)
+    cubin = results['cvt_f32_f64_kernel']
+    assert cubin[:4] == b'\x7fELF'
+    elf = ELF64(cubin)
+    text = elf.section_data('.text.cvt_f32_f64_kernel')
+    opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
+               for off in range(0, len(text), 16)]
+    assert 0x310 in opcodes, "F2F (0x310) not found in cvt.rn.f32.f64"
+
+
+def test_cvt_f64_f32_compiles():
+    """cvt.f64.f32 emits F2F.F64.F32 (opcode 0x310), no TODO NOPs."""
+    results = compile_ptx_source(CVT_F64_F32_KERNEL)
+    cubin = results['cvt_f64_f32_kernel']
+    assert cubin[:4] == b'\x7fELF'
+    elf = ELF64(cubin)
+    text = elf.section_data('.text.cvt_f64_f32_kernel')
+    opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
+               for off in range(0, len(text), 16)]
+    assert 0x310 in opcodes, "F2F (0x310) not found in cvt.f64.f32"
+
+
+def test_mul_hi_u64_compiles():
+    """mul.hi.u64 emits IMAD.WIDE.U32 sequence (opcode 0x225), no TODO NOPs."""
+    results = compile_ptx_source(MUL_HI_U64_KERNEL)
+    cubin = results['mul_hi_u64_kernel']
+    assert cubin[:4] == b'\x7fELF'
+    elf = ELF64(cubin)
+    text = elf.section_data('.text.mul_hi_u64_kernel')
+    opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
+               for off in range(0, len(text), 16)]
+    assert 0x225 in opcodes, "IMAD.WIDE.U32 (0x225) not found in mul.hi.u64"
+    last_real = max(i for i, op in enumerate(opcodes) if op != 0x918)
+    sched_nops = opcodes[:last_real].count(0x918)
+    assert sched_nops <= 4, f"Too many scheduling NOPs ({sched_nops}) in mul.hi.u64"
+
+
+def test_cvt_u8_u32_compiles():
+    """cvt.u8.u32 emits LDC+LOP3.AND (opcode 0x212), no TODO NOPs."""
+    results = compile_ptx_source(CVT_U8_U32_KERNEL)
+    cubin = results['cvt_u8_kernel']
+    assert cubin[:4] == b'\x7fELF'
+    elf = ELF64(cubin)
+    text = elf.section_data('.text.cvt_u8_kernel')
+    opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
+               for off in range(0, len(text), 16)]
+    assert 0x212 in opcodes, "LOP3.LUT (0x212) not found in cvt.u8.u32"

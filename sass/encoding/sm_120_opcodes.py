@@ -520,15 +520,9 @@ def encode_imad_wide(dest: int, src0: int, src1_imm: int, src2: int,
 def encode_imad_wide_rr(dest: int, src0: int, src1: int, src2: int,
                         ctrl: int = 0) -> bytes:
     """
-    Encode IMAD.WIDE R-R: (dest, dest+1) = src0 * src1 + (src2, src2+1).
+    Encode IMAD.WIDE R-R (signed): (dest, dest+1) = src0 * src1 + (src2, src2+1).
 
-    R-R form: b0=0x25 (WIDE), b1=0x72 (R-R form bits).
-    Follows the consistent R-imm→R-R pattern across SM_120 instructions
-    (IMAD.WIDE R-imm uses b1=0x78; R-R uses b1=0x72).
-
-    Note: This encoding is derived by analogy from IMAD R-R (confirmed opcode
-    0x2a4 / encode_imad_rr) and the IMAD.WIDE R-imm ground truth. Verify
-    against cuobjdump output for any hardware-running workload.
+    Signed form: b9=0x02.  Ground truth confirmed from SM_120 hardware.
     """
     if ctrl == 0:
         ctrl = _CTRL_DEFAULT
@@ -536,6 +530,60 @@ def encode_imad_wide_rr(dest: int, src0: int, src1: int, src2: int,
                   b2=dest, b3=src0, b4=src1 & 0xFF,
                   b8=src2,
                   b9=0x02, b10=0x8e, b11=0x07,
+                  ctrl=ctrl)
+
+
+def encode_imad_wide_u32(dest: int, src0: int, src1: int, src2: int,
+                         ctrl: int = 0) -> bytes:
+    """
+    Encode IMAD.WIDE.U32 R-R (unsigned): (dest, dest+1) = src0 * src1 + (src2, src2+1).
+
+    Unsigned form: b9=0x00 (vs signed b9=0x02).
+    Ground truth from ptxas mul.hi.u64 probe (SM_120):
+      IMAD.WIDE.U32 R6, R3, R4, RZ → bytes 25 72 06 03 04 00 00 00 ff 00 8e 07 ...
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    return _build(0x25, 0x72,
+                  b2=dest, b3=src0, b4=src1 & 0xFF,
+                  b8=src2,
+                  b9=0x00, b10=0x8e, b11=0x07,
+                  ctrl=ctrl)
+
+
+def encode_imad_wide_u32_carry(dest: int, src0: int, src1: int, src2: int,
+                                ctrl: int = 0) -> bytes:
+    """
+    Encode IMAD.WIDE.U32 R-R with P0 carry-out: (dest,dest+1) = src0*src1 + (src2,src2+1).
+
+    Carry form: b9=0x00, b10=0x80 (P0 receives overflow carry).
+    Ground truth:
+      IMAD.WIDE.U32 R8, P0, R2, R5, R6 → bytes 25 72 08 02 05 00 00 00 06 00 80 07 ...
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    return _build(0x25, 0x72,
+                  b2=dest, b3=src0, b4=src1 & 0xFF,
+                  b8=src2,
+                  b9=0x00, b10=0x80, b11=0x07,
+                  ctrl=ctrl)
+
+
+def encode_imad_wide_u32x(dest: int, src0: int, src1: int, src2: int,
+                           ctrl: int = 0) -> bytes:
+    """
+    Encode IMAD.WIDE.U32.X R-R with P0 carry-in: (dest,dest+1) = src0*src1 + (src2,src2+1) + P0.
+
+    Carry-in form: b9=0x04, b10=0x0e, b11=0x00 (reads P0 as carry-in).
+    Ground truth:
+      IMAD.WIDE.U32.X R8, R3, R5, R10, P0 → bytes 25 72 08 03 05 00 00 00 0a 04 0e 00 ...
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    return _build(0x25, 0x72,
+                  b2=dest, b3=src0, b4=src1 & 0xFF,
+                  b8=src2,
+                  b9=0x04, b10=0x0e, b11=0x00,
                   ctrl=ctrl)
 
 
@@ -2418,6 +2466,54 @@ def encode_f2i_ftz_u32_trunc(dest: int, src: int, ctrl: int = 0) -> bytes:
     raw[10] = 0x21
     raw[13], raw[14], raw[15] = b13, b14, b15
     return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# F2F — Float-to-Float precision conversion (F32↔F64)
+# ---------------------------------------------------------------------------
+# Ground truth from ptxas probe (SM_120):
+#
+# F2F.F32.F64 R7, R6  (cvt.rn.f32.f64: double→float, GPR source):
+#   bytes: 10 73 07 00 06 00 00 00 | 00 10 30 00 ...
+#   b0=0x10, b1=0x73, b2=dest, b3=0x00, b4=src_lo (lo word of f64 pair)
+#   b9=0x10, b10=0x30, b11=0x00
+#
+# F2F.F64.F32 R6, R6  (cvt.f64.f32: float→double, GPR source):
+#   bytes: 10 73 06 00 06 00 00 00 | 00 18 20 00 ...
+#   b0=0x10, b1=0x73, b2=dest_lo (lo word of f64 pair), b4=src (f32 GPR)
+#   b9=0x18, b10=0x20, b11=0x00
+#
+# Both use opcode b0=0x10, b1=0x73 (opcode & 0xFFF = 0x310).
+# Destination for F64 form writes dest and dest+1 (64-bit pair).
+
+def encode_f2f_f32_f64(dest: int, src: int, ctrl: int = 0) -> bytes:
+    """Encode F2F.F32.F64 dest, src — convert f64 register pair to f32.
+
+    src is the lo register of the f64 pair (src+1 is hi, read implicitly).
+    dest is a single f32 register.
+
+    Ground truth: F2F.F32.F64 R7, R6 → bytes 10 73 07 00 06 00 00 00 00 10 30 00 ...
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x10, 0x73,
+                  b2=dest, b3=0x00, b4=src,
+                  b8=0x00, b9=0x10, b10=0x30, b11=0x00,
+                  ctrl=ctrl)
+
+
+def encode_f2f_f64_f32(dest: int, src: int, ctrl: int = 0) -> bytes:
+    """Encode F2F.F64.F32 dest, src — convert f32 to f64 register pair.
+
+    src is a single f32 register.
+    dest is the lo register of the destination f64 pair (dest+1 written implicitly).
+
+    Ground truth: F2F.F64.F32 R6, R6 → bytes 10 73 06 00 06 00 00 00 00 18 20 00 ...
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x10, 0x73,
+                  b2=dest, b3=0x00, b4=src,
+                  b8=0x00, b9=0x18, b10=0x20, b11=0x00,
+                  ctrl=ctrl)
 
 
 # ---------------------------------------------------------------------------

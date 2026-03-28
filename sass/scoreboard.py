@@ -64,6 +64,7 @@ _OPCODE_META: dict[int, _OpMeta] = {
     0x810: _OpMeta('IADD3.IMM',  1, 0x3e, 1),  # IADD3 with 32-bit immediate operand
     0x306: _OpMeta('I2F.U32.RP', 1, 0x3e, 1),  # I2F unsigned int to float, round toward +inf
     0x305: _OpMeta('F2I.FTZ.U32',1, 0x3e, 1),  # F2I float to unsigned int, truncate
+    0x310: _OpMeta('F2F',        1, 0x3e, 1),  # F2F float-to-float precision conversion (F32↔F64)
 }
 
 
@@ -118,6 +119,8 @@ _OPCODES_ALU = {
     0x810,        # IADD3 immediate form
     0x306,        # I2F.U32.RP
     0x305,        # F2I.FTZ.U32.TRUNC
+    # Float precision conversion
+    0x310,        # F2F (F32↔F64)
 }
 # Note: IADD.64-UR (0xc35) uses wdep=0x3f (no tracking) + stall=1.
 # The 1-cycle stall ensures the result is ready for the subsequent LDG/STG.
@@ -220,6 +223,11 @@ def _get_dest_regs(raw: bytes) -> set[int]:
         if dest < 255: regs |= {dest, dest+1, dest+2, dest+3}
     elif opcode in (0x825, 0x225):  # IMAD.WIDE: writes dest pair
         if dest < 255: regs |= {dest, dest+1}
+    elif opcode == 0x310:  # F2F: F2F.F64.F32 (b9=0x18) writes pair; F2F.F32.F64 writes single
+        if dest < 255:
+            regs.add(dest)
+            if raw[9] == 0x18:  # F2F.F64.F32: dest is f64 pair
+                regs.add(dest + 1)
     elif opcode in _OPCODES_ALU:
         if dest < 255: regs.add(dest)
     return regs

@@ -1908,7 +1908,11 @@ def encode_vimnmx_u32(dest: int, src0: int, src1_imm: int, is_max: bool = False,
 
 def encode_sel(dest: int, src0: int, src1: int, pred: int = 0,
                ctrl: int = 0) -> bytes:
-    """Encode SEL dest, src0, src1, Ppred."""
+    """Encode SEL dest, src0, src1, Ppred.
+
+    Ground truth (P0): SEL R7, R2, R7, P0 → b0=0x07, b1=0x72, b2=dest, b3=src0,
+    b4=src1, b8=0x00. Hypothesis: b8 = pred_index (0..7).
+    """
     if ctrl == 0:
         ctrl = _CTRL_DEFAULT
     b13, b14, b15 = _ctrl_to_bytes(ctrl)
@@ -1918,11 +1922,7 @@ def encode_sel(dest: int, src0: int, src1: int, pred: int = 0,
     raw[2]  = dest & 0xFF
     raw[3]  = src0 & 0xFF
     raw[4]  = src1 & 0xFF
-    raw[8]  = 0x00
-    raw[9]  = 0x00
-    raw[10] = 0x00
-    raw[11] = 0x00
-    raw[12] = 0x00
+    raw[8]  = pred & 0x07   # predicate index (P0..P7); P0=0x00 verified
     raw[13] = b13
     raw[14] = b14
     raw[15] = b15

@@ -1101,6 +1101,13 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     output.append(SassInstr(encode_iadd3(d, RZ, a, RZ, negate_src1=True),
                                             f'IADD3 R{d}, RZ, -R{a}, RZ  // neg.{typ}'))
 
+                elif op == 'neg' and typ in ('s64', 'u64', 'b64'):
+                    # neg.s64: IADD.64 d, RZ, -a  (two's complement of 64-bit value)
+                    d_lo = ctx.ra.lo(instr.dest.name)
+                    a_lo = ctx.ra.lo(instr.srcs[0].name)
+                    output.append(SassInstr(encode_iadd64(d_lo, RZ, a_lo, negate_src1=True),
+                                            f'IADD.64 R{d_lo}, RZ, -R{a_lo}  // neg.{typ}'))
+
                 elif op == 'neg' and typ == 'f32':
                     # neg.f32: FADD with negated src and zero
                     d = ctx.ra.r32(instr.dest.name)
@@ -1264,6 +1271,71 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     a = ctx.ra.r32(instr.srcs[0].name)
                     output.append(SassInstr(encode_iabs(d, a),
                                             f'IABS R{d}, R{a}'))
+
+                elif op == 'abs' and typ in ('s64',):
+                    # abs.s64 d, a  — branchless sign-bit trick:
+                    #   sign = arithmetic-right-shift(a_hi, 31) = 0 or 0xFFFFFFFF
+                    #   d    = (a XOR sign) + (-sign)   where -sign = 0 or 1
+                    # This avoids predicated 64-bit instructions.
+                    d_lo = ctx.ra.lo(instr.dest.name)
+                    a_lo = ctx.ra.lo(instr.srcs[0].name)
+                    sign = ctx._next_gpr; ctx._next_gpr += 1
+                    t_lo = ctx._next_gpr; ctx._next_gpr += 1  # addend lo (0 or 1)
+                    t_hi = ctx._next_gpr; ctx._next_gpr += 1  # addend hi (always 0)
+                    output.append(SassInstr(encode_shf_r_s32_hi(sign, a_lo+1, 31),
+                        f'SHF.R.S32.HI R{sign}, RZ, 0x1f, R{a_lo+1}  // abs.s64 sign'))
+                    output.append(SassInstr(encode_lop3(d_lo,   a_lo,   sign, RZ, LOP3_XOR),
+                        f'LOP3.XOR R{d_lo}, R{a_lo}, R{sign}, RZ  // abs.s64 lo XOR'))
+                    output.append(SassInstr(encode_lop3(d_lo+1, a_lo+1, sign, RZ, LOP3_XOR),
+                        f'LOP3.XOR R{d_lo+1}, R{a_lo+1}, R{sign}, RZ  // abs.s64 hi XOR'))
+                    output.append(SassInstr(encode_iadd3(t_hi, RZ, RZ, RZ),
+                        f'MOV R{t_hi}, RZ  // abs.s64 addend hi=0'))
+                    output.append(SassInstr(encode_iadd3(t_lo, RZ, sign, RZ, negate_src1=True),
+                        f'IADD3 R{t_lo}, RZ, -R{sign}, RZ  // abs.s64 addend=-sign'))
+                    output.append(SassInstr(encode_iadd64(d_lo, d_lo, t_lo),
+                        f'IADD.64 R{d_lo}, R{d_lo}, R{t_lo}  // abs.s64 add'))
+
+                elif op == 'min' and typ in ('u64', 's64'):
+                    # min.u64 branchless: min(a,b) = b + ((a-b) & sign_mask(a-b))
+                    #   diff = a - b; mask = sign_fill(diff_hi); d = b + (diff & mask)
+                    # Works for unsigned because a < b → diff wraps to large value with sign=1.
+                    # For signed min (s64), the same bit trick applies (signed subtraction).
+                    d_lo  = ctx.ra.lo(instr.dest.name)
+                    a_lo  = ctx.ra.lo(instr.srcs[0].name)
+                    b_lo  = ctx.ra.lo(instr.srcs[1].name)
+                    t_lo  = ctx._next_gpr; ctx._next_gpr += 2   # diff pair (t_lo, t_lo+1)
+                    mask  = ctx._next_gpr; ctx._next_gpr += 1
+                    output.append(SassInstr(encode_iadd64(t_lo, a_lo, b_lo, negate_src1=True),
+                        f'IADD.64 R{t_lo}, R{a_lo}, -R{b_lo}  // min.{typ} diff'))
+                    output.append(SassInstr(encode_shf_r_s32_hi(mask, t_lo+1, 31),
+                        f'SHF.R.S32.HI R{mask}, RZ, 0x1f, R{t_lo+1}  // min.{typ} mask'))
+                    output.append(SassInstr(encode_lop3(t_lo,   t_lo,   mask, RZ, LOP3_AND),
+                        f'LOP3.AND R{t_lo}, R{t_lo}, R{mask}, RZ  // min.{typ} lo'))
+                    output.append(SassInstr(encode_lop3(t_lo+1, t_lo+1, mask, RZ, LOP3_AND),
+                        f'LOP3.AND R{t_lo+1}, R{t_lo+1}, R{mask}, RZ  // min.{typ} hi'))
+                    output.append(SassInstr(encode_iadd64(d_lo, b_lo, t_lo),
+                        f'IADD.64 R{d_lo}, R{b_lo}, R{t_lo}  // min.{typ} result'))
+
+                elif op == 'max' and typ in ('u64', 's64'):
+                    # max.u64 branchless: max(a,b) = b + ((a-b) & ~sign_mask(a-b))
+                    #   diff = a - b; mask = ~sign_fill(diff_hi); d = b + (diff & ~mask)
+                    d_lo  = ctx.ra.lo(instr.dest.name)
+                    a_lo  = ctx.ra.lo(instr.srcs[0].name)
+                    b_lo  = ctx.ra.lo(instr.srcs[1].name)
+                    t_lo  = ctx._next_gpr; ctx._next_gpr += 2   # diff pair
+                    mask  = ctx._next_gpr; ctx._next_gpr += 1   # inverted sign mask
+                    output.append(SassInstr(encode_iadd64(t_lo, a_lo, b_lo, negate_src1=True),
+                        f'IADD.64 R{t_lo}, R{a_lo}, -R{b_lo}  // max.{typ} diff'))
+                    output.append(SassInstr(encode_shf_r_s32_hi(mask, t_lo+1, 31),
+                        f'SHF.R.S32.HI R{mask}, RZ, 0x1f, R{t_lo+1}  // max.{typ} sign'))
+                    output.append(SassInstr(encode_lop3(mask, mask, RZ, RZ, 0x0F),
+                        f'LOP3.NOT R{mask}, R{mask}, RZ, RZ  // max.{typ} ~sign'))
+                    output.append(SassInstr(encode_lop3(t_lo,   t_lo,   mask, RZ, LOP3_AND),
+                        f'LOP3.AND R{t_lo}, R{t_lo}, R{mask}, RZ  // max.{typ} lo'))
+                    output.append(SassInstr(encode_lop3(t_lo+1, t_lo+1, mask, RZ, LOP3_AND),
+                        f'LOP3.AND R{t_lo+1}, R{t_lo+1}, R{mask}, RZ  // max.{typ} hi'))
+                    output.append(SassInstr(encode_iadd64(d_lo, b_lo, t_lo),
+                        f'IADD.64 R{d_lo}, R{b_lo}, R{t_lo}  // max.{typ} result'))
 
                 elif op == 'min' and typ == 'f32':
                     d = ctx.ra.r32(instr.dest.name)

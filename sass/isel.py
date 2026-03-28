@@ -961,16 +961,26 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                 elif op == 'min' and typ in ('u32', 's32'):
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
-                    b = ctx.ra.r32(instr.srcs[1].name)
-                    output.append(SassInstr(encode_vimnmx_s32(d, a, b, is_max=False),
-                                            f'VIMNMX.S32 R{d}, R{a}, R{b}, PT  // min.{typ}'))
+                    if isinstance(instr.srcs[1], ImmOp):
+                        imm = instr.srcs[1].value & 0xFFFFFFFF
+                        output.append(SassInstr(encode_vimnmx_u32(d, a, imm, is_max=False),
+                            f'VIMNMX.U32 R{d}, R{a}, 0x{imm:x}, PT  // min.{typ} imm'))
+                    else:
+                        b = ctx.ra.r32(instr.srcs[1].name)
+                        output.append(SassInstr(encode_vimnmx_s32(d, a, b, is_max=False),
+                            f'VIMNMX.S32 R{d}, R{a}, R{b}, PT  // min.{typ}'))
 
                 elif op == 'max' and typ in ('u32', 's32'):
                     d = ctx.ra.r32(instr.dest.name)
                     a = ctx.ra.r32(instr.srcs[0].name)
-                    b = ctx.ra.r32(instr.srcs[1].name)
-                    output.append(SassInstr(encode_vimnmx_s32(d, a, b, is_max=True),
-                                            f'VIMNMX.S32 R{d}, R{a}, R{b}, !PT  // max.{typ}'))
+                    if isinstance(instr.srcs[1], ImmOp):
+                        imm = instr.srcs[1].value & 0xFFFFFFFF
+                        output.append(SassInstr(encode_vimnmx_u32(d, a, imm, is_max=True),
+                            f'VIMNMX.U32 R{d}, R{a}, 0x{imm:x}, !PT  // max.{typ} imm'))
+                    else:
+                        b = ctx.ra.r32(instr.srcs[1].name)
+                        output.append(SassInstr(encode_vimnmx_s32(d, a, b, is_max=True),
+                            f'VIMNMX.S32 R{d}, R{a}, R{b}, !PT  // max.{typ}'))
 
                 elif op == 'mad' and 'lo' in instr.types:
                     # mad.lo.s32 → dest = src0 * src1 + src2

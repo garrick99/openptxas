@@ -36,25 +36,27 @@ from sass.isel import SassInstr
 class _OpMeta(NamedTuple):
     name: str
     min_gpr_gap: int  # minimum instruction gap between write and immediate GPR reader (0 = no constraint)
+    wdep: int         # scoreboard write-dep slot (0x3e=ALU, 0x3f=no-track, etc.)
+    misc: int         # ctrl misc nibble value (hardware-verified per opcode)
 
 
 # SM_120 ALU instructions that require ≥1 instruction gap before a GPR consumer.
 # The stall field is ignored by hardware; rbar alone does not gate adjacent ALU reads.
 _OPCODE_META: dict[int, _OpMeta] = {
-    0x210: _OpMeta('IADD3',   1),   # add.s32, add.u32
-    0x212: _OpMeta('IADD3X',  1),   # add.u32 with carry
-    0x224: _OpMeta('IMAD.32', 1),   # imad 32-bit result
-    0x824: _OpMeta('IMAD',    1),   # imad wide
-    0x825: _OpMeta('IMAD.HI', 1),   # imad.hi
-    0x819: _OpMeta('SHF',     1),   # shl/shr 64-bit
-    0x221: _OpMeta('FADD',    1),   # fadd
-    0x223: _OpMeta('FFMA',    1),   # fma
-    0x235: _OpMeta('IADD.64', 1),   # iadd.64
-    0xc35: _OpMeta('IADD.64-UR', 1), # iadd.64 with UR operand — result needs 1-cycle gap before GPR consumer
-    0x202: _OpMeta('MOV',     0),   # mov (available next cycle)
-    0x20c: _OpMeta('ISETP.RR',0),   # isetp r-r (writes pred, not GPR)
-    0xc0c: _OpMeta('ISETP.RU',0),   # isetp r-ur (writes pred, not GPR)
-    0x431: _OpMeta('S2R',     0),   # s2r (hardware register, no forwarding needed)
+    0x210: _OpMeta('IADD3',      1, 0x3e, 1),
+    0x212: _OpMeta('IADD3X',     1, 0x3e, 1),
+    0x224: _OpMeta('IMAD.32',    1, 0x3e, 1),
+    0x824: _OpMeta('IMAD',       1, 0x3e, 1),
+    0x825: _OpMeta('IMAD.HI',    1, 0x3e, 1),
+    0x819: _OpMeta('SHF',        1, 0x3e, 1),
+    0x221: _OpMeta('FADD',       1, 0x3e, 1),
+    0x223: _OpMeta('FFMA',       1, 0x3e, 1),
+    0x235: _OpMeta('IADD.64',    1, 0x3e, 1),
+    0xc35: _OpMeta('IADD.64-UR', 1, 0x3e, 5),  # misc=5 per hardware bisect 2026-03-25
+    0x202: _OpMeta('MOV',        0, 0x3e, 1),
+    0x20c: _OpMeta('ISETP.RR',   0, 0x3e, 0),  # ISETP R-R: misc=0 (SM_120 predicate)
+    0xc0c: _OpMeta('ISETP.RU',   0, 0x3e, 0),  # ISETP R-UR: misc=0 on SM_120
+    0x431: _OpMeta('S2R',        0, 0x31, 1),  # S2R opcode is 0x919; 0x431 entry kept for compat
 }
 
 
@@ -81,7 +83,8 @@ def _get_opcode(raw: bytes) -> int:
 def _get_dest_reg(raw: bytes) -> int:
     """Get the destination register index, or -1 if none."""
     opcode = _get_opcode(raw)
-    if opcode in _OPCODES_CTRL | _OPCODES_STG | _OPCODES_STS | _OPCODES_BAR:
+    # LDCU/S2UR write UR registers, not GPR
+    if opcode in (_OPCODES_CTRL | _OPCODES_STG | _OPCODES_STS | _OPCODES_BAR | {0x7ac, 0x9c3}):
         return -1  # no GPR dest
     return raw[2]
 
@@ -175,6 +178,8 @@ def _wdep_for_opcode(opcode: int, raw: bytes = None) -> int:
         slot = slots[_ldcu_slot_counter[0] % len(slots)]
         _ldcu_slot_counter[0] += 1
         return slot
+    if opcode == 0x918:  # NOP: even wdep (misc=0 paired with 0x3e is safe)
+        return 0x3e
     if opcode in _OPCODES_LDC:
         return 0x31
     if opcode in _OPCODES_LDS:
@@ -182,11 +187,32 @@ def _wdep_for_opcode(opcode: int, raw: bytes = None) -> int:
     if opcode in _OPCODES_LDG:
         return 0x35
     if opcode in _OPCODES_IADD64_UR:
-        return 0x3f  # No write tracking — stall=1 handles the dependency
+        return 0x3e  # ALU slot — consumer LDG/STG gets rbar via pending_writes
     if opcode in _OPCODES_ALU | _OPCODES_SMEM_SETUP:
         return 0x3e
-    # No write tracking for control flow, stores, barriers
+    # No write tracking for control flow (EXIT/BRA), stores, barriers
     return 0x3f
+
+
+# Opcode-specific misc nibble (hardware-verified on RTX 5090, 2026-03-25).
+# misc is NOT a counter — each opcode has a fixed value required by hardware.
+_OPCODE_MISC: dict[int, int] = {
+    0x918: 0,   # NOP: misc=0
+    0x947: 0,   # BRA: misc=0
+    0x94d: 5,   # EXIT: misc=5
+    0x981: 6,   # LDG.E: misc=6
+    0xc35: 5,   # IADD.64-UR: misc=5 (wide ALU result)
+    0xc0c: 0,   # ISETP R-UR: misc=0 (SM_120: misc 1-12 → wrong predicate)
+    0x20c: 0,   # ISETP R-R: misc=0 (same SM_120 predicate correctness requirement)
+}
+
+# All opcodes recognised by assign_ctrl.  Unknown opcodes raise ValueError.
+_ALL_KNOWN_OPCODES: frozenset = frozenset(
+    _OPCODES_LDG | _OPCODES_LDC | _OPCODES_LDS |
+    _OPCODES_STG | _OPCODES_STS | _OPCODES_BAR |
+    _OPCODES_CTRL | _OPCODES_ALU | _OPCODES_IADD64_UR |
+    _OPCODES_SMEM_SETUP
+)
 
 
 def _patch_ctrl(raw: bytes, ctrl: int) -> bytes:
@@ -228,9 +254,10 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
     _ldc_slot_counter[0] = 0   # reset per kernel
     result = []
 
-
     for i, si in enumerate(instrs):
         opcode = _get_opcode(si.raw)
+        if opcode not in _ALL_KNOWN_OPCODES:
+            raise ValueError(f"assign_ctrl: unrecognized opcode 0x{opcode:03x} at instruction {i}")
 
         # Determine wdep for this instruction
         wdep = _wdep_for_opcode(opcode, si.raw)
@@ -326,15 +353,16 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
             guard = (si.raw[1] >> 4) & 0xF
             if guard != 0x7:
                 _ldcu_slot_counter[0] = 0
-        # SM_120: ISETP R-UR (0xc0c) requires misc=0 or misc≥13 to produce correct
-        # predicate output. Sequential misc values 1-12 cause silent failure (P=FALSE).
-        # Force misc=0 for all ISETP R-UR instructions.
-        if opcode == 0xc0c:
-            misc = 0   # ISETP R-UR requires misc=0 for correct predicate on SM_120
-        elif opcode == 0x7ac and si.raw[9] == 0x0a:
-            misc = 7   # LDCU.64 requires misc=0x7; misc=0x1 causes ILLEGAL_ADDRESS
+        # Misc nibble: opcode-specific where hardware requires it, counter elsewhere.
+        if opcode == 0x7ac and si.raw[9] == 0x0a:
+            misc = 7   # LDCU.64: misc=7 (CRITICAL: misc=1 → ILLEGAL_ADDRESS)
+        elif opcode in _OPCODE_MISC:
+            misc = _OPCODE_MISC[opcode]
         else:
             misc = misc_counter & 0xF
+        # Hardware rule: odd wdep requires misc != 0 (misc=0 → ILLEGAL_INSTRUCTION)
+        if (wdep & 1) and misc == 0:
+            misc = 1
         ctrl = (stall << 17) | (rbar << 10) | (wdep << 4) | misc
         misc_counter += 1
 

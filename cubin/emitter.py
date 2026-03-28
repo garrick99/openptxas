@@ -126,7 +126,7 @@ def _build_nv_info_global():
 
 def _build_nv_info_kernel(num_gprs: int = 8, num_params: int = 2,
                           param_sizes: list[int] = None,
-                          exit_instr_offset: int = 0x10,
+                          exit_offsets: list[int] = None,
                           s2r_instr_offset: int = 0x10):
     """Generate per-kernel .nv.info attributes dynamically.
 
@@ -166,16 +166,17 @@ def _build_nv_info_kernel(num_gprs: int = 8, num_params: int = 2,
     # EIATTR_CBANK_PARAM_SIZE (0x1b): 0xFF (wildcard, matches ptxas behavior)
     buf.extend(bytes([0x03, 0x1b, 0xFF, 0x00]))
 
-    # EIATTR_EXIT_INSTR_OFFSETS (0x5f): format 0x03 = immediate value
-    # Encode EXIT instruction index (byte offset / 16) in the 16-bit value field
-    exit_idx = exit_instr_offset // 16
-    buf.extend(bytes([0x03, 0x5f, exit_idx & 0xFF, (exit_idx >> 8) & 0xFF]))
+    # EIATTR_EXIT_INSTR_OFFSETS (0x1c): list of EXIT byte offsets in .text
+    # Format 0x04: 4-byte header (fmt, tag, size_lo, size_hi) + N*4 bytes payload
+    if not exit_offsets:
+        exit_offsets = [0x10]  # fallback: assume first EXIT at offset 16
+    payload = b''.join(struct.pack('<I', off) for off in exit_offsets)
+    buf.extend(bytes([0x04, 0x1c]))
+    buf.extend(struct.pack('<H', len(payload)))
+    buf.extend(payload)
 
     # EIATTR_CTAID_DIMS (0x4a)
     buf.extend(bytes([0x02, 0x4a, 0x00, 0x00]))
-
-    # EIATTR_MAX_REG_COUNT (0x1c): 4-byte format, 0x60 = 96 registers max
-    buf.extend(bytes([0x04, 0x1c, 0x04, 0x00, 0x60, 0x00, 0x00, 0x00]))
 
     s2r_offset = s2r_instr_offset
     buf.extend(bytes([0x03, 0x19, s2r_offset & 0xFF, (s2r_offset >> 8) & 0xFF]))
@@ -298,6 +299,14 @@ def emit_cubin(kernel: KernelDesc) -> bytes:
         sass.extend(encode_nop())
     text_data = bytes(sass)
 
+    # Auto-scan text_data for all EXIT instructions (opcode 0x94d, bits[11:0])
+    exit_offsets = [
+        byte_off for byte_off in range(0, len(text_data), 16)
+        if (struct.unpack_from('<Q', text_data, byte_off)[0] & 0xFFF) == 0x94d
+    ]
+    if not exit_offsets:
+        exit_offsets = [kernel.exit_offset]  # fallback
+
     const0_data = b'\x00' * kernel.const0_size
     shared_reserved = b''  # NOBITS: no file content, but 64 bytes virtual
 
@@ -405,7 +414,7 @@ def emit_cubin(kernel: KernelDesc) -> bytes:
         _build_nv_info_global(),     # 6
         _build_nv_compat(),          # 7
         _build_nv_info_kernel(num_gprs=kernel.num_gprs, num_params=kernel.num_params,
-                              param_sizes=kernel.param_sizes, exit_instr_offset=kernel.exit_offset,
+                              param_sizes=kernel.param_sizes, exit_offsets=exit_offsets,
                               s2r_instr_offset=kernel.s2r_offset),
         _build_callgraph(),          # 9
         text_data,                   # 10

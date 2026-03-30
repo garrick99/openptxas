@@ -480,11 +480,9 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
         elif opcode == 0x9c3:  # S2UR: writes single UR (dest at byte 2)
             ur_dest = si.raw[2]
             pending_ur_writes[ur_dest] = (i, wdep)
-        elif wdep == 0x3e:
-            # ALU write: clear pending long-latency tracking for written regs
-            # (the register now has a new value from a fast ALU op)
-            for r in dest_regs:
-                pending_writes.pop(r, None)
+        # ALU writes (wdep=0x3e) DO need to be tracked for GPR-gap enforcement.
+        # The min_gpr_gap ensures ≥1 instruction between ALU write and consumer.
+        # Do NOT clear pending_writes here — consumers need the dependency info.
         # Track predicate writes from ISETP: pred dest at raw[2], wdep tells consumers when ready
         if opcode in (0xc0c, 0x20c):  # ISETP R-UR, ISETP R-R
             pred_dest = si.raw[2]  # destination predicate index (0..6)

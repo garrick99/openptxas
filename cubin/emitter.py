@@ -256,7 +256,14 @@ def _build_capmerc(num_gprs: int = 10):
             '00020140020000000000000000000000'
             'd005'
         )
-    buf[8] = reg_count  # patch register count
+    buf[8] = reg_count  # patch register count (header field)
+    # Also patch the per-kernel register count field deeper in the capmerc.
+    # Small template: byte 74 holds the register count.
+    # Large template: byte 218 holds the register count.
+    if reg_count <= 12:
+        buf[74] = reg_count
+    else:
+        buf[218] = reg_count
     return bytes(buf)
 
 

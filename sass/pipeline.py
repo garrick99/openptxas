@@ -576,10 +576,13 @@ def compile_function(fn: Function, verbose: bool = False) -> bytes:
                 s2r_offset = i
                 break
 
+    _final_gprs = max(alloc.num_gprs, ctx._next_gpr)
+    if verbose:
+        print(f"[pipeline] final num_gprs: alloc={alloc.num_gprs} ctx._next_gpr={ctx._next_gpr} -> {_final_gprs}")
     desc = KernelDesc(
         name=fn.name,
         sass_bytes=sass_bytes,
-        num_gprs=max(alloc.num_gprs, ctx._next_gpr),
+        num_gprs=_final_gprs,
         num_params=len(fn.params),
         param_sizes=param_sizes,
         param_offsets=alloc.param_offsets,

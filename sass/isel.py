@@ -1008,12 +1008,11 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             s_r = ctx.ra.r32(s.name)
                             d_lo = ctx.ra.lo(d.name)
                             d_hi = d_lo + 1
+                            # Use SHF.R.S32.HI directly (signed shift-right fills
+                            # with sign bit, producing 0x00000000 or 0xFFFFFFFF)
                             output.append(SassInstr(
-                                encode_shf_r_u32_hi(d_hi, s_r, 31),
-                                f'SHF.R.U32.HI R{d_hi}, RZ, 0x1f, R{s_r}  // cvt.s64.s32 sign-hi'))
-                            output.append(SassInstr(
-                                encode_iadd3(d_hi, RZ, d_hi, RZ, negate_src1=True),
-                                f'INEG R{d_hi}, R{d_hi}  // cvt.s64.s32 sign-extend'))
+                                encode_shf_r_s32_hi(d_hi, s_r, 31),
+                                f'SHF.R.S32.HI R{d_hi}, RZ, 0x1f, R{s_r}  // cvt.s64.s32 sign'))
                             if d_lo != s_r:
                                 output.append(SassInstr(
                                     encode_iadd3(d_lo, s_r, RZ, RZ),

@@ -801,6 +801,21 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 f'IMAD R{d}, R{a}, UR{ur_tmp}, RZ  // mul.lo imm'))
                         continue
                     b = ctx.ra.r32(instr.srcs[1].name)
+                    # Check if either source lives in a UR (ctaid.x via S2UR)
+                    a_ur = ctx._ur_for_param.get(
+                        instr.srcs[0].name if isinstance(instr.srcs[0], RegOp) else None)
+                    b_ur = ctx._ur_for_param.get(
+                        instr.srcs[1].name if isinstance(instr.srcs[1], RegOp) else None)
+                    if a_ur is not None:
+                        # src0 is in UR (e.g., ctaid.x) — use IMAD R{b}, UR{a_ur}, RZ
+                        output.append(SassInstr(encode_imad_ur(d, b, a_ur, RZ),
+                            f'IMAD R{d}, R{b}, UR{a_ur}, RZ  // mul.lo.{typ} (src0 in UR)'))
+                        continue
+                    if b_ur is not None:
+                        # src1 is in UR — use IMAD R{a}, UR{b_ur}, RZ
+                        output.append(SassInstr(encode_imad_ur(d, a, b_ur, RZ),
+                            f'IMAD R{d}, R{a}, UR{b_ur}, RZ  // mul.lo.{typ} (src1 in UR)'))
+                        continue
                     # Check if either source is a param → use IMAD R-UR
                     b_param = ctx._reg_param_off.get(
                         instr.srcs[1].name if isinstance(instr.srcs[1], RegOp) else None)

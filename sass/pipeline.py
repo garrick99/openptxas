@@ -19,7 +19,7 @@ from ptx.ir import Module, Function
 from ptx.passes.rotate import run as rotate_run
 from sass.regalloc import allocate
 from sass.isel import ISelContext, select_function, SassInstr
-from sass.encoding.sm_120_opcodes import encode_bra, encode_ldcu_64
+from sass.encoding.sm_120_opcodes import encode_bra, encode_ldcu_64, encode_exit
 from sass.schedule import schedule
 from sass.scoreboard import assign_ctrl
 from cubin.emitter import emit_cubin, KernelDesc
@@ -417,11 +417,6 @@ def compile_function(fn: Function, verbose: bool = False) -> bytes:
         is_predicated = guard_nibble != 0x7
 
         if opcode == 0x94d and is_predicated:  # predicated EXIT (bounds check)
-            insert_idx = idx + 1
-            break
-        elif opcode == 0x94d and not is_predicated:  # unconditional EXIT (bounds check alt)
-            # OpenCUDA emits @P0 bra body; EXIT instead of @P0 EXIT.
-            # The unconditional EXIT acts as the bounds-check fail path.
             insert_idx = idx + 1
             break
         elif opcode in (0x919, 0x9c3):  # S2R/S2UR fallback (no predicated EXIT)

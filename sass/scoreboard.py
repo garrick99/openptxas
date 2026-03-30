@@ -437,10 +437,13 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
             rbar = 0x01
             wdep = 0x3f
 
-        # Build ctrl — stall=0 always for SM_120.
-        # SM_120 uses bits[22:17] as OPEX (instruction extension), NOT stall counters.
-        # ptxas never sets these bits non-zero. Predicate hazards are hardware-auto-enforced.
-        # GPR dependencies are tracked via wdep/rbar barriers only.
+        # Build ctrl — bits[22:17] = OPEX (instruction extension / hardware modifier).
+        # These are NOT stall counters on SM_120. Each opcode has a fixed OPEX value
+        # determined by reverse-engineering ptxas output. Wrong OPEX → hardware
+        # misinterprets the instruction (e.g., LDG without OPEX=15 crashes).
+        # SM_120: OPEX bits (ctrl[22:17]) are ALWAYS 0 for all opcodes.
+        # Verified by extracting ctrl from multiple ptxas SM_120 cubins.
+        # Non-zero OPEX corrupts the instruction encoding.
         stall = 0
         if opcode == 0x94d:  # EXIT: if predicated (@Px EXIT)
             guard = (si.raw[1] >> 4) & 0xF

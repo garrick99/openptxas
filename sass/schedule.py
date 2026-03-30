@@ -21,6 +21,7 @@ from __future__ import annotations
 import struct
 
 from sass.isel import SassInstr
+from sass.encoding.sm_120_opcodes import encode_nop as _encode_nop
 
 
 # Ctrl templates from ptxas ground truth
@@ -234,11 +235,26 @@ def _hoist_ldcu64(instrs: list[SassInstr]) -> list[SassInstr]:
         else:
             pre_result = pre_boundary
 
-    # Post-boundary LDCU.64s are NOT hoisted across the boundary (would
-    # invalidate BRA fixup body indices).  Their gap to UR consumers is
-    # satisfied by the scoreboard ctrl word assignment (rbar/wdep), which
-    # works correctly even when the LDCU.64 appears after the consumer in
-    # instruction order.  No padding is needed here.
+    # Post-boundary LDCU.64s: SM_120 requires ≥3 physical instructions between
+    # LDCU.64 and its first UR consumer. Insert latency NOPs with 'latency'
+    # in the comment so the BRA fixup skips them in position counting.
+    padded_post = []
+    for idx, si in enumerate(post_boundary):
+        padded_post.append(si)
+        if _get_opcode(si.raw) == 0x7ac and si.raw[9] == 0x0a:  # LDCU.64
+            ur_dest = si.raw[2]
+            needs_gap = False
+            for k in range(1, 4):
+                if idx + k < len(post_boundary):
+                    next_si = post_boundary[idx + k]
+                    next_opc = _get_opcode(next_si.raw)
+                    if next_opc in _UR_CONSUMER_OPCODES and next_si.raw[4] == ur_dest:
+                        needs_gap = True
+                        break
+            if needs_gap:
+                for _ in range(3):
+                    padded_post.append(SassInstr(_encode_nop(), 'NOP  // LDCU.64 latency'))
+    post_boundary = padded_post
     return pre_result + post_boundary
 
 

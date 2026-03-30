@@ -429,8 +429,23 @@ def compile_function(fn: Function, verbose: bool = False) -> bytes:
     body_instrs.insert(insert_idx, ur4_desc_instr)
 
     # Update ctx.label_map and _bra_fixups to reflect the UR4 insertion.
-    # Any label or BRA index that was at or after insert_idx has shifted by 1.
+    # Labels at or after insert_idx shift by 1 instruction (16 bytes).
+    # EXCEPTION: the first body label (BRA target from bounds check) should
+    # NOT be shifted — the BRA should land ON the LDCU.64 so active threads
+    # execute the descriptor load. Without this, BRA jumps past LDCU.64 and
+    # all LDG/STG use an uninitialized descriptor → crash.
+    first_body_label = None
+    if hasattr(ctx, '_bra_fixups') and ctx._bra_fixups:
+        # Find the first BRA that goes to a post-boundary label
+        for _, target in ctx._bra_fixups:
+            tgt_byte = ctx.label_map.get(target, 0)
+            if tgt_byte // 16 >= insert_idx:
+                first_body_label = target
+                break
+
     for label in list(ctx.label_map):
+        if label == first_body_label:
+            continue  # Don't shift — BRA should land on LDCU.64
         body_byte = ctx.label_map[label]
         body_idx = body_byte // 16
         if body_idx >= insert_idx:

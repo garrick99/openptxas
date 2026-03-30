@@ -175,9 +175,6 @@ def _build_nv_info_kernel(num_gprs: int = 8, num_params: int = 2,
     buf.extend(struct.pack('<H', len(payload)))
     buf.extend(payload)
 
-    # EIATTR 0x5f: required attribute (purpose unknown, value=0x0101 from ptxas)
-    buf.extend(bytes([0x03, 0x5f, 0x01, 0x01]))
-
     # EIATTR_CTAID_DIMS (0x4a)
     buf.extend(bytes([0x02, 0x4a, 0x00, 0x00]))
 

@@ -1205,6 +1205,14 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             # Integer comparison: use ISETP R-UR (opcode 0xc0c) when src1
                             # is a u32 param backed GPR. The R-R variant (0x20c) silently
                             # produces P=FALSE on SM_120 hardware.
+                            # SM_120: ISETP.LT encoding (b8=0x10) doesn't work — hardware
+                            # treats it as GE. Invert LT→GE and GT→LE, negate the predicate.
+                            _INVERT = {'lt': 'ge', 'gt': 'le'}
+                            if cmp_name in _INVERT:
+                                cmp_name = _INVERT[cmp_name]
+                                if not hasattr(ctx, '_negated_preds'):
+                                    ctx._negated_preds = set()
+                                ctx._negated_preds.add(pd)
                             cmp_map = {'lt': ISETP_LT, 'le': ISETP_LE, 'gt': ISETP_GT,
                                        'ge': ISETP_GE, 'eq': ISETP_EQ, 'ne': ISETP_NE}
                             isetp_cmp = cmp_map.get(cmp_name, ISETP_GE)

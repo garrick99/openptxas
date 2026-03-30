@@ -1131,7 +1131,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                                             f'MOV R{d_lo}, R{a_r}  // cvt.{_dst_t}.{_src_t} lo'))
                                 # hi = sign extension (s32) or 0 (u32/b32)
                                 if _src_t == 's32' and _dst_t == 's64':
-                                    from sass.encoding.sm_120_encode import encode_shf_r_s32_hi
+                                    # encode_shf_r_s32_hi already imported at module level
                                     output.append(SassInstr(
                                         encode_shf_r_s32_hi(d_lo+1, a_r, 31),
                                         f'SHF.R.S32.HI R{d_lo+1}, RZ, 31, R{a_r}  // cvt.s64.s32 sign'))
@@ -1981,7 +1981,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     # Two-instruction sequence (ptxas ground truth):
                     #   If pos > 0: SHF.R.S32.HI dest, RZ, pos, src
                     #   Then:       BFE_SEXT dest, src_or_dest, len
-                    from sass.encoding.sm_120_encode import encode_shf_r_s32_hi
+                    # encode_shf_r_s32_hi already imported at module level
                     d   = ctx.ra.r32(instr.dest.name)
                     a   = ctx.ra.r32(instr.srcs[0].name)
                     pos = instr.srcs[1].value if isinstance(instr.srcs[1], ImmOp) else 0

@@ -417,10 +417,11 @@ def compile_function(fn: Function, verbose: bool = False) -> bytes:
         is_predicated = guard_nibble != 0x7
 
         if opcode == 0x94d and is_predicated:  # predicated EXIT (bounds check)
-            # Insert UR4 right after the EXIT so it has maximum instruction gap
-            # before any LDG/STG that uses UR4 as a descriptor.  SM_120 requires
-            # ≥3-instruction gap between LDCU.64 and its first UR consumer; placing
-            # UR4 after the bounds-check EXIT guarantees this gap for all kernels.
+            insert_idx = idx + 1
+            break
+        elif opcode == 0x94d and not is_predicated:  # unconditional EXIT (bounds check alt)
+            # OpenCUDA emits @P0 bra body; EXIT instead of @P0 EXIT.
+            # The unconditional EXIT acts as the bounds-check fail path.
             insert_idx = idx + 1
             break
         elif opcode in (0x919, 0x9c3):  # S2R/S2UR fallback (no predicated EXIT)
@@ -505,6 +506,9 @@ def compile_function(fn: Function, verbose: bool = False) -> bytes:
 
             actual_bra_byte = (actual_bra_idx + 1) * 16
             rel_offset = actual_target_byte - actual_bra_byte
+
+            print(f"[BRA fixup] {target_label}: bra_abs_idx={actual_bra_idx} bra_byte={actual_bra_byte} "
+                  f"target_byte={actual_target_byte} rel={rel_offset} total_instrs={len(sass_instrs)}")
 
             if actual_bra_idx < len(sass_instrs):
                 # Patch BRA offset in-place, preserving predicate and ctrl.

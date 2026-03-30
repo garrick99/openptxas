@@ -470,13 +470,28 @@ def _select_st_global(instr: Instruction, ra: RegAlloc,
     if not isinstance(dest_op, MemOp):
         raise ISelError(f"st.global addr must be MemOp")
     if not isinstance(src_op, RegOp):
-        raise ISelError(f"st.global data must be register")
+        # Immediate data: materialize into a temporary register first.
+        if isinstance(src_op, ImmOp):
+            t = ctx._next_gpr; ctx._next_gpr += 1
+            lit_off = ctx._alloc_literal(src_op.value & 0xFFFFFFFF)
+            from sass.encoding.sm_120_opcodes import encode_ldc
+            preamble = [SassInstr(encode_ldc(t, 4, lit_off),
+                                  f'LDC R{t}, c[0x4][{lit_off:#x}]  // materialize imm for st')]
+        else:
+            raise ISelError(f"st.global data must be register or immediate")
 
     typ = instr.types[-1] if instr.types else 'u32'
     is_64 = typ in ('u64', 's64', 'b64', 'f64')
 
     base_name = dest_op.base if dest_op.base.startswith('%') else f'%{dest_op.base}'
     addr = ra.lo(dest_op.base) if dest_op.base in ra.int_regs else RZ
+
+    # Handle materialized immediate
+    if not isinstance(src_op, RegOp):
+        data = t  # from materialized temp above
+        result = preamble + [SassInstr(encode_stg_e(ur_desc, addr, data, width=32, ctrl=0xff1),
+                                       f'STG.E desc[UR{ur_desc}][R{addr}.64], R{data}')]
+        return result
 
     if is_64:
         data = ra.lo(src_op.name)
@@ -946,6 +961,20 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             pred_str = f'@{"!" if neg else ""}P{pd} '
                             output.append(SassInstr(exit_raw,
                                                     f'{pred_str}EXIT  // early exit (idle threads)'))
+                            continue
+
+                    # Unconditional BRA to ret-only block → EXIT
+                    if not instr.pred and target:
+                        _tgt_is_ret = False
+                        for tbb in fn.blocks:
+                            if tbb.label == target:
+                                if (len(tbb.instructions) == 1
+                                        and tbb.instructions[0].op == 'ret'):
+                                    _tgt_is_ret = True
+                                break
+                        if _tgt_is_ret:
+                            output.append(SassInstr(encode_exit(),
+                                                    f'EXIT  // unconditional return'))
                             continue
 
                     # General BRA with offset fixup

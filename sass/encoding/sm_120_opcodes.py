@@ -676,9 +676,8 @@ def encode_stg_e(ur_desc: int, src_addr: int, src_data: int,
                   width: int = 32, ctrl: int = 0) -> bytes:
     """Encode STG.E desc[ur_desc][src_addr.64], src_data with variable width.
 
-    Field layout (from ptxas ground truth):
+    Field layout (verified against ptxas):
       b2=0x00, b3=addr_reg, b4=data_reg, b8=ur_desc_idx
-    Note: b4 is DATA register (not UR desc!), b8 is UR descriptor.
     """
     if ctrl == 0:
         ctrl = _CTRL_DEFAULT

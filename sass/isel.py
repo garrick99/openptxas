@@ -397,12 +397,13 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
                 ctx._next_ur = ur_idx
             ctx._next_ur += 2
             ctx._ur_params[dest.name] = ur_idx
-        d = ra.lo(dest.name)
+        # Just load into UR — address computation (IADD.64 Roffset + UR)
+        # is done at the point of use (ld.global / st.global), matching ptxas.
+        # Do NOT materialize into GPR here — that clobbers registers used
+        # by other parameters.
         return [
             SassInstr(encode_ldcu_64(ur_idx, 0, byte_off),
                       f'LDCU.64 UR{ur_idx}, c[0][0x{byte_off:x}]  // {param_name}'),
-            SassInstr(encode_iadd64_ur(d, RZ, ur_idx),
-                      f'IADD.64 R{d}, RZ, UR{ur_idx}  // materialize {param_name}'),
         ]
     else:
         # u32 param: load directly into a GPR via LDC.

@@ -410,6 +410,9 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
         # Using LDCU.32 would consume an LDCU counter slot before the descriptor,
         # forcing the descriptor to a higher counter than 2 (wdep≠0x35), which
         # breaks LDG's rbar=0x09 requirement on SM_120.
+        if dest.name not in ra.int_regs:
+            # Dead u32 parameter — skip
+            return []
         d = ra.r32(dest.name)
         if ctx:
             ctx._reg_param_off[dest.name] = byte_off

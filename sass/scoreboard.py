@@ -294,7 +294,7 @@ _OPCODE_MISC: dict[int, int] = {
     0x918: 0,   # NOP: misc=0
     0x947: 0,   # BRA: misc=0
     0x94d: 5,   # EXIT: misc=5
-    0x981: 6,   # LDG.E: misc=6
+    # LDG misc: handled per-instance below (first=4, second=1)
     0x3a9: 4,   # ATOMG.CAS: misc=4 (from RTX 5090 probe 2026-03-27)
     0xe29: 2,   # DADD: misc=2 (from RTX 5090 probe 2026-03-27)
     0xc28: 2,   # DMUL: misc=2
@@ -472,6 +472,8 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
         # Misc nibble: opcode-specific where hardware requires it, counter elsewhere.
         if opcode == 0x7ac and si.raw[9] == 0x0a:
             misc = 7   # LDCU.64: misc=7 (CRITICAL: misc=1 → ILLEGAL_ADDRESS)
+        elif opcode == 0x981:  # LDG: first=4, second=1
+            misc = 4 if ldg_count <= 1 else 1
         elif opcode in _OPCODE_MISC:
             misc = _OPCODE_MISC[opcode]
         else:

@@ -983,6 +983,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             continue
 
                     # Unconditional BRA to ret-only block → EXIT
+                    # Peephole: if previous was @!Px BRA body, merge into @Px EXIT
                     if not instr.pred and target:
                         _tgt_is_ret = False
                         for tbb in fn.blocks:
@@ -992,6 +993,24 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                     _tgt_is_ret = True
                                 break
                         if _tgt_is_ret:
+                            # Check if previous instruction was @!Px BRA (negated predicated BRA)
+                            if output and output[-1].raw[0] == 0x47:  # BRA opcode low byte
+                                prev_guard = (output[-1].raw[1] >> 4) & 0xF
+                                prev_neg = (output[-1].raw[1] >> 3) & 1
+                                if prev_guard != 0x7 and prev_neg:
+                                    # @!Px BRA body; bra exit → @Px EXIT
+                                    # Remove the @!Px BRA
+                                    prev_pred = prev_guard & 0x7
+                                    output.pop()
+                                    # Remove BRA fixup for the removed instruction
+                                    if hasattr(ctx, '_bra_fixups') and ctx._bra_fixups:
+                                        ctx._bra_fixups = ctx._bra_fixups[:-1]
+                                    # Emit @Px EXIT (non-negated predicate)
+                                    exit_raw = patch_pred(encode_exit(), pred=prev_pred, neg=False)
+                                    output.append(SassInstr(exit_raw,
+                                                            f'@P{prev_pred} EXIT  // bounds check'))
+                                    continue
+                            # No peephole match — emit plain EXIT
                             output.append(SassInstr(encode_exit(),
                                                     f'EXIT  // unconditional return'))
                             continue

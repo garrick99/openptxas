@@ -293,7 +293,8 @@ def _wdep_for_opcode(opcode: int, raw: bytes = None) -> int:
 _OPCODE_MISC: dict[int, int] = {
     0x918: 0,   # NOP: misc=0
     0x947: 0,   # BRA: misc=0
-    0x94d: 5,   # EXIT: misc=5
+    # EXIT misc: 5 for unconditional, 0 for predicated (SM_120 hardware rule)
+    # 0x94d: handled per-instance below
     # LDG misc: handled per-instance below (first=4, second=1)
     0x3a9: 4,   # ATOMG.CAS: misc=4 (from RTX 5090 probe 2026-03-27)
     0xe29: 2,   # DADD: misc=2 (from RTX 5090 probe 2026-03-27)
@@ -470,7 +471,10 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
             if guard != 0x7:
                 _ldcu_slot_counter[0] = 0
         # Misc nibble: opcode-specific where hardware requires it, counter elsewhere.
-        if opcode == 0x7ac and si.raw[9] == 0x0a:
+        if opcode == 0x94d:  # EXIT: misc depends on predication
+            guard = (si.raw[1] >> 4) & 0xF
+            misc = 0 if guard != 0x7 else 5  # predicated=0, unconditional=5
+        elif opcode == 0x7ac and si.raw[9] == 0x0a:
             misc = 7   # LDCU.64: misc=7 (CRITICAL: misc=1 → ILLEGAL_ADDRESS)
         elif opcode == 0x981:  # LDG: first=4, second=1
             misc = 4 if ldg_count <= 1 else 1
@@ -479,7 +483,9 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
         else:
             misc = misc_counter & 0xF
         # Hardware rule: odd wdep requires misc != 0 (misc=0 → ILLEGAL_INSTRUCTION)
-        if (wdep & 1) and misc == 0:
+        # EXCEPTION: predicated EXIT (@Px EXIT) MUST have misc=0 on SM_120
+        is_pred_exit = (opcode == 0x94d and (si.raw[1] >> 4) & 0xF != 0x7)
+        if (wdep & 1) and misc == 0 and not is_pred_exit:
             misc = 1
         ctrl = (stall << 17) | (rbar << 10) | (wdep << 4) | misc
         misc_counter += 1

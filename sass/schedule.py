@@ -208,14 +208,31 @@ def _hoist_ldcu64(instrs: list[SassInstr]) -> list[SassInstr]:
                 return i
         return len(remaining)  # no consumer in pre-boundary → sort last
 
+    # Also hoist S2R before any ALU that reads the S2R dest register.
+    # S2R (0x919) writes GPRs asynchronously; if it comes AFTER an IMAD
+    # that reads the same GPR, IMAD gets uninitialized data → crash.
+    # Hoist S2R to right after position 0 (LDC R1), before LDCU.64s.
+    s2r_instrs = []
+    non_s2r_remaining = []
+    for si in (remaining if not ldcu64s else remaining):
+        if _get_opcode(si.raw) == 0x919:
+            s2r_instrs.append(si)
+        else:
+            non_s2r_remaining.append(si)
+
     if ldcu64s:
         ldcu64s.sort(key=_consumer_pos)
-        if remaining:
-            pre_result = remaining[:1] + ldcu64s + remaining[1:]
+        if non_s2r_remaining:
+            # Order: LDC R1, S2R(s), LDCU.64(s), rest
+            pre_result = non_s2r_remaining[:1] + s2r_instrs + ldcu64s + non_s2r_remaining[1:]
         else:
-            pre_result = ldcu64s
+            pre_result = s2r_instrs + ldcu64s
     else:
-        pre_result = pre_boundary
+        if s2r_instrs and remaining:
+            # No LDCU.64 to hoist, but still ensure S2R is early
+            pre_result = remaining[:1] + s2r_instrs + [si for si in remaining[1:] if _get_opcode(si.raw) != 0x919]
+        else:
+            pre_result = pre_boundary
 
     # Post-boundary LDCU.64s are NOT hoisted across the boundary (would
     # invalidate BRA fixup body indices).  Their gap to UR consumers is

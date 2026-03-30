@@ -265,7 +265,9 @@ _ldc_slot_counter = [0]   # mutable counter for rotating LDC wdep slots
 
 def _wdep_for_opcode(opcode: int, raw: bytes = None) -> int:
     """Assign the scoreboard write-dependency slot for an opcode."""
-    if opcode == 0x7ac:  # LDCU: rotate over 0x31, 0x33 only — 0x35/0x37 alias LDG slots
+    if opcode == 0x7ac:  # LDCU: use 0x35 for .64 (descriptor), rotate 0x31/0x33 for .32
+        if raw is not None and raw[9] == 0x0a:  # LDCU.64 (descriptor load)
+            return 0x35  # LDG slot — so consumer LDG gets rbar=0x09
         slots = [0x31, 0x33]
         slot = slots[_ldcu_slot_counter[0] % len(slots)]
         _ldcu_slot_counter[0] += 1

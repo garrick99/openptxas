@@ -1055,16 +1055,14 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             # MOV  d_lo, s_r                → lo word
                             s_r = ctx.ra.r32(s.name)
                             d_lo = ctx.ra.lo(d.name)
+                            # Force d_lo = s_r to avoid copy (ptxas pattern)
+                            if d_lo != s_r:
+                                ctx.ra.int_regs[d.name] = s_r
+                                d_lo = s_r
                             d_hi = d_lo + 1
-                            # Use SHF.R.S32.HI directly (signed shift-right fills
-                            # with sign bit, producing 0x00000000 or 0xFFFFFFFF)
                             output.append(SassInstr(
                                 encode_shf_r_s32_hi(d_hi, s_r, 31),
                                 f'SHF.R.S32.HI R{d_hi}, RZ, 0x1f, R{s_r}  // cvt.s64.s32 sign'))
-                            if d_lo != s_r:
-                                output.append(SassInstr(
-                                    encode_iadd3(d_lo, s_r, RZ, RZ),
-                                    f'MOV R{d_lo}, R{s_r}  // cvt.s64.s32 lo'))
                         else:
                             # General 32-bit and float conversions
                             _ROUNDING = {'rn','rz','rm','rp','rni','rzi','rmi','rpi'}
@@ -1143,9 +1141,11 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                     output.append(SassInstr(encode_iadd3(d_r, a_r, RZ, RZ),
                                                             f'MOV R{d_r}, R{a_r}  // cvt.{_dst_t}.{_src_t}'))
                             elif _dst_t in _32B and _src_t in _32B:
-                                d_r = ctx.ra.r32(d.name)
+                                # Same-width int conversion (s32↔u32, etc.) — alias to same register
                                 a_r = ctx.ra.r32(s.name)
-                                if d_r != a_r:
+                                ctx.ra.int_regs[d.name] = a_r  # alias output to input
+                                d_r = a_r
+                                if d_r != a_r:  # always false now, but keep for safety
                                     output.append(SassInstr(encode_iadd3(d_r, a_r, RZ, RZ),
                                                             f'MOV R{d_r}, R{a_r}  // cvt.{_dst_t}.{_src_t}'))
                                 else:

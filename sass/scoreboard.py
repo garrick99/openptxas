@@ -302,6 +302,8 @@ _OPCODE_MISC: dict[int, int] = {
     0xc35: 5,   # IADD.64-UR: misc=5 (wide ALU result)
     0xc0c: 0,   # ISETP R-UR: misc=0 (SM_120: misc 1-12 → wrong predicate)
     0x20c: 0,   # ISETP R-R: misc=0 (same SM_120 predicate correctness requirement)
+    0x986: 1,   # STG.E: misc=1 (from ptxas ground truth)
+    0x988: 4,   # STS.E: misc=4
 }
 
 # All opcodes recognised by assign_ctrl.  Unknown opcodes raise ValueError.
@@ -339,10 +341,10 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
 
     # rbar encoding: maps wdep_slot → rbar bit pattern
     _WDEP_TO_RBAR = {
-        0x31: 0x03,   # Slot 0 → rbar=0x03 (bit 1+0)
-        0x33: 0x05,   # Slot 1 → rbar=0x05 (bit 2+0)
-        0x35: 0x09,   # Slot 2 → rbar=0x09 (bit 3+0)
-        0x37: 0x11,   # Slot 3 → rbar=0x11 (bit 4+0) - used for UR4 descriptor
+        0x31: 0x03,   # LDC/LDCU slot → rbar=0x03
+        0x33: 0x05,   # LDS/LDCU.32 slot → rbar=0x05
+        0x35: 0x09,   # LDG first slot → rbar=0x09
+        0x37: 0x09,   # LDG second slot → rbar=0x09 (same as first — ptxas verified)
         0x3e: 0x03,   # ALU → rbar=0x03
     }
 
@@ -384,9 +386,20 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
                 if r in pending_writes:
                     rbar = 0x09
 
-        # STG needs rbar=0x03
+        # STG: ptxas uses rbar=1 for STG that stores ALU results. Override
+        # the general rbar — STG doesn't need to wait for ALU address registers
+        # (they're available within 1 cycle). Only wait if data came from LDG.
         if opcode in _OPCODES_STG:
-            rbar = max(rbar, 0x03)
+            data_reg = si.raw[4]  # b4 = data register for STG
+            print(f"[STG DEBUG] data_reg=R{data_reg} pending={pending_writes.get(data_reg)} current_rbar={rbar}")
+            if data_reg in pending_writes:
+                _, pw = pending_writes[data_reg]
+                if pw in (0x35, 0x37):  # LDG result slots
+                    rbar = 0x09  # wait for LDG data
+                else:
+                    rbar = 0x01
+            else:
+                rbar = 0x01
 
         # ATOMG needs rbar=0x03 (memory ordering, same as STG)
         if opcode in _OPCODES_ATOMG:
@@ -411,12 +424,10 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
                 _, pw = pending_ur_writes[ur_desc]
                 if pw in _WDEP_TO_RBAR:
                     rbar = max(rbar, _WDEP_TO_RBAR[pw])
-        if opcode in _OPCODES_STG:
-            ur_desc = si.raw[8]
-            if ur_desc in pending_ur_writes:
-                _, pw = pending_ur_writes[ur_desc]
-                if pw in _WDEP_TO_RBAR:
-                    rbar = max(rbar, _WDEP_TO_RBAR[pw])
+        # STG UR descriptor: ptxas uses rbar=1 for STG, relying on instruction
+        # scheduling to ensure the descriptor is available. Don't override rbar
+        # for the UR descriptor — it's guaranteed ready by the time STG executes.
+        # (LDG DOES need rbar for the descriptor — see above.)
 
         # Check predicate-register hazards: any instruction guarded by @Px must
         # wait for the instruction that wrote Px to complete.

@@ -739,7 +739,17 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
     """
     output: list[SassInstr] = []
 
+    # Reorder blocks: move ret-only blocks to the end so they don't disrupt
+    # BRA target offsets between jump sites and their targets.
+    _ret_only = set()
     for bb in fn.blocks:
+        if (bb.label and len(bb.instructions) == 1
+                and bb.instructions[0].op == 'ret'):
+            _ret_only.add(bb.label)
+    ordered_blocks = [bb for bb in fn.blocks if bb.label not in _ret_only]
+    ordered_blocks += [bb for bb in fn.blocks if bb.label in _ret_only]
+
+    for bb in ordered_blocks:
         # Record label position
         if bb.label:
             ctx.label_map[bb.label] = len(output) * 16
@@ -759,14 +769,14 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
             _pre_len = len(output)
 
             try:
-                if op == 'mov' and typ in ('u32', 's32', 'b32', 'u64', 's64', 'b64'):
-                    # Immediate source: load from literal pool in constant bank
-                    if isinstance(instr.srcs[0], ImmOp) and typ in ('u32', 's32', 'b32'):
+                if op == 'mov' and typ in ('u32', 's32', 'b32', 'f32', 'u64', 's64', 'b64', 'f64'):
+                    # Immediate source: load via IADD3_IMM32 (integer) or FMUL_IMM (float)
+                    if isinstance(instr.srcs[0], ImmOp) and typ in ('u32', 's32', 'b32', 'f32'):
                         d = ctx.ra.r32(instr.dest.name)
                         imm = instr.srcs[0].value & 0xFFFFFFFF
-                        lit_off = ctx._alloc_literal(imm)
-                        output.append(SassInstr(encode_ldc(d, 0, lit_off),
-                                                f'LDC R{d}, c[0][0x{lit_off:x}]  // mov imm={imm:#x}'))
+                        # Use IADD3_IMM32 to load immediate directly (works for any 32-bit pattern)
+                        output.append(SassInstr(encode_iadd3_imm32(d, RZ, imm, RZ),
+                                                f'IADD3 R{d}, RZ, 0x{imm:x}, RZ  // mov.{typ} imm'))
                         continue
                     # Track special register sources
                     if (isinstance(instr.srcs[0], RegOp) and
@@ -1484,9 +1494,21 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         is_float = any(t in ('f32', 'f64') for t in instr.types)
                         cmp_name = next((t for t in instr.types if t in ('lt','le','gt','ge','eq','ne')), 'ge')
                         if is_float:
-                            br = ctx.ra.r32(b.name) if isinstance(b, RegOp) else (b.value if isinstance(b, ImmOp) else 0)
+                            if isinstance(b, ImmOp):
+                                # Float immediate: materialize into scratch GPR first
+                                imm = b.value & 0xFFFFFFFF
+                                br = _alloc_gpr(ctx)
+                                output.append(SassInstr(encode_iadd3_imm32(br, RZ, imm, RZ),
+                                    f'IADD3 R{br}, RZ, 0x{imm:x}, RZ  // fsetp float imm'))
+                            elif isinstance(b, RegOp):
+                                br = ctx.ra.r32(b.name)
+                            else:
+                                br = RZ
                             cmp_map = {'lt': FSETP_LT, 'le': FSETP_LE, 'gt': FSETP_GT,
                                        'ge': FSETP_GE, 'eq': FSETP_EQ, 'ne': FSETP_NE}
+                            # Clear stale negation from integer setp on same predicate
+                            if hasattr(ctx, '_negated_preds') and pd in ctx._negated_preds:
+                                ctx._negated_preds.discard(pd)
                             output.append(SassInstr(
                                 encode_fsetp(pd, ar, br, cmp_map.get(cmp_name, FSETP_GE)),
                                 f'FSETP.{cmp_name.upper()} P{pd}, R{ar}, R{br}'))

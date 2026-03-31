@@ -274,26 +274,26 @@ IMM_KERNEL = """\
 
 
 def test_mov_immediate_compiles():
-    """mov.u32 with immediate literal compiles to LDC (not a TODO NOP)."""
+    """mov.u32 with immediate literal compiles to IADD3_IMM32 (not a TODO NOP)."""
     results = compile_ptx_source(IMM_KERNEL)
     cubin = results["imm_kernel"]
     elf = ELF64(cubin)
     text = elf.section_data('.text.imm_kernel')
     opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
                for off in range(0, len(text), 16)]
-    # LDC opcode 0xb82 must appear in body (beyond preamble LDC at offset 0)
-    ldc_count = opcodes.count(0xb82)
-    assert ldc_count >= 2, f"Expected >=2 LDC instructions (preamble + literal), got {ldc_count}"
+    # IADD3.IMM32 (0x810) or IADD3 (0x210) must appear for the mov immediate
+    assert 0x810 in opcodes or 0x210 in opcodes, \
+        f"Expected IADD3 for mov immediate, opcodes={[hex(o) for o in set(opcodes)]}"
 
 
 def test_mov_immediate_bakes_constant():
-    """.nv.constant0 contains the literal 42 (0x2a) at the pool offset."""
+    """mov.u32 with immediate 42 uses IADD3_IMM32 (inline, no constant bank needed)."""
     results = compile_ptx_source(IMM_KERNEL)
     cubin = results["imm_kernel"]
     elf = ELF64(cubin)
-    const0 = elf.section_data('.nv.constant0.imm_kernel')
-    # 42 should appear as a 4-byte LE word somewhere in the constant bank
-    assert b'\x2a\x00\x00\x00' in const0, "Literal 42 not found in constant bank"
+    text = elf.section_data('.text.imm_kernel')
+    # 42 (0x2a) should appear as an inline immediate in the IADD3_IMM32 instruction
+    assert b'\x2a\x00\x00\x00' in text, "Literal 42 not found inline in .text"
 
 
 def test_setp_immediate_compiles():

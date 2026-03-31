@@ -1,36 +1,47 @@
 # OpenPTXas
 
-**PTX → OpenPTXas → cubin → RTX 5090 → correct output.**
-**No ptxas. No nvcc.**
+**Open-source PTX assembler. Real cubins. Real GPU. Correct output.**
 
-## Proof (runs on RTX 5090, no NVIDIA compiler)
+Compiles PTX into executable cubins for **SM_120 Blackwell** GPUs. Full pipeline: parse, register allocate, instruction select, schedule, scoreboard, ELF emit, GPU execute.
 
-```bash
-git clone https://github.com/garrick99/openptxas
-cd openptxas
-python demo.py
+**No ptxas. No nvcc. Just Python.**
+
+## The Proof
+
+PTX compiled to working SM_120 cubins using only open-source Python tools.
+
+**GPU-verified on RTX 5090:**
+
+| Kernel | What it does | Status |
+|--------|-------------|--------|
+| `vector_add` | Float addition, multi-block indexing | **PASS** |
+| `kernel_a` | Float multiply by constant (`in[i] * 2.0f`) | **PASS** |
+| `increment` | Integer add (`in[i] + 1`) | **PASS** |
+| `divergent_warp` | Predicated early exit, intra-warp divergence | **PASS** |
+| `sel` | Float ternary with bounds check (`v > 0.5f ? 1.0f : 0.0f`) | **PASS** |
+| `imad_chain` | Multi-block multiply-add chain | **PASS** |
+| `predicated_exit` | Idle thread writes nothing | **PASS** |
+
+### With [OpenCUDA](https://github.com/garrick99/opencuda): full CUDA C pipeline
+
+```
+CUDA C source (.cu)
+    |  OpenCUDA (Python)
+    v
+PTX assembly
+    |  OpenPTXas (Python)
+    v
+SM_120 cubin (ELF binary)
+    |  cuModuleLoad + cuLaunchKernel
+    v
+RTX 5090 GPU --> correct results
 ```
 
-```
-Compiling: examples/vector_add.ptx
-Output:    examples/vector_add.cubin (4432 bytes)
-Kernel:    vector_add
+No NVIDIA compiler involved at any stage.
 
---- Running on GPU (no NVIDIA compiler used) ---
-Device: NVIDIA GeForce RTX 5090
-Launch: 32 blocks x 32 threads = 1024 elements
-[PASS] 1024 elements verified correct
+## ptxas Gets It Wrong
 
-Our code. Their GPU.
-```
-
-This cubin was not produced by ptxas or nvcc.
-
----
-
-## ptxas gets it wrong
-
-On RTX 5090, ptxas 13.0 miscompiles a PTX subtract pattern by emitting rotate/OR where subtraction is required.
+On RTX 5090, NVIDIA's ptxas 13.0 miscompiles a PTX subtract pattern:
 
 ```
 Kernel:   (x << 8) - (x >> 56)
@@ -40,109 +51,69 @@ ptxas 13.0    0x23456789ABCDEF01  WRONG
 OpenPTXas     0x23456789ABCDEEFF  CORRECT
 ```
 
-Same kernel. Same GPU. Same input. Verified over 500,000 iterations.
+Verified over 500,000 iterations. Same kernel, same GPU, same input.
+
+## Quick Start
 
 ```bash
-python tests/gpu_killshot.py
+git clone https://github.com/garrick99/openptxas
+cd openptxas
+python demo.py                      # compile + run vector_add on GPU
+pytest tests/ -x -q                 # 205 tests
 ```
 
----
-
-## What this is
-
-An open-source PTX assembler that compiles PTX into executable cubins for **SM_120 Blackwell** GPUs. Full pipeline: parse → register allocate → instruction select → schedule → scoreboard → ELF emit → GPU execute.
-
-Pure Python. 71/71 tests passing. Hardware-verified on RTX 5090.
-
-## What's inside
+## What's Inside
 
 | Stage | Description |
 |-------|-------------|
-| **Parser** | Recursive descent PTX parser → IR |
-| **RegAlloc** | Linear scan with liveness, 64-bit pair alignment |
-| **ISel** | PTX → SASS instruction selection (60+ encoders) |
-| **Scheduler** | LDG latency hiding |
-| **Scoreboard** | Automated rbar/wdep barrier generation |
-| **Emitter** | Full ELF cubin with .nv.info, .nv.capmerc |
+| **Parser** | Recursive descent PTX parser to IR |
+| **RegAlloc** | Linear scan with liveness, safe eviction |
+| **ISel** | PTX to SASS instruction selection (60+ encoders) |
+| **Scheduler** | LDG latency hiding, LDCU.64 hoisting |
+| **Scoreboard** | Automated rbar/wdep/misc generation (bitmask-based) |
+| **Emitter** | Full ELF cubin with .nv.info, .nv.capmerc, .nv.merc |
 
-## Instruction coverage (60+ SASS encoders)
+Pure Python 3.11+. No dependencies.
+
+## SM_120 Blackwell Discoveries
+
+Reverse-engineered during development. Not documented publicly elsewhere:
+
+| Discovery | Detail |
+|-----------|--------|
+| **rbar is a bitmask** | OR-combine barrier waits: bit1=LDC, bit2=LDS, bit3=LDG |
+| **IMAD R-R (0x2a4) broken** | Produces garbage. Use IMAD.WIDE (0x225) or IMAD R-UR (0xc24) |
+| **ISETP corrupts FSETP** | Both R-R and R-UR variants clobber subsequent FSETP output |
+| **FSEL.step (0x80a)** | Combined float compare+select avoids ISETP/FSETP interaction |
+| **S2R is asynchronous** | Requires wdep=0x31 scoreboard tracking |
+| **SM_120 uses predicated execution** | No BRA-based warp divergence; ptxas if-converts everything |
+| **Capmerc DRM system** | 0x5a universal ptxas signature authenticates register metadata |
+| **Literal pool broken** | Driver doesn't init .nv.constant0 beyond params; all immediates inline |
+
+## Instruction Coverage (60+)
 
 All encoders byte-verified against ptxas 13.0 on SM_120.
 
 | Category | Instructions |
-|---|---|
-| **Integer** | IADD3, IADD3.X, IADD.64, IMAD, IMAD.WIDE, IMAD.HI, IMAD.SHL |
-| **Float** | FADD, FMUL, FFMA |
-| **Transcendentals** | MUFU (RCP, SQRT, RSQ, SIN, COS, EX2, LG2) |
-| **Shifts** | SHF.L.W.U32.HI, SHF.L.U32, SHF.L.U64.HI, SHF.R.U64, SHF.R.U32.HI |
-| **Bitwise** | LOP3.LUT (AND/OR/XOR), POPC, BREV, FLO |
-| **Comparison** | ISETP (6 modes), FSETP (8 modes) |
-| **Min/Max** | VIMNMX.S32, VIMNMX.U32, FMNMX |
-| **Conditional** | SEL, FSEL |
-| **Memory** | LDG.E (u8-u128), STG.E (u32-u128), LDS, STS, LDC, LDC.64, LDCU.64, LDCU.32 |
-| **Atomics** | ATOMG.E (ADD, MIN, MAX, AND, OR, XOR, EXCH) |
-| **Warp** | SHFL (IDX/UP/DOWN/BFLY), VOTE.BALLOT |
-| **Type convert** | I2FP.F32 (S32/U32), F2I (S32/U32), CVT (u32/u64) |
-| **Control** | MOV, NOP, EXIT, S2R, S2UR, BAR.SYNC, BRA (predicated), IABS |
-| **Tensor** | HMMA.16816.F32, IMMA.16832.S8, LDSM.16.M88.4 |
-
-## SM_120 Blackwell discoveries
-
-Reverse-engineered during development — not documented publicly elsewhere:
-
-- **S2R is asynchronous**: requires `wdep=0x31` scoreboard tracking (not fire-and-forget)
-- **Opcode 0x224 is NOT IMAD R-R**: kills non-lane-0 threads on Blackwell
-- **c[0][0x360] = blockDim.x**: driver-populated constant bank offset
-- **IMAD R-UR (0xc24)**: only non-wide multiply variant on SM_120
-- **Capmerc byte[8]**: controls hardware GPR allocation per thread
-- **LDC.64 single scoreboard slot**: multiple loads to same pair cause WAW hazards
-- **Predicate encoding**: byte[1] bits 7:4 (0x7=PT, 0x0=P0, 0x8=!P0)
-- **Pointers must use LDCU→UR path**: avoids GPR pressure and LDC.64 hazards
-
-## ptxas bug detection
-
-Detects and correctly compiles a pattern that NVIDIA's ptxas has miscompiled since SM_50 (~2014):
-
-```
-shl.b64  %lo, %a, K
-shr.u64  %hi, %a, (64-K)
-sub.s64  %res, %lo, %hi    ← ptxas incorrectly emits ROTATE instead of SUBTRACT
-```
-
-**Verified:** 500K iterations on RTX 5090 — OpenPTXas correct, ptxas wrong.
-
-## Full pipeline: CUDA C → PTX → cubin
-
-With [OpenCUDA](https://github.com/garrick99/opencuda):
-
-```bash
-# CUDA C → PTX
-cd opencuda && python -m opencuda kernel.cu --emit-ptx
-
-# PTX → cubin
-cd openptxas && python demo.py kernel.ptx
-```
-
-33 CUDA kernels compile through this pipeline with zero errors.
-
-## Status
-
-| Feature | Status |
-|---------|--------|
-| Integer backend | GPU-verified |
-| Multi-thread + multi-block | GPU-verified |
-| 32-bit and 64-bit memory | GPU-verified |
-| Predicated control flow | GPU-verified |
-| Scoreboard generation | GPU-verified |
-| Floating point | Implemented, validation in progress |
-| Shared memory | Implemented, integration in progress |
-| General loops/branches | In progress |
+|----------|-------------|
+| Integer | IADD3, IMAD, IMAD.WIDE, IMAD.SHL, IADD.64, IABS |
+| Float | FADD, FMUL, FFMA, FMUL.IMM, FFMA.IMM, FSEL.step |
+| Transcendentals | MUFU (RCP, SQRT, RSQ, SIN, COS, EX2, LG2) |
+| Shifts | SHF (L/R, U32/U64/S32, HI/LO, const/var) |
+| Bitwise | LOP3.LUT (AND/OR/XOR/NOT), POPC, BREV, FLO |
+| Comparison | ISETP (6 modes), FSETP (8 modes) |
+| Memory | LDG/STG (u8-u128), LDS/STS, LDC/LDCU |
+| Atomics | ATOMG.E (ADD, MIN, MAX, AND, OR, XOR, EXCH, CAS) |
+| Warp | SHFL (IDX/UP/DOWN/BFLY), VOTE.BALLOT |
+| Type convert | I2F, F2I, F2F, CVT (u32/u64/s32/s64) |
+| Control | MOV, NOP, EXIT, BRA, S2R, S2UR, BAR.SYNC |
+| Tensor | HMMA, IMMA, LDSM |
 
 ## Requirements
 
 - Python 3.11+
-- For GPU execution: NVIDIA GPU (RTX 5090/4090) + CUDA driver
-- For validation: NVIDIA ptxas (optional)
+- NVIDIA GPU + CUDA driver (for execution)
+- NVIDIA ptxas (optional, for validation only)
 
 ## License
 

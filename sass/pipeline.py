@@ -389,16 +389,28 @@ def _if_convert(fn: Function) -> None:
                                     continue
                                 guarded_true = _guard(true_body, pred_name, neg_bra)
                                 guarded_false = _guard(false_body, pred_name, not neg_bra)
-                                # Build a BRA to the merge block so control flow
-                                # continues correctly after the predicated body.
-                                merge_bra = Instruction(
-                                    op='bra', dest=None,
-                                    srcs=[LabelOp(name=label_merge_t)])
-                                bb.instructions = (instrs[:-2]
-                                                   + guarded_true + guarded_false
-                                                   + [merge_bra])
-                                fn.blocks = [b for b in blocks
-                                             if b is not bb_true and b is not bb_false]
+                                # Merge the merge block's body into this block
+                                # (avoids a separate block that causes scheduler
+                                # reordering issues with LDCU/LDG/FSEL ordering).
+                                bb_merge = next((b for b in blocks
+                                                 if b.label == label_merge_t), None)
+                                if bb_merge is not None:
+                                    # Include merge block body (everything except terminal BRA)
+                                    merge_body = list(bb_merge.instructions)
+                                    bb.instructions = (instrs[:-2]
+                                                       + guarded_true + guarded_false
+                                                       + merge_body)
+                                    fn.blocks = [b for b in blocks
+                                                 if b not in (bb_true, bb_false, bb_merge)]
+                                else:
+                                    merge_bra = Instruction(
+                                        op='bra', dest=None,
+                                        srcs=[LabelOp(name=label_merge_t)])
+                                    bb.instructions = (instrs[:-2]
+                                                       + guarded_true + guarded_false
+                                                       + [merge_bra])
+                                    fn.blocks = [b for b in blocks
+                                                 if b is not bb_true and b is not bb_false]
                                 changed = True
                                 break
 

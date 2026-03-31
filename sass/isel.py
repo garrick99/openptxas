@@ -2432,6 +2432,12 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                 target_byte = ctx.label_map[target_label]
                 bra_byte = (bra_idx + 1) * 16  # offset from NEXT instruction
                 rel_offset = target_byte - bra_byte
+                if rel_offset == 0:
+                    # Fall-through BRA: target is the next instruction.
+                    # Replace with NOP to avoid self-jump (infinite loop / crash).
+                    output[bra_idx] = SassInstr(encode_nop(),
+                        f'NOP  // eliminated fall-through BRA {target_label}')
+                    continue
                 # Preserve predicate from original BRA encoding
                 old_raw = output[bra_idx].raw
                 old_pred_byte = old_raw[1] & 0xF0  # predicate bits

@@ -866,15 +866,19 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
 
                 elif op == 'add' and typ in ('u32', 's32'):
                     d = ctx.ra.r32(instr.dest.name)
-                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     if isinstance(instr.srcs[1], ImmOp):
+                        # IADD3 with 32-bit immediate: dest = src0 + imm
+                        a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                         imm = instr.srcs[1].value & 0xFFFFFFFF
-                        lit_off = ctx._alloc_literal(imm)
-                        output.append(SassInstr(encode_ldc(d, 0, lit_off),
-                                                f'LDC R{d}, c[0][0x{lit_off:x}]  // add imm={imm:#x}'))
-                        output.append(SassInstr(encode_iadd3(d, a, d, RZ),
-                                                f'IADD3 R{d}, R{a}, R{d}, RZ  // add.{typ} imm'))
+                        output.append(SassInstr(encode_iadd3_imm32(d, a, imm, RZ),
+                                                f'IADD3 R{d}, R{a}, 0x{imm:x}, RZ  // add.{typ} imm'))
+                    elif isinstance(instr.srcs[0], ImmOp):
+                        b = _materialize_imm(instr.srcs[1], ctx, ctx.ra, output)
+                        imm = instr.srcs[0].value & 0xFFFFFFFF
+                        output.append(SassInstr(encode_iadd3_imm32(d, b, imm, RZ),
+                                                f'IADD3 R{d}, R{b}, 0x{imm:x}, RZ  // add.{typ} imm'))
                     else:
+                        a = ctx.ra.r32(instr.srcs[0].name)
                         b = ctx.ra.r32(instr.srcs[1].name)
                         output.append(SassInstr(encode_iadd3(d, a, b, RZ),
                                                 f'IADD3 R{d}, R{a}, R{b}, RZ  // add.{typ}'))

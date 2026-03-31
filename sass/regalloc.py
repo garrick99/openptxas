@@ -209,9 +209,9 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
         # schedule matches. Until we can generate our own capmerc, cap at R14.
         # NOTE: The EIATTR 0x5a blob (52 bytes) is a universal ptxas 13.0 signature
         # needed to authenticate capmerc. See memory/project_openptxas_sm120_rules.md.
-        # SM_120: without correct capmerc, R12+ is unreliable for some instruction
-        # patterns (FSEL at R7+ crashes). Cap at 12 for safety.
-        _MAX_GPR = 12
+        # SM_120: without correct capmerc, kernels >10 GPRs can crash depending
+        # on instruction pattern. Cap at 10 for maximum reliability.
+        _MAX_GPR = 10
         if is_64:
             if free_regs_64:
                 phys = free_regs_64.pop(0)

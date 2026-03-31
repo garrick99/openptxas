@@ -1054,10 +1054,20 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         output.append(SassInstr(encode_imad_ur(d, b, ur_tmp, RZ),
                             f'IMAD R{d}, R{b}, UR{ur_tmp}, RZ  // mul.lo.{typ}'))
                     else:
-                        # Both sources are computed GPRs — use R-R IMAD (opcode 0x2a4,
-                        # validated against ptxas 13.0 on SM_120).
-                        output.append(SassInstr(encode_imad_rr(d, a, b, RZ),
-                            f'IMAD R{d}, R{a}, R{b}, RZ  // mul.lo.{typ} R-R'))
+                        # IMAD R-R (0x2a4) is BROKEN on SM_120 but IMAD.WIDE R-R
+                        # (0x225) works. Use WIDE to get the full 64-bit product,
+                        # then take only the low 32 bits (dest register).
+                        # IMAD.WIDE writes dest AND dest+1, so allocate a scratch
+                        # for the high word to avoid clobbering live registers.
+                        t = _alloc_gpr(ctx)
+                        if t % 2 != 0:
+                            t = _alloc_gpr(ctx)  # even-align for pair
+                        _alloc_gpr(ctx)  # reserve t+1
+                        output.append(SassInstr(encode_imad_wide_rr(t, a, b, RZ),
+                            f'IMAD.WIDE R{t}, R{a}, R{b}, RZ  // mul.lo.{typ} R-R via WIDE'))
+                        if t != d:
+                            output.append(SassInstr(encode_mov(d, t),
+                                f'MOV R{d}, R{t}  // mul.lo result'))
 
                 elif op == 'mul' and 'lo' in instr.types and typ in ('u64', 's64', 'b64'):
                     # mul.lo.u64 d, a, b = lower 64 bits of a * b
@@ -1070,10 +1080,24 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     b_lo = ctx.ra.lo(instr.srcs[1].name)
                     output.append(SassInstr(encode_imad_wide_rr(d_lo, a_lo, b_lo, RZ),
                         f'IMAD.WIDE R{d_lo}, R{a_lo}, R{b_lo}, RZ  // mul.lo.{typ} wide'))
-                    output.append(SassInstr(encode_imad_rr(d_lo+1, a_lo, b_lo+1, d_lo+1),
-                        f'IMAD R{d_lo+1}, R{a_lo}, R{b_lo+1}, R{d_lo+1}  // mul.lo.{typ} cross a_lo*b_hi'))
-                    output.append(SassInstr(encode_imad_rr(d_lo+1, a_lo+1, b_lo, d_lo+1),
-                        f'IMAD R{d_lo+1}, R{a_lo+1}, R{b_lo}, R{d_lo+1}  // mul.lo.{typ} cross a_hi*b_lo'))
+                    # IMAD R-R (0x2a4) is broken on SM_120. Use IMAD.WIDE for cross terms:
+                    # cross1 = a_lo * b_hi (only need low 32 bits)
+                    # cross2 = a_hi * b_lo (only need low 32 bits)
+                    # d_hi += cross1 + cross2
+                    t = _alloc_gpr(ctx)
+                    if t % 2 != 0:
+                        t = _alloc_gpr(ctx)
+                    _alloc_gpr(ctx)  # reserve t+1
+                    # cross1: t = a_lo * b_hi (low 32 of wide product)
+                    output.append(SassInstr(encode_imad_wide_rr(t, a_lo, b_lo+1, RZ),
+                        f'IMAD.WIDE R{t}, R{a_lo}, R{b_lo+1}, RZ  // cross a_lo*b_hi'))
+                    output.append(SassInstr(encode_iadd3(d_lo+1, d_lo+1, t, RZ),
+                        f'IADD3 R{d_lo+1}, R{d_lo+1}, R{t}, RZ  // d_hi += cross1'))
+                    # cross2: t = a_hi * b_lo (low 32 of wide product)
+                    output.append(SassInstr(encode_imad_wide_rr(t, a_lo+1, b_lo, RZ),
+                        f'IMAD.WIDE R{t}, R{a_lo+1}, R{b_lo}, RZ  // cross a_hi*b_lo'))
+                    output.append(SassInstr(encode_iadd3(d_lo+1, d_lo+1, t, RZ),
+                        f'IADD3 R{d_lo+1}, R{d_lo+1}, R{t}, RZ  // d_hi += cross2'))
 
                 elif op == 'st' and 'shared' in instr.types:
                     from ptx.ir import MemOp
@@ -1694,10 +1718,21 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             output.append(SassInstr(encode_imad_ur(d, b, ur_tmp, c),
                                 f'IMAD R{d}, R{b}, UR{ur_tmp}, R{c}  // mad.lo.{typ} R-UR'))
                         else:
-                            # True R-R: neither source from param. Use IADD3 doubling chain.
-                            # TODO: implement general R-R multiply via repeated doubling
-                            output.append(SassInstr(encode_imad_rr(d, a, b, c),
-                                f'IMAD R{d}, R{a}, R{b}, R{c}  // mad.lo.{typ} R-R (CAUTION: 0x2a4 unreliable)'))
+                            # IMAD R-R (0x2a4) is BROKEN on SM_120 but IMAD.WIDE R-R
+                            # (0x225) works. Use WIDE for the multiply, then add the
+                            # addend via IADD3.
+                            t = _alloc_gpr(ctx)
+                            if t % 2 != 0:
+                                t = _alloc_gpr(ctx)
+                            _alloc_gpr(ctx)  # reserve t+1
+                            output.append(SassInstr(encode_imad_wide_rr(t, a, b, RZ),
+                                f'IMAD.WIDE R{t}, R{a}, R{b}, RZ  // mad.lo.{typ} R-R via WIDE'))
+                            if c != RZ:
+                                output.append(SassInstr(encode_iadd3(d, t, c, RZ),
+                                    f'IADD3 R{d}, R{t}, R{c}, RZ  // mad.lo add'))
+                            elif t != d:
+                                output.append(SassInstr(encode_mov(d, t),
+                                    f'MOV R{d}, R{t}  // mad.lo result'))
 
                 elif op == 'mad' and 'wide' in instr.types and typ in ('u32', 's32'):
                     # mad.wide.u32/s32 d64, a32, b32_or_imm, c64

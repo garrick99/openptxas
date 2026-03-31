@@ -236,7 +236,7 @@ MUL_RR_KERNEL = """\
 
 
 def test_mul_rr_compiles():
-    """mul.lo with two computed GPRs compiles to IMAD.RR (0x2a4), not NOP."""
+    """mul.lo with two computed GPRs compiles to IMAD.WIDE (0x225) — 0x2a4 is broken on SM_120."""
     results = compile_ptx_source(MUL_RR_KERNEL)
     cubin = results["mul_rr"]
     assert cubin[:4] == b'\x7fELF'
@@ -244,7 +244,8 @@ def test_mul_rr_compiles():
     text = elf.section_data('.text.mul_rr')
     opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
                for off in range(0, len(text), 16)]
-    assert 0x2a4 in opcodes, "IMAD.RR (0x2a4) not found — mul.lo R-R emitted NOP"
+    assert 0x225 in opcodes, "IMAD.WIDE (0x225) not found — mul.lo R-R needs WIDE fallback"
+    assert 0x2a4 not in opcodes, "IMAD.RR (0x2a4) found — this opcode is broken on SM_120"
 
 
 # ---------------------------------------------------------------------------

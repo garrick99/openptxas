@@ -177,7 +177,12 @@ class RegDecl:
     @property
     def names(self) -> list[str]:
         if self.count == 1:
-            return [f"%{self.name}"]
+            # If name ends with a digit, it's a direct declaration like .reg .u32 %r4
+            # If not (like .reg .f32 %f<1>), the code uses %f0, so append index 0
+            if self.name and self.name[-1].isdigit():
+                return [f"%{self.name}"]
+            else:
+                return [f"%{self.name}0"]
         return [f"%{self.name}{i}" for i in range(self.count)]
 
 

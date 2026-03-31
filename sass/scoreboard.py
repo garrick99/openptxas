@@ -455,14 +455,10 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
         if opcode in _OPCODES_BAR:
             wdep = 0x3f
             rbar = 0x01
-        if opcode == 0x94d:  # EXIT
-            guard = (si.raw[1] >> 4) & 0xF
-            if guard != 0x7:  # Predicated @Px EXIT: use default ctrl
-                wdep = 0x3e
-                rbar = 0x01
-            else:  # Unconditional EXIT
-                rbar = 0x01
-                wdep = 0x3f
+        if opcode == 0x94d:  # EXIT — always wdep=0x3f, misc=5 (ptxas-verified)
+            # ptxas uses identical ctrl for both predicated and unconditional EXIT
+            rbar = 0x01
+            wdep = 0x3f
 
         # Build ctrl — bits[22:17] = OPEX (instruction extension / hardware modifier).
         # These are NOT stall counters on SM_120. Each opcode has a fixed OPEX value
@@ -484,9 +480,8 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
             if guard != 0x7:
                 _ldcu_slot_counter[0] = 0
         # Misc nibble: opcode-specific where hardware requires it, counter elsewhere.
-        if opcode == 0x94d:  # EXIT: misc depends on predication
-            guard = (si.raw[1] >> 4) & 0xF
-            misc = 0 if guard != 0x7 else 5  # predicated=0, unconditional=5
+        if opcode == 0x94d:  # EXIT: always misc=5 (ptxas-verified, same for pred/unpred)
+            misc = 5
         elif opcode == 0x7ac and si.raw[9] == 0x0a:
             misc = 7   # LDCU.64: misc=7 (CRITICAL: misc=1 → ILLEGAL_ADDRESS)
         elif opcode == 0x981:  # LDG: misc=6 (hardware-verified SM_120)
@@ -496,9 +491,7 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
         else:
             misc = misc_counter & 0xF
         # Hardware rule: odd wdep requires misc != 0 (misc=0 → ILLEGAL_INSTRUCTION)
-        # EXCEPTION: predicated EXIT (@Px EXIT) MUST have misc=0 on SM_120
-        is_pred_exit = (opcode == 0x94d and (si.raw[1] >> 4) & 0xF != 0x7)
-        if (wdep & 1) and misc == 0 and not is_pred_exit:
+        if (wdep & 1) and misc == 0:
             misc = 1
         ctrl = (stall << 17) | (rbar << 10) | (wdep << 4) | misc
         misc_counter += 1

@@ -2363,16 +2363,22 @@ FSETP_NEU = 0x0d
 
 def encode_fsetp(pred_dest: int, src0: int, src1: int, cmp: int = FSETP_LT,
                   ctrl: int = 0) -> bytes:
+    """Encode FSETP Ppred, src0, src1, cmp (FP32 comparison → predicate).
+
+    Ground truth (ptxas sm_120, setp.gt.f32 %p0, %f0, 0.0):
+        0b720004ff0000000040f00300ca4f00
+        b3=R4(src0), b4=R255(src1=RZ), b9=0x40(GT|P0), b10=0xf0(PT), b11=0x03(AND)
+    """
     if ctrl == 0: ctrl = _CTRL_DEFAULT
     b13, b14, b15 = _ctrl_to_bytes(ctrl)
     raw = bytearray(16)
     raw[0], raw[1] = 0x0b, 0x72
-    raw[2] = 0x00  # pred encoding in modifier bytes
+    raw[2] = 0x00
     raw[3] = src0 & 0xFF
     raw[4] = src1 & 0xFF
-    raw[9] = 0xf0 | (pred_dest & 0x07)  # pred dest + PT
-    raw[10] = 0x03  # AND + PT
-    raw[11] = cmp & 0xFF
+    raw[9] = ((cmp & 0x0F) << 4) | (pred_dest & 0x07)  # comparison mode + pred dest
+    raw[10] = 0xf0  # PT in AND mask
+    raw[11] = 0x03  # AND combiner
     raw[13], raw[14], raw[15] = b13, b14, b15
     return bytes(raw)
 

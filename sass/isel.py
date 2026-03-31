@@ -455,6 +455,8 @@ def _select_add_u64(instr: Instruction, ra: RegAlloc,
                 ctx._addr_scratch = 10  # R10:R11 as default scratch
             d_lo = ctx._addr_scratch
             ra.int_regs[dest.name] = d_lo
+        if ctx:
+            ctx._gpr_written.add(dest.name)
         return [
             SassInstr(encode_iadd64_ur(d_lo, r_lo, ur_idx),
                       f'IADD.64 R{d_lo}, R{r_lo}, UR{ur_idx}  // add.u64 (UR base)'),
@@ -464,6 +466,8 @@ def _select_add_u64(instr: Instruction, ra: RegAlloc,
         a_lo = ra.lo(a.name)
         b_lo = ra.lo(b.name)
         d_lo = ra.lo(dest.name)  # use allocator's assignment
+        if ctx:
+            ctx._gpr_written.add(dest.name)
         return [
             SassInstr(encode_iadd64(d_lo, a_lo, b_lo),
                       f'IADD.64 R{d_lo}, R{a_lo}, R{b_lo}  // add.u64'),
@@ -544,21 +548,23 @@ def _select_ld_global(instr: Instruction, ra: RegAlloc,
 
     base_name = src.base if src.base.startswith('%') else f'%{src.base}'
 
-    # Check if the address register is in a UR (loaded via LDCU.64 from ld.param.u64).
-    # If so, materialize into a GPR pair via IADD.64-UR before the LDG.
+    # Resolve address register: if the register was written to GPR (by add.u64 etc.),
+    # use the GPR value. Otherwise, if it's only in a UR (raw pointer from ld.param.u64),
+    # materialize via IADD.64-UR.
     result = []
     ur_params = getattr(ctx, '_ur_params', {}) if ctx else {}
-    if base_name in ur_params:
+    gpr_written = getattr(ctx, '_gpr_written', set()) if ctx else set()
+    if base_name in gpr_written and src.base in ra.int_regs:
+        addr = ra.lo(src.base)
+    elif base_name in ur_params:
+        # Register only exists as a UR (raw pointer from ld.param.u64, no add.u64)
         ur_idx = ur_params[base_name]
-        # Allocate a scratch GPR pair for the address
         addr = _alloc_gpr(ctx)
         if addr % 2 != 0:
-            addr = _alloc_gpr(ctx)  # ensure even-aligned for 64-bit
-        _alloc_gpr(ctx)  # reserve addr+1
+            addr = _alloc_gpr(ctx)
+        _alloc_gpr(ctx)
         result.append(SassInstr(encode_iadd64_ur(addr, RZ, ur_idx),
                                 f'IADD.64 R{addr}, RZ, UR{ur_idx}  // UR->GPR addr'))
-    elif src.base in ra.int_regs:
-        addr = ra.lo(src.base)
     else:
         addr = RZ
 
@@ -587,11 +593,14 @@ def _select_atom_cas(instr: Instruction, ra: RegAlloc,
     cmp = ra.r32(cmp_op.name)
     nv  = ra.r32(new_op.name)
 
-    # Check if address is in UR (from ld.param.u64)
+    # Resolve address: prefer GPR (if written by add.u64) over stale UR entry
     prefix = []
     base_name = addr_op.base if addr_op.base.startswith('%') else f'%{addr_op.base}'
     ur_params = getattr(ctx, '_ur_params', {}) if ctx else {}
-    if base_name in ur_params:
+    gpr_written = getattr(ctx, '_gpr_written', set()) if ctx else set()
+    if base_name in gpr_written and addr_op.base in ra.int_regs:
+        addr = ra.lo(addr_op.base)
+    elif base_name in ur_params:
         ur_idx = ur_params[base_name]
         addr = _alloc_gpr(ctx)
         if addr % 2 != 0:
@@ -599,8 +608,6 @@ def _select_atom_cas(instr: Instruction, ra: RegAlloc,
         _alloc_gpr(ctx)
         prefix.append(SassInstr(encode_iadd64_ur(addr, RZ, ur_idx),
                                 f'IADD.64 R{addr}, RZ, UR{ur_idx}  // UR->GPR addr'))
-    elif addr_op.base in ra.int_regs:
-        addr = ra.lo(addr_op.base)
     else:
         addr = RZ
 
@@ -632,10 +639,13 @@ def _select_st_global(instr: Instruction, ra: RegAlloc,
 
     base_name = dest_op.base if dest_op.base.startswith('%') else f'%{dest_op.base}'
 
-    # Check if the address register is in a UR (loaded via LDCU.64 from ld.param.u64).
+    # Resolve address: prefer GPR (if written by add.u64) over stale UR entry
     prefix = []
     ur_params = getattr(ctx, '_ur_params', {}) if ctx else {}
-    if base_name in ur_params:
+    gpr_written = getattr(ctx, '_gpr_written', set()) if ctx else set()
+    if base_name in gpr_written and dest_op.base in ra.int_regs:
+        addr = ra.lo(dest_op.base)
+    elif base_name in ur_params:
         ur_idx = ur_params[base_name]
         addr = _alloc_gpr(ctx)
         if addr % 2 != 0:
@@ -643,8 +653,6 @@ def _select_st_global(instr: Instruction, ra: RegAlloc,
         _alloc_gpr(ctx)
         prefix.append(SassInstr(encode_iadd64_ur(addr, RZ, ur_idx),
                                 f'IADD.64 R{addr}, RZ, UR{ur_idx}  // UR->GPR addr'))
-    elif dest_op.base in ra.int_regs:
-        addr = ra.lo(dest_op.base)
     else:
         addr = RZ
 
@@ -689,6 +697,8 @@ class ISelContext:
     _reg_sr_source: dict[str, int] = field(default_factory=dict)
     # Map PTX register name → UR index (u32 params loaded via LDCU.32 for ISETP R-UR)
     _ur_for_param:  dict[str, int] = field(default_factory=dict)
+    # Set of PTX register names that have been written to GPR (overriding any UR value)
+    _gpr_written:   set = field(default_factory=set)
     # Literal constant pool: value → c[0] byte offset (baked into .nv.constant0)
     # Base offset is set by the pipeline after regalloc (after the param area ends).
     _const_pool_base: int = 0

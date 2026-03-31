@@ -1199,7 +1199,7 @@ def encode_fadd(dest: int, src0: int, src1: int,
 
 
 def encode_fmul(dest: int, src0: int, src1: int, ctrl: int = 0) -> bytes:
-    """Encode FMUL dest, src0, src1 (FP32 multiply)."""
+    """Encode FMUL dest, src0, src1 (FP32 multiply, both operands in GPR)."""
     if ctrl == 0:
         ctrl = _CTRL_DEFAULT
     # FMUL is FFMA with src2=RZ (addend=0): dest = src0 * src1 + 0
@@ -1208,6 +1208,35 @@ def encode_fmul(dest: int, src0: int, src1: int, ctrl: int = 0) -> bytes:
                   b8=RZ,
                   b9=0x00, b10=0x00, b11=0x00,
                   ctrl=ctrl)
+
+
+def encode_fmul_imm(dest: int, src0: int, imm_f32: int, ctrl: int = 0) -> bytes:
+    """Encode FMUL dest, src0, float_imm (FP32 multiply with 32-bit immediate).
+
+    Opcode 0x820. The 32-bit IEEE 754 float is encoded in b4-b7.
+    Ground truth (ptxas sm_120): mul.f32 %f1, %f0, 0f40000000 (2.0f):
+        20780704000000400000400000ca4f00
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    import struct as _s
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0x20
+    raw[1] = 0x78
+    raw[2] = dest & 0xFF
+    raw[3] = src0 & 0xFF
+    # 32-bit float immediate in b4-b7
+    _s.pack_into('<I', raw, 4, imm_f32 & 0xFFFFFFFF)
+    # b8-b11: from ptxas ground truth
+    raw[8] = 0x00
+    raw[9] = 0x00
+    raw[10] = 0x40
+    raw[11] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
 
 
 def encode_ffma(dest: int, src0: int, src1: int, src2: int,
@@ -1220,6 +1249,32 @@ def encode_ffma(dest: int, src0: int, src1: int, src2: int,
                   b8=src2,
                   b9=0x01 if negate_src0 else 0x00, b10=0x00, b11=0x00,
                   ctrl=ctrl)
+
+
+def encode_ffma_imm(dest: int, src0: int, imm_f32: int, src2: int,
+                    ctrl: int = 0) -> bytes:
+    """Encode FFMA dest, src0, float_imm, src2 (FP32 fused multiply-add with immediate).
+
+    Opcode 0x823. dest = src0 * float_imm + src2.
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    import struct as _s
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0x23
+    raw[1] = 0x78
+    raw[2] = dest & 0xFF
+    raw[3] = src0 & 0xFF
+    _s.pack_into('<I', raw, 4, imm_f32 & 0xFFFFFFFF)
+    raw[8] = src2 & 0xFF
+    raw[9] = 0x00
+    raw[10] = 0x00
+    raw[11] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
 
 
 # ---------------------------------------------------------------------------

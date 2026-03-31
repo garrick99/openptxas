@@ -56,7 +56,7 @@ from sass.encoding.sm_120_opcodes import (
     encode_isetp, ISETP_LT, ISETP_EQ, ISETP_LE, ISETP_GT, ISETP_NE, ISETP_GE,
     encode_fsetp, FSETP_LT, FSETP_EQ, FSETP_LE, FSETP_GT, FSETP_NE, FSETP_GE,
     encode_bra, patch_pred,
-    encode_fadd, encode_fmul, encode_ffma,
+    encode_fadd, encode_fmul, encode_fmul_imm, encode_ffma, encode_ffma_imm,
     encode_mufu, MUFU_RCP, MUFU_SQRT, MUFU_SIN, MUFU_COS, MUFU_EX2, MUFU_LG2,
     encode_sel, encode_fsel,
     encode_vimnmx_s32, encode_vimnmx_u32,
@@ -1146,10 +1146,22 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
 
                 elif op == 'mul' and typ == 'f32':
                     d = ctx.ra.r32(instr.dest.name)
-                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
-                    b = _materialize_imm(instr.srcs[1], ctx, ctx.ra, output)
-                    output.append(SassInstr(encode_fmul(d, a, b),
-                                            f'FMUL R{d}, R{a}, R{b}  // mul.f32'))
+                    # Use FMUL with inline immediate (0x820) when one operand is constant
+                    if isinstance(instr.srcs[1], ImmOp):
+                        a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
+                        imm = instr.srcs[1].value & 0xFFFFFFFF
+                        output.append(SassInstr(encode_fmul_imm(d, a, imm),
+                                                f'FMUL R{d}, R{a}, 0x{imm:08x}  // mul.f32 imm'))
+                    elif isinstance(instr.srcs[0], ImmOp):
+                        b = _materialize_imm(instr.srcs[1], ctx, ctx.ra, output)
+                        imm = instr.srcs[0].value & 0xFFFFFFFF
+                        output.append(SassInstr(encode_fmul_imm(d, b, imm),
+                                                f'FMUL R{d}, R{b}, 0x{imm:08x}  // mul.f32 imm'))
+                    else:
+                        a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
+                        b = _materialize_imm(instr.srcs[1], ctx, ctx.ra, output)
+                        output.append(SassInstr(encode_fmul(d, a, b),
+                                                f'FMUL R{d}, R{a}, R{b}  // mul.f32'))
 
                 elif op == 'fma' and typ == 'f32':
                     d = ctx.ra.r32(instr.dest.name)

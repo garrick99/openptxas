@@ -159,6 +159,7 @@ _TOKEN_RE = re.compile(r"""
     (?P<COMMENT_BLOCK>  /\*.*?\*/          ) |
     (?P<COMMENT_LINE>   //[^\n]*           ) |
     (?P<STRING>         "(?:[^"\\]|\\.)*"  ) |
+    (?P<FP_HEX>         0[fFdD][0-9a-fA-F]+ ) |
     (?P<HEX_INT>        0[xX][0-9a-fA-F]+ ) |
     (?P<FLOAT>          [-+]?[0-9]*\.[0-9]+(?:[eE][-+]?[0-9]+)? ) |
     (?P<INT>            [0-9]+             ) |
@@ -635,6 +636,19 @@ class _Parser:
                     self._advance(); break
                 self._advance()
             return result
+
+        # Float hex literal: 0fXXXXXXXX (32-bit) or 0dXXXXXXXXXXXXXXXX (64-bit)
+        if tok.kind == "FP_HEX":
+            self._advance()
+            prefix = tok.value[:2]  # "0f" or "0d"
+            hex_digits = tok.value[2:]
+            bits = int(hex_digits, 16)
+            if prefix.lower() == '0f':
+                # 32-bit float: store as ImmOp with raw IEEE 754 bits
+                return ImmOp(bits)
+            else:
+                # 64-bit double: store as ImmOp with raw IEEE 754 bits
+                return ImmOp(bits)
 
         # Hex literal
         if tok.kind == "HEX_INT":

@@ -56,6 +56,8 @@ _OPCODE_META: dict[int, _OpMeta] = {
     0x219: _OpMeta('SHF.R.S32.HI.VAR', 1, 0x3e, 1),  # SHF.R.S32.HI variable-shift (shr.s32)
     0x221: _OpMeta('FADD',       1, 0x3e, 1),
     0x223: _OpMeta('FFMA',       1, 0x3e, 1),
+    0x820: _OpMeta('FMUL.IMM',   1, 0x3e, 1),  # FMUL with 32-bit float immediate
+    0x823: _OpMeta('FFMA.IMM',   1, 0x3e, 1),  # FFMA with 32-bit float immediate
     0x235: _OpMeta('IADD.64',    1, 0x3e, 1),
     0xc35: _OpMeta('IADD.64-UR', 1, 0x3e, 5),  # misc=5 per hardware bisect 2026-03-25
     0x202: _OpMeta('MOV',        0, 0x3e, 1),
@@ -97,6 +99,8 @@ _OPCODES_ALU = {
     # Float arithmetic
     0x221,        # FADD
     0x223,        # FMUL / FFMA
+    0x820,        # FMUL with float immediate
+    0x823,        # FFMA with float immediate
     0x209,        # FMNMX (float min/max)
     0x308,        # MUFU (RCP, SQRT, SIN, COS, EX2, LG2)
     # Type conversion
@@ -194,6 +198,9 @@ def _get_src_regs(raw: bytes) -> set[int]:
             for r in range(4): regs.add(raw[3]+r)
             for r in range(2): regs.add(raw[4]+r)
             for r in range(4): regs.add(raw[8]+r)
+        elif opcode in (0x820, 0x823):  # FMUL.IMM/FFMA.IMM: src0=b3 (GPR), b4-b7=imm, src2=b8
+            if raw[3] < 255: regs.add(raw[3])
+            if opcode == 0x823 and raw[8] < 255: regs.add(raw[8])  # FFMA addend
         elif opcode in (0x221, 0x223):  # FADD/FFMA: src0=b3, src1=b4, src2=b8
             if raw[4] < 255: regs.add(raw[4])
             if raw[8] < 255 and opcode == 0x223: regs.add(raw[8])

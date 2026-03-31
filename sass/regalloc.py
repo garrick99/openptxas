@@ -158,7 +158,8 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120) -> AllocResult:
     # Predicate allocation (simple sequential)
     for rd in fn.reg_decls:
         if rd.type.kind == ScalarKind.PRED:
-            for name in rd.names:
+            for i in range(rd.count):
+                name = f"%{rd.name}{i}"
                 if name in used_regs:
                     pred_regs[name] = next_pred
                     next_pred += 1
@@ -171,7 +172,7 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120) -> AllocResult:
             continue
         is_64 = rd.type.width >= 64
         for i in range(rd.count):
-            name = f"%{rd.name}{i}" if rd.count > 1 else f"%{rd.name}"
+            name = f"%{rd.name}{i}"
             if name not in used_regs:
                 continue
             first = reg_first_def.get(name, 0)
@@ -202,20 +203,46 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120) -> AllocResult:
                 new_active.append((aname, areg, alast, a64))
         active = new_active
 
-        # Allocate: prefer reusing a free register, else allocate new
+        # Allocate: prefer reusing a free register, else allocate new.
+        # SM_120 HARDWARE LIMIT: Without proper merc 0x5a metadata, the GPU
+        # only reliably supports R0-R13 for all instruction types (LOP3 in
+        # particular fails with R14+). Cap allocation to avoid ERR715.
+        _MAX_GPR = 14  # Without per-instruction capmerc generation, R14+ is unreliable
         if is_64:
             if free_regs_64:
                 phys = free_regs_64.pop(0)
             else:
                 if next_gpr % 2 != 0:
                     next_gpr += 1
-                phys = next_gpr
-                next_gpr += 2
+                if next_gpr + 1 >= _MAX_GPR:
+                    # Spill: evict the earliest-ending 64-bit active register
+                    candidates = [(a, i) for i, (a, ar, al, a64) in enumerate(active) if a64]
+                    if candidates:
+                        _, idx = min(candidates, key=lambda x: active[x[1]][2])
+                        evicted = active.pop(idx)
+                        phys = evicted[1]
+                    else:
+                        phys = next_gpr  # fallback: exceed limit
+                        next_gpr += 2
+                else:
+                    phys = next_gpr
+                    next_gpr += 2
             int_regs[name] = phys
             active.append((name, phys, last_use, True))
         else:
             if free_regs_32:
                 phys = free_regs_32.pop(0)
+            elif next_gpr >= _MAX_GPR:
+                # Spill: evict the earliest-ending 32-bit active register
+                candidates = [(a, i) for i, (a, ar, al, a64) in enumerate(active) if not a64]
+                if candidates:
+                    _, idx = min(candidates, key=lambda x: active[x[1]][2])
+                    evicted = active.pop(idx)
+                    phys = evicted[1]
+                    free_regs_32 = []  # cleared since we just used the slot
+                else:
+                    phys = next_gpr
+                    next_gpr += 1
             else:
                 phys = next_gpr
                 next_gpr += 1

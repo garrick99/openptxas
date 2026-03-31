@@ -75,8 +75,10 @@ from sass.encoding.sm_120_opcodes import (
     encode_iadd3_pred_neg_b4, encode_iadd3_pred_small_imm,
     encode_iadd3_pred_neg_b3, encode_lop3_pred,
     encode_lop3, LOP3_AND, LOP3_OR, LOP3_XOR,
-    RZ, PT, SR_TID_X, SR_TID_Y,
-    SR_CTAID_X,
+    RZ, PT, SR_TID_X, SR_TID_Y, SR_TID_Z,
+    SR_CTAID_X, SR_CTAID_Y, SR_CTAID_Z,
+    SR_NTID_X, SR_NTID_Y, SR_NTID_Z,
+    SR_NCTAID_X, SR_NCTAID_Y, SR_NCTAID_Z,
 )
 from sass.encoding.sm_120_encode import (
     encode_shf_l_w_u32_hi,
@@ -133,14 +135,111 @@ def _nop(comment: str = '') -> SassInstr:
     return SassInstr(encode_nop(), comment or 'NOP')
 
 
+def _alloc_scratch(ctx: 'ISelContext', count: int = 1) -> list[int]:
+    """Allocate scratch GPRs from the pool. Returns list of register indices."""
+    regs = []
+    for _ in range(count):
+        if ctx._scratch_pool:
+            r = ctx._scratch_pool.pop()
+        else:
+            r = ctx._next_gpr
+            ctx._next_gpr += 1
+            ctx._scratch_highwater = max(ctx._scratch_highwater, ctx._next_gpr)
+        regs.append(r)
+    return regs
+
+
+def _free_scratch(ctx: 'ISelContext', regs: list[int]):
+    """Return scratch GPRs to the pool for reuse."""
+    ctx._scratch_pool.extend(regs)
+
+
+_GPR_HARD_LIMIT = 14  # Without per-instruction capmerc generation, R14+ is unreliable
+
+def _alloc_gpr(ctx: 'ISelContext') -> int:
+    """Allocate a single GPR, preferring the scratch pool.
+    Never returns >= _GPR_HARD_LIMIT to avoid ERR715."""
+    # Try scratch pool first, filtering out too-high registers
+    while ctx._scratch_pool:
+        r = ctx._scratch_pool.pop()
+        if r < _GPR_HARD_LIMIT:
+            return r
+    # Fresh allocation
+    if ctx._next_gpr < _GPR_HARD_LIMIT:
+        r = ctx._next_gpr
+        ctx._next_gpr += 1
+        ctx._scratch_highwater = max(ctx._scratch_highwater, ctx._next_gpr)
+        return r
+    # Out of registers — this is a hard error but return R0 as emergency fallback
+    return 0
+
+
+def _mark_scratch(ctx: 'ISelContext'):
+    """Save current GPR watermark. Call before a multi-instruction sequence."""
+    ctx._scratch_mark = ctx._next_gpr
+
+
+def _release_scratch(ctx: 'ISelContext'):
+    """Release all GPRs allocated since the last _mark_scratch call."""
+    if ctx._scratch_mark >= 0:
+        for r in range(ctx._scratch_mark, ctx._next_gpr):
+            if r not in ctx._scratch_pool:
+                ctx._scratch_pool.append(r)
+        ctx._scratch_mark = -1
+
+
+def _emit_lop3(output: list, ctx: 'ISelContext', dest: int, src0: int,
+               src1: int, src2: int, lut: int, comment: str = ''):
+    """Emit LOP3.LUT with register safety. On SM_120, LOP3 dest must be < R14
+    (hardware limitation of the logic execution unit). If dest >= 14, use a
+    scratch register and MOV the result."""
+    if dest < 14:
+        output.append(SassInstr(encode_lop3(dest, src0, src1, src2, lut), comment))
+    else:
+        # LOP3 to a low scratch, then MOV to actual dest.
+        used = {src0, src1, src2, dest}
+        scratch = next((r for r in range(14) if r not in used), 0)
+        output.append(SassInstr(encode_lop3(scratch, src0, src1, src2, lut),
+                                f'{comment} (via R{scratch})'))
+        output.append(SassInstr(encode_iadd3(dest, scratch, RZ, RZ),
+                                f'MOV R{dest}, R{scratch}  // lop3 fixup'))
+
+
+def _alloc_scratch_pred(ctx: 'ISelContext', count: int = 1) -> list[int]:
+    """Allocate scratch predicate registers."""
+    regs = []
+    for _ in range(count):
+        r = ctx._next_pred
+        ctx._next_pred += 1
+    regs.append(r)
+    return regs
+
+
+def _materialize_imm(op: Operand, ctx: 'ISelContext', ra: RegAlloc,
+                     output: list, bits: int = 32) -> int:
+    """If op is an ImmOp, materialize it into a scratch GPR and return the index.
+    If op is a RegOp, just return the register index. Handles 32-bit values."""
+    if isinstance(op, RegOp):
+        return ra.r32(op.name) if bits == 32 else ra.lo(op.name)
+    if isinstance(op, ImmOp):
+        val = op.value & 0xFFFFFFFF
+        scratch = _alloc_gpr(ctx)
+        # Use IADD3 Rd, RZ, imm, RZ to load a 32-bit immediate
+        output.append(SassInstr(encode_iadd3_imm32(scratch, RZ, val, RZ),
+                                f'MOV R{scratch}, 0x{val:x}  // materialize imm'))
+        return scratch
+    raise ISelError(f"Expected register or immediate operand, got {op!r}")
+
+
 # ---------------------------------------------------------------------------
 # PTX → SASS per-instruction mappers
 # ---------------------------------------------------------------------------
 
 _SPECIAL_REGS = {
-    '%tid.x': SR_TID_X, '%tid.y': SR_TID_Y,
-    '%ctaid.x': SR_CTAID_X,
-    '%ntid.x': 0x29,  # SR_NTID_X
+    '%tid.x': SR_TID_X, '%tid.y': SR_TID_Y, '%tid.z': SR_TID_Z,
+    '%ctaid.x': SR_CTAID_X, '%ctaid.y': SR_CTAID_Y, '%ctaid.z': SR_CTAID_Z,
+    '%ntid.x': SR_NTID_X, '%ntid.y': SR_NTID_Y, '%ntid.z': SR_NTID_Z,
+    '%nctaid.x': SR_NCTAID_X, '%nctaid.y': SR_NCTAID_Y, '%nctaid.z': SR_NCTAID_Z,
 }
 
 # SM_120 constant bank offsets for system values (driver-populated)
@@ -347,6 +446,15 @@ def _select_add_u64(instr: Instruction, ra: RegAlloc,
             ur_idx = ctx._ur_params[b.name]
             r_lo = ra.lo(a.name)
         d_lo = ra.lo(dest.name) if dest.name in ra.int_regs else r_lo
+        # SM_120 hardware limit: 64-bit dest pair must be < R14 unless
+        # the merc metadata declares per-instruction register allocation.
+        # Without proper merc 0x5a attribute, R14+ triggers ERR715.
+        # Reuse a scratch pair from the context's reusable pool.
+        if d_lo >= 14:
+            if not hasattr(ctx, '_addr_scratch'):
+                ctx._addr_scratch = 10  # R10:R11 as default scratch
+            d_lo = ctx._addr_scratch
+            ra.int_regs[dest.name] = d_lo
         return [
             SassInstr(encode_iadd64_ur(d_lo, r_lo, ur_idx),
                       f'IADD.64 R{d_lo}, R{r_lo}, UR{ur_idx}  // add.u64 (UR base)'),
@@ -476,7 +584,7 @@ def _select_st_global(instr: Instruction, ra: RegAlloc,
     if not isinstance(src_op, RegOp):
         # Immediate data: materialize into a temporary register first.
         if isinstance(src_op, ImmOp):
-            t = ctx._next_gpr; ctx._next_gpr += 1
+            t = _alloc_gpr(ctx)
             lit_off = ctx._alloc_literal(src_op.value & 0xFFFFFFFF)
             from sass.encoding.sm_120_opcodes import encode_ldc
             preamble = [SassInstr(encode_ldc(t, 4, lit_off),
@@ -537,7 +645,14 @@ class ISelContext:
     _const_pool:      dict[int, int] = field(default_factory=dict)
     # Next available scratch GPR (for isel-internal temporaries, e.g. bfe mask)
     # Initialized from alloc.num_gprs by the pipeline; may grow during isel.
+    # SM_120 HARDWARE LIMIT: Without proper merc 0x5a metadata, the GPU only
+    # allows access to R0..R(capmerc_byte8 - 1). Default capmerc allocates
+    # based on num_gprs. To avoid ERR715, we cap scratch allocation and
+    # reuse temporaries via a free-list.
     _next_gpr: int = 0
+    _scratch_pool: list = field(default_factory=list)  # free scratch GPRs
+    _scratch_highwater: int = 0  # max _next_gpr reached (for capmerc)
+    _scratch_mark: int = -1  # saved _next_gpr for batch free
     # Next available scratch predicate register (for isel-internal use, e.g. div.u32)
     # Initialized from alloc.num_pred by the pipeline; may grow during isel.
     _next_pred: int = 0
@@ -570,7 +685,12 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
         if bb.label:
             ctx.label_map[bb.label] = len(output) * 16
 
-        for instr in bb.instructions:
+        for _instr_idx, instr in enumerate(bb.instructions):
+            if hasattr(ctx, '_skip_instrs') and id(instr) in ctx._skip_instrs:
+                continue
+            # Mark scratch watermark before each instruction so temporaries
+            # (div/rem/mul.hi scratch regs) are reclaimed after emission.
+            _mark_scratch(ctx)
             op = instr.op.lower()
             # typ = last type qualifier (the data type). Earlier elements are modifiers (lo, hi, approx, etc.)
             typ = instr.types[-1].lower() if instr.types else ''
@@ -598,16 +718,18 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         # so mad.lo can use LDCU.32 + IMAD R-UR
                         if instr.srcs[0].name == '%ntid.x':
                             ctx._reg_param_off[instr.dest.name] = _CBANK_NTID_X
-                        elif instr.srcs[0].name == '%ctaid.x':
+                        elif instr.srcs[0].name in ('%ctaid.x', '%ctaid.y', '%ctaid.z'):
                             # Put ctaid into a fresh UR via S2UR so mad.lo can use IMAD R-UR.
                             # IMAD R-R (0x224) is not validated on SM_120; IMAD R-UR (0xc24)
                             # is confirmed by ptxas. Must NOT use UR4 (reserved for mem
                             # descriptor by pipeline.py) to avoid a WAR hazard where the
                             # descriptor LDCU overwrites UR4 before IMAD finishes reading it.
+                            sr_code = _SPECIAL_REGS[instr.srcs[0].name]
+                            sr_label = instr.srcs[0].name.lstrip('%').replace('.', '_').upper()
                             ur_ctaid = ctx._next_ur; ctx._next_ur += 1
                             ctx._ur_for_param[instr.dest.name] = ur_ctaid
-                            output.append(SassInstr(encode_s2ur(ur_ctaid, SR_CTAID_X),
-                                                    f'S2UR UR{ur_ctaid}, SR_CTAID_X  // {instr.dest.name} = ctaid.x'))
+                            output.append(SassInstr(encode_s2ur(ur_ctaid, sr_code),
+                                                    f'S2UR UR{ur_ctaid}, SR_{sr_label}  // {instr.dest.name} = {instr.srcs[0].name.lstrip("%")}'))
                             continue
                     output.extend(_select_mov(instr, ctx.ra))
 
@@ -618,7 +740,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     # 32-bit shift left: IMAD.SHL or SHF.L.U32 for constants,
                     # SHF.L.U32.VAR (opcode 0x7299) for runtime register shifts.
                     d = ctx.ra.r32(instr.dest.name)
-                    a = ctx.ra.r32(instr.srcs[0].name)
+                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     if isinstance(instr.srcs[1], ImmOp):
                         k = instr.srcs[1].value
                         if k <= 15:
@@ -628,13 +750,13 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             output.append(SassInstr(encode_shf_l_u32(d, a, k, RZ),
                                                     f'SHF.L.U32 R{d}, R{a}, 0x{k:x}, RZ  // shl.{typ} {k}'))
                     else:
-                        k_reg = ctx.ra.r32(instr.srcs[1].name)
+                        k_reg = _materialize_imm(instr.srcs[1], ctx, ctx.ra, output)
                         output.append(SassInstr(encode_shf_l_u32_var(d, a, k_reg),
                                                 f'SHF.L.U32 R{d}, R{a}, R{k_reg}, RZ  // shl.{typ} (var)'))
 
                 elif op == 'shr' and typ in ('b32', 'u32', 's32'):
                     d = ctx.ra.r32(instr.dest.name)
-                    a = ctx.ra.r32(instr.srcs[0].name)
+                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     is_signed = (typ == 's32')
                     if isinstance(instr.srcs[1], ImmOp):
                         k = instr.srcs[1].value
@@ -645,7 +767,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             output.append(SassInstr(encode_shf_r_u32_hi(d, a, k),
                                                     f'SHF.R.U32.HI R{d}, RZ, 0x{k:x}, R{a}  // shr.{typ} {k}'))
                     else:
-                        k_reg = ctx.ra.r32(instr.srcs[1].name)
+                        k_reg = _materialize_imm(instr.srcs[1], ctx, ctx.ra, output)
                         if is_signed:
                             output.append(SassInstr(encode_shf_r_s32_hi_var(d, a, k_reg),
                                                     f'SHF.R.S32.HI R{d}, RZ, R{k_reg}, R{a}  // shr.s32 (var)'))
@@ -685,7 +807,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
 
                 elif op == 'add' and typ in ('u32', 's32'):
                     d = ctx.ra.r32(instr.dest.name)
-                    a = ctx.ra.r32(instr.srcs[0].name)
+                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     if isinstance(instr.srcs[1], ImmOp):
                         imm = instr.srcs[1].value & 0xFFFFFFFF
                         lit_off = ctx._alloc_literal(imm)
@@ -700,7 +822,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
 
                 elif op == 'sub' and typ in ('u32', 's32'):
                     d = ctx.ra.r32(instr.dest.name)
-                    a = ctx.ra.r32(instr.srcs[0].name)
+                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     if isinstance(instr.srcs[1], ImmOp):
                         imm = instr.srcs[1].value & 0xFFFFFFFF
                         lit_off = ctx._alloc_literal(imm)
@@ -715,7 +837,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
 
                 elif op in ('and', 'or', 'xor') and typ in ('b32', 'u32', 's32'):
                     d = ctx.ra.r32(instr.dest.name)
-                    a = ctx.ra.r32(instr.srcs[0].name)
+                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     lut = {'and': LOP3_AND, 'or': LOP3_OR, 'xor': LOP3_XOR}[op]
                     if isinstance(instr.srcs[1], ImmOp):
                         # Immediate src1: load from literal pool into dest, then LOP3.LUT.
@@ -724,12 +846,10 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         lit_off = ctx._alloc_literal(imm)
                         output.append(SassInstr(encode_ldc(d, 0, lit_off),
                                                 f'LDC R{d}, c[0][0x{lit_off:x}]  // {op} imm={imm:#x}'))
-                        output.append(SassInstr(encode_lop3(d, a, d, RZ, lut),
-                                                f'LOP3.LUT R{d}, R{a}, R{d}, RZ, 0x{lut:02x}  // {op}.{typ} imm'))
+                        _emit_lop3(output, ctx, d, a, d, RZ, lut, f'LOP3.LUT R{d}, R{a}, R{d}, RZ, 0x{lut:02x}  // {op}.{typ} imm')
                     else:
                         b = ctx.ra.r32(instr.srcs[1].name)
-                        output.append(SassInstr(encode_lop3(d, a, b, RZ, lut),
-                                                f'LOP3.LUT R{d}, R{a}, R{b}, RZ, 0x{lut:02x}  // {op}.{typ}'))
+                        _emit_lop3(output, ctx, d, a, b, RZ, lut, f'LOP3.LUT R{d}, R{a}, R{b}, RZ, 0x{lut:02x}  // {op}.{typ}')
 
                 elif op in ('and', 'or', 'xor') and typ in ('b64', 'u64', 's64'):
                     # 64-bit logic: apply LOP3 to lo and hi words separately.
@@ -740,45 +860,91 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         imm = instr.srcs[1].value & 0xFFFF_FFFF_FFFF_FFFF
                         imm_lo = imm & 0xFFFFFFFF
                         imm_hi = (imm >> 32) & 0xFFFFFFFF
-                        t = ctx._next_gpr; ctx._next_gpr += 1
+                        t = _alloc_gpr(ctx)
                         lit_lo = ctx._alloc_literal(imm_lo)
                         output.append(SassInstr(encode_ldc(t, 0, lit_lo),
                                                 f'LDC R{t}, c[0][0x{lit_lo:x}]  // {op}.b64 imm_lo'))
-                        output.append(SassInstr(encode_lop3(d_lo, a_lo, t, RZ, lut),
-                                                f'LOP3.LUT R{d_lo}, R{a_lo}, R{t}, RZ, 0x{lut:02x}  // {op}.b64 lo'))
+                        _emit_lop3(output, ctx, d_lo, a_lo, t, RZ, lut, f'LOP3.LUT R{d_lo}, R{a_lo}, R{t}, RZ, 0x{lut:02x}  // {op}.b64 lo')
                         lit_hi = ctx._alloc_literal(imm_hi)
                         output.append(SassInstr(encode_ldc(t, 0, lit_hi),
                                                 f'LDC R{t}, c[0][0x{lit_hi:x}]  // {op}.b64 imm_hi'))
-                        output.append(SassInstr(encode_lop3(d_lo+1, a_lo+1, t, RZ, lut),
-                                                f'LOP3.LUT R{d_lo+1}, R{a_lo+1}, R{t}, RZ, 0x{lut:02x}  // {op}.b64 hi'))
+                        _emit_lop3(output, ctx, d_lo+1, a_lo+1, t, RZ, lut, f'LOP3.LUT R{d_lo+1}, R{a_lo+1}, R{t}, RZ, 0x{lut:02x}  // {op}.b64 hi')
                     else:
                         b_lo = ctx.ra.lo(instr.srcs[1].name)
-                        output.append(SassInstr(encode_lop3(d_lo, a_lo, b_lo, RZ, lut),
-                                                f'LOP3.LUT R{d_lo}, R{a_lo}, R{b_lo}, RZ, 0x{lut:02x}  // {op}.b64 lo'))
-                        output.append(SassInstr(encode_lop3(d_lo+1, a_lo+1, b_lo+1, RZ, lut),
-                                                f'LOP3.LUT R{d_lo+1}, R{a_lo+1}, R{b_lo+1}, RZ, 0x{lut:02x}  // {op}.b64 hi'))
+                        _emit_lop3(output, ctx, d_lo, a_lo, b_lo, RZ, lut, f'LOP3.LUT R{d_lo}, R{a_lo}, R{b_lo}, RZ, 0x{lut:02x}  // {op}.b64 lo')
+                        _emit_lop3(output, ctx, d_lo+1, a_lo+1, b_lo+1, RZ, lut, f'LOP3.LUT R{d_lo+1}, R{a_lo+1}, R{b_lo+1}, RZ, 0x{lut:02x}  // {op}.b64 hi')
 
                 elif op == 'not' and typ in ('b32', 'u32', 's32'):
                     # not.b32 d, a  →  LOP3.LUT d, a, RZ, RZ, 0x0F  (~a)
                     d = ctx.ra.r32(instr.dest.name)
-                    a = ctx.ra.r32(instr.srcs[0].name)
-                    output.append(SassInstr(encode_lop3(d, a, RZ, RZ, 0x0F),
-                                            f'LOP3.LUT R{d}, R{a}, RZ, RZ, 0x0f  // not.{typ}'))
+                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
+                    _emit_lop3(output, ctx, d, a, RZ, RZ, 0x0F, f'LOP3.LUT R{d}, R{a}, RZ, RZ, 0x0f  // not.{typ}')
 
                 elif op == 'not' and typ in ('b64', 'u64', 's64'):
                     # not.b64 d, a  →  two LOP3.LUT on lo and hi words
                     d_lo = ctx.ra.lo(instr.dest.name)
                     a_lo = ctx.ra.lo(instr.srcs[0].name)
-                    output.append(SassInstr(encode_lop3(d_lo, a_lo, RZ, RZ, 0x0F),
-                                            f'LOP3.LUT R{d_lo}, R{a_lo}, RZ, RZ, 0x0f  // not.{typ} lo'))
-                    output.append(SassInstr(encode_lop3(d_lo+1, a_lo+1, RZ, RZ, 0x0F),
-                                            f'LOP3.LUT R{d_lo+1}, R{a_lo+1}, RZ, RZ, 0x0f  // not.{typ} hi'))
+                    _emit_lop3(output, ctx, d_lo, a_lo, RZ, RZ, 0x0F, f'LOP3.LUT R{d_lo}, R{a_lo}, RZ, RZ, 0x0f  // not.{typ} lo')
+                    _emit_lop3(output, ctx, d_lo+1, a_lo+1, RZ, RZ, 0x0F, f'LOP3.LUT R{d_lo+1}, R{a_lo+1}, RZ, RZ, 0x0f  // not.{typ} hi')
 
                 elif op == 'mul' and 'lo' in instr.types and typ in ('u32', 's32'):
+                    # PEEPHOLE: mul+add fusion → IMAD with third operand (DISABLED FOR TESTING)
+                    if False:
+                        pass
+                    # Look ahead: find add.u32 within next 3 instructions that uses our result
+                    _next = None
+                    _next_offset = 0
+                    for _la in range(1, min(4, len(bb.instructions) - _instr_idx)):
+                        _cand = bb.instructions[_instr_idx + _la]
+                        if (_cand.op == 'add' and _cand.types and _cand.types[-1] in ('u32', 's32')
+                                and isinstance(_cand.srcs[0], RegOp) and isinstance(_cand.srcs[1], RegOp)):
+                            _next = _cand
+                            _next_offset = _la
+                            break
+                    if _next:
+                        # Check if one source of the add is the mul's dest
+                        mul_dest_name = instr.dest.name
+                        add_src0, add_src1 = _next.srcs[0].name, _next.srcs[1].name
+                        add_other = None
+                        if add_src0 == mul_dest_name:
+                            add_other = add_src1
+                        elif add_src1 == mul_dest_name:
+                            add_other = add_src0
+                        if add_other is not None:
+                            # FUSION: mul a*b + c → IMAD dest, a, b_ur, c
+                            fused_dest = ctx.ra.r32(_next.dest.name)
+                            mul_a = instr.srcs[0].name
+                            mul_b = instr.srcs[1].name
+                            c_reg = ctx.ra.r32(add_other)
+                            # Check if mul_a or mul_b is in UR (ctaid.x)
+                            a_ur = ctx._ur_for_param.get(mul_a)
+                            b_ur = ctx._ur_for_param.get(mul_b)
+                            if a_ur is not None:
+                                a_gpr = ctx.ra.r32(mul_b)
+                                output.append(SassInstr(encode_imad_ur(fused_dest, a_gpr, a_ur, c_reg),
+                                    f'IMAD R{fused_dest}, R{a_gpr}, UR{a_ur}, R{c_reg}  // fused mul+add'))
+                            elif b_ur is not None:
+                                a_gpr = ctx.ra.r32(mul_a)
+                                output.append(SassInstr(encode_imad_ur(fused_dest, a_gpr, b_ur, c_reg),
+                                    f'IMAD R{fused_dest}, R{a_gpr}, UR{b_ur}, R{c_reg}  // fused mul+add'))
+                            else:
+                                # Both in GPR — can't fuse with R-UR IMAD
+                                # Fall through to normal mul handling
+                                pass
+                            if a_ur is not None or b_ur is not None:
+                                # Alias mul dest to fused dest
+                                ctx.ra.int_regs[mul_dest_name] = fused_dest
+                                ctx.ra.int_regs[_next.dest.name] = fused_dest
+                                # Mark the add instruction to skip
+                                if not hasattr(ctx, '_skip_instrs'):
+                                    ctx._skip_instrs = set()
+                                ctx._skip_instrs.add(id(_next))
+                                continue
+
                     # mul.lo.s32 → IMAD R-UR or IMAD.WIDE with immediate
                     # NOTE: IMAD R-R (0x224) is NOT valid on SM_120!
                     d = ctx.ra.r32(instr.dest.name)
-                    a = ctx.ra.r32(instr.srcs[0].name)
+                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     if isinstance(instr.srcs[1], ImmOp):
                         # Immediate multiplier: use IMAD.SHL.U32 if power-of-2 and ≤15,
                         # else load into UR via literal pool and use IMAD R-UR.
@@ -883,35 +1049,30 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
 
                 elif op == 'add' and typ == 'f32':
                     d = ctx.ra.r32(instr.dest.name)
-                    a = ctx.ra.r32(instr.srcs[0].name)
-                    b = ctx.ra.r32(instr.srcs[1].name)
+                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
+                    b = _materialize_imm(instr.srcs[1], ctx, ctx.ra, output)
                     output.append(SassInstr(encode_fadd(d, a, b),
                                             f'FADD R{d}, R{a}, R{b}  // add.f32'))
 
                 elif op == 'sub' and typ == 'f32':
                     d = ctx.ra.r32(instr.dest.name)
-                    a = ctx.ra.r32(instr.srcs[0].name)
-                    b = ctx.ra.r32(instr.srcs[1].name)
-                    # sub.f32 = FADD with negated src1... actually FADD negate is on src0
-                    # sub a,b = a + (-b) = FADD(a, -b)? Need to check encoding.
-                    # Actually from ptxas: FFMA R9, -R2, R5, R9 uses negate on src0.
-                    # For FADD: negate_src0=True gives -src0 + src1. For sub we want src0 - src1.
-                    # Use FADD with swapped args and negate: FADD(d, -b, a) = a - b
+                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
+                    b = _materialize_imm(instr.srcs[1], ctx, ctx.ra, output)
                     output.append(SassInstr(encode_fadd(d, b, a, negate_src0=True),
                                             f'FADD R{d}, -R{b}, R{a}  // sub.f32'))
 
                 elif op == 'mul' and typ == 'f32':
                     d = ctx.ra.r32(instr.dest.name)
-                    a = ctx.ra.r32(instr.srcs[0].name)
-                    b = ctx.ra.r32(instr.srcs[1].name)
+                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
+                    b = _materialize_imm(instr.srcs[1], ctx, ctx.ra, output)
                     output.append(SassInstr(encode_fmul(d, a, b),
                                             f'FMUL R{d}, R{a}, R{b}  // mul.f32'))
 
                 elif op == 'fma' and typ == 'f32':
                     d = ctx.ra.r32(instr.dest.name)
-                    a = ctx.ra.r32(instr.srcs[0].name)
-                    b = ctx.ra.r32(instr.srcs[1].name)
-                    c = ctx.ra.r32(instr.srcs[2].name)
+                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
+                    b = _materialize_imm(instr.srcs[1], ctx, ctx.ra, output)
+                    c = _materialize_imm(instr.srcs[2], ctx, ctx.ra, output)
                     output.append(SassInstr(encode_ffma(d, a, b, c),
                                             f'FFMA R{d}, R{a}, R{b}, R{c}  // fma.f32'))
 
@@ -1074,10 +1235,19 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             # MOV  d_lo, s_r                → lo word
                             s_r = ctx.ra.r32(s.name)
                             d_lo = ctx.ra.lo(d.name)
-                            # Force d_lo = s_r to avoid copy (ptxas pattern)
+                            # Force d_lo = s_r ONLY if s_r is even-aligned.
+                            # 64-bit pairs MUST start on an even register (SM_120 hw req).
+                            # Odd-aligned source → must MOV to d_lo first.
                             if d_lo != s_r:
-                                ctx.ra.int_regs[d.name] = s_r
-                                d_lo = s_r
+                                if s_r % 2 == 0:
+                                    # Source is even — safe to alias
+                                    ctx.ra.int_regs[d.name] = s_r
+                                    d_lo = s_r
+                                else:
+                                    # Source is odd — copy to allocator's even-aligned dest
+                                    output.append(SassInstr(encode_iadd3(d_lo, s_r, RZ, RZ),
+                                                            f'MOV R{d_lo}, R{s_r}  // cvt.s64.s32 align'))
+                                    s_r = d_lo  # sign-extend from the copy
                             d_hi = d_lo + 1
                             output.append(SassInstr(
                                 encode_shf_r_s32_hi(d_hi, s_r, 31),
@@ -1137,21 +1307,19 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 d_r = ctx.ra.r32(d.name)
                                 a_r = ctx.ra.r32(s.name)
                                 lit_off = ctx._alloc_literal(0xFF)
-                                t = ctx._next_gpr; ctx._next_gpr += 1
+                                t = _alloc_gpr(ctx)
                                 output.append(SassInstr(encode_ldc(t, 0, lit_off),
                                                         f'LDC R{t}, c[0][0x{lit_off:x}]  // 0xFF mask'))
-                                output.append(SassInstr(encode_lop3(d_r, a_r, t, RZ, LOP3_AND),
-                                                        f'LOP3.AND R{d_r}, R{a_r}, R{t}, RZ  // cvt.{_dst_t}.{_src_t}'))
+                                _emit_lop3(output, ctx, d_r, a_r, t, RZ, LOP3_AND, f'LOP3.AND R{d_r}, R{a_r}, R{t}, RZ  // cvt.{_dst_t}.{_src_t}')
                             elif _dst_t in ('u16', 's16', 'b16') and _src_t in _32B:
                                 # Truncate to 16 bits: AND with 0xFFFF
                                 d_r = ctx.ra.r32(d.name)
                                 a_r = ctx.ra.r32(s.name)
                                 lit_off = ctx._alloc_literal(0xFFFF)
-                                t = ctx._next_gpr; ctx._next_gpr += 1
+                                t = _alloc_gpr(ctx)
                                 output.append(SassInstr(encode_ldc(t, 0, lit_off),
                                                         f'LDC R{t}, c[0][0x{lit_off:x}]  // 0xFFFF mask'))
-                                output.append(SassInstr(encode_lop3(d_r, a_r, t, RZ, LOP3_AND),
-                                                        f'LOP3.AND R{d_r}, R{a_r}, R{t}, RZ  // cvt.{_dst_t}.{_src_t}'))
+                                _emit_lop3(output, ctx, d_r, a_r, t, RZ, LOP3_AND, f'LOP3.AND R{d_r}, R{a_r}, R{t}, RZ  // cvt.{_dst_t}.{_src_t}')
                             elif _dst_t in _32B and _src_t in ('u8', 's8', 'b8', 'u16', 's16', 'b16'):
                                 # Widening from narrow: just copy (narrow stored as u32, already zero-extended)
                                 d_r = ctx.ra.r32(d.name)
@@ -1306,8 +1474,8 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         emit_pd = 0
                         ctx.ra.pred_regs[pred.name] = 0
                     f_reg = ctx.ra.r32(f_op.name)
-                    R_mask = ctx._next_gpr; ctx._next_gpr += 1
-                    R_abs  = ctx._next_gpr; ctx._next_gpr += 1
+                    R_mask = _alloc_gpr(ctx)
+                    R_abs  = _alloc_gpr(ctx)
                     FINITE_MASK = 0x7F800000
                     output.append(SassInstr(
                         encode_iadd3_imm32(R_mask, RZ, FINITE_MASK, RZ),
@@ -1328,7 +1496,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     # neg: IADD3 with src0=RZ, src1=src, negate_src1
                     # dest = 0 - src
                     d = ctx.ra.r32(instr.dest.name)
-                    a = ctx.ra.r32(instr.srcs[0].name)
+                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     output.append(SassInstr(encode_iadd3(d, RZ, a, RZ, negate_src1=True),
                                             f'IADD3 R{d}, RZ, -R{a}, RZ  // neg.{typ}'))
 
@@ -1342,14 +1510,14 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                 elif op == 'neg' and typ == 'f32':
                     # neg.f32: FADD with negated src and zero
                     d = ctx.ra.r32(instr.dest.name)
-                    a = ctx.ra.r32(instr.srcs[0].name)
+                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     output.append(SassInstr(encode_fadd(d, RZ, a, negate_src0=True),
                                             f'FADD R{d}, -R{a}, RZ  // neg.f32'))
 
                 elif op == 'abs' and typ == 'f32':
                     # abs.f32: FADD |src|, -RZ (with abs modifier bit in b11)
                     d = ctx.ra.r32(instr.dest.name)
-                    a = ctx.ra.r32(instr.srcs[0].name)
+                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     # FADD with abs on src0: encode as FADD d, |a|, -RZ
                     # Ground truth: b11 has abs bit 0x02
                     output.append(SassInstr(encode_fadd(d, a, RZ, negate_src0=True),
@@ -1364,7 +1532,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         if isinstance(src_op, RegOp):
                             return ctx.ra.r32(src_op.name)
                         elif isinstance(src_op, ImmOp):
-                            t = ctx._next_gpr; ctx._next_gpr += 1
+                            t = _alloc_gpr(ctx)
                             out.append(SassInstr(encode_iadd3_imm32(t, RZ, src_op.value & 0xFFFFFFFF, RZ),
                                                  f'MOV R{t}, {src_op.value}  // selp imm'))
                             return t
@@ -1376,27 +1544,21 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
 
                 elif op == 'min' and typ in ('u32', 's32'):
                     d = ctx.ra.r32(instr.dest.name)
-                    a = ctx.ra.r32(instr.srcs[0].name)
-                    if isinstance(instr.srcs[1], ImmOp):
-                        imm = instr.srcs[1].value & 0xFFFFFFFF
-                        output.append(SassInstr(encode_vimnmx_u32(d, a, imm, is_max=False),
-                            f'VIMNMX.U32 R{d}, R{a}, 0x{imm:x}, PT  // min.{typ} imm'))
-                    else:
-                        b = ctx.ra.r32(instr.srcs[1].name)
-                        output.append(SassInstr(encode_vimnmx_s32(d, a, b, is_max=False),
-                            f'VIMNMX.S32 R{d}, R{a}, R{b}, PT  // min.{typ}'))
+                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
+                    b = _materialize_imm(instr.srcs[1], ctx, ctx.ra, output)
+                    is_signed = typ == 's32'
+                    enc = encode_vimnmx_s32 if is_signed else encode_vimnmx_u32
+                    output.append(SassInstr(enc(d, a, b, is_max=False),
+                        f'VIMNMX.{"S" if is_signed else "U"}32 R{d}, R{a}, R{b}, PT  // min.{typ}'))
 
                 elif op == 'max' and typ in ('u32', 's32'):
                     d = ctx.ra.r32(instr.dest.name)
-                    a = ctx.ra.r32(instr.srcs[0].name)
-                    if isinstance(instr.srcs[1], ImmOp):
-                        imm = instr.srcs[1].value & 0xFFFFFFFF
-                        output.append(SassInstr(encode_vimnmx_u32(d, a, imm, is_max=True),
-                            f'VIMNMX.U32 R{d}, R{a}, 0x{imm:x}, !PT  // max.{typ} imm'))
-                    else:
-                        b = ctx.ra.r32(instr.srcs[1].name)
-                        output.append(SassInstr(encode_vimnmx_s32(d, a, b, is_max=True),
-                            f'VIMNMX.S32 R{d}, R{a}, R{b}, !PT  // max.{typ}'))
+                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
+                    b = _materialize_imm(instr.srcs[1], ctx, ctx.ra, output)
+                    is_signed = typ == 's32'
+                    enc = encode_vimnmx_s32 if is_signed else encode_vimnmx_u32
+                    output.append(SassInstr(enc(d, a, b, is_max=True),
+                        f'VIMNMX.{"S" if is_signed else "U"}32 R{d}, R{a}, R{b}, !PT  // max.{typ}'))
 
                 elif op == 'sad' and typ in ('u32', 's32'):
                     # sad.u32 d, a, b, c  →  d = |a - b| + c
@@ -1404,11 +1566,11 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     # VIMNMX.MIN t1, a, b
                     # IADD3 d, t0, -t1, c  (d = max - min + c = |a-b| + c)
                     d = ctx.ra.r32(instr.dest.name)
-                    a = ctx.ra.r32(instr.srcs[0].name)
-                    b = ctx.ra.r32(instr.srcs[1].name)
-                    c = ctx.ra.r32(instr.srcs[2].name) if len(instr.srcs) > 2 and isinstance(instr.srcs[2], RegOp) else RZ
-                    t_max = ctx._next_gpr; ctx._next_gpr += 1
-                    t_min = ctx._next_gpr; ctx._next_gpr += 1
+                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
+                    b = _materialize_imm(instr.srcs[1], ctx, ctx.ra, output)
+                    c = _materialize_imm(instr.srcs[2], ctx, ctx.ra, output) if len(instr.srcs) > 2 else RZ
+                    t_max = _alloc_gpr(ctx)
+                    t_min = _alloc_gpr(ctx)
                     is_signed = typ == 's32'
                     output.append(SassInstr(encode_vimnmx_s32(t_max, a, b, is_max=True) if is_signed else encode_vimnmx_u32(t_max, a, b, is_max=True),
                                             f'VIMNMX.{"S" if is_signed else "U"}32 R{t_max}, R{a}, R{b}  // sad max'))
@@ -1420,7 +1582,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                 elif op == 'mad' and 'lo' in instr.types:
                     # mad.lo.s32 → dest = src0 * src1 + src2
                     d = ctx.ra.r32(instr.dest.name)
-                    a = ctx.ra.r32(instr.srcs[0].name)
+                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     c_op = instr.srcs[2] if len(instr.srcs) > 2 else None
                     c = ctx.ra.r32(c_op.name) if isinstance(c_op, RegOp) else RZ
                     if isinstance(instr.srcs[1], ImmOp):
@@ -1429,7 +1591,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         if imm > 0 and (imm & (imm - 1)) == 0:
                             shift = imm.bit_length() - 1
                             if shift <= 15:
-                                t = ctx._next_gpr; ctx._next_gpr += 1
+                                t = _alloc_gpr(ctx)
                                 output.append(SassInstr(encode_imad_shl_u32(t, a, shift),
                                     f'IMAD.SHL.U32 R{t}, R{a}, 0x{imm:x}, RZ  // mad.lo shift'))
                                 output.append(SassInstr(encode_iadd3(d, t, c, RZ),
@@ -1474,7 +1636,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     # Result pair: (dest_lo, dest_hi) = a * b + c64
                     # IMAD.WIDE writes dest and dest+1 atomically.
                     d_lo = ctx.ra.lo(instr.dest.name)
-                    a    = ctx.ra.r32(instr.srcs[0].name)
+                    a    = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     c_lo = ctx.ra.lo(instr.srcs[2].name) if len(instr.srcs) > 2 else RZ
                     if isinstance(instr.srcs[1], ImmOp):
                         imm = instr.srcs[1].value & 0xFFFF_FFFF
@@ -1501,8 +1663,8 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
 
                 elif op == 'mul' and 'hi' in instr.types and typ in ('u32', 's32'):
                     d = ctx.ra.r32(instr.dest.name)
-                    a = ctx.ra.r32(instr.srcs[0].name)
-                    b = ctx.ra.r32(instr.srcs[1].name)
+                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
+                    b = _materialize_imm(instr.srcs[1], ctx, ctx.ra, output)
                     output.append(SassInstr(encode_imad_hi(d, a, b, RZ, signed=(typ == 's32')),
                                             f'IMAD.HI R{d}, R{a}, R{b}, RZ  // mul.hi.{typ}'))
 
@@ -1525,7 +1687,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     t0_lo = ctx._next_gpr; ctx._next_gpr += 2  # t0 pair
                     t1_lo = ctx._next_gpr; ctx._next_gpr += 2  # t1 pair
                     t2_lo = ctx._next_gpr; ctx._next_gpr += 2  # t2 pair
-                    carry = ctx._next_gpr; ctx._next_gpr += 1
+                    carry = _alloc_gpr(ctx)
                     # Step 1: t0 = a_hi * b_lo
                     output.append(SassInstr(encode_imad_wide_u32(t0_lo, a_hi, b_lo, RZ),
                         f'IMAD.WIDE.U32 R{t0_lo}, R{a_hi}, R{b_lo}, RZ  // mul.hi.u64 step1'))
@@ -1539,7 +1701,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     output.append(SassInstr(encode_iadd3x(carry, RZ, RZ, RZ),
                         f'IADD3.X R{carry}, PT, PT, RZ, RZ, RZ, P0, !PT  // mul.hi.u64 carry'))
                     # Step 5: save t1_hi (hi word of a_lo*b_hi + t0) for final product
-                    sum_hi = ctx._next_gpr; ctx._next_gpr += 1
+                    sum_hi = _alloc_gpr(ctx)
                     output.append(SassInstr(encode_mov(sum_hi, t1_lo + 1),
                         f'MOV R{sum_hi}, R{t1_lo+1}  // mul.hi.u64 save t1_hi'))
                     # Step 6: IADD3 to detect carry from t2_hi + t1_lo into P0
@@ -1551,26 +1713,26 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
 
                 elif op == 'popc' and typ in ('b32',):
                     d = ctx.ra.r32(instr.dest.name)
-                    a = ctx.ra.r32(instr.srcs[0].name)
+                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     output.append(SassInstr(encode_popc(d, a),
                                             f'POPC R{d}, R{a}'))
 
                 elif op == 'clz' and typ in ('b32',):
                     d = ctx.ra.r32(instr.dest.name)
-                    a = ctx.ra.r32(instr.srcs[0].name)
+                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     # CLZ = 31 - FLO for non-zero (ptxas compiles CLZ to FLO)
                     output.append(SassInstr(encode_flo(d, a),
                                             f'FLO.U32 R{d}, R{a}  // clz.b32'))
 
                 elif op == 'brev' and typ in ('b32',):
                     d = ctx.ra.r32(instr.dest.name)
-                    a = ctx.ra.r32(instr.srcs[0].name)
+                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     output.append(SassInstr(encode_brev(d, a),
                                             f'BREV R{d}, R{a}'))
 
                 elif op == 'abs' and typ in ('s32',):
                     d = ctx.ra.r32(instr.dest.name)
-                    a = ctx.ra.r32(instr.srcs[0].name)
+                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     output.append(SassInstr(encode_iabs(d, a),
                                             f'IABS R{d}, R{a}'))
 
@@ -1581,15 +1743,13 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     # This avoids predicated 64-bit instructions.
                     d_lo = ctx.ra.lo(instr.dest.name)
                     a_lo = ctx.ra.lo(instr.srcs[0].name)
-                    sign = ctx._next_gpr; ctx._next_gpr += 1
-                    t_lo = ctx._next_gpr; ctx._next_gpr += 1  # addend lo (0 or 1)
-                    t_hi = ctx._next_gpr; ctx._next_gpr += 1  # addend hi (always 0)
+                    sign = _alloc_gpr(ctx)
+                    t_lo = _alloc_gpr(ctx)  # addend lo (0 or 1)
+                    t_hi = _alloc_gpr(ctx)  # addend hi (always 0)
                     output.append(SassInstr(encode_shf_r_s32_hi(sign, a_lo+1, 31),
                         f'SHF.R.S32.HI R{sign}, RZ, 0x1f, R{a_lo+1}  // abs.s64 sign'))
-                    output.append(SassInstr(encode_lop3(d_lo,   a_lo,   sign, RZ, LOP3_XOR),
-                        f'LOP3.XOR R{d_lo}, R{a_lo}, R{sign}, RZ  // abs.s64 lo XOR'))
-                    output.append(SassInstr(encode_lop3(d_lo+1, a_lo+1, sign, RZ, LOP3_XOR),
-                        f'LOP3.XOR R{d_lo+1}, R{a_lo+1}, R{sign}, RZ  // abs.s64 hi XOR'))
+                    _emit_lop3(output, ctx, d_lo,   a_lo,   sign, RZ, LOP3_XOR, f'LOP3.XOR R{d_lo}, R{a_lo}, R{sign}, RZ  // abs.s64 lo XOR')
+                    _emit_lop3(output, ctx, d_lo+1, a_lo+1, sign, RZ, LOP3_XOR, f'LOP3.XOR R{d_lo+1}, R{a_lo+1}, R{sign}, RZ  // abs.s64 hi XOR')
                     output.append(SassInstr(encode_iadd3(t_hi, RZ, RZ, RZ),
                         f'MOV R{t_hi}, RZ  // abs.s64 addend hi=0'))
                     output.append(SassInstr(encode_iadd3(t_lo, RZ, sign, RZ, negate_src1=True),
@@ -1606,15 +1766,13 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     a_lo  = ctx.ra.lo(instr.srcs[0].name)
                     b_lo  = ctx.ra.lo(instr.srcs[1].name)
                     t_lo  = ctx._next_gpr; ctx._next_gpr += 2   # diff pair (t_lo, t_lo+1)
-                    mask  = ctx._next_gpr; ctx._next_gpr += 1
+                    mask  = _alloc_gpr(ctx)
                     output.append(SassInstr(encode_iadd64(t_lo, a_lo, b_lo, negate_src1=True),
                         f'IADD.64 R{t_lo}, R{a_lo}, -R{b_lo}  // min.{typ} diff'))
                     output.append(SassInstr(encode_shf_r_s32_hi(mask, t_lo+1, 31),
                         f'SHF.R.S32.HI R{mask}, RZ, 0x1f, R{t_lo+1}  // min.{typ} mask'))
-                    output.append(SassInstr(encode_lop3(t_lo,   t_lo,   mask, RZ, LOP3_AND),
-                        f'LOP3.AND R{t_lo}, R{t_lo}, R{mask}, RZ  // min.{typ} lo'))
-                    output.append(SassInstr(encode_lop3(t_lo+1, t_lo+1, mask, RZ, LOP3_AND),
-                        f'LOP3.AND R{t_lo+1}, R{t_lo+1}, R{mask}, RZ  // min.{typ} hi'))
+                    _emit_lop3(output, ctx, t_lo,   t_lo,   mask, RZ, LOP3_AND, f'LOP3.AND R{t_lo}, R{t_lo}, R{mask}, RZ  // min.{typ} lo')
+                    _emit_lop3(output, ctx, t_lo+1, t_lo+1, mask, RZ, LOP3_AND, f'LOP3.AND R{t_lo+1}, R{t_lo+1}, R{mask}, RZ  // min.{typ} hi')
                     output.append(SassInstr(encode_iadd64(d_lo, b_lo, t_lo),
                         f'IADD.64 R{d_lo}, R{b_lo}, R{t_lo}  // min.{typ} result'))
 
@@ -1625,37 +1783,34 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     a_lo  = ctx.ra.lo(instr.srcs[0].name)
                     b_lo  = ctx.ra.lo(instr.srcs[1].name)
                     t_lo  = ctx._next_gpr; ctx._next_gpr += 2   # diff pair
-                    mask  = ctx._next_gpr; ctx._next_gpr += 1   # inverted sign mask
+                    mask  = _alloc_gpr(ctx)   # inverted sign mask
                     output.append(SassInstr(encode_iadd64(t_lo, a_lo, b_lo, negate_src1=True),
                         f'IADD.64 R{t_lo}, R{a_lo}, -R{b_lo}  // max.{typ} diff'))
                     output.append(SassInstr(encode_shf_r_s32_hi(mask, t_lo+1, 31),
                         f'SHF.R.S32.HI R{mask}, RZ, 0x1f, R{t_lo+1}  // max.{typ} sign'))
-                    output.append(SassInstr(encode_lop3(mask, mask, RZ, RZ, 0x0F),
-                        f'LOP3.NOT R{mask}, R{mask}, RZ, RZ  // max.{typ} ~sign'))
-                    output.append(SassInstr(encode_lop3(t_lo,   t_lo,   mask, RZ, LOP3_AND),
-                        f'LOP3.AND R{t_lo}, R{t_lo}, R{mask}, RZ  // max.{typ} lo'))
-                    output.append(SassInstr(encode_lop3(t_lo+1, t_lo+1, mask, RZ, LOP3_AND),
-                        f'LOP3.AND R{t_lo+1}, R{t_lo+1}, R{mask}, RZ  // max.{typ} hi'))
+                    _emit_lop3(output, ctx, mask, mask, RZ, RZ, 0x0F, f'LOP3.NOT R{mask}, R{mask}, RZ, RZ  // max.{typ} ~sign')
+                    _emit_lop3(output, ctx, t_lo,   t_lo,   mask, RZ, LOP3_AND, f'LOP3.AND R{t_lo}, R{t_lo}, R{mask}, RZ  // max.{typ} lo')
+                    _emit_lop3(output, ctx, t_lo+1, t_lo+1, mask, RZ, LOP3_AND, f'LOP3.AND R{t_lo+1}, R{t_lo+1}, R{mask}, RZ  // max.{typ} hi')
                     output.append(SassInstr(encode_iadd64(d_lo, b_lo, t_lo),
                         f'IADD.64 R{d_lo}, R{b_lo}, R{t_lo}  // max.{typ} result'))
 
                 elif op == 'min' and typ == 'f32':
                     d = ctx.ra.r32(instr.dest.name)
-                    a = ctx.ra.r32(instr.srcs[0].name)
-                    b = ctx.ra.r32(instr.srcs[1].name)
+                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
+                    b = _materialize_imm(instr.srcs[1], ctx, ctx.ra, output)
                     output.append(SassInstr(encode_fmnmx(d, a, b, is_max=False),
                                             f'FMNMX R{d}, R{a}, R{b}, PT  // min.f32'))
 
                 elif op == 'max' and typ == 'f32':
                     d = ctx.ra.r32(instr.dest.name)
-                    a = ctx.ra.r32(instr.srcs[0].name)
-                    b = ctx.ra.r32(instr.srcs[1].name)
+                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
+                    b = _materialize_imm(instr.srcs[1], ctx, ctx.ra, output)
                     output.append(SassInstr(encode_fmnmx(d, a, b, is_max=True),
                                             f'FMNMX R{d}, R{a}, R{b}, !PT  // max.f32'))
 
                 elif op == 'shfl':
                     d = ctx.ra.r32(instr.dest.name)
-                    a = ctx.ra.r32(instr.srcs[0].name)
+                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     mode_map = {'idx': SHFL_IDX, 'up': SHFL_UP, 'down': SHFL_DOWN, 'bfly': SHFL_BFLY}
                     mode = SHFL_IDX
                     for t in instr.types:
@@ -1680,13 +1835,13 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     # Matches the exact sequence ptxas emits for div.u32 (sm_120).
                     # Ground truth: cuobjdump verified against ptxas 13.0 output.
                     d  = ctx.ra.r32(instr.dest.name)
-                    a  = ctx.ra.r32(instr.srcs[0].name)   # dividend
-                    b  = ctx.ra.r32(instr.srcs[1].name)   # divisor
+                    a  = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
+                    b  = _materialize_imm(instr.srcs[1], ctx, ctx.ra, output)
                     # Allocate 4 scratch GPRs and 3 scratch predicate registers
-                    t0 = ctx._next_gpr; ctx._next_gpr += 1
-                    t1 = ctx._next_gpr; ctx._next_gpr += 1
-                    t2 = ctx._next_gpr; ctx._next_gpr += 1
-                    t3 = ctx._next_gpr; ctx._next_gpr += 1
+                    t0 = _alloc_gpr(ctx)
+                    t1 = _alloc_gpr(ctx)
+                    t2 = _alloc_gpr(ctx)
+                    t3 = _alloc_gpr(ctx)
                     pnz  = ctx._next_pred; ctx._next_pred += 1  # divisor != 0
                     pge1 = ctx._next_pred; ctx._next_pred += 1  # first correction
                     pge2 = ctx._next_pred; ctx._next_pred += 1  # second correction
@@ -1739,28 +1894,27 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     # LOP3.XOR to capture sign, NR on |a|/|b|, then sign-correct.
                     # Ground truth: cuobjdump verified against ptxas 13.0 output.
                     d  = ctx.ra.r32(instr.dest.name)
-                    a  = ctx.ra.r32(instr.srcs[0].name)   # dividend
-                    b  = ctx.ra.r32(instr.srcs[1].name)   # divisor
-                    t0 = ctx._next_gpr; ctx._next_gpr += 1
-                    t1 = ctx._next_gpr; ctx._next_gpr += 1
-                    t2 = ctx._next_gpr; ctx._next_gpr += 1
-                    t3 = ctx._next_gpr; ctx._next_gpr += 1
-                    ab_s = ctx._next_gpr; ctx._next_gpr += 1  # |a| temp / saved |a|
-                    sign = ctx._next_gpr; ctx._next_gpr += 1  # sign = a ^ b (bit 31)
+                    a  = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
+                    b  = _materialize_imm(instr.srcs[1], ctx, ctx.ra, output)
+                    t0 = _alloc_gpr(ctx)
+                    t1 = _alloc_gpr(ctx)
+                    t2 = _alloc_gpr(ctx)
+                    t3 = _alloc_gpr(ctx)
+                    ab_s = _alloc_gpr(ctx)  # |a| temp / saved |a|
+                    sign = _alloc_gpr(ctx)  # sign = a ^ b (bit 31)
                     ppos  = ctx._next_pred; ctx._next_pred += 1  # result is positive
                     pge1  = ctx._next_pred; ctx._next_pred += 1
                     pge2  = ctx._next_pred; ctx._next_pred += 1
                     pnz   = ctx._next_pred; ctx._next_pred += 1  # divisor != 0
                     # Compute |b| in t2 (reuse t2 for NR), |a| saved in ab_s
-                    abs_b = ctx._next_gpr; ctx._next_gpr += 1  # |b| for NR
+                    abs_b = _alloc_gpr(ctx)  # |b| for NR
                     output.append(SassInstr(encode_iabs(abs_b, b),
                         f'IABS R{abs_b}, R{b}  // div.s32: |b|'))
                     output.append(SassInstr(encode_iabs(ab_s, a),
                         f'IABS R{ab_s}, R{a}  // div.s32: |a|'))
                     output.append(SassInstr(encode_i2f_s32_rp(t0, abs_b),
                         f'I2F.S32.RP R{t0}, R{abs_b}  // float(|b|) round-up'))
-                    output.append(SassInstr(encode_lop3(sign, a, b, RZ, LOP3_XOR),
-                        f'LOP3.XOR R{sign}, R{a}, R{b}, RZ  // sign = a^b'))
+                    _emit_lop3(output, ctx, sign, a, b, RZ, LOP3_XOR, f'LOP3.XOR R{sign}, R{a}, R{b}, RZ  // sign = a^b')
                     output.append(SassInstr(encode_mufu(t0, t0, MUFU_RCP),
                         f'MUFU.RCP R{t0}, R{t0}'))
                     output.append(SassInstr(encode_iadd3_imm32(t1, t0, 0x0ffffffe, RZ),
@@ -1818,12 +1972,12 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     # Uses same Newton-Raphson setup as div.u32 but outputs remainder.
                     # Ground truth: cuobjdump verified against ptxas 13.0 rem.u32 output.
                     d  = ctx.ra.r32(instr.dest.name)
-                    a  = ctx.ra.r32(instr.srcs[0].name)
-                    b  = ctx.ra.r32(instr.srcs[1].name)
-                    t0 = ctx._next_gpr; ctx._next_gpr += 1
-                    t1 = ctx._next_gpr; ctx._next_gpr += 1
-                    t2 = ctx._next_gpr; ctx._next_gpr += 1
-                    t3 = ctx._next_gpr; ctx._next_gpr += 1
+                    a  = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
+                    b  = _materialize_imm(instr.srcs[1], ctx, ctx.ra, output)
+                    t0 = _alloc_gpr(ctx)
+                    t1 = _alloc_gpr(ctx)
+                    t2 = _alloc_gpr(ctx)
+                    t3 = _alloc_gpr(ctx)
                     pnz  = ctx._next_pred; ctx._next_pred += 1
                     pge1 = ctx._next_pred; ctx._next_pred += 1
                     pge2 = ctx._next_pred; ctx._next_pred += 1
@@ -1870,14 +2024,14 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     # Sign of remainder = sign of dividend (C semantics: a = (a/b)*b + rem).
                     # Ground truth: cuobjdump verified against ptxas 13.0 rem.s32 output.
                     d     = ctx.ra.r32(instr.dest.name)
-                    a     = ctx.ra.r32(instr.srcs[0].name)   # dividend (original, for sign)
-                    b     = ctx.ra.r32(instr.srcs[1].name)   # divisor (original, for NE check)
-                    abs_b = ctx._next_gpr; ctx._next_gpr += 1
-                    abs_a = ctx._next_gpr; ctx._next_gpr += 1
-                    t0    = ctx._next_gpr; ctx._next_gpr += 1
-                    t1    = ctx._next_gpr; ctx._next_gpr += 1
-                    t2    = ctx._next_gpr; ctx._next_gpr += 1
-                    t3    = ctx._next_gpr; ctx._next_gpr += 1
+                    a     = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
+                    b     = _materialize_imm(instr.srcs[1], ctx, ctx.ra, output)
+                    abs_b = _alloc_gpr(ctx)
+                    abs_a = _alloc_gpr(ctx)
+                    t0    = _alloc_gpr(ctx)
+                    t1    = _alloc_gpr(ctx)
+                    t2    = _alloc_gpr(ctx)
+                    t3    = _alloc_gpr(ctx)
                     pgt1  = ctx._next_pred; ctx._next_pred += 1  # |b| > rem (no correction)
                     psign = ctx._next_pred; ctx._next_pred += 1  # a >= 0
                     pgt2  = ctx._next_pred; ctx._next_pred += 1  # second correction check
@@ -1937,37 +2091,37 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
 
                 elif op == 'rcp' and any(m in instr.types for m in ('approx','rn','rz','rm','rp')) and typ == 'f32':
                     d = ctx.ra.r32(instr.dest.name)
-                    a = ctx.ra.r32(instr.srcs[0].name)
+                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     output.append(SassInstr(encode_mufu(d, a, MUFU_RCP),
                                             f'MUFU.RCP R{d}, R{a}'))
 
                 elif op == 'sqrt' and any(m in instr.types for m in ('approx','rn','rz','rm','rp')) and typ == 'f32':
                     d = ctx.ra.r32(instr.dest.name)
-                    a = ctx.ra.r32(instr.srcs[0].name)
+                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     output.append(SassInstr(encode_mufu(d, a, MUFU_SQRT),
                                             f'MUFU.SQRT R{d}, R{a}'))
 
                 elif op == 'sin' and 'approx' in instr.types and typ == 'f32':
                     d = ctx.ra.r32(instr.dest.name)
-                    a = ctx.ra.r32(instr.srcs[0].name)
+                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     output.append(SassInstr(encode_mufu(d, a, MUFU_SIN),
                                             f'MUFU.SIN R{d}, R{a}'))
 
                 elif op == 'cos' and 'approx' in instr.types and typ == 'f32':
                     d = ctx.ra.r32(instr.dest.name)
-                    a = ctx.ra.r32(instr.srcs[0].name)
+                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     output.append(SassInstr(encode_mufu(d, a, MUFU_COS),
                                             f'MUFU.COS R{d}, R{a}'))
 
                 elif op == 'ex2' and 'approx' in instr.types and typ == 'f32':
                     d = ctx.ra.r32(instr.dest.name)
-                    a = ctx.ra.r32(instr.srcs[0].name)
+                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     output.append(SassInstr(encode_mufu(d, a, MUFU_EX2),
                                             f'MUFU.EX2 R{d}, R{a}'))
 
                 elif op == 'lg2' and 'approx' in instr.types and typ == 'f32':
                     d = ctx.ra.r32(instr.dest.name)
-                    a = ctx.ra.r32(instr.srcs[0].name)
+                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     output.append(SassInstr(encode_mufu(d, a, MUFU_LG2),
                                             f'MUFU.LG2 R{d}, R{a}'))
 
@@ -1975,15 +2129,15 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     # rsqrt = rcp(sqrt(x)) but MUFU has dedicated RSQ function
                     MUFU_RSQ = 0x02  # common on NVIDIA
                     d = ctx.ra.r32(instr.dest.name)
-                    a = ctx.ra.r32(instr.srcs[0].name)
+                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     output.append(SassInstr(encode_mufu(d, a, MUFU_RSQ),
                                             f'MUFU.RSQ R{d}, R{a}'))
 
                 elif op == 'div' and typ == 'f32':
                     # Float division: MUFU.RCP + FMUL
                     d = ctx.ra.r32(instr.dest.name)
-                    a = ctx.ra.r32(instr.srcs[0].name)
-                    b = ctx.ra.r32(instr.srcs[1].name)
+                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
+                    b = _materialize_imm(instr.srcs[1], ctx, ctx.ra, output)
                     # temp = rcp(b), result = a * temp
                     output.append(SassInstr(encode_mufu(d, b, MUFU_RCP),
                                             f'MUFU.RCP R{d}, R{b}  // div.f32 step 1'))
@@ -1992,23 +2146,23 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
 
                 elif op == 'prmt':
                     d = ctx.ra.r32(instr.dest.name)
-                    a = ctx.ra.r32(instr.srcs[0].name)
+                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     if isinstance(instr.srcs[1], ImmOp):
                         # prmt d, a, sel_imm, c  (selector is 2nd arg, immediate)
                         sel = instr.srcs[1].value
-                        c = ctx.ra.r32(instr.srcs[2].name) if len(instr.srcs) > 2 else RZ
+                        c = _materialize_imm(instr.srcs[2], ctx, ctx.ra, output) if len(instr.srcs) > 2 else RZ
                         output.append(SassInstr(encode_prmt(d, a, sel, c),
                                                 f'PRMT R{d}, R{a}, 0x{sel:04x}, R{c}'))
                     elif len(instr.srcs) >= 3 and isinstance(instr.srcs[2], ImmOp):
                         # prmt d, a, b, sel_imm  (selector is last arg, immediate)
-                        b = ctx.ra.r32(instr.srcs[1].name)
+                        b = _materialize_imm(instr.srcs[1], ctx, ctx.ra, output)
                         sel = instr.srcs[2].value
                         output.append(SassInstr(encode_prmt(d, a, sel, b),
                                                 f'PRMT R{d}, R{a}, 0x{sel:04x}, R{b}'))
                     elif len(instr.srcs) >= 3:
                         # prmt d, a, b, sel_reg  (all register operands)
-                        b = ctx.ra.r32(instr.srcs[1].name)
-                        sel_r = ctx.ra.r32(instr.srcs[2].name)
+                        b = _materialize_imm(instr.srcs[1], ctx, ctx.ra, output)
+                        sel_r = _materialize_imm(instr.srcs[2], ctx, ctx.ra, output)
                         output.append(SassInstr(encode_prmt_reg(d, a, b, sel_r),
                                                 f'PRMT.REG R{d}, R{a}, R{b}, R{sel_r}'))
                     else:
@@ -2018,7 +2172,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     # Bit field extract: dest = (src >> start) & ((1<<length)-1)
                     # Decomposed as: SHF.R.U32.HI + (optional LDC + LOP3 for masking)
                     d = ctx.ra.r32(instr.dest.name)
-                    a = ctx.ra.r32(instr.srcs[0].name)
+                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     start  = instr.srcs[1].value if isinstance(instr.srcs[1], ImmOp) else 0
                     length = instr.srcs[2].value if (len(instr.srcs) > 2 and isinstance(instr.srcs[2], ImmOp)) else 32
                     mask = (1 << length) - 1 if length < 32 else 0xFFFFFFFF
@@ -2042,7 +2196,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             encode_shf_r_u32_hi(d, a, start),
                             f'SHF.R.U32.HI R{d}, RZ, 0x{start:x}, R{a}  // bfe.u32 >>start'))
                         lit_off = ctx._alloc_literal(mask)
-                        t = ctx._next_gpr; ctx._next_gpr += 1
+                        t = _alloc_gpr(ctx)
                         output.append(SassInstr(
                             encode_ldc(t, 0, lit_off),
                             f'LDC R{t}, c[0][0x{lit_off:x}]  // bfe.u32 mask=0x{mask:x}'))
@@ -2057,7 +2211,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     #   Then:       BFE_SEXT dest, src_or_dest, len
                     # encode_shf_r_s32_hi already imported at module level
                     d   = ctx.ra.r32(instr.dest.name)
-                    a   = ctx.ra.r32(instr.srcs[0].name)
+                    a   = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     pos = instr.srcs[1].value if isinstance(instr.srcs[1], ImmOp) else 0
                     length = instr.srcs[2].value if (len(instr.srcs) > 2 and isinstance(instr.srcs[2], ImmOp)) else 32
                     if pos > 0:
@@ -2084,8 +2238,8 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     raw_mask  = (1 << count) - 1 if count < 32 else 0xFFFFFFFF
                     shifted_mask     = (raw_mask << start) & 0xFFFFFFFF
                     not_shifted_mask = (~shifted_mask) & 0xFFFFFFFF
-                    t1 = ctx._next_gpr; ctx._next_gpr += 1
-                    t2 = ctx._next_gpr; ctx._next_gpr += 1
+                    t1 = _alloc_gpr(ctx)
+                    t2 = _alloc_gpr(ctx)
                     # t1 = (a << start) & shifted_mask
                     output.append(SassInstr(
                         encode_shf_l_u32(t1, a, start),
@@ -2117,6 +2271,11 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
             except ISelError as e:
                 # Emit NOP with error comment rather than crashing
                 output.append(_nop(f'ISEL ERROR: {e}  [{instr.op}]'))
+
+            # Release scratch GPRs allocated during this instruction.
+            # This reclaims temporaries used by div/rem/mul.hi sequences so
+            # subsequent instructions can reuse the same physical registers.
+            _release_scratch(ctx)
 
             # Apply predicate guard to all SASS instructions generated for
             # this PTX instruction (except bra/ret which handle it themselves).

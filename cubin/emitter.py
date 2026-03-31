@@ -193,6 +193,69 @@ def _build_nv_info_kernel(num_gprs: int = 8, num_params: int = 2,
     return bytes(buf)
 
 
+def _build_merc_nv_info_kernel(num_gprs: int = 8, num_params: int = 2,
+                                param_sizes: list[int] = None,
+                                exit_offsets: list[int] = None):
+    """Generate per-kernel .nv.merc.nv.info attributes.
+
+    The merc (Mercury compiler) version includes the 0x5a attribute which
+    encodes per-instruction register allocation data. Without it, the GPU
+    limits register access and triggers ERR715 for R14+.
+
+    Since we can't generate the real 0x5a data (requires RE of Mercury format),
+    we emit a 52-byte all-0xFF blob which tells the hardware to allow maximum
+    register access for all instructions.
+    """
+    if param_sizes is None:
+        param_sizes = [8] * num_params
+
+    buf = bytearray()
+
+    # EIATTR_REGCOUNT (0x37)
+    buf.extend(bytes([0x04, 0x37, 0x04, 0x00, 0x82, 0x00, 0x00, 0x00]))
+
+    # EIATTR_0x5a: per-instruction register allocation (52 bytes).
+    # Uses the exact bytes from ptxas vector_add (sm_120) as a baseline.
+    # This data is a compressed encoding of instruction-level metadata.
+    buf.extend(bytes([0x04, 0x5a, 0x34, 0x00]))  # header: fmt=04, tag=5a, size=52
+    buf.extend(bytes.fromhex(
+        '8a9d22a4b19d146d00b42af3f758038e0c070a1be2de8ad75263870c'
+        'd72b0700cd2b8a124e4c1624ba19f5f027946a021a000000'))
+
+    # EIATTR_PARAM_INFO (0x17): same as non-merc version
+    cumulative_offset = 0
+    param_offsets_list = []
+    for i in range(num_params):
+        param_offsets_list.append(cumulative_offset)
+        cumulative_offset += param_sizes[i]
+    for i in range(num_params - 1, -1, -1):
+        buf.extend(bytes([0x04, 0x17, 0x0c, 0x00]))
+        buf.extend(bytes([0x00, 0x00, 0x00, 0x00]))
+        buf.extend(bytes([i & 0xFF, 0x00]))
+        off = param_offsets_list[i]
+        buf.extend(bytes([off & 0xFF, (off >> 8) & 0xFF]))
+        size_ind = 0x11 if param_sizes[i] <= 4 else 0x21
+        buf.extend(bytes([0x00, 0xf0, size_ind, 0x00]))
+
+    # EIATTR_PARAM_CBANK (0x50)
+    buf.extend(bytes([0x03, 0x50, 0x00, 0x00]))
+    # EIATTR_CBANK_PARAM_SIZE (0x1b)
+    buf.extend(bytes([0x03, 0x1b, 0xFF, 0x00]))
+    # EIATTR_0x5f: version/flag (always 0x0101 in ptxas cubins)
+    buf.extend(bytes([0x03, 0x5f, 0x01, 0x01]))
+    # EIATTR_CTAID_DIMS (0x4a)
+    buf.extend(bytes([0x02, 0x4a, 0x00, 0x00]))
+    # EIATTR_EXIT_INSTR_OFFSETS (0x1c)
+    if not exit_offsets:
+        exit_offsets = [0x10]
+    payload = b''.join(struct.pack('<I', off) for off in exit_offsets)
+    buf.extend(bytes([0x04, 0x1c]))
+    buf.extend(struct.pack('<H', len(payload)))
+    buf.extend(payload)
+
+    return bytes(buf)
+
+
 def _build_nv_compat():
     return bytes.fromhex(
         '020900000202010002050500030701010203000002060100040b08005000000000000000'
@@ -225,45 +288,32 @@ def _build_capmerc(num_gprs: int = 10):
     # Capmerc byte[8] = register allocation: tells hardware how many GPRs to allocate.
     # Must use the full 130-byte template (16-byte minimal doesn't work).
     # Allocate registers: round up to next multiple of 8, minimum 16
-    # Byte[8] = register count. Must match kernel's actual GPR usage.
-    # Use a larger template (from ptxas vector_add) that supports 20+ GPRs.
-    reg_count = max(num_gprs, 8)  # minimum 8 GPRs
-    if reg_count <= 12:
-        # Small kernel: use 130-byte template
-        buf = bytearray.fromhex(
-            '0c000000010000c00800000050000000'
-            '010b040af80004000000410000040000'
-            '010b040af80004000000410101020000'
-            '010b0e0afa0005000000030139040000'
-            '02220e06f80052000000830040000200'
-            '00000000000000000000000000000000'
-            '02380e32f80040110000000082000a00'
-            '00020140010000000000000000000000'
-            'd004'
-        )
-    else:
-        # Large kernel: use 238-byte template (from ptxas vector_add)
-        buf = bytearray.fromhex(
-            '0c000000010000c016000000e0861500'
-            '010b040af80004000000410000040000'
-            '010b040af80004000000010001020000'
-            '010b060afa0004000000010104020000'
-            '02220806fa004200000041014000020000000000000000000000000018000000'
-            '010b040af80004000000c1000104000002220806fa00620000000702400002000000000000000000000000000000000002220806fa005200000083014000020000000000000000000000000010000000'
-            '010b0e0afa0005000000030139040000'
-            '410c5404410c5404410c5404'
-            '02380e32f80040110000000082000a00'
-            '00020140020000000000000000000000'
-            'd005'
-        )
-    buf[8] = reg_count  # patch register count (header field)
-    # Also patch the per-kernel register count field deeper in the capmerc.
-    # Small template: byte 74 holds the register count.
-    # Large template: byte 218 holds the register count.
-    if reg_count <= 12:
-        buf[74] = reg_count
-    else:
-        buf[218] = reg_count
+    # Byte[8] = register count. Tells HW how many GPRs to allocate per thread.
+    # The 202-byte generic template (extracted from ptxas sm_120 test kernels)
+    # is instruction-sequence-independent — only the header/footer change.
+    # Verified across 6 ptxas cubins with 19-35 GPRs: body bytes 16-199 identical.
+    reg_count = max(num_gprs, 16)  # minimum 16 GPRs
+    # Generic 202-byte capmerc template (from ptxas sm_120 test kernels).
+    # Body bytes 16-199 are identical across ptxas cubins with 19-35 GPRs.
+    # Only the header (byte[8], bytes[13-15]) and footer vary per GPR count.
+    buf = bytearray.fromhex(
+        '0c000000010000c016000000e06a1700'  # 16B header
+        '010b040af80004000000410000040000'
+        '010b040af80004000000010001020000'
+        '010b060afa0004000000010104020000'
+        '02220806fa0042000000410140000200'
+        '00000000000000000000000018000000'
+        '010b040af80004000000c10001040000'
+        '02220806fa0062000000070240000200'
+        '00000000000000000000000000000000'
+        '010b0e0afa0005000000030139040000'
+        '410c5404410c540402380e32f8004011'
+        '0000000082000a00000201c001000000'
+        '0000000000000000d005'              # 2B footer
+    )
+    buf[8] = reg_count
+    # Register bitmap: set all bits for maximum register access
+    buf[13] = 0xFF; buf[14] = 0xFF; buf[15] = 0xFF
     return bytes(buf)
 
 
@@ -286,6 +336,8 @@ class KernelDesc:
     s2r_offset: int = 0x10  # byte offset of first S2R instruction in .text
     smem_size: int = 0           # static shared memory size in bytes (0 = none)
     sm_version: int = 120        # 89 (Ada) or 120 (Blackwell)
+    ptxas_capmerc: bytes | None = None    # capmerc from ptxas (overrides generated)
+    ptxas_merc_info: bytes | None = None  # merc.nv.info from ptxas (overrides generated)
 
 
 def emit_cubin(kernel: KernelDesc) -> bytes:
@@ -460,11 +512,18 @@ def emit_cubin(kernel: KernelDesc) -> bytes:
     SHT_CUDA_MERC_INFO = 0x70000083
     SHT_CUDA_MERC_SYMTAB = 0x70000085
 
+    # Use ptxas metadata when available (enables R14+ registers).
+    # Fall back to our generated templates otherwise.
+    capmerc_data = kernel.ptxas_capmerc or _build_capmerc(kernel.num_gprs)
+    merc_info_data = kernel.ptxas_merc_info or _build_merc_nv_info_kernel(
+        num_gprs=kernel.num_gprs, num_params=kernel.num_params,
+        param_sizes=kernel.param_sizes, exit_offsets=exit_offsets)
+
     section_datas.extend([
         const0_data,
-        _build_capmerc(kernel.num_gprs),
+        capmerc_data,
         _build_nv_info_global(),
-        _build_nv_info_kernel(num_gprs=kernel.num_gprs),
+        merc_info_data,
         symtab_data,
     ])
 

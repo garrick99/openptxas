@@ -392,7 +392,7 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
         # (they're available within 1 cycle). Only wait if data came from LDG.
         if opcode in _OPCODES_STG:
             data_reg = si.raw[4]  # b4 = data register for STG
-            print(f"[STG DEBUG] data_reg=R{data_reg} pending={pending_writes.get(data_reg)} current_rbar={rbar}")
+            pass  # STG rbar tracking
             if data_reg in pending_writes:
                 _, pw = pending_writes[data_reg]
                 if pw in (0x35, 0x37):  # LDG result slots
@@ -443,13 +443,14 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
         if opcode in _OPCODES_BAR:
             wdep = 0x3f
             rbar = 0x01
-        if opcode == 0x94d:  # EXIT — SM_120 auto-tracks predicate hazards
-            # Always use rbar=0x01 for EXIT (both conditional and unconditional).
-            # SM_120 hardware enforces predicate read-after-write automatically;
-            # ptxas uses rbar=1 for @Px EXIT. Using rbar=3 waits for the wrong
-            # barrier slot and may execute @P0 EXIT before P0 is ready.
-            rbar = 0x01
-            wdep = 0x3f
+        if opcode == 0x94d:  # EXIT
+            guard = (si.raw[1] >> 4) & 0xF
+            if guard != 0x7:  # Predicated @Px EXIT: use default ctrl
+                wdep = 0x3e
+                rbar = 0x01
+            else:  # Unconditional EXIT
+                rbar = 0x01
+                wdep = 0x3f
 
         # Build ctrl — bits[22:17] = OPEX (instruction extension / hardware modifier).
         # These are NOT stall counters on SM_120. Each opcode has a fixed OPEX value

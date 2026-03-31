@@ -20,10 +20,10 @@ Field layout (128-bit = lo[63:0] | hi[63:0], little-endian byte array):
 Ground truth samples from sm_120_encoding_tables.json confirmed throughout.
 
 SR codes for S2R:
-    SR_TID_X  = 0x21
-    SR_TID_Y  = 0x22
-    SR_CTAID_X = 0x25
-    SR_NTID_X  = 0x29
+    SR_TID_X    = 0x21    SR_TID_Y    = 0x22    SR_TID_Z    = 0x23
+    SR_CTAID_X  = 0x25    SR_CTAID_Y  = 0x26    SR_CTAID_Z  = 0x27
+    SR_NTID_X   = 0x29    SR_NTID_Y   = 0x2a    SR_NTID_Z   = 0x2b
+    SR_NCTAID_X = 0x2d    SR_NCTAID_Y = 0x2e
 """
 
 from __future__ import annotations
@@ -46,10 +46,18 @@ def patch_pred(raw: bytes, pred: int = PT, neg: bool = False) -> bytes:
     return bytes(buf)
 
 # SR codes for S2R
-SR_TID_X   = 0x21
-SR_TID_Y   = 0x22
-SR_CTAID_X = 0x25
-SR_NTID_X  = 0x29
+SR_TID_X     = 0x21
+SR_TID_Y     = 0x22
+SR_TID_Z     = 0x23
+SR_CTAID_X   = 0x25
+SR_CTAID_Y   = 0x26
+SR_CTAID_Z   = 0x27
+SR_NTID_X    = 0x29
+SR_NTID_Y    = 0x2a
+SR_NTID_Z    = 0x2b
+SR_NCTAID_X  = 0x2d
+SR_NCTAID_Y  = 0x2e
+SR_NCTAID_Z  = 0x2f
 
 # Default control word: safe for standalone emission.
 # Uses stall=0 with read barrier at 0x1f and write dep at 0x3e,
@@ -407,13 +415,17 @@ def encode_iadd3(dest: int, src0: int, src1: int, src2: int,
     """
     if ctrl == 0:
         ctrl = _CTRL_DEFAULT
-    # Negate modifier: bit in b11 controls src1 negation
-    b11 = 0x0f if negate_src1 else 0x07
-    return _build(0x10, 0x72,
-                  b2=dest, b3=src0, b4=src1,
-                  b8=src2,
-                  b9=0xe0, b10=0xf1, b11=b11,
-                  ctrl=ctrl)
+    # Negate modifier: ptxas uses b7=0x80 and b10=0xff for src1 negation (sub).
+    # Ground truth: ptxas sub.u32 → IADD3 with b7=0x80 b10=0xff b11=0x07
+    b10 = 0xff if negate_src1 else 0xf1
+    raw = bytearray(_build(0x10, 0x72,
+                           b2=dest, b3=src0, b4=src1,
+                           b8=src2,
+                           b9=0xe0, b10=b10, b11=0x07,
+                           ctrl=ctrl))
+    if negate_src1:
+        raw[7] = 0x80  # negate flag in byte 7
+    return bytes(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -861,10 +873,11 @@ def encode_ldsm_x4(dest: int, addr_reg: int, ctrl: int = 0) -> bytes:
 # ---------------------------------------------------------------------------
 
 def encode_i2f_f32_s32(dest: int, src: int, ctrl: int = 0) -> bytes:
-    """Encode I2FP.F32.S32 dest, src (signed int32 to float32)."""
+    """Encode I2FP.F32.S32 dest, src (signed int32 to float32).
+    Ground truth: ptxas cvt.rn.f32.s32 → b9=0x10, b10=0x20."""
     if ctrl == 0: ctrl = _CTRL_DEFAULT
     return _build(0x45, 0x72, b2=dest, b3=0x00, b4=src,
-                  b8=0x00, b9=0x14, b10=0x20, b11=0x00, ctrl=ctrl)
+                  b8=0x00, b9=0x10, b10=0x20, b11=0x00, ctrl=ctrl)
 
 
 def encode_f2i_s32_f32(dest: int, src: int, ctrl: int = 0) -> bytes:
@@ -2362,15 +2375,11 @@ def encode_vote_ballot(dest: int, ctrl: int = 0) -> bytes:
 # I2FP.F32.S32: modifier differs from U32 in b10 or b11.
 
 def encode_i2fp_u32(dest: int, src: int, ctrl: int = 0) -> bytes:
-    """Encode I2FP.F32.U32 — unsigned int to float."""
+    """Encode I2FP.F32.U32 — unsigned int to float.
+    Ground truth: ptxas cvt.rn.f32.u32 → b9=0x14, b10=0x20."""
     if ctrl == 0: ctrl = _CTRL_DEFAULT
-    b13, b14, b15 = _ctrl_to_bytes(ctrl)
-    raw = bytearray(16)
-    raw[0], raw[1] = 0x45, 0x72
-    raw[2] = dest & 0xFF
-    raw[3] = src & 0xFF
-    raw[9] = 0x00  # U32 variant
-    raw[13], raw[14], raw[15] = b13, b14, b15
+    return _build(0x45, 0x72, b2=dest, b3=0x00, b4=src,
+                  b8=0x00, b9=0x14, b10=0x20, b11=0x00, ctrl=ctrl)
     return bytes(raw)
 
 
@@ -2381,15 +2390,11 @@ def encode_i2fp_u32(dest: int, src: int, ctrl: int = 0) -> bytes:
 # F2I.TRUNC.NTZ:     0x0000000000117305 (signed, default)
 
 def encode_f2i_u32(dest: int, src: int, ctrl: int = 0) -> bytes:
-    """Encode F2I.U32.TRUNC.NTZ — float to unsigned int."""
+    """Encode F2I.U32.TRUNC.NTZ — float to unsigned int.
+    Ground truth: ptxas cvt.rzi.u32.f32 → b3=0, b4=src, b9=0xf0, b10=0x20."""
     if ctrl == 0: ctrl = _CTRL_DEFAULT
-    b13, b14, b15 = _ctrl_to_bytes(ctrl)
-    raw = bytearray(16)
-    raw[0], raw[1] = 0x05, 0x73
-    raw[2] = dest & 0xFF
-    raw[3] = src & 0xFF
-    raw[9] = 0x00  # U32 variant
-    raw[13], raw[14], raw[15] = b13, b14, b15
+    return _build(0x05, 0x73, b2=dest, b3=0x00, b4=src,
+                  b8=0x00, b9=0xf0, b10=0x20, b11=0x00, ctrl=ctrl)
     return bytes(raw)
 
 
@@ -2509,7 +2514,7 @@ def encode_f2i_ftz_u32_trunc(dest: int, src: int, ctrl: int = 0) -> bytes:
     raw[2] = dest & 0xFF
     raw[4] = src & 0xFF
     raw[9]  = 0xf0
-    raw[10] = 0x21
+    raw[10] = 0x20  # ground truth: ptxas uses 0x20 (not 0x21)
     raw[13], raw[14], raw[15] = b13, b14, b15
     return bytes(raw)
 

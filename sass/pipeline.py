@@ -333,11 +333,13 @@ def _if_convert(fn: Function) -> None:
                 break
 
 
-def compile_function(fn: Function, verbose: bool = False) -> bytes:
+def compile_function(fn: Function, verbose: bool = False,
+                     ptxas_meta: dict = None) -> bytes:
     """
     Compile a single PTX function/kernel to a cubin.
 
     Returns raw cubin bytes ready for cuModuleLoad.
+    ptxas_meta: optional {'capmerc': bytes, 'merc_info': bytes} from ptxas.
     """
     # 0a. If-conversion: convert short if-else diamonds to predicated instructions,
     # matching ptxas behaviour for divergent branches on SM_120.
@@ -590,9 +592,11 @@ def compile_function(fn: Function, verbose: bool = False) -> bytes:
                 s2r_offset = i
                 break
 
-    _final_gprs = max(alloc.num_gprs, ctx._next_gpr)
+    _final_gprs = max(alloc.num_gprs, ctx._next_gpr,
+                      getattr(ctx, '_scratch_highwater', 0))
     if verbose:
-        print(f"[pipeline] final num_gprs: alloc={alloc.num_gprs} ctx._next_gpr={ctx._next_gpr} -> {_final_gprs}")
+        print(f"[pipeline] final num_gprs: alloc={alloc.num_gprs} ctx._next_gpr={ctx._next_gpr} "
+              f"highwater={getattr(ctx, '_scratch_highwater', 0)} -> {_final_gprs}")
     desc = KernelDesc(
         name=fn.name,
         sass_bytes=sass_bytes,
@@ -604,8 +608,109 @@ def compile_function(fn: Function, verbose: bool = False) -> bytes:
         const0_init_data=const0_init,
         exit_offset=exit_offset,
         s2r_offset=s2r_offset,
+        # Don't pass ptxas metadata to emitter — apply as post-process patch instead.
+        # This preserves ELF section structure while only changing data bytes.
+        ptxas_capmerc=None,
+        ptxas_merc_info=None,
     )
-    return emit_cubin(desc)
+    cubin_bytes = emit_cubin(desc)
+
+    # Post-process: patch capmerc and merc.nv.info with ptxas metadata.
+    # This preserves our ELF structure while replacing only the data bytes
+    # within existing sections, which is proven to work for enabling R14+.
+    if ptxas_meta:
+        cubin_bytes = _patch_ptxas_metadata(cubin_bytes, ptxas_meta)
+
+    return cubin_bytes
+
+
+def _patch_ptxas_metadata(cubin_bytes: bytes, ptxas_meta: dict) -> bytes:
+    """Overwrite capmerc and merc.nv.info section data with ptxas-generated values."""
+    import struct
+    data = bytearray(cubin_bytes)
+    e_shoff = struct.unpack_from('<Q', data, 40)[0]
+    e_shnum = struct.unpack_from('<H', data, 60)[0]
+    e_shentsize = struct.unpack_from('<H', data, 58)[0]
+    e_shstrndx = struct.unpack_from('<H', data, 62)[0]
+    sh_off = e_shoff + e_shstrndx * e_shentsize
+    str_offset = struct.unpack_from('<Q', data, sh_off + 24)[0]
+    strtab = data[str_offset:str_offset +
+                  struct.unpack_from('<Q', data, sh_off + 32)[0]]
+    for i in range(e_shnum):
+        off = e_shoff + i * e_shentsize
+        sh_name_idx = struct.unpack_from('<I', data, off)[0]
+        sh_offset_val = struct.unpack_from('<Q', data, off + 24)[0]
+        sh_size = struct.unpack_from('<Q', data, off + 32)[0]
+        name_end = strtab.index(0, sh_name_idx)
+        sname = strtab[sh_name_idx:name_end].decode('ascii', errors='replace')
+        if 'capmerc' in sname and 'text' in sname and 'capmerc' in ptxas_meta:
+            ptxas_cap = ptxas_meta['capmerc']
+            # Overwrite section data (pad or truncate to match section size)
+            patch = bytearray(ptxas_cap[:sh_size])
+            if len(patch) < sh_size:
+                patch.extend(bytearray(sh_size - len(patch)))
+            data[sh_offset_val:sh_offset_val + sh_size] = patch
+        if 'merc.nv.info.' in sname and 'merc_info' in ptxas_meta:
+            ptxas_mi = ptxas_meta['merc_info']
+            patch = bytearray(ptxas_mi[:sh_size])
+            if len(patch) < sh_size:
+                patch.extend(bytearray(sh_size - len(patch)))
+            data[sh_offset_val:sh_offset_val + sh_size] = patch
+    return bytes(data)
+
+
+def _extract_ptxas_metadata(ptx_src: str) -> dict[str, dict]:
+    """Run ptxas on the PTX source and extract capmerc + merc.nv.info per kernel.
+
+    Returns {kernel_name: {'capmerc': bytes, 'merc_info': bytes}} or empty dict
+    if ptxas is not available.
+    """
+    import tempfile, subprocess, struct
+    result = {}
+    try:
+        with tempfile.NamedTemporaryFile(suffix='.ptx', delete=False, mode='w') as f:
+            f.write(ptx_src)
+            ptx_path = f.name
+        cubin_path = ptx_path.replace('.ptx', '.cubin')
+        r = subprocess.run(['ptxas', '-arch', 'sm_120', '-o', cubin_path, ptx_path],
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            return result
+        data = open(cubin_path, 'rb').read()
+        e_shoff = struct.unpack_from('<Q', data, 40)[0]
+        e_shnum = struct.unpack_from('<H', data, 60)[0]
+        e_shentsize = struct.unpack_from('<H', data, 58)[0]
+        e_shstrndx = struct.unpack_from('<H', data, 62)[0]
+        sh_off = e_shoff + e_shstrndx * e_shentsize
+        str_offset = struct.unpack_from('<Q', data, sh_off + 24)[0]
+        strtab = data[str_offset:str_offset +
+                      struct.unpack_from('<Q', data, sh_off + 32)[0]]
+        sections = {}
+        for i in range(e_shnum):
+            off = e_shoff + i * e_shentsize
+            sh_name_idx = struct.unpack_from('<I', data, off)[0]
+            sh_offset_val = struct.unpack_from('<Q', data, off + 24)[0]
+            sh_size = struct.unpack_from('<Q', data, off + 32)[0]
+            name_end = strtab.index(0, sh_name_idx)
+            sname = strtab[sh_name_idx:name_end].decode('ascii', errors='replace')
+            sections[sname] = data[sh_offset_val:sh_offset_val + sh_size]
+        for sname, sec_data in sections.items():
+            if sname.startswith('.nv.capmerc.text.'):
+                kname = sname[len('.nv.capmerc.text.'):]
+                if kname not in result:
+                    result[kname] = {}
+                result[kname]['capmerc'] = sec_data
+            if sname.startswith('.nv.merc.nv.info.'):
+                kname = sname[len('.nv.merc.nv.info.'):]
+                if kname not in result:
+                    result[kname] = {}
+                result[kname]['merc_info'] = sec_data
+        import os
+        os.unlink(ptx_path)
+        os.unlink(cubin_path)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+    return result
 
 
 def compile_ptx_source(ptx_src: str, verbose: bool = False) -> dict[str, bytes]:
@@ -615,10 +720,15 @@ def compile_ptx_source(ptx_src: str, verbose: bool = False) -> dict[str, bytes]:
     mod = parse(ptx_src)
     mod, rotate_groups = rotate_run(mod)
 
+    # Extract capmerc/merc metadata from ptxas (if available) to enable
+    # R14+ register access. Without ptxas metadata, GPRs are limited to R0-R13.
+    ptxas_meta = _extract_ptxas_metadata(ptx_src)
+
     results = {}
     for fn in mod.functions:
         if fn.is_kernel:
-            results[fn.name] = compile_function(fn, verbose=verbose)
+            results[fn.name] = compile_function(
+                fn, verbose=verbose, ptxas_meta=ptxas_meta.get(fn.name))
 
     return results
 

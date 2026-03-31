@@ -2974,3 +2974,55 @@ if __name__ == "__main__":
         print("All ground truth samples encode correctly.")
     else:
         print("FAILURES detected — fix the encoders before use.")
+
+
+# ---------------------------------------------------------------------------
+# FSEL — Combined Float Compare + Select (SM_120 Blackwell)
+# ---------------------------------------------------------------------------
+# ptxas uses these instead of separate FSETP + predicated MOV to avoid the
+# SM_120 hardware bug where ISETP corrupts subsequent FSETP predicate state.
+#
+# Opcode 0x80a: FSEL.step dest, src, threshold, cmp
+#   dest = (src cmp threshold) ? 1.0 : 0.0
+#   Ground truth: 0a7807040000003f0040800300ca4f00
+#     R7 = (R4 > 0.5f) ? 1.0 : 0.0
+#
+# Opcode 0x80b: FSETP with inline float immediate (sets predicate)
+#   Ground truth: 0b7800040000003f0040f00300ca4f00
+#     P0 = (R4 > 0.5f)
+
+FSEL_LT = 0x01
+FSEL_EQ = 0x02
+FSEL_LE = 0x03
+FSEL_GT = 0x04
+FSEL_NE = 0x05
+FSEL_GE = 0x06
+
+def encode_fsel_step(dest: int, src: int, threshold_f32: int, cmp: int = FSEL_GT,
+                     ctrl: int = 0) -> bytes:
+    """Encode FSEL.step: dest = (src cmp threshold) ? 1.0 : 0.0.
+
+    Opcode 0x80a. Combined compare+select that avoids FSETP predicate corruption.
+
+    Ground truth (ptxas sm_120): out[i] = in[i] > 0.5f ? 1.0f : 0.0f
+        0a7807040000003f0040800300ca4f00
+        b2=R7(dest), b3=R4(src), b4-b7=0x3f000000(0.5f), b9=0x40(GT), b10=0x80
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    import struct as _s
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0x0a
+    raw[1] = 0x78
+    raw[2] = dest & 0xFF
+    raw[3] = src & 0xFF
+    _s.pack_into('<I', raw, 4, threshold_f32 & 0xFFFFFFFF)
+    raw[8] = 0x00
+    raw[9] = (cmp & 0x0F) << 4  # comparison type
+    raw[10] = 0x80  # step mode: true=1.0, false=0.0
+    raw[11] = 0x03
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)

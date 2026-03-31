@@ -1495,24 +1495,59 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         is_float = any(t in ('f32', 'f64') for t in instr.types)
                         cmp_name = next((t for t in instr.types if t in ('lt','le','gt','ge','eq','ne')), 'ge')
                         if is_float:
-                            if isinstance(b, ImmOp):
-                                # Float immediate: materialize into scratch GPR first
-                                imm = b.value & 0xFFFFFFFF
-                                br = _alloc_gpr(ctx)
-                                output.append(SassInstr(encode_iadd3_imm32(br, RZ, imm, RZ),
-                                    f'IADD3 R{br}, RZ, 0x{imm:x}, RZ  // fsetp float imm'))
-                            elif isinstance(b, RegOp):
-                                br = ctx.ra.r32(b.name)
+                            # PEEPHOLE: check if next 2 instructions are @p mov.f32 imm + @!p mov.f32 imm
+                            # with values 1.0 and 0.0 (step function). If so, fuse into FSEL.step.
+                            # This avoids the SM_120 bug where ISETP corrupts FSETP state.
+                            from sass.encoding.sm_120_opcodes import encode_fsel_step, FSEL_GT, FSEL_LT, FSEL_GE, FSEL_LE, FSEL_EQ, FSEL_NE
+                            _fsel_cmp = {'lt': FSEL_LT, 'le': FSEL_LE, 'gt': FSEL_GT,
+                                         'ge': FSEL_GE, 'eq': FSEL_EQ, 'ne': FSEL_NE}
+                            remaining = bb.instructions[_instr_idx+1:]
+                            can_fsel = False
+                            if (len(remaining) >= 2
+                                and remaining[0].op == 'mov' and remaining[0].pred == pred.name
+                                and remaining[1].op == 'mov' and remaining[1].pred == pred.name
+                                and isinstance(remaining[0].srcs[0], ImmOp)
+                                and isinstance(remaining[1].srcs[0], ImmOp)):
+                                v_true = remaining[0].srcs[0].value & 0xFFFFFFFF
+                                v_false = remaining[1].srcs[0].value & 0xFFFFFFFF
+                                neg0 = remaining[0].neg
+                                neg1 = remaining[1].neg
+                                # @p mov true_val + @!p mov false_val (or reversed negation)
+                                if (not neg0 and neg1 and v_true == 0x3F800000 and v_false == 0):
+                                    can_fsel = True
+                                elif (neg0 and not neg1 and v_true == 0 and v_false == 0x3F800000):
+                                    can_fsel = True
+                            if can_fsel and isinstance(b, ImmOp):
+                                # FSEL.step: dest = (src cmp threshold) ? 1.0 : 0.0
+                                threshold = b.value & 0xFFFFFFFF
+                                dest_name = remaining[0].dest.name
+                                d = ctx.ra.r32(dest_name)
+                                output.append(SassInstr(
+                                    encode_fsel_step(d, ar, threshold, _fsel_cmp.get(cmp_name, FSEL_GT)),
+                                    f'FSEL.step R{d}, R{ar}, 0x{threshold:08x}, {cmp_name.upper()}'))
+                                # Skip the next 2 instructions (predicated movs)
+                                if not hasattr(ctx, '_skip_instrs'):
+                                    ctx._skip_instrs = set()
+                                ctx._skip_instrs.add(id(remaining[0]))
+                                ctx._skip_instrs.add(id(remaining[1]))
                             else:
-                                br = RZ
-                            cmp_map = {'lt': FSETP_LT, 'le': FSETP_LE, 'gt': FSETP_GT,
-                                       'ge': FSETP_GE, 'eq': FSETP_EQ, 'ne': FSETP_NE}
-                            # Clear stale negation from integer setp on same predicate
-                            if hasattr(ctx, '_negated_preds') and pd in ctx._negated_preds:
-                                ctx._negated_preds.discard(pd)
-                            output.append(SassInstr(
-                                encode_fsetp(pd, ar, br, cmp_map.get(cmp_name, FSETP_GE)),
-                                f'FSETP.{cmp_name.upper()} P{pd}, R{ar}, R{br}'))
+                                # Fallback: separate FSETP + predicated MOV
+                                if isinstance(b, ImmOp):
+                                    imm = b.value & 0xFFFFFFFF
+                                    br = _alloc_gpr(ctx)
+                                    output.append(SassInstr(encode_iadd3_imm32(br, RZ, imm, RZ),
+                                        f'IADD3 R{br}, RZ, 0x{imm:x}, RZ  // fsetp float imm'))
+                                elif isinstance(b, RegOp):
+                                    br = ctx.ra.r32(b.name)
+                                else:
+                                    br = RZ
+                                cmp_map = {'lt': FSETP_LT, 'le': FSETP_LE, 'gt': FSETP_GT,
+                                           'ge': FSETP_GE, 'eq': FSETP_EQ, 'ne': FSETP_NE}
+                                if hasattr(ctx, '_negated_preds') and pd in ctx._negated_preds:
+                                    ctx._negated_preds.discard(pd)
+                                output.append(SassInstr(
+                                    encode_fsetp(pd, ar, br, cmp_map.get(cmp_name, FSETP_GE)),
+                                    f'FSETP.{cmp_name.upper()} P{pd}, R{ar}, R{br}'))
                         else:
                             # Integer comparison: use ISETP R-UR (opcode 0xc0c) when src1
                             # is a u32 param backed GPR. The R-R variant (0x20c) silently

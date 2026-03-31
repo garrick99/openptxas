@@ -750,7 +750,8 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
     ordered_blocks += [bb for bb in fn.blocks if bb.label in _ret_only]
 
     for bb in ordered_blocks:
-        # Record label position
+        # Record label position and mark the first instruction with label tag
+        block_start_idx = len(output)
         if bb.label:
             ctx.label_map[bb.label] = len(output) * 16
 
@@ -2447,27 +2448,30 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     new_raw = patch_pred(old.raw, pred=pd, neg=neg)
                     output[si_idx] = SassInstr(new_raw, pred_str + old.comment)
 
-    # BRA offset fixup pass
+        # Tag the first instruction of this block with label marker for BRA fixup.
+        # The scheduler may reorder instructions, so the pipeline needs to find
+        # labels by scanning comments rather than using body-relative byte offsets.
+        if bb.label and block_start_idx < len(output):
+            si = output[block_start_idx]
+            output[block_start_idx] = SassInstr(si.raw, f'// {bb.label}: {si.comment}')
+
+    # BRA offset fixup: do NOT patch here — the pipeline handles final fixup
+    # after preamble insertion and scheduling. We only do fall-through elimination
+    # (body-relative) and mark entries as handled so the pipeline skips them.
     if hasattr(ctx, '_bra_fixups'):
+        surviving = []
         for bra_idx, target_label in ctx._bra_fixups:
             if target_label in ctx.label_map:
                 target_byte = ctx.label_map[target_label]
-                bra_byte = (bra_idx + 1) * 16  # offset from NEXT instruction
+                bra_byte = (bra_idx + 1) * 16
                 rel_offset = target_byte - bra_byte
                 if rel_offset == 0:
-                    # Fall-through BRA: target is the next instruction.
-                    # Replace with NOP to avoid self-jump (infinite loop / crash).
+                    # Fall-through BRA: replace with NOP, don't pass to pipeline
                     output[bra_idx] = SassInstr(encode_nop(),
                         f'NOP  // eliminated fall-through BRA {target_label}')
                     continue
-                # Preserve predicate from original BRA encoding
-                old_raw = output[bra_idx].raw
-                old_pred_byte = old_raw[1] & 0xF0  # predicate bits
-                new_raw = encode_bra(rel_offset)
-                new_raw = bytearray(new_raw)
-                new_raw[1] = (new_raw[1] & 0x0F) | old_pred_byte
-                output[bra_idx] = SassInstr(
-                    bytes(new_raw),
-                    f'{output[bra_idx].comment.split("BRA")[0]}BRA {target_label} (offset={rel_offset})')
+            # Keep this fixup for the pipeline to handle
+            surviving.append((bra_idx, target_label))
+        ctx._bra_fixups = surviving
 
     return output

@@ -19,7 +19,7 @@ from ptx.ir import Module, Function
 from ptx.passes.rotate import run as rotate_run
 from sass.regalloc import allocate
 from sass.isel import ISelContext, select_function, SassInstr
-from sass.encoding.sm_120_opcodes import encode_bra, encode_ldcu_64, encode_exit
+from sass.encoding.sm_120_opcodes import encode_bra, encode_ldcu_64, encode_exit, encode_nop
 from sass.schedule import schedule
 from sass.scoreboard import assign_ctrl
 from cubin.emitter import emit_cubin, KernelDesc
@@ -475,28 +475,47 @@ def compile_function(fn: Function, verbose: bool = False,
     # Strategy: map body instruction indices to final sass_instrs positions by
     # iterating the stream and counting non-latency-NOP instructions. Latency
     # NOPs have 'latency' in their comment and are transparent to label positions.
-    if hasattr(ctx, '_bra_fixups'):
+    # BRA fixup: resolve branch targets in the FINAL instruction stream.
+    # The scheduler may reorder instructions, so body-relative indices are unreliable.
+    # Instead, scan the final stream for BRA instructions and match by comment,
+    # then find target labels by scanning for label-bearing instructions.
+    #
+    # Step 1: Find where each label lands in the final stream.
+    # Labels were set as body-relative bytes. Map them to absolute positions
+    # by scanning the stream for the instruction at that body position.
+    if hasattr(ctx, '_bra_fixups') and ctx._bra_fixups:
+        # Find label positions in the final stream by scanning instruction comments.
+        # Labels are embedded as "LABEL:xxx" in the comment of the first instruction
+        # of each block (set by the isel when it records the label).
+        # Since the scheduler may reorder and insert NOPs, body-relative byte
+        # offsets from label_map are unreliable. Instead, search for label markers.
+        label_abs_byte = {}
+        for j, si in enumerate(sass_instrs):
+            for lbl in ctx.label_map:
+                # Match only the label tag at the START of the comment (not in BRA comments)
+                if si.comment.startswith(f'// {lbl}:'):
+                    label_abs_byte[lbl] = j * 16
+        # Fallback: for labels not found by comment, use preamble + body offset
+        for lbl, body_byte in ctx.label_map.items():
+            if lbl not in label_abs_byte:
+                label_abs_byte[lbl] = n_preamble * 16 + body_byte
 
-        def _body_idx_to_abs(sass_instrs, n_preamble, body_idx):
-            """Return the abs sass_instrs index for the n-th body instruction
-            (0-based, after preamble), skipping scheduler-inserted latency NOPs."""
-            count = 0
-            for j in range(n_preamble, len(sass_instrs)):
-                if 'latency' in sass_instrs[j].comment.lower():
-                    continue
-                if count == body_idx:
-                    return j
-                count += 1
-            return n_preamble + body_idx  # fallback
-
-        for bra_idx, target_label in ctx._bra_fixups:
-            # bra_idx is body-relative (after preamble, after UR4 update).
-            actual_bra_idx = _body_idx_to_abs(sass_instrs, n_preamble, bra_idx)
-
-            if target_label not in ctx.label_map:
+        # Step 2: Find BRA instructions in the final stream by opcode
+        for i, si in enumerate(sass_instrs):
+            opc = (si.raw[0] | (si.raw[1] << 8)) & 0xFFF
+            if opc != 0x947:  # BRA opcode
+                continue
+            # Extract target label from comment — match "BRA <label>" specifically
+            # to avoid matching label tags at the start of the comment
+            target_label = None
+            for _, tl in ctx._bra_fixups:
+                if f'BRA {tl}' in si.comment:
+                    target_label = tl
+                    break
+            if target_label is None:
                 continue
 
-            # Check if target block is a ret-only block (maps to EXIT).
+            # Check if target is a ret-only block
             target_is_exit = any(
                 tbb.label == target_label
                 and len(tbb.instructions) == 1
@@ -505,42 +524,39 @@ def compile_function(fn: Function, verbose: bool = False,
             )
 
             if target_is_exit:
-                # Scan backward for the last unconditional EXIT.
+                # Jump to last EXIT
                 actual_target_byte = None
                 for si_idx in range(len(sass_instrs) - 1, -1, -1):
                     if sass_instrs[si_idx].raw[:2] == bytes([0x4d, 0x79]):
                         actual_target_byte = si_idx * 16
                         break
+            elif target_label in label_abs_byte:
+                actual_target_byte = label_abs_byte[target_label]
             else:
-                # body_idx of target (post-UR4, label_map is updated).
-                target_body_idx = ctx.label_map[target_label] // 16
-                actual_target_abs = _body_idx_to_abs(
-                    sass_instrs, n_preamble, target_body_idx)
-                actual_target_byte = actual_target_abs * 16
+                continue
 
             if actual_target_byte is None:
                 continue
 
-            actual_bra_byte = (actual_bra_idx + 1) * 16
-            rel_offset = actual_target_byte - actual_bra_byte
+            bra_next_byte = (i + 1) * 16
+            rel_offset = actual_target_byte - bra_next_byte
 
-            print(f"[BRA fixup] {target_label}: bra_abs_idx={actual_bra_idx} bra_byte={actual_bra_byte} "
-                  f"target_byte={actual_target_byte} rel={rel_offset} total_instrs={len(sass_instrs)}")
+            if rel_offset == 0:
+                sass_instrs[i] = SassInstr(encode_nop(),
+                    f'NOP  // eliminated fall-through BRA {target_label}')
+                continue
 
-            if actual_bra_idx < len(sass_instrs):
-                # Patch BRA offset in-place, preserving predicate and ctrl.
-                old_raw = bytearray(sass_instrs[actual_bra_idx].raw)
-                signed_insns = rel_offset // 16
-                offset18 = signed_insns & 0x3FFFF
-                old_raw[8]  = offset18 & 0xFF
-                old_raw[9]  = (offset18 >> 8) & 0xFF
-                old_raw[10] = 0x80 | ((offset18 >> 16) & 0x03)
-                old_raw[11] = 0x03
-                old_comment = sass_instrs[actual_bra_idx].comment
-                pred_prefix = old_comment.split('BRA')[0] if 'BRA' in old_comment else ''
-                sass_instrs[actual_bra_idx] = SassInstr(
-                    bytes(old_raw),
-                    f'{pred_prefix}BRA {target_label} (offset={rel_offset})')
+            old_raw = bytearray(si.raw)
+            signed_insns = rel_offset // 16
+            offset18 = signed_insns & 0x3FFFF
+            old_raw[8]  = offset18 & 0xFF
+            old_raw[9]  = (offset18 >> 8) & 0xFF
+            old_raw[10] = 0x80 | ((offset18 >> 16) & 0x03)
+            old_raw[11] = 0x03
+            pred_prefix = si.comment.split('BRA')[0] if 'BRA' in si.comment else ''
+            sass_instrs[i] = SassInstr(
+                bytes(old_raw),
+                f'{pred_prefix}BRA {target_label} (offset={rel_offset})')
 
     if verbose:
         print(f"[pipeline] {len(sass_instrs)} SASS instructions:")

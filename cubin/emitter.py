@@ -516,9 +516,13 @@ def emit_cubin(kernel: KernelDesc) -> bytes:
     SHT_CUDA_MERC_INFO = 0x70000083
     SHT_CUDA_MERC_SYMTAB = 0x70000085
 
-    # Use ptxas metadata when available (enables R14+ registers).
-    # Fall back to our generated templates otherwise.
-    capmerc_data = kernel.ptxas_capmerc or _build_capmerc(kernel.num_gprs)
+    # Use ptxas metadata when available. Otherwise, use the capmerc generator
+    # which produces text-size-aware capmerc from SASS analysis.
+    if kernel.ptxas_capmerc:
+        capmerc_data = kernel.ptxas_capmerc
+    else:
+        from cubin.capmerc_gen import build_capmerc_from_sass
+        capmerc_data = build_capmerc_from_sass(text_data, num_gprs=kernel.num_gprs)
     merc_info_data = kernel.ptxas_merc_info or _build_merc_nv_info_kernel(
         num_gprs=kernel.num_gprs, num_params=kernel.num_params,
         param_sizes=kernel.param_sizes, exit_offsets=exit_offsets)

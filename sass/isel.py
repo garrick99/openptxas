@@ -543,16 +543,34 @@ def _select_ld_global(instr: Instruction, ra: RegAlloc,
     is_64 = typ in ('u64', 's64', 'b64', 'f64')
 
     base_name = src.base if src.base.startswith('%') else f'%{src.base}'
-    addr = ra.lo(src.base) if src.base in ra.int_regs else RZ
+
+    # Check if the address register is in a UR (loaded via LDCU.64 from ld.param.u64).
+    # If so, materialize into a GPR pair via IADD.64-UR before the LDG.
+    result = []
+    ur_params = getattr(ctx, '_ur_params', {}) if ctx else {}
+    if base_name in ur_params:
+        ur_idx = ur_params[base_name]
+        # Allocate a scratch GPR pair for the address
+        addr = _alloc_gpr(ctx)
+        if addr % 2 != 0:
+            addr = _alloc_gpr(ctx)  # ensure even-aligned for 64-bit
+        _alloc_gpr(ctx)  # reserve addr+1
+        result.append(SassInstr(encode_iadd64_ur(addr, RZ, ur_idx),
+                                f'IADD.64 R{addr}, RZ, UR{ur_idx}  // UR->GPR addr'))
+    elif src.base in ra.int_regs:
+        addr = ra.lo(src.base)
+    else:
+        addr = RZ
 
     if is_64:
         d = ra.lo(dest.name)
-        return [SassInstr(encode_ldg_e_64(d, ur_desc, addr),
-                          f'LDG.E.64 R{d}, desc[UR{ur_desc}][R{addr}.64]')]
+        result.append(SassInstr(encode_ldg_e_64(d, ur_desc, addr),
+                          f'LDG.E.64 R{d}, desc[UR{ur_desc}][R{addr}.64]'))
     else:
         d = ra.r32(dest.name)
-        return [SassInstr(encode_ldg_e(d, ur_desc, addr, width=32),
-                          f'LDG.E R{d}, desc[UR{ur_desc}][R{addr}.64]')]
+        result.append(SassInstr(encode_ldg_e(d, ur_desc, addr, width=32),
+                          f'LDG.E R{d}, desc[UR{ur_desc}][R{addr}.64]'))
+    return result
 
 
 def _select_atom_cas(instr: Instruction, ra: RegAlloc,
@@ -566,10 +584,27 @@ def _select_atom_cas(instr: Instruction, ra: RegAlloc,
     if not isinstance(addr_op, MemOp):
         raise ISelError("atom.cas addr must be MemOp")
     d   = ra.r32(dest_op.name)
-    addr = ra.lo(addr_op.base) if addr_op.base in ra.int_regs else RZ
     cmp = ra.r32(cmp_op.name)
     nv  = ra.r32(new_op.name)
-    return [SassInstr(encode_atomg_cas_b32(d, addr, cmp, nv),
+
+    # Check if address is in UR (from ld.param.u64)
+    prefix = []
+    base_name = addr_op.base if addr_op.base.startswith('%') else f'%{addr_op.base}'
+    ur_params = getattr(ctx, '_ur_params', {}) if ctx else {}
+    if base_name in ur_params:
+        ur_idx = ur_params[base_name]
+        addr = _alloc_gpr(ctx)
+        if addr % 2 != 0:
+            addr = _alloc_gpr(ctx)
+        _alloc_gpr(ctx)
+        prefix.append(SassInstr(encode_iadd64_ur(addr, RZ, ur_idx),
+                                f'IADD.64 R{addr}, RZ, UR{ur_idx}  // UR->GPR addr'))
+    elif addr_op.base in ra.int_regs:
+        addr = ra.lo(addr_op.base)
+    else:
+        addr = RZ
+
+    return prefix + [SassInstr(encode_atomg_cas_b32(d, addr, cmp, nv),
                       f'ATOMG.E.CAS.b32 R{d}, [R{addr}], R{cmp}, R{nv}')]
 
 
@@ -596,22 +631,37 @@ def _select_st_global(instr: Instruction, ra: RegAlloc,
     is_64 = typ in ('u64', 's64', 'b64', 'f64')
 
     base_name = dest_op.base if dest_op.base.startswith('%') else f'%{dest_op.base}'
-    addr = ra.lo(dest_op.base) if dest_op.base in ra.int_regs else RZ
+
+    # Check if the address register is in a UR (loaded via LDCU.64 from ld.param.u64).
+    prefix = []
+    ur_params = getattr(ctx, '_ur_params', {}) if ctx else {}
+    if base_name in ur_params:
+        ur_idx = ur_params[base_name]
+        addr = _alloc_gpr(ctx)
+        if addr % 2 != 0:
+            addr = _alloc_gpr(ctx)
+        _alloc_gpr(ctx)
+        prefix.append(SassInstr(encode_iadd64_ur(addr, RZ, ur_idx),
+                                f'IADD.64 R{addr}, RZ, UR{ur_idx}  // UR->GPR addr'))
+    elif dest_op.base in ra.int_regs:
+        addr = ra.lo(dest_op.base)
+    else:
+        addr = RZ
 
     # Handle materialized immediate
     if not isinstance(src_op, RegOp):
         data = t  # from materialized temp above
-        result = preamble + [SassInstr(encode_stg_e(ur_desc, addr, data, width=32, ctrl=0xff1),
+        result = prefix + preamble + [SassInstr(encode_stg_e(ur_desc, addr, data, width=32, ctrl=0xff1),
                                        f'STG.E desc[UR{ur_desc}][R{addr}.64], R{data}')]
         return result
 
     if is_64:
         data = ra.lo(src_op.name)
-        return [SassInstr(encode_stg_e_64(ur_desc, addr, data, ctrl=0xff1),
+        return prefix + [SassInstr(encode_stg_e_64(ur_desc, addr, data, ctrl=0xff1),
                           f'STG.E.64 desc[UR{ur_desc}][R{addr}.64], R{data}')]
     else:
         data = ra.r32(src_op.name)
-        return [SassInstr(encode_stg_e(ur_desc, addr, data, width=32, ctrl=0xff1),
+        return prefix + [SassInstr(encode_stg_e(ur_desc, addr, data, width=32, ctrl=0xff1),
                           f'STG.E desc[UR{ur_desc}][R{addr}.64], R{data}')]
 
 

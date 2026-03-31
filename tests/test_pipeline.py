@@ -1218,7 +1218,9 @@ def test_atom_cas_b32_compiles():
     assert 0x3a9 in opcodes, f"ATOMG.CAS (0x3a9) not found; opcodes={[hex(o) for o in set(opcodes)]}"
     last_real = max(i for i, op in enumerate(opcodes) if op != 0x918)
     sched_nops = opcodes[:last_real].count(0x918)
-    assert sched_nops == 0, f"Scheduling NOPs ({sched_nops}) in atom.cas kernel (trailing padding is OK)"
+    # Allow scheduling NOPs for IADD.64 UR->GPR materialization latency
+    # (atom.cas and st.global each need UR->GPR conversion = 2 IADD.64 + 2 NOPs)
+    assert sched_nops <= 2, f"Scheduling NOPs ({sched_nops}) in atom.cas kernel (trailing padding is OK)"
 
 
 SELP_IMM_KERNEL = """\

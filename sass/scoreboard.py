@@ -58,7 +58,7 @@ _OPCODE_META: dict[int, _OpMeta] = {
     0x223: _OpMeta('FFMA',       1, 0x3e, 1),
     0x820: _OpMeta('FMUL.IMM',   1, 0x3e, 1),  # FMUL with 32-bit float immediate
     0x823: _OpMeta('FFMA.IMM',   1, 0x3e, 1),  # FFMA with 32-bit float immediate
-    0x80a: _OpMeta('FSEL.STEP',  1, 0x3e, 1),  # Combined float compare+select (step function)
+    0x80a: _OpMeta('FSEL.STEP',  1, 0x3e, 5),  # Combined float compare+select (misc=5, ptxas-verified)
     0x235: _OpMeta('IADD.64',    1, 0x3e, 1),
     0xc35: _OpMeta('IADD.64-UR', 1, 0x3e, 5),  # misc=5 per hardware bisect 2026-03-25
     0x202: _OpMeta('MOV',        0, 0x3e, 1),
@@ -325,6 +325,7 @@ _OPCODE_MISC: dict[int, int] = {
     0xc35: 5,   # IADD.64-UR: misc=5 (wide ALU result)
     0xc0c: 0,   # ISETP R-UR: misc=0 (SM_120: misc 1-12 → wrong predicate)
     0x20c: 0,   # ISETP R-R: misc=0 (same SM_120 predicate correctness requirement)
+    0x80a: 5,   # FSEL.step: misc=5 (ptxas-verified, combined float compare+select)
     0x986: 1,   # STG.E: misc=1 (from ptxas ground truth)
     0x988: 4,   # STS.E: misc=4
 }

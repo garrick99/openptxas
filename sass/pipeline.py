@@ -243,6 +243,10 @@ def _if_convert(fn: Function) -> None:
             result.append(new_inst)
         return result
 
+    def _has_inner_predicates(inst_list):
+        """Check if any instruction already has a predicate (from inner if-conversion)."""
+        return any(inst.pred for inst in inst_list)
+
     changed = True
     while changed:
         changed = False
@@ -286,6 +290,9 @@ def _if_convert(fn: Function) -> None:
                             neg_bra = cond.neg
                             then_instrs = instrs[bra_idx + 1 : -1]
                             else_instrs = list(bb_else.instructions)
+                            # Skip if body already has inner predicates (nested if-conversion)
+                            if _has_inner_predicates(then_instrs) or _has_inner_predicates(else_instrs):
+                                continue
                             guarded_then = _guard(then_instrs, pred_name, not neg_bra)
                             guarded_else = _guard(else_instrs, pred_name, neg_bra)
                             bb.instructions = instrs[:bra_idx] + guarded_then + guarded_else
@@ -325,12 +332,75 @@ def _if_convert(fn: Function) -> None:
                 neg_bra = last.neg
                 then_instrs = bb_then.instructions[:-1]
                 else_instrs = list(bb_else.instructions)
+                # Skip if body already has inner predicates (nested if-conversion)
+                if _has_inner_predicates(then_instrs) or _has_inner_predicates(else_instrs):
+                    continue
                 guarded_then = _guard(then_instrs, pred_name, not neg_bra)
                 guarded_else = _guard(else_instrs, pred_name, neg_bra)
                 bb.instructions = bb.instructions[:-1] + guarded_then + guarded_else
                 fn.blocks = [b for b in blocks if b is not bb_then and b is not bb_else]
                 changed = True
                 break
+
+            if changed:
+                break
+
+            # --- Pattern C: two-way branch where both targets jump to same merge ---
+            # Block ends with: @Px BRA label_true ; BRA label_false
+            # true_block:  instrs... ; BRA label_merge
+            # false_block: instrs... ; BRA label_merge  (or falls through to merge)
+            # Converts to: instrs_before ; @Px true_instrs ; @!Px false_instrs
+            if (len(instrs) >= 2
+                    and last.op == 'bra' and not last.pred
+                    and instrs[-2].op == 'bra' and instrs[-2].pred):
+                cond_bra = instrs[-2]
+                label_true = _bra_target(cond_bra)
+                label_false = _bra_target(last)
+                if label_true is not None and label_false is not None:
+                    bb_true = next((b for b in blocks if b.label == label_true), None)
+                    bb_false = next((b for b in blocks if b.label == label_false), None)
+                    if bb_true is not None and bb_false is not None:
+                        # Both blocks must end with BRA to the same merge label
+                        if (bb_true.instructions and bb_false.instructions
+                                and bb_true.instructions[-1].op == 'bra'
+                                and not bb_true.instructions[-1].pred):
+                            label_merge_t = _bra_target(bb_true.instructions[-1])
+                            # False block can end with BRA merge or fall through
+                            if (bb_false.instructions[-1].op == 'bra'
+                                    and not bb_false.instructions[-1].pred):
+                                label_merge_f = _bra_target(bb_false.instructions[-1])
+                                false_body = bb_false.instructions[:-1]
+                            else:
+                                # Fall-through: merge is the block after false
+                                idx_false = blocks.index(bb_false)
+                                if idx_false + 1 < len(blocks):
+                                    label_merge_f = blocks[idx_false + 1].label
+                                else:
+                                    label_merge_f = None
+                                false_body = list(bb_false.instructions)
+                            if (label_merge_t is not None
+                                    and label_merge_t == label_merge_f):
+                                pred_name = cond_bra.pred
+                                neg_bra = cond_bra.neg
+                                true_body = bb_true.instructions[:-1]
+                                # Skip if body already has inner predicates
+                                if (_has_inner_predicates(true_body)
+                                        or _has_inner_predicates(false_body)):
+                                    continue
+                                guarded_true = _guard(true_body, pred_name, neg_bra)
+                                guarded_false = _guard(false_body, pred_name, not neg_bra)
+                                # Build a BRA to the merge block so control flow
+                                # continues correctly after the predicated body.
+                                merge_bra = Instruction(
+                                    op='bra', dest=None,
+                                    srcs=[LabelOp(name=label_merge_t)])
+                                bb.instructions = (instrs[:-2]
+                                                   + guarded_true + guarded_false
+                                                   + [merge_bra])
+                                fn.blocks = [b for b in blocks
+                                             if b is not bb_true and b is not bb_false]
+                                changed = True
+                                break
 
 
 def compile_function(fn: Function, verbose: bool = False,

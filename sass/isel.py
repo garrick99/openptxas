@@ -2423,30 +2423,33 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                 # Emit NOP with error comment rather than crashing
                 output.append(_nop(f'ISEL ERROR: {e}  [{instr.op}]'))
 
-            # Release scratch GPRs allocated during this instruction.
-            # This reclaims temporaries used by div/rem/mul.hi sequences so
-            # subsequent instructions can reuse the same physical registers.
-            _release_scratch(ctx)
+            finally:
+                # Release scratch GPRs allocated during this instruction.
+                # This reclaims temporaries used by div/rem/mul.hi sequences so
+                # subsequent instructions can reuse the same physical registers.
+                _release_scratch(ctx)
 
-            # Apply predicate guard to all SASS instructions generated for
-            # this PTX instruction (except bra/ret which handle it themselves).
-            # LDCU (0x7ac) and S2UR (0x9c3) write to warp-uniform UR registers
-            # and MUST NOT be predicated with divergent thread predicates —
-            # the hardware ignores or mishandles divergent predicates on UR writes.
-            _UR_WRITE_OPCODES = frozenset({0x7ac, 0x9c3})
-            if instr.pred and op not in ('bra', 'ret'):
-                pd = ctx.ra.pred(instr.pred) if instr.pred in ctx.ra.pred_regs else 0
-                neg = instr.neg
-                if hasattr(ctx, '_negated_preds') and pd in ctx._negated_preds:
-                    neg = not neg
-                pred_str = f'@{"!" if neg else ""}P{pd} '
-                for si_idx in range(_pre_len, len(output)):
-                    old = output[si_idx]
-                    opcode = (old.raw[0] | (old.raw[1] << 8)) & 0xFFF
-                    if opcode in _UR_WRITE_OPCODES:
-                        continue  # UR-write instrs must be unconditional
-                    new_raw = patch_pred(old.raw, pred=pd, neg=neg)
-                    output[si_idx] = SassInstr(new_raw, pred_str + old.comment)
+                # Apply predicate guard to all SASS instructions generated for
+                # this PTX instruction (except bra/ret which handle it themselves).
+                # LDCU (0x7ac) and S2UR (0x9c3) write to warp-uniform UR registers
+                # and MUST NOT be predicated with divergent thread predicates —
+                # the hardware ignores or mishandles divergent predicates on UR writes.
+                # NOTE: This is in a finally block so that 'continue' statements
+                # inside the try block cannot skip predicate application.
+                _UR_WRITE_OPCODES = frozenset({0x7ac, 0x9c3})
+                if instr.pred and op not in ('bra', 'ret'):
+                    pd = ctx.ra.pred(instr.pred) if instr.pred in ctx.ra.pred_regs else 0
+                    neg = instr.neg
+                    if hasattr(ctx, '_negated_preds') and pd in ctx._negated_preds:
+                        neg = not neg
+                    pred_str = f'@{"!" if neg else ""}P{pd} '
+                    for si_idx in range(_pre_len, len(output)):
+                        old = output[si_idx]
+                        opcode = (old.raw[0] | (old.raw[1] << 8)) & 0xFFF
+                        if opcode in _UR_WRITE_OPCODES:
+                            continue  # UR-write instrs must be unconditional
+                        new_raw = patch_pred(old.raw, pred=pd, neg=neg)
+                        output[si_idx] = SassInstr(new_raw, pred_str + old.comment)
 
         # Tag the first instruction of this block with label marker for BRA fixup.
         # The scheduler may reorder instructions, so the pipeline needs to find

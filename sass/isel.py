@@ -1559,8 +1559,13 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                         encode_isetp(pd, ar, br, cmp=isetp_cmp),
                                         f'ISETP.{cmp_name.upper()}.U32.AND P{pd}, PT, R{ar}, R{br}, PT'))
                             elif isinstance(b, ImmOp):
-                                # Immediate src1: load via literal pool into UR,
-                                # then use ISETP R-UR (verified path on SM_120).
+                                # Immediate src1: load into UR via LDCU.32, then ISETP R-UR.
+                                # NOTE: ISETP R-R (0x20c) CLOBBERS ALL predicates on SM_120 —
+                                # it clears the entire predicate register file as a side effect.
+                                # Must use R-UR (0xc0c) path which only writes the target pred.
+                                # For literal immediates, we use the literal pool (LDCU.32 from
+                                # c[0]). This works when the value fits in the param area or when
+                                # the .nv.constant0 section is properly loaded by the driver.
                                 imm_val = b.value & 0xFFFFFFFF
                                 lit_off = ctx._alloc_literal(imm_val)
                                 emit_pd = pd

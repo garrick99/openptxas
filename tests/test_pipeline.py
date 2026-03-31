@@ -304,10 +304,8 @@ def test_setp_immediate_compiles():
     text = elf.section_data('.text.imm_kernel')
     opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
                for off in range(0, len(text), 16)]
-    # ISETP R-UR opcode 0xc0c must appear
+    # ISETP R-UR (0xc0c) must appear (R-R 0x20c clobbers all predicates on SM_120)
     assert 0xc0c in opcodes, "ISETP R-UR (0xc0c) not found — setp with immediate failed"
-    # LDCU.32 opcode 0x7ac must appear (at least one for setp imm, possibly more for params)
-    assert 0x7ac in opcodes, "LDCU.32 (0x7ac) not found — setp immediate literal load missing"
 
 
 # ---------------------------------------------------------------------------

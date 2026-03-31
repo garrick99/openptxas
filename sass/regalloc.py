@@ -111,7 +111,8 @@ def _find_ldg_coalesces(fn: Function) -> dict[str, str]:
     return coalesces
 
 
-def allocate(fn: Function, param_base: int = PARAM_BASE_SM120) -> AllocResult:
+def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
+             has_capmerc: bool = False) -> AllocResult:
     """
     Allocate physical registers for a PTX function.
 
@@ -202,10 +203,13 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120) -> AllocResult:
         active = new_active
 
         # Allocate: prefer reusing a free register, else allocate new.
-        # SM_120 HARDWARE LIMIT: Without proper merc 0x5a metadata, the GPU
-        # only reliably supports R0-R13 for all instruction types (LOP3 in
-        # particular fails with R14+). Cap allocation to avoid ERR715.
-        _MAX_GPR = 14  # Without per-instruction capmerc generation, R14+ is unreliable
+        # SM_120 HARDWARE LIMIT: Without correct per-instruction capmerc metadata,
+        # the GPU only reliably supports R0-R13. The driver validates capmerc against
+        # .text at load time, so ptxas-generated capmerc only works when our instruction
+        # schedule matches. Until we can generate our own capmerc, cap at R14.
+        # NOTE: The EIATTR 0x5a blob (52 bytes) is a universal ptxas 13.0 signature
+        # needed to authenticate capmerc. See memory/project_openptxas_sm120_rules.md.
+        _MAX_GPR = 14
         if is_64:
             if free_regs_64:
                 phys = free_regs_64.pop(0)

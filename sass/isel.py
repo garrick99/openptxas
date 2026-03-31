@@ -154,23 +154,21 @@ def _free_scratch(ctx: 'ISelContext', regs: list[int]):
     ctx._scratch_pool.extend(regs)
 
 
-_GPR_HARD_LIMIT = 14  # Without per-instruction capmerc generation, R14+ is unreliable
+_GPR_HARD_LIMIT_DEFAULT = 14  # Without capmerc, R14+ triggers ERR715
+_GPR_HARD_LIMIT_CAPMERC = 255  # With ptxas capmerc, full range available
 
 def _alloc_gpr(ctx: 'ISelContext') -> int:
-    """Allocate a single GPR, preferring the scratch pool.
-    Never returns >= _GPR_HARD_LIMIT to avoid ERR715."""
-    # Try scratch pool first, filtering out too-high registers
+    """Allocate a single GPR, preferring the scratch pool."""
+    limit = getattr(ctx, '_gpr_limit', _GPR_HARD_LIMIT_DEFAULT)
     while ctx._scratch_pool:
         r = ctx._scratch_pool.pop()
-        if r < _GPR_HARD_LIMIT:
+        if r < limit:
             return r
-    # Fresh allocation
-    if ctx._next_gpr < _GPR_HARD_LIMIT:
+    if ctx._next_gpr < limit:
         r = ctx._next_gpr
         ctx._next_gpr += 1
         ctx._scratch_highwater = max(ctx._scratch_highwater, ctx._next_gpr)
         return r
-    # Out of registers — this is a hard error but return R0 as emergency fallback
     return 0
 
 
@@ -450,7 +448,8 @@ def _select_add_u64(instr: Instruction, ra: RegAlloc,
         # the merc metadata declares per-instruction register allocation.
         # Without proper merc 0x5a attribute, R14+ triggers ERR715.
         # Reuse a scratch pair from the context's reusable pool.
-        if d_lo >= 14:
+        limit = getattr(ctx, '_gpr_limit', _GPR_HARD_LIMIT_DEFAULT)
+        if d_lo >= limit:
             if not hasattr(ctx, '_addr_scratch'):
                 ctx._addr_scratch = 10  # R10:R11 as default scratch
             d_lo = ctx._addr_scratch

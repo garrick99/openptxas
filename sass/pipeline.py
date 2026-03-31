@@ -349,7 +349,8 @@ def compile_function(fn: Function, verbose: bool = False,
     _sink_param_loads(fn)
 
     # 1. Register allocation
-    alloc = allocate(fn)
+    has_capmerc = ptxas_meta is not None and 'capmerc' in (ptxas_meta or {})
+    alloc = allocate(fn, has_capmerc=has_capmerc)
 
     if verbose:
         print(f"[pipeline] {fn.name}: {alloc.num_gprs} GPRs, "
@@ -392,6 +393,10 @@ def compile_function(fn: Function, verbose: bool = False,
         _next_gpr=alloc.num_gprs,
         _next_pred=alloc.num_pred,
     )
+    # NOTE: ptxas capmerc is instruction-schedule-specific. Until we can generate
+    # our own capmerc, keep the R14 cap. The injected capmerc may not match our
+    # instruction schedule, causing cuModuleLoadData to reject the cubin.
+    # ctx._gpr_limit = 255  # TODO: enable when capmerc generation works
     body_instrs = select_function(fn, ctx)
 
     # SM_120 requires at least one S2R before LDCU param loads.

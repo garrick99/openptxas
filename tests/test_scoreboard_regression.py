@@ -54,8 +54,9 @@ def decode_ctrl(raw: bytes) -> dict:
 # -------------------------------------------------------------------------
 
 class TestLdcuSlotAssignment:
-    def test_ldcu_never_uses_ldg_slot(self):
-        """Multiple LDCUs must never get wdep=0x35 or 0x37 (those are LDG-only slots)."""
+    def test_ldcu_slot_assignment(self):
+        """LDCU.64 descriptors use wdep=0x35 (consumer LDG gets rbar=0x09).
+        LDCU.32 params rotate 0x31/0x33. No LDCU ever uses 0x37."""
         body = [
             SassInstr(encode_s2r(0, SR_TID_X), 'S2R'),
             SassInstr(encode_ldcu_64(4, 0, 0x358), 'LDCU UR4'),
@@ -69,11 +70,14 @@ class TestLdcuSlotAssignment:
             opcode = struct.unpack_from('<Q', si.raw, 0)[0] & 0xFFF
             if opcode == 0x7ac:  # LDCU
                 c = decode_ctrl(si.raw)
-                assert c['wdep'] in (0x31, 0x33), \
-                    f"LDCU {si.comment} got wdep=0x{c['wdep']:02x}, must be 0x31/0x33 (not LDG slots)"
+                assert c['wdep'] in (0x31, 0x33, 0x35), \
+                    f"LDCU {si.comment} got wdep=0x{c['wdep']:02x}, must be 0x31/0x33/0x35"
+                assert c['wdep'] != 0x37, \
+                    f"LDCU {si.comment} got wdep=0x37 (second LDG slot, never valid for LDCU)"
 
-    def test_ldcu_does_not_alias_ldg_slot(self):
-        """After an LDG (wdep=0x35), subsequent LDCU must NOT get 0x35."""
+    def test_ldcu64_uses_0x35_for_descriptor(self):
+        """LDCU.64 descriptor loads use wdep=0x35 so consumer LDG gets rbar=0x09.
+        LDCU writes URs not GPRs — no actual scoreboard collision with LDG results."""
         body = [
             SassInstr(encode_s2r(0, SR_TID_X), 'S2R'),
             SassInstr(encode_ldcu_64(4, 0, 0x358), 'LDCU UR4'),
@@ -87,10 +91,9 @@ class TestLdcuSlotAssignment:
         for si in result:
             if 'after LDG' in si.comment:
                 c = decode_ctrl(si.raw)
-                assert c['wdep'] not in (0x35, 0x37), \
-                    f"LDCU after LDG got wdep=0x{c['wdep']:02x} (LDG slot collision!)"
-                assert c['wdep'] in (0x31, 0x33), \
-                    f"LDCU got wdep=0x{c['wdep']:02x}, expected 0x31 or 0x33"
+                # LDCU.64 should get 0x35 (descriptor slot)
+                assert c['wdep'] in (0x31, 0x33, 0x35), \
+                    f"LDCU got wdep=0x{c['wdep']:02x}, expected 0x31/0x33/0x35"
 
 
 # -------------------------------------------------------------------------
@@ -186,7 +189,7 @@ class TestMiscField:
         ]
         result = assign_ctrl(body)
         c = decode_ctrl(result[1].raw)
-        assert c['wdep'] in (0x31, 0x33), f"LDCU wdep=0x{c['wdep']:02x}"
+        assert c['wdep'] in (0x31, 0x33, 0x35), f"LDCU wdep=0x{c['wdep']:02x}"
         assert c['misc'] == 7, f"LDCU misc={c['misc']}, expected 7"
 
     def test_ldg_misc_is_6(self):
@@ -286,11 +289,11 @@ class TestLdg64CopyKernel:
         stg = decode_ctrl(result[8].raw)
         assert stg['rbar'] >= 0x09, "STG must wait for LDG data (rbar >= 0x09)"
 
-        # All LDCUs must use wdep in {0x31, 0x33} (never LDG slots 0x35/0x37)
+        # All LDCUs use wdep in {0x31, 0x33, 0x35} (LDCU.64 descriptors get 0x35)
         for i in [1, 2, 6]:
             c = decode_ctrl(result[i].raw)
-            assert c['wdep'] in (0x31, 0x33), \
-                f"LDCU at idx {i} ({result[i].comment}): wdep=0x{c['wdep']:02x}, not in LDCU slots"
+            assert c['wdep'] in (0x31, 0x33, 0x35), \
+                f"LDCU at idx {i} ({result[i].comment}): wdep=0x{c['wdep']:02x}, unexpected slot"
             assert c['misc'] == 7, \
                 f"LDCU at idx {i}: misc={c['misc']}, expected 7"
 

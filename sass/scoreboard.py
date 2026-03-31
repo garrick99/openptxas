@@ -20,11 +20,12 @@ Scoreboard slots (from ptxas RE):
   0x3e = ALU result slot (SHF, IADD, FADD, etc.)
   0x3f = no write tracking (EXIT, BRA, STG, BAR)
 
-Read barrier encoding:
-  0x01 = no wait (default)
-  0x03 = wait for LDG/STG slot
-  0x05 = wait for 2nd LDG slot
-  0x09 = wait for LDG data (first consumer after LDG)
+Read barrier encoding (BITMASK — combine with OR, not max):
+  bit 0 (0x01) = always set (base)
+  bit 1 (0x02) = wait for LDC/LDCU scoreboard slot
+  bit 2 (0x04) = wait for LDS scoreboard slot
+  bit 3 (0x08) = wait for LDG scoreboard slot
+  Common values: 0x01=no wait, 0x03=LDC, 0x05=LDS, 0x09=LDG, 0x0B=LDC+LDG
 """
 
 from __future__ import annotations
@@ -227,8 +228,10 @@ def _get_dest_regs(raw: bytes) -> set[int]:
                 regs.add(dest+1)
             elif b9 in (0x1d, 0x9d):  # LDG.E.128
                 regs |= {dest+1, dest+2, dest+3}
+            elif b9 in (0x19, 0x99):  # LDG.E.32 (single register)
+                pass  # already added dest
             else:
-                regs.add(dest+1)  # default to 64-bit
+                regs.add(dest+1)  # unknown width — assume 64-bit
     elif opcode in _OPCODES_ATOMG:
         # ATOMG.CAS: writes single dest (b2) — the old value read from memory
         if dest < 255: regs.add(dest)
@@ -265,9 +268,11 @@ _ldc_slot_counter = [0]   # mutable counter for rotating LDC wdep slots
 
 def _wdep_for_opcode(opcode: int, raw: bytes = None) -> int:
     """Assign the scoreboard write-dependency slot for an opcode."""
-    if opcode == 0x7ac:  # LDCU: use 0x35 for .64 (descriptor), rotate 0x31/0x33 for .32
+    if opcode == 0x7ac:  # LDCU
         if raw is not None and raw[9] == 0x0a:  # LDCU.64 (descriptor load)
-            return 0x35  # LDG slot — so consumer LDG gets rbar=0x09
+            # Use 0x35 so LDG consumers get rbar=0x09 to wait for descriptor.
+            # LDCU writes URs (not GPRs), so no actual scoreboard collision with LDG results.
+            return 0x35
         slots = [0x31, 0x33]
         slot = slots[_ldcu_slot_counter[0] % len(slots)]
         _ldcu_slot_counter[0] += 1
@@ -295,7 +300,7 @@ _OPCODE_MISC: dict[int, int] = {
     0x947: 0,   # BRA: misc=0
     # EXIT misc: 5 for unconditional, 0 for predicated (SM_120 hardware rule)
     # 0x94d: handled per-instance below
-    # LDG misc: handled per-instance below (first=4, second=1)
+    # LDG misc: 6 (hardware-verified SM_120)
     0x3a9: 4,   # ATOMG.CAS: misc=4 (from RTX 5090 probe 2026-03-27)
     0xe29: 2,   # DADD: misc=2 (from RTX 5090 probe 2026-03-27)
     0xc28: 2,   # DMUL: misc=2
@@ -379,7 +384,7 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
                 # For LDG consumers: first consumer gets 0x09, subsequent get 0x03
                 if pending_wdep == 0x35:
                     candidate_rbar = 0x09
-                rbar = max(rbar, candidate_rbar)
+                rbar = rbar | candidate_rbar
 
         # STS needs rbar=0x09 if writing data that came from LDG
         if opcode in _OPCODES_STS:
@@ -404,7 +409,7 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
 
         # ATOMG needs rbar=0x03 (memory ordering, same as STG)
         if opcode in _OPCODES_ATOMG:
-            rbar = max(rbar, 0x03)
+            rbar = rbar | 0x03
 
         # LDCU consumers: any instruction using UR operands needs rbar for LDCU
         # Check byte 4 for UR source in R-UR instructions
@@ -413,7 +418,7 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
             if ur_src in pending_ur_writes:
                 _, pw = pending_ur_writes[ur_src]
                 if pw in _WDEP_TO_RBAR:
-                    rbar = max(rbar, _WDEP_TO_RBAR[pw])
+                    rbar = rbar | _WDEP_TO_RBAR[pw]
         # LDG/STG use descriptor from UR (LDG: b4=UR, STG: b8=UR)
         # NOTE: UR4 descriptor is loaded via LDCU in the preamble with
         # hardcoded ctrl. Body LDCUs (for pointer params) also track in
@@ -424,7 +429,7 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
             if ur_desc in pending_ur_writes:
                 _, pw = pending_ur_writes[ur_desc]
                 if pw in _WDEP_TO_RBAR:
-                    rbar = max(rbar, _WDEP_TO_RBAR[pw])
+                    rbar = rbar | _WDEP_TO_RBAR[pw]
         # STG UR descriptor: ptxas uses rbar=1 for STG, relying on instruction
         # scheduling to ensure the descriptor is available. Don't override rbar
         # for the UR descriptor — it's guaranteed ready by the time STG executes.
@@ -437,7 +442,7 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
             if guard in pending_pred_writes:
                 _, pw = pending_pred_writes[guard]
                 candidate = _WDEP_TO_RBAR.get(pw, 0x01)
-                rbar = max(rbar, candidate)
+                rbar = rbar | candidate
 
         # BAR.SYNC and EXIT get special ctrl
         if opcode in _OPCODES_BAR:
@@ -477,8 +482,8 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
             misc = 0 if guard != 0x7 else 5  # predicated=0, unconditional=5
         elif opcode == 0x7ac and si.raw[9] == 0x0a:
             misc = 7   # LDCU.64: misc=7 (CRITICAL: misc=1 → ILLEGAL_ADDRESS)
-        elif opcode == 0x981:  # LDG: first=4, second=1
-            misc = 4 if ldg_count <= 1 else 1
+        elif opcode == 0x981:  # LDG: misc=6 (hardware-verified SM_120)
+            misc = 6
         elif opcode in _OPCODE_MISC:
             misc = _OPCODE_MISC[opcode]
         else:

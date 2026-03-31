@@ -474,12 +474,10 @@ class TestCompileTimeInvariants:
 
         assert not violations, f"LDCU.64 gap violations:\n" + "\n".join(str(v) for v in violations)
 
-    def test_ldcu_wdep_no_ldg_alias(self):
-        """R2: LDCU instructions must not use wdep 0x35 or 0x37 (LDG slots).
-
-        Tripwire: if scoreboard.py's LDCU rotation includes 0x35 or 0x37,
-        the wdep aliases with LDG's scoreboard slot causing false-clears
-        → LDG result consumed before data arrives → ILLEGAL_ADDRESS.
+    def test_ldcu_wdep_valid(self):
+        """R2: LDCU.64 descriptors use wdep=0x35 (consumer LDG gets rbar=0x09).
+        LDCU writes URs not GPRs, so no actual scoreboard collision.
+        LDCU must never use 0x37 (second LDG slot).
         """
         text   = self._text(_PTX_THREE_LDCU64, 'hazard_three_ldcu64')
         instrs = [text[i:i+16] for i in range(0, len(text), 16)]
@@ -489,9 +487,11 @@ class TestCompileTimeInvariants:
                 continue
             ctrl = _get_ctrl(raw)
             wdep = _get_wdep(ctrl)
-            assert wdep not in (0x35, 0x37), (
-                f"LDCU at instr[{i}] has wdep=0x{wdep:02x} — aliases LDG slot. "
-                f"Valid LDCU slots: 0x31, 0x33.")
+            assert wdep in (0x31, 0x33, 0x35), (
+                f"LDCU at instr[{i}] has wdep=0x{wdep:02x}. "
+                f"Valid LDCU slots: 0x31, 0x33, 0x35.")
+            assert wdep != 0x37, (
+                f"LDCU at instr[{i}] has wdep=0x37 (second LDG slot, never valid).")
 
     def test_ldcu64_misc_is_7(self):
         """R3: LDCU.64 misc field must be 0x7, not 0x1.

@@ -158,8 +158,7 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120) -> AllocResult:
     # Predicate allocation (simple sequential)
     for rd in fn.reg_decls:
         if rd.type.kind == ScalarKind.PRED:
-            for i in range(rd.count):
-                name = f"%{rd.name}{i}"
+            for name in rd.names:
                 if name in used_regs:
                     pred_regs[name] = next_pred
                     next_pred += 1
@@ -171,8 +170,7 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120) -> AllocResult:
         if rd.type.kind == ScalarKind.PRED:
             continue
         is_64 = rd.type.width >= 64
-        for i in range(rd.count):
-            name = f"%{rd.name}{i}"
+        for name in rd.names:
             if name not in used_regs:
                 continue
             first = reg_first_def.get(name, 0)

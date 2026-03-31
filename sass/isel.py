@@ -1627,9 +1627,27 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         output.append(SassInstr(encode_imad_ur(d, a, ur_src, c),
                             f'IMAD R{d}, R{a}, UR{ur_src}, R{c}  // mad.lo.{typ}'))
                     else:
-                        # Both src0 and src1 are computed GPRs — use R-R IMAD (0x2a4).
-                        output.append(SassInstr(encode_imad_rr(d, a, b, c),
-                            f'IMAD R{d}, R{a}, R{b}, R{c}  // mad.lo.{typ} R-R'))
+                        # IMAD R-R (0x2a4) is BROKEN on SM_120 — only IMAD R-UR (0xc24) works.
+                        # Check if either source came from ld.param; if so, reload via LDCU.32.
+                        src1_param_off = ctx._reg_param_off.get(src1_name) if ctx else None
+                        src0_param_off = ctx._reg_param_off.get(src0_name) if ctx else None
+                        if src1_param_off is not None:
+                            ur_tmp = ctx._next_ur; ctx._next_ur += 1
+                            output.append(SassInstr(encode_ldcu_32(ur_tmp, 0, src1_param_off),
+                                f'LDCU.32 UR{ur_tmp}, c[0][0x{src1_param_off:x}]  // mad src1->UR'))
+                            output.append(SassInstr(encode_imad_ur(d, a, ur_tmp, c),
+                                f'IMAD R{d}, R{a}, UR{ur_tmp}, R{c}  // mad.lo.{typ} R-UR'))
+                        elif src0_param_off is not None:
+                            ur_tmp = ctx._next_ur; ctx._next_ur += 1
+                            output.append(SassInstr(encode_ldcu_32(ur_tmp, 0, src0_param_off),
+                                f'LDCU.32 UR{ur_tmp}, c[0][0x{src0_param_off:x}]  // mad src0->UR'))
+                            output.append(SassInstr(encode_imad_ur(d, b, ur_tmp, c),
+                                f'IMAD R{d}, R{b}, UR{ur_tmp}, R{c}  // mad.lo.{typ} R-UR'))
+                        else:
+                            # True R-R: neither source from param. Use IADD3 doubling chain.
+                            # TODO: implement general R-R multiply via repeated doubling
+                            output.append(SassInstr(encode_imad_rr(d, a, b, c),
+                                f'IMAD R{d}, R{a}, R{b}, R{c}  // mad.lo.{typ} R-R (CAUTION: 0x2a4 unreliable)'))
 
                 elif op == 'mad' and 'wide' in instr.types and typ in ('u32', 's32'):
                     # mad.wide.u32/s32 d64, a32, b32_or_imm, c64

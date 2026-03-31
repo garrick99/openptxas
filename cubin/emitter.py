@@ -163,8 +163,11 @@ def _build_nv_info_kernel(num_gprs: int = 8, num_params: int = 2,
     # EIATTR_PARAM_CBANK (0x50)
     buf.extend(bytes([0x03, 0x50, 0x00, 0x00]))
 
-    # EIATTR_CBANK_PARAM_SIZE (0x1b): 0xFF (wildcard, matches ptxas behavior)
-    buf.extend(bytes([0x03, 0x1b, 0xFF, 0x00]))
+    # EIATTR_CBANK_PARAM_SIZE (0x1b): actual total parameter bytes.
+    # Must NOT exceed the real param area — driver zeros this many bytes at
+    # param_base, clobbering any literal pool values placed after params.
+    total_param_bytes = sum(param_sizes) if param_sizes else 0
+    buf.extend(bytes([0x03, 0x1b, total_param_bytes & 0xFF, 0x00]))
 
     # EIATTR_EXIT_INSTR_OFFSETS (0x1c): list of EXIT byte offsets in .text
     # Format 0x04: 4-byte header (fmt, tag, size_lo, size_hi) + N*4 bytes payload
@@ -240,7 +243,8 @@ def _build_merc_nv_info_kernel(num_gprs: int = 8, num_params: int = 2,
     # EIATTR_PARAM_CBANK (0x50)
     buf.extend(bytes([0x03, 0x50, 0x00, 0x00]))
     # EIATTR_CBANK_PARAM_SIZE (0x1b)
-    buf.extend(bytes([0x03, 0x1b, 0xFF, 0x00]))
+    total_param_bytes = sum(param_sizes) if param_sizes else 0
+    buf.extend(bytes([0x03, 0x1b, total_param_bytes & 0xFF, 0x00]))
     # EIATTR_0x5f: version/flag (always 0x0101 in ptxas cubins)
     buf.extend(bytes([0x03, 0x5f, 0x01, 0x01]))
     # EIATTR_CTAID_DIMS (0x4a)

@@ -217,14 +217,17 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
                 if next_gpr % 2 != 0:
                     next_gpr += 1
                 if next_gpr + 1 >= _MAX_GPR:
-                    # Spill: evict the earliest-ending 64-bit active register
-                    candidates = [(a, i) for i, (a, ar, al, a64) in enumerate(active) if a64]
-                    if candidates:
-                        _, idx = min(candidates, key=lambda x: active[x[1]][2])
+                    # Only evict intervals that DON'T overlap the new one.
+                    # Evicting a still-live register causes silent miscompilation.
+                    safe = [(a, i) for i, (a, ar, al, a64) in enumerate(active)
+                            if a64 and al < first_def]
+                    if safe:
+                        _, idx = min(safe, key=lambda x: active[x[1]][2])
                         evicted = active.pop(idx)
                         phys = evicted[1]
                     else:
-                        phys = next_gpr  # fallback: exceed limit
+                        # No safe eviction — exceed limit (correct code > ERR715 risk)
+                        phys = next_gpr
                         next_gpr += 2
                 else:
                     phys = next_gpr
@@ -235,13 +238,13 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
             if free_regs_32:
                 phys = free_regs_32.pop(0)
             elif next_gpr >= _MAX_GPR:
-                # Spill: evict the earliest-ending 32-bit active register
-                candidates = [(a, i) for i, (a, ar, al, a64) in enumerate(active) if not a64]
-                if candidates:
-                    _, idx = min(candidates, key=lambda x: active[x[1]][2])
+                # Only evict non-overlapping intervals
+                safe = [(a, i) for i, (a, ar, al, a64) in enumerate(active)
+                        if not a64 and al < first_def]
+                if safe:
+                    _, idx = min(safe, key=lambda x: active[x[1]][2])
                     evicted = active.pop(idx)
                     phys = evicted[1]
-                    free_regs_32 = []  # cleared since we just used the slot
                 else:
                     phys = next_gpr
                     next_gpr += 1

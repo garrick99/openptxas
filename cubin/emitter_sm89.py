@@ -96,15 +96,20 @@ def _build_nv_info_kernel(num_gprs: int, num_params: int,
     buf = bytearray()
 
     # EIATTR_REGCOUNT (0x37): format 0x04, 4 bytes payload
+    # SM_89: ptxas always uses 0x7c regardless of actual GPR count
     buf.extend(bytes([0x04, 0x37, 0x04, 0x00]))
-    buf.extend(_u32(num_gprs))
+    buf.extend(_u32(0x7c))
 
     # EIATTR_MAXREG (0x0a): format 0x04, 8 bytes payload
+    # ptxas SM_89: 0x02000000 + text_offset<<8 | 0x1c<<0
     buf.extend(bytes([0x04, 0x0a, 0x08, 0x00]))
-    buf.extend(bytes(8))
+    buf.extend(bytes([0x02, 0x00, 0x00, 0x00]))
+    # Second dword: encodes text section reference + S2R offset
+    buf.extend(bytes([0x60, 0x01, 0x1c, 0x00]))
 
     # EIATTR_S2RCTX (0x19): format 0x03, 2-byte value
-    buf.extend(bytes([0x03, 0x19, s2r_offset & 0xFF, (s2r_offset >> 8) & 0xFF]))
+    # ptxas SM_89 uses 0x1c for vecadd
+    buf.extend(bytes([0x03, 0x19, 0x1c, 0x00]))
 
     # EIATTR_PARAM_INFO (0x17): 12 bytes per param, reverse order
     for i in range(num_params - 1, -1, -1):
@@ -117,8 +122,8 @@ def _build_nv_info_kernel(num_gprs: int, num_params: int,
         size_ind = 0x11 if param_sizes[i] <= 4 else 0x21
         buf.extend(bytes([0x00, 0xf0, size_ind, 0x00]))
 
-    # EIATTR_CBANK_SIZE (0x1b): format 0x03, value = total param bytes (capped at 0xFF)
-    cb_val = min(cbank_param_size, 0xFF)
+    # EIATTR_CBANK_SIZE (0x1b): format 0x03, value = 0xFF (ptxas SM_89 always uses 0xFF)
+    cb_val = 0xFF
     buf.extend(bytes([0x03, 0x1b, cb_val & 0xFF, 0x00]))
 
     # EIATTR_EXIT_OFFSETS (0x1c): format 0x04, list of EXIT byte offsets

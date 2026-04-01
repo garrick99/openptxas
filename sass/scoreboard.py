@@ -52,6 +52,15 @@ _OPCODE_META: dict[int, _OpMeta] = {
     0x825: _OpMeta('IMAD.WIDE',  1, 0x3e, 1),   # IMAD.WIDE R-imm (64-bit result)
     0x225: _OpMeta('IMAD.WIDE.RR', 1, 0x3e, 1),  # IMAD.WIDE R-R
     0x819: _OpMeta('SHF',        1, 0x3e, 1),
+    0xa19: _OpMeta('SHF.89',     1, 0x3e, 1),  # SM_89 SHF
+    0xa10: _OpMeta('IADD3.89',   1, 0x3e, 1),  # SM_89 IADD3 cbuf
+    0xa24: _OpMeta('IMAD.89',    1, 0x3e, 1),  # SM_89 IMAD cbuf
+    0x624: _OpMeta('IMAD.MOV',   0, 0x3f, 1),  # SM_89 param load (like LDC)
+    0xa02: _OpMeta('MOV.cb',     0, 0x3e, 1),  # SM_89 MOV from cbuf
+    0xab9: _OpMeta('ULDC.64',    0, 0x31, 7),  # SM_89 uniform const load
+    0xa0c: _OpMeta('ISETP.89',   0, 0x3e, 0),  # SM_89 ISETP cbuf
+    0x807: _OpMeta('SEL.89',     0, 0x3e, 1),  # SM_89 SEL immediate
+    0xa12: _OpMeta('LOP3.89',    1, 0x3e, 1),  # SM_89 LOP3.LUT cbuf
     0x299: _OpMeta('SHF.VAR',   1, 0x3e, 1),   # variable-shift SHF (opcode 0x7299)
     0x219: _OpMeta('SHF.R.S32.HI.VAR', 1, 0x3e, 1),  # SHF.R.S32.HI variable-shift (shr.s32)
     0x221: _OpMeta('FADD',       1, 0x3e, 1),
@@ -75,10 +84,11 @@ _OPCODE_META: dict[int, _OpMeta] = {
 }
 
 
-# Opcode classification
+# Opcode classification (includes both SM_120 and SM_89 variants)
 _OPCODES_LDG = {0x981}
-_OPCODES_ATOMG = {0x3a9}  # ATOMG.CAS (and future ATOMG variants with opcode 0x3a9)
-_OPCODES_LDC = {0xb82, 0x7ac, 0x919, 0x9c3}  # LDC, LDCU, S2R, S2UR
+_OPCODES_ATOMG = {0x3a9}
+_OPCODES_LDC = {0xb82, 0x7ac, 0x919, 0x9c3,  # SM_120: LDC, LDCU, S2R, S2UR
+                0x624, 0xab9, 0xa02}           # SM_89: IMAD.MOV.U32(cbuf), ULDC.64, MOV(cbuf)
 _OPCODES_LDS = {0x984}
 _OPCODES_STG = {0x986}
 _OPCODES_STS = {0x988}
@@ -86,11 +96,14 @@ _OPCODES_BAR = {0xb1d}
 _OPCODES_DFPU = {0xe29, 0xc28, 0xc2b}  # DADD, DMUL, DFMA (double-precision, wdep=0x33)
 _OPCODES_CTRL = {0x94d, 0x947, 0x918}  # EXIT, BRA, NOP
 _OPCODES_ALU = {
-    # Integer arithmetic
-    0x210,        # IADD3
+    # Integer arithmetic (SM_120 + SM_89)
+    0x210,        # IADD3 (SM_120 R-R / SM_89 R-R)
+    0xa10,        # IADD3 (SM_89 cbuf form)
     0x235,        # IADD.64
     0x202,        # IADD3.X (with carry)
     0x224, 0x2a4, 0xc24,  # IMAD R-R (old), IMAD R-R (validated), IMAD R-UR
+    0xa24,                # IMAD (SM_89 cbuf/UR form)
+    0x624,                # IMAD.MOV.U32 (SM_89 param load from cbuf)
     0x824, 0x825, 0x225, # IMAD.SHL.U32, IMAD.WIDE (imm), IMAD.WIDE (R-R)
     0x227,        # IMAD.HI.U32
     0x213,        # IABS
@@ -109,12 +122,16 @@ _OPCODES_ALU = {
     0x245,        # I2FP.F32.U32
     0x305,        # F2I.U32
     # Logic
-    0x212,        # LOP3.LUT
-    0x819,        # SHF (all variants: L/R, U32/U64/S32, HI/LO/W, constant shift)
+    0x212,        # LOP3.LUT (SM_120)
+    0xa12,        # LOP3.LUT (SM_89 cbuf form)
+    0x819,        # SHF (SM_120, all variants)
+    0xa19,        # SHF (SM_89)
     0x299,        # SHF.VAR (variable-shift SHF, shift amount in register)
     0x219,        # SHF.R.S32.HI.VAR (arithmetic right shift, variable amount)
     # Select / predicate
-    0x207,        # SEL
+    0x207,        # SEL (SM_120)
+    0x807,        # SEL (SM_89, imm form)
+    0xa0c,        # ISETP (SM_89 cbuf form)
     0x208,        # FSEL
     0x20b,        # FSETP
     0x20c,        # ISETP R-R
@@ -142,6 +159,12 @@ _OPCODES_ALU = {
 # The 1-cycle stall ensures the result is ready for the subsequent LDG/STG.
 _OPCODES_IADD64_UR = {0xc35}
 _OPCODES_SMEM_SETUP = {0x9c3, 0x882, 0x291}  # S2UR, UMOV, ULEA
+
+# SM_89-specific opcodes that map to SM_120 equivalents in ALU set
+# ISETP (SM_89 cbuf): 0xa0c — already handled if in _OPCODES_ALU
+# SHF (SM_89): 0xa19
+# SEL (SM_89): 0x807
+# MOV cbuf (SM_89): 0xa02 — already in _OPCODES_LDC
 
 
 def _get_opcode(raw: bytes) -> int:

@@ -108,6 +108,7 @@ def encode_stg_e(addr: int, data: int, width: int = 32, ctrl: int = 0) -> bytes:
     b9_map = {32: 0x19, 64: 0x1b}
     return _build(0x86, 0x79,
                   b2=0x00, b3=addr, b4=data,
+                  b8=0x04,  # addressing mode (SM_89, from ptxas ground truth)
                   b9=b9_map.get(width, 0x19), b10=0x10, b11=0x0c,
                   ctrl=ctrl or 0x000fe2)
 
@@ -131,7 +132,7 @@ def encode_imad_mov_u32_cbuf(dest: int, bank: int, offset_bytes: int,
     dword_off = (offset_bytes >> 2) & 0x3FFF
     return _build(0x24, 0x76,
                   b2=dest, b3=RZ,
-                  b4=dword_off & 0xFF, b5=(dword_off >> 8) & 0xFF,
+                  b4=(dword_off >> 8) & 0xFF, b5=dword_off & 0xFF,
                   b6=(bank & 0xF) << 4,
                   b8=RZ, b9=0x00, b10=0x8e, b11=0x07,
                   ctrl=ctrl or _CTRL_DEFAULT)
@@ -146,7 +147,7 @@ def encode_mov_cbuf(dest: int, bank: int, offset_bytes: int,
     dword_off = (offset_bytes >> 2) & 0x3FFF
     return _build(0x02, 0x7a,
                   b2=dest,
-                  b4=dword_off & 0xFF, b5=(dword_off >> 8) & 0xFF,
+                  b4=(dword_off >> 8) & 0xFF, b5=dword_off & 0xFF,
                   b9=0x0f,
                   ctrl=ctrl or _CTRL_DEFAULT)
 
@@ -160,7 +161,7 @@ def encode_uldc_64(dest_ur: int, bank: int, offset_bytes: int,
     dword_off = (offset_bytes >> 2) & 0x3FFF
     return _build(0xb9, 0x7a,
                   b2=dest_ur,
-                  b4=dword_off & 0xFF, b5=(dword_off >> 8) & 0xFF,
+                  b4=(dword_off >> 8) & 0xFF, b5=dword_off & 0xFF,
                   b9=0x0a,
                   ctrl=ctrl or _CTRL_DEFAULT)
 
@@ -174,7 +175,7 @@ def encode_iadd3_cbuf(dest: int, src0: int, bank: int, offset_bytes: int,
     dword_off = (offset_bytes >> 2) & 0x3FFF
     return _build(0x10, 0x7a,
                   b2=dest, b3=src0,
-                  b4=dword_off & 0xFF, b5=(dword_off >> 8) & 0xFF,
+                  b4=(dword_off >> 8) & 0xFF, b5=dword_off & 0xFF,
                   b8=src2, b9=0xe0, b10=0xff, b11=0x07,
                   ctrl=ctrl or _CTRL_DEFAULT)
 
@@ -225,7 +226,7 @@ def encode_isetp_cbuf(pred_dest: int, src0: int, bank: int, offset_bytes: int,
     dword_off = (offset_bytes >> 2) & 0x3FFF
     return _build(0x0c, 0x7a,
                   b2=src0, b3=0x00,
-                  b4=dword_off & 0xFF, b5=(dword_off >> 8) & 0xFF,
+                  b4=(dword_off >> 8) & 0xFF, b5=dword_off & 0xFF,
                   b8=0xf0 | (pred_dest & 0x07),
                   b9=0x03, b10=0x00, b11=cmp,
                   ctrl=ctrl or _CTRL_DEFAULT)

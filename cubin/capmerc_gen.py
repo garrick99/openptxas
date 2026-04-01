@@ -134,14 +134,16 @@ def _build_type01_alu_basic(region_idx: int = 0) -> bytes:
     rec = bytearray(PROLOGUE_RECORD)  # start from prologue template
     # Modify for specific region
     if region_idx == 0:
-        # Second ALU record: byte[10]=0x81, byte[12]=0x01, byte[13]=0x02
-        rec[10] = 0x81
+        # Second ALU record: byte[10] encodes register liveness.
+        # 0x81 restricts to low register range; 0x01 allows full range.
+        # ptxas uses 0x01 for all register counts (verified across 8-24 GPR probes).
+        rec[10] = 0x01
         rec[11] = 0x00
         rec[12] = 0x01
         rec[13] = 0x02
     elif region_idx == 1:
-        # Third ALU record: byte[10]=0xc1, byte[12]=0x01, byte[13]=0x04
-        rec[10] = 0xc1
+        # Third ALU record: byte[10]=0x01 for full register range (was 0xc1)
+        rec[10] = 0x01
         rec[11] = 0x00
         rec[12] = 0x01
         rec[13] = 0x04
@@ -548,13 +550,13 @@ def build_capmerc(
 
 # SM_120 opcode categories
 _MEM_STORE_OPCODES = {0x385, 0x38d, 0x986}  # STG.E, STS, STG.E.64
-_MEM_LOAD_OPCODES = {0x381, 0x389, 0x30c}   # LDG.E, LDS, LDSM
+_MEM_LOAD_OPCODES = {0x981, 0x389, 0x30c}   # LDG.E (0x981, was 0x381), LDS, LDSM
 _BRANCH_OPCODES = {0x947, 0x94d}             # BRA, EXIT (predicated)
 _SHIFT_OPCODES = {0x819}                     # SHF
-_IMAD_OPCODES = {0x824, 0x825, 0xc11}        # IMAD, IMAD.WIDE, IMAD.W
-_ISETP_OPCODES = {0x86c, 0xc0c}              # ISETP, ISETP.GE
-_UR_OPCODES = {0x919, 0x7ac, 0xb82}          # S2UR, ULDC.64, LDCU.UR
-_FADD_OPCODES = {0x221, 0x220, 0x223}        # FADD, FMUL, FFMA
+_IMAD_OPCODES = {0x824, 0x825, 0xc24, 0xc11, 0x224, 0x225}  # IMAD variants (incl R-UR 0xc24)
+_ISETP_OPCODES = {0x86c, 0xc0c, 0x20c}      # ISETP variants (R-R 0x20c, R-UR 0xc0c)
+_UR_OPCODES = {0x9c3, 0x7ac, 0xb82}         # S2UR (0x9c3), ULDC.64, LDCU
+_FADD_OPCODES = {0x221, 0x220, 0x223}       # FADD, FMUL, FFMA
 _CONST_LOAD_OPCODES = {0x182, 0x189, 0x431, 0x7ac, 0xb82}  # LDCU variants
 
 

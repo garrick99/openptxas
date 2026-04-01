@@ -718,13 +718,26 @@ def compile_function(fn: Function, verbose: bool = False,
         ptxas_capmerc=None,
         ptxas_merc_info=None,
     )
-    cubin_bytes = emit_cubin(desc)
-
-    # Post-process: patch capmerc and merc.nv.info with ptxas metadata.
-    # This preserves our ELF structure while replacing only the data bytes
-    # within existing sections, which is proven to work for enabling R14+.
-    if ptxas_meta:
-        cubin_bytes = _patch_ptxas_metadata(cubin_bytes, ptxas_meta)
+    if sm_version == 89:
+        # SM_89: use simplified emitter (no capmerc/merc)
+        from cubin.emitter_sm89 import emit_cubin_sm89
+        cubin_bytes = emit_cubin_sm89(
+            kernel_name=desc.name,
+            sass_bytes=desc.sass_bytes,
+            num_gprs=desc.num_gprs,
+            num_params=desc.num_params,
+            param_sizes=desc.param_sizes,
+            param_offsets=desc.param_offsets,
+            const0_size=desc.const0_size,
+            const0_init_data=desc.const0_init_data,
+            exit_offsets=exit_offsets,
+        )
+    else:
+        # SM_120: full emitter with capmerc/merc
+        cubin_bytes = emit_cubin(desc)
+        # Post-process: patch capmerc and merc.nv.info with ptxas metadata.
+        if ptxas_meta:
+            cubin_bytes = _patch_ptxas_metadata(cubin_bytes, ptxas_meta)
 
     return cubin_bytes
 

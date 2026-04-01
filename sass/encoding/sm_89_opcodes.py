@@ -77,14 +77,26 @@ def encode_s2r(dest: int, sr_code: int, ctrl: int = 0) -> bytes:
     return _build(0x19, 0x79, b2=dest, b9=sr_code, ctrl=ctrl or _CTRL_DEFAULT)
 
 def encode_bra(offset: int, ctrl: int = 0) -> bytes:
-    """BRA with signed offset (PC-relative from next instruction)."""
-    signed_insns = offset // 16
-    offset18 = signed_insns & 0x3FFFF
+    """BRA with signed offset (PC-relative from next instruction).
+
+    SM_89 BRA encoding (from ptxas ground truth):
+    - bytes 0-1: opcode (0x47, 0x79)
+    - bytes 4-7: signed 32-bit byte offset (LE)
+    - bytes 8-11: flags (0xff, 0xff, 0x83, 0x03)
+    - bytes 13-15: ctrl
+
+    Ground truth: BRA self-loop (offset=-16) at 0x140:
+        47 79 00 00 f0 ff ff ff  ff ff 83 03  00 c0 0f 00
+    """
+    # Encode offset as signed 32-bit byte offset in bytes 4-7
+    off32 = offset & 0xFFFFFFFF
     return _build(0x47, 0x79,
-                  b8=offset18 & 0xFF,
-                  b9=(offset18 >> 8) & 0xFF,
-                  b10=0x80 | ((offset18 >> 16) & 0x03),
-                  b11=0x03,
+                  b4=off32 & 0xFF,
+                  b5=(off32 >> 8) & 0xFF,
+                  b6=(off32 >> 16) & 0xFF,
+                  b7=(off32 >> 24) & 0xFF,
+                  b8=0xFF, b9=0xFF,
+                  b10=0x83, b11=0x03,
                   ctrl=ctrl or _CTRL_NOP)
 
 def encode_ldg_e(dest: int, addr: int, width: int = 32, ctrl: int = 0) -> bytes:

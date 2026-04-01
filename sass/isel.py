@@ -240,15 +240,18 @@ _SPECIAL_REGS = {
     '%nctaid.x': SR_NCTAID_X, '%nctaid.y': SR_NCTAID_Y, '%nctaid.z': SR_NCTAID_Z,
 }
 
-# SM_120 constant bank offsets for system values (driver-populated)
-_CBANK_NTID_X = 0x360  # blockDim.x lives at c[0][0x360]
+# Constant bank offsets for system values (driver-populated)
+_CBANK_NTID_X = 0x360      # SM_120: blockDim.x at c[0][0x360]
+_CBANK_NTID_X_SM89 = 0x0   # SM_89:  blockDim.x at c[0][0x0]
 
 
-def _select_mov(instr: Instruction, ra: RegAlloc) -> list[SassInstr]:
+def _select_mov(instr: Instruction, ra: RegAlloc,
+                ctx: 'ISelContext' = None) -> list[SassInstr]:
     """mov.u32 or mov.u64 (register-register or special register read)."""
     typ = instr.types[0] if instr.types else 'u32'
     dest = instr.dest
     src = instr.srcs[0]
+    sm_ver = ctx.sm_version if ctx else 120
 
     if not isinstance(dest, RegOp):
         raise ISelError(f"MOV dest must be register: {dest!r}")
@@ -258,13 +261,20 @@ def _select_mov(instr: Instruction, ra: RegAlloc) -> list[SassInstr]:
         d = ra.r32(dest.name)
         sr = _SPECIAL_REGS[src.name]
 
-        # ntid.x: load from constant bank c[0][0x360] instead of S2R.
-        # The driver populates this offset with blockDim.x. This avoids
-        # the SR bus and gives us a constant-bank source that the mad.lo
-        # handler can use with LDCU.32 + IMAD R-UR.
+        # ntid.x: load from constant bank instead of S2R.
+        # The driver populates the cbank offset with blockDim.x.
         if src.name == '%ntid.x':
-            return [SassInstr(encode_ldc(d, 0, _CBANK_NTID_X),
-                              f'LDC R{d}, c[0][0x{_CBANK_NTID_X:x}]  // ntid.x')]
+            if sm_ver == 89:
+                # SM_89: ntid.x at c[0][0x0], load via IMAD.MOV.U32
+                from sass.encoding.sm_89_opcodes import encode_imad_mov_u32_cbuf
+                ntid_off = _CBANK_NTID_X_SM89
+                if ctx:
+                    ctx._reg_param_off[dest.name] = ntid_off
+                return [SassInstr(encode_imad_mov_u32_cbuf(d, 0, ntid_off),
+                                  f'IMAD.MOV.U32 R{d}, RZ, RZ, c[0][0x{ntid_off:x}]  // ntid.x')]
+            else:
+                return [SassInstr(encode_ldc(d, 0, _CBANK_NTID_X),
+                                  f'LDC R{d}, c[0][0x{_CBANK_NTID_X:x}]  // ntid.x')]
 
         return [SassInstr(encode_s2r(d, sr),
                           f'S2R R{d}, SR_{src.name}  // {dest.name} = {src.name}')]
@@ -423,7 +433,7 @@ def _select_sub_u64(instr: Instruction, ra: RegAlloc) -> list[SassInstr]:
 
 def _select_add_u64(instr: Instruction, ra: RegAlloc,
                     ctx: 'ISelContext' = None) -> list[SassInstr]:
-    """add.u64 dest, a, b → IADD.64 with UR source if one operand is in UR bank."""
+    """add.u64 dest, a, b → IADD.64 (SM_120) or IADD3+IADD3.X (SM_89)."""
     from sass.encoding.sm_120_opcodes import encode_iadd64_ur
     dest = instr.dest
     a    = instr.srcs[0]
@@ -431,6 +441,25 @@ def _select_add_u64(instr: Instruction, ra: RegAlloc,
     if not isinstance(dest, RegOp) or not isinstance(a, RegOp) or not isinstance(b, RegOp):
         raise ISelError(f"add.u64: all operands must be registers")
 
+    sm_ver = ctx.sm_version if ctx else 120
+
+    if sm_ver == 89:
+        # SM_89: no IADD.64 instruction. Use IADD3 + IADD3.X (carry pair).
+        # IADD3 d_lo, a_lo, b_lo, RZ (carry out via P0)
+        # IADD3.X d_hi, a_hi, b_hi, RZ (carry in from P0)
+        a_lo = ra.lo(a.name); a_hi = a_lo + 1
+        b_lo = ra.lo(b.name); b_hi = b_lo + 1
+        d_lo = ra.lo(dest.name); d_hi = d_lo + 1
+        if ctx:
+            ctx._gpr_written.add(dest.name)
+        return [
+            SassInstr(encode_iadd3(d_lo, a_lo, b_lo, RZ),
+                      f'IADD3 R{d_lo}, R{a_lo}, R{b_lo}, RZ  // add.u64 lo'),
+            SassInstr(encode_iadd3x(d_hi, a_hi, b_hi, RZ),
+                      f'IADD3.X R{d_hi}, R{a_hi}, R{b_hi}, RZ  // add.u64 hi'),
+        ]
+
+    # SM_120 path
     # Check if either operand is a UR param (loaded via LDCU)
     a_in_ur = ctx and a.name in ctx._ur_params
     b_in_ur = ctx and b.name in ctx._ur_params
@@ -477,10 +506,11 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
                      param_offsets: dict[str, int],
                      ctx: 'ISelContext' = None) -> list[SassInstr]:
     """
-    ld.param.u64 → LDCU.64 (into uniform register for descriptor-based addressing).
-    ld.param.u32 → LDC (into general register).
+    ld.param.u64 → LDCU.64 (SM_120) or 2x IMAD.MOV.U32 (SM_89).
+    ld.param.u32 → LDC (SM_120) or IMAD.MOV.U32 (SM_89).
 
     SM_120 descriptor-based memory model requires pointer params in UR bank.
+    SM_89 loads params directly into GPR (no LDCU/LDC instructions).
     """
     dest = instr.dest
     src  = instr.srcs[0]
@@ -497,7 +527,35 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
     else:
         byte_off = param_offsets.get(param_name, 0)
 
+    sm_ver = ctx.sm_version if ctx else 120
     typ = instr.types[-1] if instr.types else 'u32'
+
+    if sm_ver == 89:
+        # SM_89: load params into GPR via IMAD.MOV.U32 (no LDC/LDCU)
+        from sass.encoding.sm_89_opcodes import encode_imad_mov_u32_cbuf
+        if typ in ('u64', 's64', 'b64'):
+            # 64-bit: 2x IMAD.MOV.U32 into GPR pair (lo, hi)
+            d_lo = ra.lo(dest.name)
+            result = [
+                SassInstr(encode_imad_mov_u32_cbuf(d_lo, 0, byte_off),
+                          f'IMAD.MOV.U32 R{d_lo}, RZ, RZ, c[0][0x{byte_off:x}]  // {param_name} lo'),
+                SassInstr(encode_imad_mov_u32_cbuf(d_lo + 1, 0, byte_off + 4),
+                          f'IMAD.MOV.U32 R{d_lo+1}, RZ, RZ, c[0][0x{byte_off+4:x}]  // {param_name} hi'),
+            ]
+            if ctx:
+                ctx._gpr_written.add(dest.name)
+            return result
+        else:
+            # u32: single IMAD.MOV.U32 into GPR
+            if dest.name not in ra.int_regs:
+                return []  # dead parameter
+            d = ra.r32(dest.name)
+            if ctx:
+                ctx._reg_param_off[dest.name] = byte_off
+            return [SassInstr(encode_imad_mov_u32_cbuf(d, 0, byte_off),
+                              f'IMAD.MOV.U32 R{d}, RZ, RZ, c[0][0x{byte_off:x}]  // {param_name}')]
+
+    # SM_120 path (original)
     if typ in ('u64', 's64', 'b64'):
         # Load 64-bit param into UR via LDCU.64, materialize to GPR via IADD.64-UR.
         # Avoids LDC.64 single-slot scoreboard collision for 3+ pointer params.
@@ -715,6 +773,8 @@ class ISelContext:
     # Next available scratch predicate register (for isel-internal use, e.g. div.u32)
     # Initialized from alloc.num_pred by the pipeline; may grow during isel.
     _next_pred: int = 0
+    # Target SM version (89 = Ada Lovelace / RTX 4090, 120 = Blackwell / RTX 5090)
+    sm_version: int = 120
 
     def _alloc_literal(self, value: int) -> int:
         """Return the c[0] byte offset for a 32-bit literal constant.
@@ -785,23 +845,27 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         isinstance(instr.dest, RegOp)):
                         ctx._reg_sr_source[instr.dest.name] = _SPECIAL_REGS[instr.srcs[0].name]
                         # ntid.x loaded from constant bank — track as param-like source
-                        # so mad.lo can use LDCU.32 + IMAD R-UR
                         if instr.srcs[0].name == '%ntid.x':
-                            ctx._reg_param_off[instr.dest.name] = _CBANK_NTID_X
+                            ctx._reg_param_off[instr.dest.name] = (
+                                _CBANK_NTID_X_SM89 if ctx.sm_version == 89 else _CBANK_NTID_X)
                         elif instr.srcs[0].name in ('%ctaid.x', '%ctaid.y', '%ctaid.z'):
-                            # Put ctaid into a fresh UR via S2UR so mad.lo can use IMAD R-UR.
-                            # IMAD R-R (0x224) is not validated on SM_120; IMAD R-UR (0xc24)
-                            # is confirmed by ptxas. Must NOT use UR4 (reserved for mem
-                            # descriptor by pipeline.py) to avoid a WAR hazard where the
-                            # descriptor LDCU overwrites UR4 before IMAD finishes reading it.
-                            sr_code = _SPECIAL_REGS[instr.srcs[0].name]
-                            sr_label = instr.srcs[0].name.lstrip('%').replace('.', '_').upper()
-                            ur_ctaid = ctx._next_ur; ctx._next_ur += 1
-                            ctx._ur_for_param[instr.dest.name] = ur_ctaid
-                            output.append(SassInstr(encode_s2ur(ur_ctaid, sr_code),
-                                                    f'S2UR UR{ur_ctaid}, SR_{sr_label}  // {instr.dest.name} = {instr.srcs[0].name.lstrip("%")}'))
-                            continue
-                    output.extend(_select_mov(instr, ctx.ra))
+                            if ctx.sm_version == 89:
+                                # SM_89: use S2R directly into GPR (IMAD.WIDE R-R handles mul)
+                                pass  # fall through to _select_mov → S2R
+                            else:
+                                # SM_120: Put ctaid into a fresh UR via S2UR so mad.lo can use IMAD R-UR.
+                                # IMAD R-R (0x224) is not validated on SM_120; IMAD R-UR (0xc24)
+                                # is confirmed by ptxas. Must NOT use UR4 (reserved for mem
+                                # descriptor by pipeline.py) to avoid a WAR hazard where the
+                                # descriptor LDCU overwrites UR4 before IMAD finishes reading it.
+                                sr_code = _SPECIAL_REGS[instr.srcs[0].name]
+                                sr_label = instr.srcs[0].name.lstrip('%').replace('.', '_').upper()
+                                ur_ctaid = ctx._next_ur; ctx._next_ur += 1
+                                ctx._ur_for_param[instr.dest.name] = ur_ctaid
+                                output.append(SassInstr(encode_s2ur(ur_ctaid, sr_code),
+                                                        f'S2UR UR{ur_ctaid}, SR_{sr_label}  // {instr.dest.name} = {instr.srcs[0].name.lstrip("%")}'))
+                                continue
+                    output.extend(_select_mov(instr, ctx.ra, ctx))
 
                 elif op == 'shl' and typ in ('b64', 'u64', 's64'):
                     output.extend(_select_shl_b64(instr, ctx.ra))
@@ -1288,7 +1352,11 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
 
                     # General BRA with offset fixup
                     bra_idx = len(output)
-                    bra_raw = encode_bra(0)
+                    if ctx.sm_version == 89:
+                        from sass.encoding.sm_89_opcodes import encode_bra as _sm89_bra
+                        bra_raw = _sm89_bra(0)
+                    else:
+                        bra_raw = encode_bra(0)
                     if instr.pred:
                         pd = ctx.ra.pred(instr.pred) if instr.pred in ctx.ra.pred_regs else 0
                         # Check if the predicate was negated by the setp handler
@@ -1549,13 +1617,11 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                     encode_fsetp(pd, ar, br, cmp_map.get(cmp_name, FSETP_GE)),
                                     f'FSETP.{cmp_name.upper()} P{pd}, R{ar}, R{br}'))
                         else:
-                            # Integer comparison: use ISETP R-UR (opcode 0xc0c) when src1
-                            # is a u32 param backed GPR. The R-R variant (0x20c) silently
-                            # produces P=FALSE on SM_120 hardware.
+                            # Integer comparison
                             # SM_120: ISETP.LT encoding (b8=0x10) doesn't work on hardware.
                             # Invert LT→GE and GT→LE, negate the predicate on branches.
                             _INVERT = {'lt': 'ge', 'gt': 'le'}
-                            if cmp_name in _INVERT:
+                            if cmp_name in _INVERT and ctx.sm_version != 89:
                                 cmp_name = _INVERT[cmp_name]
                                 if not hasattr(ctx, '_negated_preds'):
                                     ctx._negated_preds = set()
@@ -1563,7 +1629,18 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             cmp_map = {'lt': ISETP_LT, 'le': ISETP_LE, 'gt': ISETP_GT,
                                        'ge': ISETP_GE, 'eq': ISETP_EQ, 'ne': ISETP_NE}
                             isetp_cmp = cmp_map.get(cmp_name, ISETP_GE)
-                            if isinstance(b, RegOp):
+                            if ctx.sm_version == 89:
+                                # SM_89: ISETP R-R (0x20c) works correctly.
+                                br = ctx.ra.r32(b.name) if isinstance(b, RegOp) else RZ
+                                if isinstance(b, ImmOp):
+                                    imm_val = b.value & 0xFFFFFFFF
+                                    br = _alloc_gpr(ctx)
+                                    output.append(SassInstr(encode_iadd3_imm32(br, RZ, imm_val, RZ),
+                                        f'IADD3 R{br}, RZ, 0x{imm_val:x}, RZ  // setp imm'))
+                                output.append(SassInstr(
+                                    encode_isetp(pd, ar, br, cmp=isetp_cmp),
+                                    f'ISETP.{cmp_name.upper()}.U32.AND P{pd}, PT, R{ar}, R{br}, PT'))
+                            elif isinstance(b, RegOp):
                                 b_param_off = ctx._reg_param_off.get(b.name) if ctx else None
                                 if b_param_off is not None:
                                     # src1 came from ld.param.u32 — load via LDCU.32 into UR,
@@ -1790,9 +1867,13 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             f'IMAD R{d}, R{a}, UR{ur_src}, R{c}  // mad.lo.{typ}'))
                     else:
                         # IMAD R-R (0x2a4) is BROKEN on SM_120 — only IMAD R-UR (0xc24) works.
-                        # Check if either source came from ld.param; if so, reload via LDCU.32.
+                        # SM_89: skip LDCU.32 path, go straight to IMAD.WIDE R-R fallback.
                         src1_param_off = ctx._reg_param_off.get(src1_name) if ctx else None
                         src0_param_off = ctx._reg_param_off.get(src0_name) if ctx else None
+                        if ctx and ctx.sm_version == 89:
+                            # Force R-R fallback — SM_89 has no LDCU.32/IMAD R-UR
+                            src1_param_off = None
+                            src0_param_off = None
                         if src1_param_off is not None:
                             ur_tmp = ctx._next_ur; ctx._next_ur += 1
                             output.append(SassInstr(encode_ldcu_32(ur_tmp, 0, src1_param_off),

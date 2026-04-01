@@ -101,15 +101,15 @@ def _build_nv_info_kernel(num_gprs: int, num_params: int,
     buf.extend(_u32(0x7c))
 
     # EIATTR_MAXREG (0x0a): format 0x04, 8 bytes payload
-    # ptxas SM_89: 0x02000000 + text_offset<<8 | 0x1c<<0
+    # ptxas SM_89: 0x02000000 + (param_base | s2r_offset<<16)
     buf.extend(bytes([0x04, 0x0a, 0x08, 0x00]))
     buf.extend(bytes([0x02, 0x00, 0x00, 0x00]))
-    # Second dword: encodes text section reference + S2R offset
-    buf.extend(bytes([0x60, 0x01, 0x1c, 0x00]))
+    # Second dword: param_base(16-bit LE) + s2r_offset(16-bit LE)
+    buf.extend(bytes([0x60, 0x01, s2r_offset & 0xFF, (s2r_offset >> 8) & 0xFF]))
 
     # EIATTR_S2RCTX (0x19): format 0x03, 2-byte value
-    # ptxas SM_89 uses 0x1c for vecadd
-    buf.extend(bytes([0x03, 0x19, 0x1c, 0x00]))
+    # Byte offset of the S2R(CTAID) instruction in .text
+    buf.extend(bytes([0x03, 0x19, s2r_offset & 0xFF, (s2r_offset >> 8) & 0xFF]))
 
     # EIATTR_PARAM_INFO (0x17): 12 bytes per param, reverse order
     for i in range(num_params - 1, -1, -1):
@@ -173,7 +173,8 @@ def emit_cubin_sm89(kernel_name: str,
                     param_offsets: list[int],
                     const0_size: int,
                     const0_init_data: bytes | None = None,
-                    exit_offsets: list[int] | None = None) -> bytes:
+                    exit_offsets: list[int] | None = None,
+                    s2r_offset: int = 0x10) -> bytes:
     """
     Generate a complete SM_89 cubin ELF binary.
 
@@ -205,11 +206,13 @@ def emit_cubin_sm89(kernel_name: str,
     """
 
     # --- Prepare text data (pad to 128-byte alignment, minimum 128 bytes) ---
+    # Use proper SM_89 NOP encoding (0x7918 opcode + default ctrl)
+    _NOP_SM89 = bytes.fromhex('18790000000000000000000000c00f00')
     text_data = bytearray(sass_bytes)
     while len(text_data) % 128 != 0:
-        text_data.extend(b'\x00' * 16)  # NOP-sized padding
+        text_data.extend(_NOP_SM89)
     if len(text_data) < 128:
-        text_data.extend(b'\x00' * (128 - len(text_data)))
+        text_data.extend(_NOP_SM89 * ((128 - len(text_data)) // 16))
     text_data = bytes(text_data)
 
     # Auto-scan for EXIT instructions if not provided
@@ -298,6 +301,7 @@ def emit_cubin_sm89(kernel_name: str,
     symtab = bytearray()
     symtab.extend(_sym(0, 0, 0, 0, 0, 0))                                         # [0] null
     symtab.extend(_sym(sn_text, (STB_LOCAL << 4) | STT_SECTION, 0, TEXT_IDX, 0, 0))  # [1] .text section
+    # st_other=0x10 is a fixed value used by ptxas on SM_89 regardless of GPR count.
     symtab.extend(_sym(sn_kernel, (STB_GLOBAL << 4) | STT_FUNC, 0x10, TEXT_IDX, 0, len(text_data)))  # [2] kernel
     symtab_data = bytes(symtab)
 
@@ -313,7 +317,7 @@ def emit_cubin_sm89(kernel_name: str,
         _build_nv_info_global(NUM_SECTIONS),                          # 5: .nv.info
         _build_nv_info_kernel(num_gprs, num_params, param_sizes,      # 6: .nv.info.{k}
                               param_offsets, cbank_param_size,
-                              exit_offsets),
+                              exit_offsets, s2r_offset),
         _build_callgraph(),                                           # 7: .nv.callgraph
         _build_rel_action(),                                          # 8: .nv.rel.action
         _build_rel_debug_frame(),                                     # 9: .rel.debug_frame

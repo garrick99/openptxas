@@ -443,18 +443,30 @@ def compile_function(fn: Function, verbose: bool = False,
             off = alloc.param_offsets.get(p.name, -1)
             print(f"  param {p.name}: c[0][0x{off:x}]")
 
-    # 2. Emit kernel preamble — use EXACT bytes from ptxas for the setup
-    # instructions that configure frame pointer and memory descriptors.
-    # These ctrl/barrier values are critical for correct GPU execution.
-    preamble = [
-        # LDC R1, c[0][0x37c] — frame pointer (first instruction)
-        SassInstr(bytes.fromhex('827b01ff00df00000008000000e20f00'),
-                  'LDC R1, c[0][0x37c]  // frame ptr'),
-    ]
-
-    ur4_desc_instr = SassInstr(
-        encode_ldcu_64(4, 0, 0x358, ctrl=0x717),
-        'LDCU.64 UR4, c[0][0x358]  // mem desc')
+    # 2. Emit kernel preamble — architecture-specific
+    if sm_version == 89:
+        # SM_89: IMAD.MOV.U32 R1, RZ, RZ, c[0][0x28] — frame pointer
+        from sass.encoding.sm_89_opcodes import (
+            encode_imad_mov_u32_cbuf as sm89_imad_mov,
+            encode_uldc_64 as sm89_uldc64,
+        )
+        preamble = [
+            SassInstr(sm89_imad_mov(1, 0, 0x28),
+                      'IMAD.MOV.U32 R1, RZ, RZ, c[0][0x28]  // frame ptr'),
+        ]
+        # SM_89 descriptor: ULDC.64 UR4, c[0][0x118]
+        ur4_desc_instr = SassInstr(
+            sm89_uldc64(4, 0, 0x118),
+            'ULDC.64 UR4, c[0][0x118]  // mem desc')
+    else:
+        # SM_120: LDC R1, c[0][0x37c] — frame pointer (first instruction)
+        preamble = [
+            SassInstr(bytes.fromhex('827b01ff00df00000008000000e20f00'),
+                      'LDC R1, c[0][0x37c]  // frame ptr'),
+        ]
+        ur4_desc_instr = SassInstr(
+            encode_ldcu_64(4, 0, 0x358, ctrl=0x717),
+            'LDCU.64 UR4, c[0][0x358]  // mem desc')
 
     # 3. Instruction selection
     # Compute literal pool base: after the last param in c[0], 4-byte aligned.
@@ -466,7 +478,7 @@ def compile_function(fn: Function, verbose: bool = False,
             for name, off in alloc.param_offsets.items()
         )
     else:
-        last_param_end = 0x380
+        last_param_end = param_base
     lit_pool_base = (last_param_end + 3) & ~3  # 4-byte align
 
     ctx = ISelContext(
@@ -476,11 +488,13 @@ def compile_function(fn: Function, verbose: bool = False,
         _const_pool_base=lit_pool_base,
         _next_gpr=alloc.num_gprs,
         _next_pred=alloc.num_pred,
+        sm_version=sm_version,
     )
-    # NOTE: ptxas capmerc is instruction-schedule-specific. Until we can generate
-    # our own capmerc, keep the R14 cap. The injected capmerc may not match our
-    # instruction schedule, causing cuModuleLoadData to reject the cubin.
-    # ctx._gpr_limit = 255  # TODO: enable when capmerc generation works
+    # SM_89: no capmerc DRM — full register range available.
+    # SM_120: without proper capmerc, R14+ triggers ERR715.
+    if sm_version == 89:
+        ctx._gpr_limit = 255  # SM_89 has no capmerc restriction
+    # else: default _GPR_HARD_LIMIT_DEFAULT=14 applies for SM_120
     body_instrs = select_function(fn, ctx)
 
     # SM_120 requires at least one S2R before LDCU param loads.
@@ -494,11 +508,9 @@ def compile_function(fn: Function, verbose: bool = False,
         body_instrs.insert(0, SassInstr(encode_s2r(0, SR_TID_X),
                                          'S2R R0, SR_TID.X  // required for LDCU init'))
 
-    # Insert LDCU.64 UR4 (mem descriptor) right after the bounds-check predicated EXIT.
-    # SM_120 requires ≥3-instruction gap between LDCU.64 and its first UR consumer
-    # (LDG/STG/IADD.64-UR/ISETP-RU that read UR at byte[4]).  Placing UR4 immediately
-    # after the EXIT maximises the gap.  For kernels without a predicated EXIT,
-    # fall back to just after the last S2R/S2UR in the preamble.
+    # Insert ULDC/LDCU descriptor load after the bounds-check predicated EXIT.
+    # Both SM_89 and SM_120 use UR4 for the memory descriptor; only the
+    # encoding and constant bank offset differ (handled above).
     #
     # Predicated EXIT: opcode=0x94d with guard nibble ≠ 0x7 (not @PT).
     insert_idx = 0
@@ -631,16 +643,34 @@ def compile_function(fn: Function, verbose: bool = False,
                 continue
 
             old_raw = bytearray(si.raw)
-            signed_insns = rel_offset // 16
-            offset18 = signed_insns & 0x3FFFF
-            old_raw[8]  = offset18 & 0xFF
-            old_raw[9]  = (offset18 >> 8) & 0xFF
-            old_raw[10] = 0x80 | ((offset18 >> 16) & 0x03)
-            old_raw[11] = 0x03
+            if sm_version == 89:
+                # SM_89: signed 32-bit byte offset in bytes 4-7
+                off32 = rel_offset & 0xFFFFFFFF
+                old_raw[4] = off32 & 0xFF
+                old_raw[5] = (off32 >> 8) & 0xFF
+                old_raw[6] = (off32 >> 16) & 0xFF
+                old_raw[7] = (off32 >> 24) & 0xFF
+            else:
+                # SM_120: 18-bit instruction offset in bytes 8-11
+                signed_insns = rel_offset // 16
+                offset18 = signed_insns & 0x3FFFF
+                old_raw[8]  = offset18 & 0xFF
+                old_raw[9]  = (offset18 >> 8) & 0xFF
+                old_raw[10] = 0x80 | ((offset18 >> 16) & 0x03)
+                old_raw[11] = 0x03
             pred_prefix = si.comment.split('BRA')[0] if 'BRA' in si.comment else ''
             sass_instrs[i] = SassInstr(
                 bytes(old_raw),
                 f'{pred_prefix}BRA {target_label} (offset={rel_offset})')
+
+    # Append BRA trap loop after the final EXIT (required by NVIDIA hardware).
+    # This catches warps that somehow continue past EXIT and prevents
+    # execution of uninitialized memory.
+    if sm_version == 89:
+        from sass.encoding.sm_89_opcodes import encode_bra as sm89_bra
+        sass_instrs.append(SassInstr(sm89_bra(-16), 'BRA $ // trap loop'))
+    else:
+        sass_instrs.append(SassInstr(encode_bra(-16), 'BRA $ // trap loop'))
 
     if verbose:
         print(f"[pipeline] {len(sass_instrs)} SASS instructions:")
@@ -663,7 +693,7 @@ def compile_function(fn: Function, verbose: bool = False,
     # 5. Emit cubin
     # Compute constant bank size: param area + literal pool
     total_param_bytes = sum(param_sizes)
-    param_area_end = ((0x380 + total_param_bytes + 3) // 4) * 4
+    param_area_end = ((param_base + total_param_bytes + 3) // 4) * 4
     # Add literal pool entries (4 bytes each)
     lit_pool_bytes = len(ctx._const_pool) * 4
     const0_size = ((param_area_end + lit_pool_bytes + 3) // 4) * 4
@@ -677,13 +707,15 @@ def compile_function(fn: Function, verbose: bool = False,
             _struct.pack_into('<I', const0_init, offset, value & 0xFFFFFFFF)
         const0_init = bytes(const0_init)
 
-    # Find EXIT and S2R instruction offsets in the SASS byte stream
+    # Find ALL EXIT and S2R instruction offsets in the SASS byte stream
+    exit_offsets_all = []
     exit_offset = 0
     s2r_offset = 0x10  # default
     for i in range(0, len(sass_bytes), 16):
         if sass_bytes[i:i+2] == bytes([0x4d, 0x79]):  # EXIT opcode
-            exit_offset = i
-            break
+            exit_offsets_all.append(i)
+            if not exit_offset:
+                exit_offset = i
     # Find S2R that reads CTAID.X (SR code 0x25 in byte 9)
     # Falls back to any S2R if no CTAID S2R is found
     for i in range(0, len(sass_bytes), 16):
@@ -721,16 +753,24 @@ def compile_function(fn: Function, verbose: bool = False,
     if sm_version == 89:
         # SM_89: use simplified emitter (no capmerc/merc)
         from cubin.emitter_sm89 import emit_cubin_sm89
+        # Convert param_offsets dict → list of relative offsets within param area
+        # alloc.param_offsets has absolute cbank offsets (e.g. 0x160, 0x168);
+        # the SM_89 emitter expects offsets relative to param base (0, 8, 16...).
+        param_off_list = [
+            alloc.param_offsets.get(p.name, 0) - param_base
+            for p in fn.params
+        ]
         cubin_bytes = emit_cubin_sm89(
             kernel_name=desc.name,
             sass_bytes=desc.sass_bytes,
             num_gprs=desc.num_gprs,
             num_params=desc.num_params,
             param_sizes=desc.param_sizes,
-            param_offsets=desc.param_offsets,
+            param_offsets=param_off_list,
             const0_size=desc.const0_size,
             const0_init_data=desc.const0_init_data,
-            exit_offsets=exit_offsets,
+            exit_offsets=exit_offsets_all,
+            s2r_offset=s2r_offset,
         )
     else:
         # SM_120: full emitter with capmerc/merc

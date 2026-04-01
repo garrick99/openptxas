@@ -2603,7 +2603,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                 # NOTE: This is in a finally block so that 'continue' statements
                 # inside the try block cannot skip predicate application.
                 _UR_WRITE_OPCODES = frozenset({0x7ac, 0x9c3})
-                if instr.pred and op not in ('bra', 'ret'):
+                if instr.pred and op not in ('bra',):  # ret needs predication for early-exit pattern
                     pd = ctx.ra.pred(instr.pred) if instr.pred in ctx.ra.pred_regs else 0
                     neg = instr.neg
                     if hasattr(ctx, '_negated_preds') and pd in ctx._negated_preds:

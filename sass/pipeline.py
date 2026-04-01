@@ -345,6 +345,55 @@ def _if_convert(fn: Function) -> None:
             if changed:
                 break
 
+            # --- Pattern D: early-exit for ret-only false path ---
+            # Block ends with: @Px BRA label_true ; BRA label_false
+            # true_block = body ; false_block = ret-only
+            # Converts to: @!Px ret (early exit) ; body (unpredicated)
+            # This avoids predicated body instructions that conflict with
+            # IADD3.cb carry output clobbering the execution predicate.
+            if (len(instrs) >= 2
+                    and last.op == 'bra' and not last.pred
+                    and instrs[-2].op == 'bra' and instrs[-2].pred):
+                cond_bra_d = instrs[-2]
+                label_true_d = _bra_target(cond_bra_d)
+                label_false_d = _bra_target(last)
+                if label_true_d and label_false_d:
+                    bb_true_d = next((b for b in blocks if b.label == label_true_d), None)
+                    bb_false_d = next((b for b in blocks if b.label == label_false_d), None)
+                    if (bb_true_d and bb_false_d
+                            and len(bb_false_d.instructions) <= 1
+                            and (not bb_false_d.instructions
+                                 or bb_false_d.instructions[0].op == 'ret')):
+                        # False path is ret-only → emit @!pred ret + unpredicated body
+                        pred_name_d = cond_bra_d.pred
+                        neg_d = cond_bra_d.neg
+                        # @!pred ret (early exit for inactive threads)
+                        exit_inst = copy.copy(bb_false_d.instructions[0] if bb_false_d.instructions
+                                              else Instruction(op='ret', dest=None, srcs=[]))
+                        exit_inst.pred = pred_name_d
+                        exit_inst.neg = not neg_d  # invert: @pred bra true → @!pred ret
+                        # Unpredicated body from true block (strip trailing bra)
+                        true_body_d = bb_true_d.instructions[:-1] if (
+                            bb_true_d.instructions and bb_true_d.instructions[-1].op == 'bra'
+                            and not bb_true_d.instructions[-1].pred) else list(bb_true_d.instructions)
+                        bb.instructions = instrs[:-2] + [exit_inst] + true_body_d
+                        # Append merge block body if the true block's bra targets a merge
+                        if (bb_true_d.instructions and bb_true_d.instructions[-1].op == 'bra'):
+                            merge_label = _bra_target(bb_true_d.instructions[-1])
+                            bb_merge_d = next((b for b in blocks if b.label == merge_label), None)
+                            if bb_merge_d:
+                                bb.instructions += list(bb_merge_d.instructions)
+                                fn.blocks = [b for b in blocks
+                                             if b not in (bb_true_d, bb_false_d, bb_merge_d)]
+                            else:
+                                fn.blocks = [b for b in blocks
+                                             if b not in (bb_true_d, bb_false_d)]
+                        else:
+                            fn.blocks = [b for b in blocks
+                                         if b not in (bb_true_d, bb_false_d)]
+                        changed = True
+                        break
+
             # --- Pattern C: two-way branch where both targets jump to same merge ---
             # Block ends with: @Px BRA label_true ; BRA label_false
             # true_block:  instrs... ; BRA label_merge

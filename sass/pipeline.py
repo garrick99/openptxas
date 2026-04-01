@@ -416,7 +416,7 @@ def _if_convert(fn: Function) -> None:
 
 
 def compile_function(fn: Function, verbose: bool = False,
-                     ptxas_meta: dict = None) -> bytes:
+                     ptxas_meta: dict = None, sm_version: int = 120) -> bytes:
     """
     Compile a single PTX function/kernel to a cubin.
 
@@ -431,8 +431,10 @@ def compile_function(fn: Function, verbose: bool = False,
     _sink_param_loads(fn)
 
     # 1. Register allocation
+    from sass.regalloc import PARAM_BASE_SM120, PARAM_BASE_SM89
+    param_base = PARAM_BASE_SM89 if sm_version == 89 else PARAM_BASE_SM120
     has_capmerc = ptxas_meta is not None and 'capmerc' in (ptxas_meta or {})
-    alloc = allocate(fn, has_capmerc=has_capmerc)
+    alloc = allocate(fn, param_base=param_base, has_capmerc=has_capmerc)
 
     if verbose:
         print(f"[pipeline] {fn.name}: {alloc.num_gprs} GPRs, "
@@ -823,15 +825,23 @@ def compile_ptx_source(ptx_src: str, verbose: bool = False) -> dict[str, bytes]:
     mod = parse(ptx_src)
     mod, rotate_groups = rotate_run(mod)
 
-    # Extract capmerc/merc metadata from ptxas (if available) to enable
-    # R14+ register access. Without ptxas metadata, GPRs are limited to R0-R13.
-    ptxas_meta = _extract_ptxas_metadata(ptx_src)
+    # Detect target architecture from PTX
+    sm_version = 120  # default
+    if hasattr(mod, 'target') and mod.target:
+        import re
+        m = re.search(r'sm_(\d+)', mod.target)
+        if m:
+            sm_version = int(m.group(1))
+
+    # Extract capmerc/merc metadata from ptxas (SM_120 only — SM_89 has no capmerc)
+    ptxas_meta = _extract_ptxas_metadata(ptx_src) if sm_version >= 120 else {}
 
     results = {}
     for fn in mod.functions:
         if fn.is_kernel:
             results[fn.name] = compile_function(
-                fn, verbose=verbose, ptxas_meta=ptxas_meta.get(fn.name))
+                fn, verbose=verbose, ptxas_meta=ptxas_meta.get(fn.name),
+                sm_version=sm_version)
 
     return results
 

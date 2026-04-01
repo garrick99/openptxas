@@ -600,8 +600,10 @@ def test_div_u32_compiles():
     assert 0x305 in opcodes, "F2I.FTZ.U32 not found — div.u32 NR not emitted"
     assert 0x227 in opcodes, "IMAD.HI.U32 not found — div.u32 NR not emitted"
     # Verify NOPs are scheduling-only (not TODO NOPs from unimplemented instrs).
-    nop_count = opcodes.count(0x918)
-    assert nop_count <= 6, "Too many NOPs in div.u32 (likely unimplemented instruction)"
+    # Exclude trailing NOPs (text section padding after EXIT+BRA trap).
+    last_real = max(i for i, opc in enumerate(opcodes) if opc != 0x918)
+    nop_count = opcodes[:last_real + 1].count(0x918)
+    assert nop_count <= 6, f"Too many NOPs in div.u32 body (likely unimplemented instruction): {nop_count}"
 
 REM_U32_KERNEL = """\
 .version 9.0
@@ -636,7 +638,8 @@ def test_rem_u32_compiles():
                for off in range(0, len(text), 16)]
     assert 0x306 in opcodes, "I2F.U32.RP not found in rem.u32"
     assert 0x227 in opcodes, "IMAD.HI.U32 not found in rem.u32"
-    nop_count = opcodes.count(0x918)
+    last_real = max(i for i, opc in enumerate(opcodes) if opc != 0x918)
+    nop_count = opcodes[:last_real + 1].count(0x918)
     assert nop_count <= 6, f"Too many NOPs ({nop_count}) in rem.u32"
 
 DIV_S32_KERNEL = """\
@@ -673,7 +676,8 @@ def test_div_s32_compiles():
     assert 0x213 in opcodes, "IABS not found in div.s32"
     assert 0x306 in opcodes, "I2F.RP not found in div.s32"
     assert 0x227 in opcodes, "IMAD.HI not found in div.s32"
-    nop_count = opcodes.count(0x918)
+    last_real = max(i for i, opc in enumerate(opcodes) if opc != 0x918)
+    nop_count = opcodes[:last_real + 1].count(0x918)
     assert nop_count <= 8, f"Too many NOPs ({nop_count}) in div.s32"
 
 
@@ -711,7 +715,8 @@ def test_rem_s32_compiles():
     assert 0x213 in opcodes, "IABS not found in rem.s32"
     assert 0x306 in opcodes, "I2F.RP not found in rem.s32"
     assert 0x227 in opcodes, "IMAD.HI not found in rem.s32"
-    nop_count = opcodes.count(0x918)
+    last_real = max(i for i, opc in enumerate(opcodes) if opc != 0x918)
+    nop_count = opcodes[:last_real + 1].count(0x918)
     assert nop_count <= 10, f"Too many NOPs ({nop_count}) in rem.s32"
 
 

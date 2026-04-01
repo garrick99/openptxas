@@ -213,13 +213,29 @@ def _hoist_ldcu64(instrs: list[SassInstr]) -> list[SassInstr]:
     # S2R (0x919) writes GPRs asynchronously; if it comes AFTER an IMAD
     # that reads the same GPR, IMAD gets uninitialized data → crash.
     # Hoist S2R to right after position 0 (LDC R1), before LDCU.64s.
+    # IMPORTANT: only hoist the FIRST S2R for each dest register.
+    # If the same dest has multiple S2R writes (register reuse),
+    # only the first must be early; the second must stay in its
+    # original position to avoid clobbering the first value.
     s2r_instrs = []
     non_s2r_remaining = []
+    s2r_dests_seen = set()
     for si in (remaining if not ldcu64s else remaining):
         if _get_opcode(si.raw) == 0x919:
-            s2r_instrs.append(si)
+            dest_reg = si.raw[2]
+            if dest_reg not in s2r_dests_seen:
+                s2r_instrs.append(si)
+                s2r_dests_seen.add(dest_reg)
+            else:
+                # Second write to same dest — keep in place (register reuse:
+                # e.g., ctaid→multiply→tid pattern where %r1 is reused).
+                non_s2r_remaining.append(si)
         else:
             non_s2r_remaining.append(si)
+
+    # ALSO detect SM_89 IMAD.MOV.U32 (0x7624) as "S2R-like" — they read from
+    # constant bank and should also be hoisted for latency hiding.
+    # (Skip for now — IMAD.MOV.U32 doesn't have the same async latency as S2R.)
 
     if ldcu64s:
         ldcu64s.sort(key=_consumer_pos)
@@ -229,9 +245,11 @@ def _hoist_ldcu64(instrs: list[SassInstr]) -> list[SassInstr]:
         else:
             pre_result = s2r_instrs + ldcu64s
     else:
-        if s2r_instrs and remaining:
-            # No LDCU.64 to hoist, but still ensure S2R is early
-            pre_result = remaining[:1] + s2r_instrs + [si for si in remaining[1:] if _get_opcode(si.raw) != 0x919]
+        if s2r_instrs and non_s2r_remaining:
+            # No LDCU.64 to hoist, but still ensure hoisted S2Rs are early.
+            # Use non_s2r_remaining (already excludes hoisted S2Rs but keeps
+            # duplicate-dest S2Rs in their original position).
+            pre_result = non_s2r_remaining[:1] + s2r_instrs + non_s2r_remaining[1:]
         else:
             pre_result = pre_boundary
 

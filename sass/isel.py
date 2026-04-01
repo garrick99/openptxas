@@ -456,15 +456,16 @@ def _select_add_u64(instr: Instruction, ra: RegAlloc,
 
         if a_cbuf is not None and not a_in_gpr:
             # a is in cbuf, b is in GPR → IADD3.cb dest, b, c[0][a_off], RZ
+            # Use P1 for carry to avoid clobbering the execution predicate (P0).
             r_lo = ra.lo(b.name)
             d_lo = ra.lo(dest.name); d_hi = d_lo + 1
             if ctx:
                 ctx._gpr_written.add(dest.name)
             return [
-                SassInstr(encode_iadd3_cbuf(d_lo, r_lo, 0, a_cbuf, RZ, pred_out=0),
-                          f'IADD3 R{d_lo}, P0, R{r_lo}, c[0][0x{a_cbuf:x}], RZ  // add.u64 lo cbuf'),
-                SassInstr(encode_iadd3x_cbuf(d_hi, r_lo + 1, 0, a_cbuf + 4, RZ, pred_in=0),
-                          f'IADD3.X R{d_hi}, R{r_lo+1}, c[0][0x{a_cbuf+4:x}], RZ, P0  // add.u64 hi cbuf'),
+                SassInstr(encode_iadd3_cbuf(d_lo, r_lo, 0, a_cbuf, RZ, pred_out=1),
+                          f'IADD3 R{d_lo}, P1, R{r_lo}, c[0][0x{a_cbuf:x}], RZ  // add.u64 lo cbuf'),
+                SassInstr(encode_iadd3x_cbuf(d_hi, r_lo + 1, 0, a_cbuf + 4, RZ, pred_in=1),
+                          f'IADD3.X R{d_hi}, R{r_lo+1}, c[0][0x{a_cbuf+4:x}], RZ, P1  // add.u64 hi cbuf'),
             ]
         elif b_cbuf is not None and not b_in_gpr:
             # b is in cbuf, a is in GPR → IADD3.cb dest, a, c[0][b_off], RZ
@@ -473,10 +474,10 @@ def _select_add_u64(instr: Instruction, ra: RegAlloc,
             if ctx:
                 ctx._gpr_written.add(dest.name)
             return [
-                SassInstr(encode_iadd3_cbuf(d_lo, r_lo, 0, b_cbuf, RZ, pred_out=0),
-                          f'IADD3 R{d_lo}, P0, R{r_lo}, c[0][0x{b_cbuf:x}], RZ  // add.u64 lo cbuf'),
-                SassInstr(encode_iadd3x_cbuf(d_hi, r_lo + 1, 0, b_cbuf + 4, RZ, pred_in=0),
-                          f'IADD3.X R{d_hi}, R{r_lo+1}, c[0][0x{b_cbuf+4:x}], RZ, P0  // add.u64 hi cbuf'),
+                SassInstr(encode_iadd3_cbuf(d_lo, r_lo, 0, b_cbuf, RZ, pred_out=1),
+                          f'IADD3 R{d_lo}, P1, R{r_lo}, c[0][0x{b_cbuf:x}], RZ  // add.u64 lo cbuf'),
+                SassInstr(encode_iadd3x_cbuf(d_hi, r_lo + 1, 0, b_cbuf + 4, RZ, pred_in=1),
+                          f'IADD3.X R{d_hi}, R{r_lo+1}, c[0][0x{b_cbuf+4:x}], RZ, P1  // add.u64 hi cbuf'),
             ]
         else:
             # Both in GPR → IADD3 + IADD3.X R-R
@@ -1158,6 +1159,21 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         instr.srcs[1].name if isinstance(instr.srcs[1], RegOp) else None)
                     a_param = ctx._reg_param_off.get(
                         instr.srcs[0].name if isinstance(instr.srcs[0], RegOp) else None)
+                    if ctx.sm_version == 89:
+                        # SM_89: use IMAD.cb (constant bank multiply) instead of LDCU.32+R-UR.
+                        # If a source is tracked in _reg_param_off, emit IMAD.cb directly.
+                        if b_param is not None:
+                            from sass.encoding.sm_89_opcodes import encode_imad_cbuf
+                            output.append(SassInstr(encode_imad_cbuf(d, a, 0, b_param, RZ),
+                                f'IMAD R{d}, R{a}, c[0][0x{b_param:x}], RZ  // mul.lo.{typ} cbuf'))
+                            continue
+                        elif a_param is not None:
+                            from sass.encoding.sm_89_opcodes import encode_imad_cbuf
+                            output.append(SassInstr(encode_imad_cbuf(d, b, 0, a_param, RZ),
+                                f'IMAD R{d}, R{b}, c[0][0x{a_param:x}], RZ  // mul.lo.{typ} cbuf'))
+                            continue
+                        # else: neither in cbuf, fall through to IMAD.WIDE R-R
+                        b_param = None; a_param = None
                     if b_param is not None:
                         ur_tmp = ctx._next_ur; ctx._next_ur += 1
                         output.append(SassInstr(encode_ldcu_32(ur_tmp, 0, b_param),

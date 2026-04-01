@@ -149,6 +149,21 @@ def encode_imad_mov_u32_cbuf(dest: int, bank: int, offset_bytes: int,
                   b8=RZ, b9=0x00, b10=0x8e, b11=0x07,
                   ctrl=ctrl or _CTRL_DEFAULT)
 
+def encode_imad_cbuf(dest: int, src0: int, bank: int, offset_bytes: int,
+                     src2: int = RZ, ctrl: int = 0) -> bytes:
+    """IMAD dest, src0, c[bank][offset], src2 — multiply-add with cbuf (0xa24).
+
+    Ground truth: IMAD R0, R3, c[0x0][0x0], R0
+        247a0003 00000000 00008e02 00ca1f00
+    """
+    dword_off = (offset_bytes >> 2) & 0x3FFF
+    return _build(0x24, 0x7a,
+                  b2=dest, b3=src0,
+                  b4=(dword_off >> 8) & 0xFF, b5=dword_off & 0xFF,
+                  b8=src2, b9=0x00, b10=0x8e, b11=0x02,
+                  ctrl=ctrl or _CTRL_DEFAULT)
+
+
 def encode_mov_cbuf(dest: int, bank: int, offset_bytes: int,
                     ctrl: int = 0) -> bytes:
     """MOV dest, c[bank][offset] — constant bank load (0xa02).
@@ -205,7 +220,8 @@ def encode_iadd3x_cbuf(dest: int, src0: int, bank: int, offset_bytes: int,
         107a0500 005d0000 ffe4ff00 00e40f04
     """
     dword_off = (offset_bytes >> 2) & 0x3FFF
-    b10 = 0x7F if pred_in == 0 else 0xFF  # P0→0x7F, P1→0xFF
+    # Carry-in predicate encoding: P0→0x7F, P1��0xFF, P2→0x7F+?, etc.
+    b10 = 0x7F | ((pred_in & 0x01) << 7)  # P0→0x7F, P1→0xFF
     return _build(0x10, 0x7a,
                   b2=dest, b3=src0,
                   b4=(dword_off >> 8) & 0xFF, b5=dword_off & 0xFF,

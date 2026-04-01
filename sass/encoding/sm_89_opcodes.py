@@ -178,17 +178,38 @@ def encode_uldc_64(dest_ur: int, bank: int, offset_bytes: int,
                   ctrl=ctrl or _CTRL_DEFAULT)
 
 def encode_iadd3_cbuf(dest: int, src0: int, bank: int, offset_bytes: int,
-                      src2: int = RZ, ctrl: int = 0) -> bytes:
-    """IADD3 dest, src0, c[bank][offset], src2 — integer add with cbuf (0xa10).
+                      src2: int = RZ, pred_out: int = 0, ctrl: int = 0) -> bytes:
+    """IADD3 dest, P{pred_out}, src0, c[bank][offset], src2 — add with cbuf + carry out.
 
-    Ground truth: IADD3 R5, R5, c[0x0][0x164], RZ
-        107a0505 00590000 ffe0ff07 00ca0f00
+    Ground truth: IADD3 R2, P0, R6, c[0x0][0x168], RZ
+        107a0206 005a0000 ffe0f107 00e40f00
+    Ground truth: IADD3 R4, P1, R6, c[0x0][0x170], RZ
+        107a0406 005c0000 ffe0f307 00e40f04
     """
     dword_off = (offset_bytes >> 2) & 0x3FFF
+    b10 = 0xF0 | ((pred_out & 0x07) << 1) | 1  # P0→0xF1, P1→0xF3
     return _build(0x10, 0x7a,
                   b2=dest, b3=src0,
                   b4=(dword_off >> 8) & 0xFF, b5=dword_off & 0xFF,
-                  b8=src2, b9=0xe0, b10=0xff, b11=0x07,
+                  b8=src2, b9=0xe0, b10=b10, b11=0x07,
+                  ctrl=ctrl or _CTRL_DEFAULT)
+
+
+def encode_iadd3x_cbuf(dest: int, src0: int, bank: int, offset_bytes: int,
+                       src2: int = RZ, pred_in: int = 0, ctrl: int = 0) -> bytes:
+    """IADD3.X dest, src0, c[bank][offset], src2, P{pred_in}, !PT — carry-extended cbuf add.
+
+    Ground truth: IADD3.X R3, R0, c[0x0][0x16c], RZ, P0, !PT
+        107a0300 005b0000 ffe47f00 00e40f00
+    Ground truth: IADD3.X R5, R0, c[0x0][0x174], RZ, P1, !PT
+        107a0500 005d0000 ffe4ff00 00e40f04
+    """
+    dword_off = (offset_bytes >> 2) & 0x3FFF
+    b10 = 0x7F if pred_in == 0 else 0xFF  # P0→0x7F, P1→0xFF
+    return _build(0x10, 0x7a,
+                  b2=dest, b3=src0,
+                  b4=(dword_off >> 8) & 0xFF, b5=dword_off & 0xFF,
+                  b8=src2, b9=0xe4, b10=b10, b11=0x00,
                   ctrl=ctrl or _CTRL_DEFAULT)
 
 def encode_iadd3(dest: int, src0: int, src1: int, src2: int = RZ,

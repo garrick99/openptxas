@@ -112,7 +112,7 @@ def _find_ldg_coalesces(fn: Function) -> dict[str, str]:
 
 
 def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
-             has_capmerc: bool = False) -> AllocResult:
+             has_capmerc: bool = False, sm_version: int = 120) -> AllocResult:
     """
     Allocate physical registers for a PTX function.
 
@@ -164,6 +164,34 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
                     pred_regs[name] = next_pred
                     next_pred += 1
 
+    # SM_89 cbuf optimization: identify 64-bit param registers that are ONLY
+    # used as sources in add.u64 (where IADD3.cb reads from cbuf directly).
+    # These don't need GPR allocation, saving 2 GPRs per pointer param.
+    cbuf_only_regs: set[str] = set()
+    if sm_version == 89:
+        # Find all regs defined by ld.param.u64
+        param_load_regs = set()
+        for inst in all_instrs:
+            if (inst.op == 'ld' and 'param' in inst.types
+                    and any(t in ('u64', 's64', 'b64') for t in inst.types)
+                    and isinstance(inst.dest, RegOp)):
+                param_load_regs.add(inst.dest.name)
+        # Check if each param reg is ONLY used as source in add.u64
+        for pname in param_load_regs:
+            only_add64 = True
+            for inst in all_instrs:
+                for src in inst.srcs:
+                    src_name = src.name if isinstance(src, RegOp) else (
+                        src.base if isinstance(src, MemOp) and isinstance(src.base, str) else None)
+                    if src_name == pname:
+                        if not (inst.op == 'add' and any(t in ('u64', 's64') for t in inst.types)):
+                            only_add64 = False
+                            break
+                if not only_add64:
+                    break
+            if only_add64:
+                cbuf_only_regs.add(pname)
+
     # Linear scan register allocation for GPRs
     # Sort registers by first definition order
     reg_info = []  # (name, is_64, first_def, last_use)
@@ -174,6 +202,8 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
         for name in rd.names:
             if name not in used_regs:
                 continue
+            if name in cbuf_only_regs:
+                continue  # SM_89: skip GPR for cbuf-inline params
             first = reg_first_def.get(name, 0)
             last = reg_last_use.get(name, len(all_instrs))
             reg_info.append((name, is_64, first, last))

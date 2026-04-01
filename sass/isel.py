@@ -444,20 +444,53 @@ def _select_add_u64(instr: Instruction, ra: RegAlloc,
     sm_ver = ctx.sm_version if ctx else 120
 
     if sm_ver == 89:
-        # SM_89: no IADD.64 instruction. Use IADD3 + IADD3.X (carry pair).
-        # IADD3 d_lo, a_lo, b_lo, RZ (carry out via P0)
-        # IADD3.X d_hi, a_hi, b_hi, RZ (carry in from P0)
-        a_lo = ra.lo(a.name); a_hi = a_lo + 1
-        b_lo = ra.lo(b.name); b_hi = b_lo + 1
-        d_lo = ra.lo(dest.name); d_hi = d_lo + 1
-        if ctx:
-            ctx._gpr_written.add(dest.name)
-        return [
-            SassInstr(encode_iadd3(d_lo, a_lo, b_lo, RZ),
-                      f'IADD3 R{d_lo}, R{a_lo}, R{b_lo}, RZ  // add.u64 lo'),
-            SassInstr(encode_iadd3x(d_hi, a_hi, b_hi, RZ),
-                      f'IADD3.X R{d_hi}, R{a_hi}, R{b_hi}, RZ  // add.u64 hi'),
-        ]
+        # SM_89: no IADD.64 instruction. Use IADD3.cb + IADD3.X.cb when one
+        # operand is a 64-bit param (read directly from constant bank), or
+        # IADD3 + IADD3.X R-R for two GPR operands.
+        from sass.encoding.sm_89_opcodes import encode_iadd3_cbuf, encode_iadd3x_cbuf
+
+        a_cbuf = ctx._reg_param_off.get(a.name) if ctx else None
+        b_cbuf = ctx._reg_param_off.get(b.name) if ctx else None
+        a_in_gpr = ctx and a.name in ctx._gpr_written
+        b_in_gpr = ctx and b.name in ctx._gpr_written
+
+        if a_cbuf is not None and not a_in_gpr:
+            # a is in cbuf, b is in GPR → IADD3.cb dest, b, c[0][a_off], RZ
+            r_lo = ra.lo(b.name)
+            d_lo = ra.lo(dest.name); d_hi = d_lo + 1
+            if ctx:
+                ctx._gpr_written.add(dest.name)
+            return [
+                SassInstr(encode_iadd3_cbuf(d_lo, r_lo, 0, a_cbuf, RZ, pred_out=0),
+                          f'IADD3 R{d_lo}, P0, R{r_lo}, c[0][0x{a_cbuf:x}], RZ  // add.u64 lo cbuf'),
+                SassInstr(encode_iadd3x_cbuf(d_hi, r_lo + 1, 0, a_cbuf + 4, RZ, pred_in=0),
+                          f'IADD3.X R{d_hi}, R{r_lo+1}, c[0][0x{a_cbuf+4:x}], RZ, P0  // add.u64 hi cbuf'),
+            ]
+        elif b_cbuf is not None and not b_in_gpr:
+            # b is in cbuf, a is in GPR → IADD3.cb dest, a, c[0][b_off], RZ
+            r_lo = ra.lo(a.name)
+            d_lo = ra.lo(dest.name); d_hi = d_lo + 1
+            if ctx:
+                ctx._gpr_written.add(dest.name)
+            return [
+                SassInstr(encode_iadd3_cbuf(d_lo, r_lo, 0, b_cbuf, RZ, pred_out=0),
+                          f'IADD3 R{d_lo}, P0, R{r_lo}, c[0][0x{b_cbuf:x}], RZ  // add.u64 lo cbuf'),
+                SassInstr(encode_iadd3x_cbuf(d_hi, r_lo + 1, 0, b_cbuf + 4, RZ, pred_in=0),
+                          f'IADD3.X R{d_hi}, R{r_lo+1}, c[0][0x{b_cbuf+4:x}], RZ, P0  // add.u64 hi cbuf'),
+            ]
+        else:
+            # Both in GPR → IADD3 + IADD3.X R-R
+            a_lo = ra.lo(a.name); a_hi = a_lo + 1
+            b_lo = ra.lo(b.name); b_hi = b_lo + 1
+            d_lo = ra.lo(dest.name); d_hi = d_lo + 1
+            if ctx:
+                ctx._gpr_written.add(dest.name)
+            return [
+                SassInstr(encode_iadd3(d_lo, a_lo, b_lo, RZ),
+                          f'IADD3 R{d_lo}, R{a_lo}, R{b_lo}, RZ  // add.u64 lo'),
+                SassInstr(encode_iadd3x(d_hi, a_hi, b_hi, RZ),
+                          f'IADD3.X R{d_hi}, R{a_hi}, R{b_hi}, RZ  // add.u64 hi'),
+            ]
 
     # SM_120 path
     # Check if either operand is a UR param (loaded via LDCU)
@@ -531,20 +564,16 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
     typ = instr.types[-1] if instr.types else 'u32'
 
     if sm_ver == 89:
-        # SM_89: load params into GPR via IMAD.MOV.U32 (no LDC/LDCU)
+        # SM_89: use inline cbuf operands (IADD3.cb) for 64-bit params.
+        # Don't load into GPR — just record the cbuf offset. The add.u64
+        # handler will emit IADD3.cb + IADD3.X.cb to add register + cbuf directly.
         from sass.encoding.sm_89_opcodes import encode_imad_mov_u32_cbuf
         if typ in ('u64', 's64', 'b64'):
-            # 64-bit: 2x IMAD.MOV.U32 into GPR pair (lo, hi)
-            d_lo = ra.lo(dest.name)
-            result = [
-                SassInstr(encode_imad_mov_u32_cbuf(d_lo, 0, byte_off),
-                          f'IMAD.MOV.U32 R{d_lo}, RZ, RZ, c[0][0x{byte_off:x}]  // {param_name} lo'),
-                SassInstr(encode_imad_mov_u32_cbuf(d_lo + 1, 0, byte_off + 4),
-                          f'IMAD.MOV.U32 R{d_lo+1}, RZ, RZ, c[0][0x{byte_off+4:x}]  // {param_name} hi'),
-            ]
+            # Record cbuf offset for inline use by add.u64
             if ctx:
-                ctx._gpr_written.add(dest.name)
-            return result
+                ctx._reg_param_off[dest.name] = byte_off
+                # Mark as "cbuf only" — NOT in GPR, NOT in UR
+            return []  # No GPR load — read inline from cbuf
         else:
             # u32: single IMAD.MOV.U32 into GPR
             if dest.name not in ra.int_regs:

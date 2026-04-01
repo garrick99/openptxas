@@ -434,7 +434,8 @@ def compile_function(fn: Function, verbose: bool = False,
     from sass.regalloc import PARAM_BASE_SM120, PARAM_BASE_SM89
     param_base = PARAM_BASE_SM89 if sm_version == 89 else PARAM_BASE_SM120
     has_capmerc = ptxas_meta is not None and 'capmerc' in (ptxas_meta or {})
-    alloc = allocate(fn, param_base=param_base, has_capmerc=has_capmerc)
+    alloc = allocate(fn, param_base=param_base, has_capmerc=has_capmerc,
+                     sm_version=sm_version)
 
     if verbose:
         print(f"[pipeline] {fn.name}: {alloc.num_gprs} GPRs, "

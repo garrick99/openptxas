@@ -531,20 +531,30 @@ def compile_function(fn: Function, verbose: bool = False,
         last_param_end = param_base
     lit_pool_base = (last_param_end + 3) & ~3  # 4-byte align
 
+    # Reserve a dedicated even-aligned scratch pair for UR→GPR address
+    # materializations (ld.global / st.global with pointer-only params).
+    # This pair is reused across all address materializations without going
+    # through the scratch pool, preventing register pressure from growing when
+    # the pool contains only odd-indexed registers.
+    _addr_scratch_base = alloc.num_gprs
+    if _addr_scratch_base % 2 != 0:
+        _addr_scratch_base += 1  # align to even
+
     ctx = ISelContext(
         ra=alloc.ra,
         param_offsets=alloc.param_offsets,
         ur_desc=4,  # UR4 for memory descriptors (ptxas convention)
         _const_pool_base=lit_pool_base,
-        _next_gpr=alloc.num_gprs,
+        _next_gpr=_addr_scratch_base + 2,  # pool-based scratch starts above addr pair
         _next_pred=alloc.num_pred,
         sm_version=sm_version,
     )
-    # SM_89: no capmerc DRM — full register range available.
-    # SM_120: without proper capmerc, R14+ triggers ERR715.
-    if sm_version == 89:
-        ctx._gpr_limit = 255  # SM_89 has no capmerc restriction
-    # else: default _GPR_HARD_LIMIT_DEFAULT=14 applies for SM_120
+    ctx._addr_scratch_lo = _addr_scratch_base  # dedicated addr pair: R(base):R(base+1)
+    # Both SM_89 and SM_120 now have full register range available.
+    # SM_89: no capmerc DRM.
+    # SM_120: capmerc byte[10] fix (0x81→0x01, 0xc1→0x01) unlocks R12+.
+    # Verified 2026-04-01 (commit 8d516ca).
+    ctx._gpr_limit = 255
     body_instrs = select_function(fn, ctx)
 
     # SM_120 requires at least one S2R before LDCU param loads.
@@ -827,13 +837,20 @@ def compile_function(fn: Function, verbose: bool = False,
         cubin_bytes = emit_cubin(desc)
         # Post-process: patch capmerc and merc.nv.info with ptxas metadata.
         if ptxas_meta:
-            cubin_bytes = _patch_ptxas_metadata(cubin_bytes, ptxas_meta)
+            cubin_bytes = _patch_ptxas_metadata(cubin_bytes, ptxas_meta,
+                                                min_gprs=desc.num_gprs)
 
     return cubin_bytes
 
 
-def _patch_ptxas_metadata(cubin_bytes: bytes, ptxas_meta: dict) -> bytes:
-    """Overwrite capmerc and merc.nv.info section data with ptxas-generated values."""
+def _patch_ptxas_metadata(cubin_bytes: bytes, ptxas_meta: dict,
+                          min_gprs: int = 0) -> bytes:
+    """Overwrite capmerc and merc.nv.info section data with ptxas-generated values.
+
+    min_gprs: if > 0, enforce that the patched capmerc byte[8] (GPR count) is
+    at least this value. Prevents ptxas's compact capmerc from under-reporting
+    the register count when our isel uses more scratch registers than ptxas does.
+    """
     import struct
     data = bytearray(cubin_bytes)
     e_shoff = struct.unpack_from('<Q', data, 40)[0]
@@ -857,13 +874,26 @@ def _patch_ptxas_metadata(cubin_bytes: bytes, ptxas_meta: dict) -> bytes:
             patch = bytearray(ptxas_cap[:sh_size])
             if len(patch) < sh_size:
                 patch.extend(bytearray(sh_size - len(patch)))
+            # Ensure GPR count (byte[8]) covers our actual register usage.
+            # ptxas may allocate fewer registers than our isel when it uses
+            # scratch registers beyond the static allocation (e.g. UR→GPR addr).
+            if min_gprs > 0 and len(patch) > 8:
+                patch[8] = max(patch[8], min_gprs)
             data[sh_offset_val:sh_offset_val + sh_size] = patch
         if 'merc.nv.info.' in sname and 'merc_info' in ptxas_meta:
-            ptxas_mi = ptxas_meta['merc_info']
-            patch = bytearray(ptxas_mi[:sh_size])
-            if len(patch) < sh_size:
-                patch.extend(bytearray(sh_size - len(patch)))
-            data[sh_offset_val:sh_offset_val + sh_size] = patch
+            # Only use ptxas merc.nv.info when ptxas and our isel agree on
+            # register count. If we use more registers (e.g. UR→GPR scratch
+            # spills), ptxas's 0x5a per-instruction blob may restrict R14+
+            # access and cause ERR715. Fall back to our generated merc.nv.info
+            # (which uses the permissive vector_add 0x5a blob).
+            ptxas_cap = ptxas_meta.get('capmerc', b'')
+            ptxas_gprs = ptxas_cap[8] if len(ptxas_cap) > 8 else 0
+            if min_gprs <= ptxas_gprs:
+                ptxas_mi = ptxas_meta['merc_info']
+                patch = bytearray(ptxas_mi[:sh_size])
+                if len(patch) < sh_size:
+                    patch.extend(bytearray(sh_size - len(patch)))
+                data[sh_offset_val:sh_offset_val + sh_size] = patch
     return bytes(data)
 
 

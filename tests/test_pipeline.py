@@ -1386,3 +1386,73 @@ def test_f64_arith_compiles():
     last_real = max(i for i, op in enumerate(opcodes) if op != 0x918)
     sched_nops = opcodes[:last_real].count(0x918)
     assert sched_nops <= 3, f"Too many scheduling NOPs ({sched_nops}) in f64_arith_kernel"
+
+
+F64_SETP_KERNEL = """\
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry f64_setp_kernel(
+    .param .u64 out_ptr,
+    .param .f64 a,
+    .param .f64 b)
+{
+    .reg .f64 %fd<2>;
+    .reg .b64 %rd<2>;
+    .reg .pred %p<1>;
+    ld.param.f64 %fd0, [a];
+    ld.param.f64 %fd1, [b];
+    setp.lt.f64 %p0, %fd0, %fd1;
+    ld.param.u64 %rd0, [out_ptr];
+    @%p0 st.global.u64 [%rd0], %fd0;
+    @!%p0 st.global.u64 [%rd0], %fd1;
+    ret;
+}
+"""
+
+F64_NEG_ABS_KERNEL = """\
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry f64_neg_abs_kernel(
+    .param .u64 out_ptr,
+    .param .f64 a)
+{
+    .reg .f64 %fd<4>;
+    .reg .b64 %rd<2>;
+    ld.param.f64 %fd0, [a];
+    neg.f64 %fd1, %fd0;
+    abs.f64 %fd2, %fd1;
+    add.f64 %fd3, %fd1, %fd2;
+    ld.param.u64 %rd0, [out_ptr];
+    st.global.f64 [%rd0], %fd3;
+    ret;
+}
+"""
+
+
+def test_f64_setp_compiles():
+    """setp.lt.f64 emits DSETP (opcode 0x22a)."""
+    results = compile_ptx_source(F64_SETP_KERNEL)
+    cubin = results['f64_setp_kernel']
+    assert cubin[:4] == b'\x7fELF'
+    elf = ELF64(cubin)
+    text = elf.section_data('.text.f64_setp_kernel')
+    opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
+               for off in range(0, len(text), 16)]
+    assert 0x22a in opcodes, f"DSETP (0x22a) not found; opcodes={[hex(o) for o in set(opcodes)]}"
+
+
+def test_f64_neg_abs_compiles():
+    """neg.f64 and abs.f64 emit LOP3.XOR/AND sequences (no TODO NOPs)."""
+    results = compile_ptx_source(F64_NEG_ABS_KERNEL)
+    cubin = results['f64_neg_abs_kernel']
+    assert cubin[:4] == b'\x7fELF'
+    elf = ELF64(cubin)
+    text = elf.section_data('.text.f64_neg_abs_kernel')
+    opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
+               for off in range(0, len(text), 16)]
+    assert 0x212 in opcodes, f"LOP3 (0x212) not found — neg/abs.f64 lowering missing"
+    assert 0x810 in opcodes, f"IADD3.IMM (0x810) not found — sign mask load missing"

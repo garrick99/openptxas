@@ -933,6 +933,65 @@ def encode_hmma_f16_f32(dest: int, src_a: int, src_b: int, src_c: int,
     return bytes(raw)
 
 
+# HMMA.16816.F32.BF16 — BF16 tensor core (decoded 2026-04-01)
+# Ground truth: hi=0x008fe2000004180c → raw[9]=0x18, raw[10]=0x04
+
+def encode_hmma_bf16_f32(dest: int, src_a: int, src_b: int, src_c: int,
+                          ctrl: int = 0) -> bytes:
+    """HMMA.16816.F32.BF16 — BF16 tensor core m16n8k16, FP32 accumulate."""
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0x3c; raw[1] = 0x72
+    raw[2] = dest & 0xFF; raw[3] = src_a & 0xFF; raw[4] = src_b & 0xFF
+    raw[8] = src_c & 0xFF
+    raw[9] = 0x18; raw[10] = 0x04  # BF16 modifier
+    raw[13] = b13; raw[14] = b14; raw[15] = b15
+    return bytes(raw)
+
+
+# HMMA.1688.F32.TF32 — TF32 tensor core (decoded 2026-04-01)
+# Ground truth: hi=0x008fe2000008100c → raw[9]=0x10, raw[10]=0x08
+
+def encode_hmma_tf32_f32(dest: int, src_a: int, src_b: int, src_c: int,
+                          ctrl: int = 0) -> bytes:
+    """HMMA.1688.F32.TF32 — TF32 tensor core m16n8k8, FP32 accumulate."""
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0x3c; raw[1] = 0x72
+    raw[2] = dest & 0xFF; raw[3] = src_a & 0xFF; raw[4] = src_b & 0xFF
+    raw[8] = src_c & 0xFF
+    raw[9] = 0x10; raw[10] = 0x08  # TF32 modifier
+    raw[13] = b13; raw[14] = b14; raw[15] = b15
+    return bytes(raw)
+
+
+# DMMA.8x8x4 — FP64 tensor core (NEWLY DISCOVERED 2026-04-01)
+# Ground truth: DMMA.8x8x4 R8, R2, R4, R8
+#   lo=0x000000040208723f  hi=0x008e240000000008
+# Opcode: 0x23f, b8=0x08 (src_c), raw[9]=0x00, raw[10]=0x00
+# Consumer Blackwell (RTX 5090) HAS FP64 tensor cores.
+
+def encode_dmma_8x8x4(dest: int, src_a: int, src_b: int, src_c: int,
+                       ctrl: int = 0) -> bytes:
+    """DMMA.8x8x4 — FP64 tensor core m8n8k4. Double-precision MMA on RTX 5090."""
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x3f, 0x72, b2=dest, b3=src_a, b4=src_b, b8=src_c,
+                  b9=0x00, b10=0x00, b11=0x00, ctrl=ctrl)
+
+
+# CS2R — Convergence Special Register Read (NEWLY DISCOVERED 2026-04-01)
+# Ground truth: CS2R R14, SRZ → 0x00000000000e7805 | 0x000fe2000001ff00
+# Opcode: 0x805, used in tensor core kernels for warp convergence state
+
+def encode_cs2r(dest: int, sr_code: int = 0, ctrl: int = 0) -> bytes:
+    """CS2R Rdest, SR — read convergence special register."""
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x05, 0x78, b2=dest, b3=0x00, b4=0x00, b8=0x00,
+                  b9=0x01, b10=0xFF, b11=0x00, ctrl=ctrl)
+
+
 # IMMA.16832.S8.S8 — INT8 matrix multiply-accumulate
 #   Shape: m16 n8 k32, INT8 inputs (A: 4 regs, B: 2 regs), INT32 accumulation (4 regs)
 #   Opcode: 0x237, b9=0x5c, b10=0x40
@@ -2341,8 +2400,9 @@ def encode_fmnmx(dest: int, src0: int, src1: int, is_max: bool = False,
     raw[3] = src0 & 0xFF
     raw[4] = src1 & 0xFF
     # PT (min) vs !PT (max) encoded in modifier bytes
-    raw[9] = 0xfe
-    raw[10] = 0x07 if is_max else 0x03
+    # Empirically verified on SM_120: mode byte is b10=0xfe, selector is b11=0x03(min)/0x07(max)
+    raw[10] = 0xfe
+    raw[11] = 0x07 if is_max else 0x03
     raw[13], raw[14], raw[15] = b13, b14, b15
     return bytes(raw)
 
@@ -2967,6 +3027,48 @@ def encode_dfma(dest_lo: int, src0_lo: int, src1_lo: int, src2_lo: int,
                   ctrl=ctrl)
 
 
+# ---------------------------------------------------------------------------
+# DSETP — Double-Precision Set Predicate (comparison)
+# ---------------------------------------------------------------------------
+# Opcode: 0x2a, 0x72 (SM_120 opcode 0x22a — probe-verified, field layout inferred
+# from FSETP pattern + DADD b11=0x08 FP64 flag. NOT yet hardware-verified.)
+#
+# Layout mirrors FSETP (0x20b) with:
+#   b3=src0_lo (64-bit pair src0), b4=src1_lo (64-bit pair src1)
+#   b9 = (cmp<<4) | pred_dest  (same encoding as FSETP)
+#   b10 = 0xf0 (PT mask, same as FSETP)
+#   b11 = 0x0b = 0x03 (AND combiner) | 0x08 (FP64 precision flag)
+#
+DSETP_LT = 0x01
+DSETP_EQ = 0x02
+DSETP_LE = 0x03
+DSETP_GT = 0x04
+DSETP_NE = 0x05
+DSETP_GE = 0x06
+
+def encode_dsetp(pred_dest: int, src0_lo: int, src1_lo: int, cmp: int = DSETP_LT,
+                 ctrl: int = 0) -> bytes:
+    """Encode DSETP Ppred, src0, src1, cmp (FP64 comparison → predicate).
+
+    src0_lo and src1_lo are the low registers of the 64-bit pairs.
+    Hardware implicitly reads src0_lo+1 and src1_lo+1 for the high words.
+
+    NOTE: field layout inferred from FSETP+DADD patterns; needs hardware verification.
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0], raw[1] = 0x2a, 0x72
+    raw[2] = 0x00
+    raw[3] = src0_lo & 0xFF
+    raw[4] = src1_lo & 0xFF
+    raw[9]  = ((cmp & 0x0F) << 4) | (pred_dest & 0x07)
+    raw[10] = 0xf0   # PT in AND mask
+    raw[11] = 0x0b   # AND combiner (0x03) | FP64 flag (0x08)
+    raw[13], raw[14], raw[15] = b13, b14, b15
+    return bytes(raw)
+
+
 if __name__ == "__main__":
     ok = roundtrip_verify_opcodes(verbose=True)
     print()
@@ -3026,3 +3128,119 @@ def encode_fsel_step(dest: int, src: int, threshold_f32: int, cmp: int = FSEL_GT
     raw[14] = b14
     raw[15] = b15
     return bytes(raw)
+
+
+# ===========================================================================
+# NEW ENCODERS — decoded 2026-04-01 from ptxas 13.0 sm_120 probe cubins
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# SHF.R — Right shifts (64-bit and 32-bit.HI)
+# ---------------------------------------------------------------------------
+# Opcode family: 0x219 (SHF register shift, byte0=0x19 byte1=0x72)
+# Modifier byte 9: R.U64=0x12, R.S64=0x10, R.U32.HI=0x16, R.S32.HI=0x14
+# Ground truth:
+#   SHF.R.U64 R6, R2, R7, R3 → 0x0000000702067219 | 0x002fc40000001203
+#   SHF.R.S64 R6, R2, R7, R3 → 0x0000000702067219 | 0x002fc40000001003
+#   SHF.R.U32.HI RZ, R7, R3  → 0x00000007ff077219 | 0x000fca0000011603
+#   SHF.R.S32.HI RZ, R7, R3  → 0x00000007ff077219 | 0x000fca0000011403
+
+def encode_shf_r_u64(dest, src_lo, shift_reg, src_hi, ctrl=0):
+    """SHF.R.U64 — 64-bit logical right shift."""
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x19, 0x72, b2=dest, b3=src_lo, b4=shift_reg, b8=src_hi,
+                  b9=0x12, b10=0x00, b11=0x00, ctrl=ctrl)
+
+def encode_shf_r_s64(dest, src_lo, shift_reg, src_hi, ctrl=0):
+    """SHF.R.S64 — 64-bit arithmetic right shift."""
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x19, 0x72, b2=dest, b3=src_lo, b4=shift_reg, b8=src_hi,
+                  b9=0x10, b10=0x00, b11=0x00, ctrl=ctrl)
+
+def encode_shf_r_u32_hi(dest, src_lo, shift_reg, src_hi, ctrl=0):
+    """SHF.R.U32.HI — upper 32-bit logical right shift."""
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x19, 0x72, b2=dest, b3=src_lo, b4=shift_reg, b8=src_hi,
+                  b9=0x16, b10=0x01, b11=0x00, ctrl=ctrl)
+
+def encode_shf_r_s32_hi(dest, src_lo, shift_reg, src_hi, ctrl=0):
+    """SHF.R.S32.HI — upper 32-bit arithmetic right shift."""
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x19, 0x72, b2=dest, b3=src_lo, b4=shift_reg, b8=src_hi,
+                  b9=0x14, b10=0x01, b11=0x00, ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# REDUX.SUM — Warp-wide sum reduction → uniform register
+# ---------------------------------------------------------------------------
+# Ground truth: REDUX.SUM UR6, R0 → 0x00000000000673c4 | 0x001e24000000c000
+# Opcode: 0x3c4 (byte0=0xc4, byte1=0x73), b10=0xc0 (SUM mode)
+
+def encode_redux_sum(dest_ur, src, ctrl=0):
+    """REDUX.SUM URdest, Rsrc — warp-wide unsigned sum into uniform register."""
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0xc4, 0x73, b2=dest_ur, b3=src, b4=0x00, b8=0x00,
+                  b9=0x00, b10=0xc0, b11=0x00, ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# LDGSTS.E — Async global → shared copy (cp.async)
+# ---------------------------------------------------------------------------
+# Ground truth: LDGSTS.E [R5], desc[UR4][R2.64]
+#   → 0x0000000002057fae | 0x008fe8000b9a1004
+# Opcode: 0xfae (byte0=0xae, byte1=0x7f)
+
+def encode_ldgsts_e(smem_addr, glob_addr, ur_desc, ctrl=0):
+    """LDGSTS.E [Rsmem], desc[URd][Rglob.64] — async global→shared 4B copy."""
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0xae; raw[1] = 0x7f
+    raw[2] = smem_addr & 0xFF; raw[3] = glob_addr & 0xFF; raw[4] = ur_desc & 0xFF
+    raw[8] = 0x04; raw[9] = 0x10; raw[10] = 0x9a; raw[11] = 0x0b
+    raw[13] = b13; raw[14] = b14; raw[15] = b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# LDGDEPBAR — cp.async commit group
+# ---------------------------------------------------------------------------
+# Ground truth: 0x00000000000079af | 0x000e220000000000
+# Opcode: 0x9af (byte0=0xaf, byte1=0x79)
+
+def encode_ldgdepbar(ctrl=0):
+    """LDGDEPBAR — commit async copy group (cp.async.commit_group)."""
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0xaf, 0x79, b2=0x00, b3=0x00, b4=0x00, b8=0x00,
+                  b9=0x00, b10=0x00, b11=0x00, ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# DEPBAR.LE — cp.async wait group
+# ---------------------------------------------------------------------------
+# Ground truth: DEPBAR.LE SB0, 0x0 → 0x000080000000791a | 0x000fc80000000000
+# Opcode: 0x91a (byte0=0x1a, byte1=0x79)
+
+def encode_depbar_le(sb=0, count=0, ctrl=0):
+    """DEPBAR.LE SBn, count — wait for async copies: pending <= count."""
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0x1a; raw[1] = 0x79
+    raw[4] = 0x80 | ((sb & 0x7) << 4) | (count & 0xF)
+    raw[13] = b13; raw[14] = b14; raw[15] = b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# F2FP.F16.F32 — FP32 to packed FP16
+# ---------------------------------------------------------------------------
+# Ground truth: F2FP.F16.F32.PACK_AB R0, RZ, R2
+#   → 0x00000002ff00723e | 0x004fca00000000ff
+# Opcode: 0x23e (byte0=0x3e, byte1=0x72)
+
+def encode_f2fp_f16_f32(dest, src, ctrl=0):
+    """F2FP.F16.F32.PACK_AB Rdest, RZ, Rsrc — FP32 to packed FP16 pair."""
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x3e, 0x72, b2=dest, b3=RZ, b4=src, b8=0xFF,
+                  b9=0x00, b10=0x00, b11=0x00, ctrl=ctrl)

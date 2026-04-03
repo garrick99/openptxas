@@ -233,15 +233,10 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
         active = new_active
 
         # Allocate: prefer reusing a free register, else allocate new.
-        # SM_120 HARDWARE LIMIT: Without correct per-instruction capmerc metadata,
-        # the GPU only reliably supports R0-R13. The driver validates capmerc against
-        # .text at load time, so ptxas-generated capmerc only works when our instruction
-        # schedule matches. Until we can generate our own capmerc, cap at R14.
-        # NOTE: The EIATTR 0x5a blob (52 bytes) is a universal ptxas 13.0 signature
-        # needed to authenticate capmerc. See memory/project_openptxas_sm120_rules.md.
-        # SM_120: without correct capmerc, kernels >10 GPRs can crash depending
-        # on instruction pattern. Cap at 10 for maximum reliability.
-        _MAX_GPR = 10
+        # SM_120 HARDWARE LIMIT: capmerc byte[10] fix (0x81→0x01, 0xc1→0x01)
+        # unlocks R12+ at load time. With correct capmerc generation, the full
+        # register range is available. Verified 2026-04-01 (commit 8d516ca).
+        _MAX_GPR = 255
         if is_64:
             if free_regs_64:
                 phys = free_regs_64.pop(0)

@@ -67,6 +67,7 @@ from sass.encoding.sm_120_opcodes import (
     encode_vote_ballot,
     encode_atomg_cas_b32,
     encode_dadd, encode_dmul, encode_dfma,
+    encode_dsetp, DSETP_LT, DSETP_EQ, DSETP_LE, DSETP_GT, DSETP_NE, DSETP_GE,
     encode_i2fp_u32, encode_f2i_u32,
     encode_f2f_f32_f64, encode_f2f_f64_f32,
     encode_f2i_s32_f64, encode_f2i_u32_f64, encode_i2f_f64_s32,
@@ -167,6 +168,39 @@ def _alloc_gpr(ctx: 'ISelContext') -> int:
     if ctx._next_gpr < limit:
         r = ctx._next_gpr
         ctx._next_gpr += 1
+        ctx._scratch_highwater = max(ctx._scratch_highwater, ctx._next_gpr)
+        return r
+    return 0
+
+
+def _alloc_gpr_pair(ctx: 'ISelContext') -> int:
+    """Allocate an even-aligned GPR pair (lo, lo+1) for 64-bit scratch use.
+
+    Unlike calling _alloc_gpr twice and retrying on odd results, this properly
+    returns odd-indexed registers to the pool instead of discarding them.
+    Returns the lo (even) register index; the hi is lo+1.
+    """
+    limit = getattr(ctx, '_gpr_limit', _GPR_HARD_LIMIT_DEFAULT)
+    # First pass: look for an even register already in the pool.
+    odd_rejects: list[int] = []
+    while ctx._scratch_pool:
+        r = ctx._scratch_pool.pop()
+        if r >= limit:
+            continue  # discard out-of-range
+        if r % 2 == 0:
+            # Found an even base — put the rejects back and return it.
+            ctx._scratch_pool.extend(odd_rejects)
+            return r
+        odd_rejects.append(r)
+    # No even register in pool — put rejects back and allocate fresh.
+    ctx._scratch_pool.extend(odd_rejects)
+    if ctx._next_gpr % 2 != 0:
+        # Advance to next even boundary; give the skipped odd reg to the pool.
+        ctx._scratch_pool.append(ctx._next_gpr)
+        ctx._next_gpr += 1
+    if ctx._next_gpr + 1 < limit:
+        r = ctx._next_gpr
+        ctx._next_gpr += 2  # consume both lo and hi
         ctx._scratch_highwater = max(ctx._scratch_highwater, ctx._next_gpr)
         return r
     return 0
@@ -644,12 +678,14 @@ def _select_ld_global(instr: Instruction, ra: RegAlloc,
     if base_name in gpr_written and src.base in ra.int_regs:
         addr = ra.lo(src.base)
     elif base_name in ur_params:
-        # Register only exists as a UR (raw pointer from ld.param.u64, no add.u64)
+        # Register only exists as a UR (raw pointer from ld.param.u64, no add.u64).
+        # Use the dedicated addr-scratch pair from context when available.
+        # This pair is reserved above the static allocation and reused across
+        # all address materializations, preventing register pressure growth.
         ur_idx = ur_params[base_name]
-        addr = _alloc_gpr(ctx)
-        if addr % 2 != 0:
-            addr = _alloc_gpr(ctx)
-        _alloc_gpr(ctx)
+        addr = getattr(ctx, '_addr_scratch_lo', None)
+        if addr is None:
+            addr = _alloc_gpr_pair(ctx)
         result.append(SassInstr(encode_iadd64_ur(addr, RZ, ur_idx),
                                 f'IADD.64 R{addr}, RZ, UR{ur_idx}  // UR->GPR addr'))
     else:
@@ -689,10 +725,9 @@ def _select_atom_cas(instr: Instruction, ra: RegAlloc,
         addr = ra.lo(addr_op.base)
     elif base_name in ur_params:
         ur_idx = ur_params[base_name]
-        addr = _alloc_gpr(ctx)
-        if addr % 2 != 0:
-            addr = _alloc_gpr(ctx)
-        _alloc_gpr(ctx)
+        addr = getattr(ctx, '_addr_scratch_lo', None)
+        if addr is None:
+            addr = _alloc_gpr_pair(ctx)
         prefix.append(SassInstr(encode_iadd64_ur(addr, RZ, ur_idx),
                                 f'IADD.64 R{addr}, RZ, UR{ur_idx}  // UR->GPR addr'))
     else:
@@ -734,10 +769,9 @@ def _select_st_global(instr: Instruction, ra: RegAlloc,
         addr = ra.lo(dest_op.base)
     elif base_name in ur_params:
         ur_idx = ur_params[base_name]
-        addr = _alloc_gpr(ctx)
-        if addr % 2 != 0:
-            addr = _alloc_gpr(ctx)
-        _alloc_gpr(ctx)
+        addr = getattr(ctx, '_addr_scratch_lo', None)
+        if addr is None:
+            addr = _alloc_gpr_pair(ctx)
         prefix.append(SassInstr(encode_iadd64_ur(addr, RZ, ur_idx),
                                 f'IADD.64 R{addr}, RZ, UR{ur_idx}  // UR->GPR addr'))
     else:
@@ -1605,9 +1639,33 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     if isinstance(pred, RegOp) and isinstance(a, RegOp):
                         pd = ctx.ra.pred(pred.name) if pred.name in ctx.ra.pred_regs else 0
                         ar = ctx.ra.r32(a.name)
-                        is_float = any(t in ('f32', 'f64') for t in instr.types)
+                        is_f64  = 'f64' in instr.types
+                        is_float = is_f64 or 'f32' in instr.types
                         cmp_name = next((t for t in instr.types if t in ('lt','le','gt','ge','eq','ne')), 'ge')
-                        if is_float:
+                        if is_f64:
+                            # FP64 comparison: emit DSETP using register pairs
+                            ar64 = ctx.ra.lo(a.name)
+                            cmp_map64 = {'lt': DSETP_LT, 'le': DSETP_LE, 'gt': DSETP_GT,
+                                         'ge': DSETP_GE, 'eq': DSETP_EQ, 'ne': DSETP_NE}
+                            if isinstance(b, ImmOp):
+                                # Materialize FP64 immediate as a register pair
+                                imm_bits = b.value & 0xFFFFFFFF
+                                br_lo = _alloc_gpr(ctx)
+                                br_hi = _alloc_gpr(ctx)
+                                output.append(SassInstr(encode_iadd3_imm32(br_lo, RZ, 0, RZ),
+                                    f'IADD3 R{br_lo}, RZ, 0, RZ  // dsetp imm lo'))
+                                output.append(SassInstr(encode_iadd3_imm32(br_hi, RZ, imm_bits, RZ),
+                                    f'IADD3 R{br_hi}, RZ, 0x{imm_bits:x}, RZ  // dsetp imm hi'))
+                                br_lo64 = br_lo
+                            elif isinstance(b, RegOp):
+                                br_lo64 = ctx.ra.lo(b.name)
+                            else:
+                                br_lo64 = RZ
+                            dsetp_cmp = cmp_map64.get(cmp_name, DSETP_GE)
+                            output.append(SassInstr(
+                                encode_dsetp(pd, ar64, br_lo64, dsetp_cmp),
+                                f'DSETP.{cmp_name.upper()} P{pd}, R{ar64}, R{br_lo64}  // setp.f64'))
+                        elif is_float:
                             # PEEPHOLE: check if next 2 instructions are @p mov.f32 imm + @!p mov.f32 imm
                             # with values 1.0 and 0.0 (step function). If so, fuse into FSEL.step.
                             # This avoids the SM_120 bug where ISETP corrupts FSETP state.
@@ -1806,6 +1864,34 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     # Ground truth: b11 has abs bit 0x02
                     output.append(SassInstr(encode_fadd(d, a, RZ, negate_src0=True),
                                             f'FADD R{d}, |R{a}|, -RZ  // abs.f32'))
+
+                elif op == 'neg' and typ == 'f64':
+                    # neg.f64: flip sign bit (bit 31) of hi word via XOR 0x80000000.
+                    # lo word is unchanged.
+                    d = ctx.ra.lo(instr.dest.name)
+                    a = ctx.ra.lo(instr.srcs[0].name)
+                    tmp = _alloc_gpr(ctx)
+                    output.append(SassInstr(encode_iadd3_imm32(tmp, RZ, 0x80000000, RZ),
+                                            f'IADD3 R{tmp}, RZ, 0x80000000, RZ  // neg.f64 sign mask'))
+                    output.append(SassInstr(encode_lop3(d+1, a+1, tmp, RZ, LOP3_XOR),
+                                            f'LOP3 R{d+1}, R{a+1}, R{tmp}, RZ, XOR  // neg.f64 hi'))
+                    if d != a:
+                        output.append(SassInstr(encode_iadd3(d, a, RZ, RZ),
+                                                f'IADD3 R{d}, R{a}, RZ, RZ  // neg.f64 lo'))
+
+                elif op == 'abs' and typ == 'f64':
+                    # abs.f64: clear sign bit (bit 31) of hi word via AND 0x7FFFFFFF.
+                    # lo word is unchanged.
+                    d = ctx.ra.lo(instr.dest.name)
+                    a = ctx.ra.lo(instr.srcs[0].name)
+                    tmp = _alloc_gpr(ctx)
+                    output.append(SassInstr(encode_iadd3_imm32(tmp, RZ, 0x7FFFFFFF, RZ),
+                                            f'IADD3 R{tmp}, RZ, 0x7FFFFFFF, RZ  // abs.f64 mask'))
+                    output.append(SassInstr(encode_lop3(d+1, a+1, tmp, RZ, LOP3_AND),
+                                            f'LOP3 R{d+1}, R{a+1}, R{tmp}, RZ, AND  // abs.f64 hi'))
+                    if d != a:
+                        output.append(SassInstr(encode_iadd3(d, a, RZ, RZ),
+                                                f'IADD3 R{d}, R{a}, RZ, RZ  // abs.f64 lo'))
 
                 elif op == 'selp':
                     d = ctx.ra.r32(instr.dest.name)

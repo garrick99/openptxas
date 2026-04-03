@@ -52,6 +52,7 @@ _OPCODE_META: dict[int, _OpMeta] = {
     0x825: _OpMeta('IMAD.WIDE',  1, 0x3e, 1),   # IMAD.WIDE R-imm (64-bit result)
     0x225: _OpMeta('IMAD.WIDE.RR', 1, 0x3e, 1),  # IMAD.WIDE R-R
     0x819: _OpMeta('SHF',        1, 0x3e, 1),
+    0x219: _OpMeta('SHF.R.VAR', 1, 0x3e, 1),  # SHF.R (variable shift: U64/S64/U32.HI/S32.HI)
     0xa19: _OpMeta('SHF.89',     1, 0x3e, 1),  # SM_89 SHF
     0xa10: _OpMeta('IADD3.89',   1, 0x3e, 1),  # SM_89 IADD3 cbuf
     0xa24: _OpMeta('IMAD.89',    1, 0x3e, 1),  # SM_89 IMAD cbuf
@@ -81,6 +82,7 @@ _OPCODE_META: dict[int, _OpMeta] = {
     0x311: _OpMeta('F2I.F64',   1, 0x3e, 1),  # F2I.F64 float64-to-int32 conversion
     0x312: _OpMeta('I2F.F64',   1, 0x3e, 1),  # I2F.F64 int32-to-float64 conversion (writes pair)
     0x81a: _OpMeta('BFE_SEXT',  1, 0x3e, 1),  # BFE sign-extension step (bfe.s32 lowering)
+    0x22a: _OpMeta('DSETP',     0, 0x3e, 0),  # DSETP FP64 compare → predicate (misc=0, like ISETP)
 }
 
 
@@ -93,8 +95,12 @@ _OPCODES_LDS = {0x984}
 _OPCODES_STG = {0x986}
 _OPCODES_STS = {0x988}
 _OPCODES_BAR = {0xb1d}
-_OPCODES_DFPU = {0xe29, 0xc28, 0xc2b}  # DADD, DMUL, DFMA (double-precision, wdep=0x33)
-_OPCODES_CTRL = {0x94d, 0x947, 0x918}  # EXIT, BRA, NOP
+_OPCODES_DFPU  = {0xe29, 0xc28, 0xc2b}   # DADD, DMUL, DFMA (double-precision, wdep=0x33)
+_OPCODES_DSETP = {0x22a}                 # DSETP (FP64 compare → predicate; reads pairs, no GPR dest)
+_OPCODES_CTRL = {0x94d, 0x947, 0x918, 0x91a}  # EXIT, BRA, NOP, DEPBAR.LE
+_OPCODES_LDGSTS = {0xfae}  # LDGSTS.E (cp.async global→shared)
+_OPCODES_LDGDEPBAR = {0x9af}  # LDGDEPBAR (cp.async commit)
+_OPCODES_REDUX = {0x3c4}  # REDUX.SUM (warp reduction → UR)
 _OPCODES_ALU = {
     # Integer arithmetic (SM_120 + SM_89)
     0x210,        # IADD3 (SM_120 R-R / SM_89 R-R)
@@ -154,6 +160,12 @@ _OPCODES_ALU = {
     0x312,        # I2F.F64 (int32→F64)
     # BFE helpers
     0x81a,        # BFE_SEXT (bfe.s32 sign-extend step)
+    # FP64 comparison
+    0x22a,        # DSETP (FP64 compare → predicate; reads pairs, no GPR dest)
+    # FP conversion (decoded 2026-04-01)
+    0x23e,        # F2FP.F16.F32 (FP32→packed FP16)
+    # Warp reduction (decoded 2026-04-01) — writes UR, not GPR
+    0x3c4,        # REDUX.SUM (warp sum → UR)
 }
 # Note: IADD.64-UR (0xc35) uses wdep=0x3f (no tracking) + stall=1.
 # The 1-cycle stall ensures the result is ready for the subsequent LDG/STG.
@@ -198,6 +210,10 @@ def _get_src_regs(raw: bytes) -> set[int]:
         if raw[3] < 255: regs |= {raw[3], raw[3]+1}
         if raw[4] < 255: regs |= {raw[4], raw[4]+1}
         if opcode == 0xc2b and raw[8] < 255: regs |= {raw[8], raw[8]+1}  # DFMA src2
+    elif opcode in _OPCODES_DSETP:
+        # DSETP: src0(b3, 64-bit pair), src1(b4, 64-bit pair); no GPR dest
+        if raw[3] < 255: regs |= {raw[3], raw[3]+1}
+        if raw[4] < 255: regs |= {raw[4], raw[4]+1}
     elif opcode in _OPCODES_STG:
         # STG: addr at b3, data at b4 (NOT b8 — b8 is UR descriptor)
         if raw[3] < 255: regs |= {raw[3], raw[3]+1}
@@ -247,6 +263,8 @@ def _get_dest_regs(raw: bytes) -> set[int]:
     """Get destination register indices this instruction writes."""
     opcode = _get_opcode(raw)
     if opcode in (0x7ac, 0x9c3):  # LDCU, S2UR: write UR bank, not GPR
+        return set()
+    if opcode in _OPCODES_DSETP:  # DSETP: writes predicate, not GPR
         return set()
     dest = raw[2]
     regs = set()

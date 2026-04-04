@@ -73,8 +73,9 @@ from sass.encoding.sm_120_opcodes import (
     encode_f2f_f32_f64, encode_f2f_f64_f32,
     encode_f2i_s32_f64, encode_f2i_u32_f64, encode_i2f_f64_s32, encode_i2f_f64_u32,
     encode_i2f_u32_rp, encode_i2f_s32_rp, encode_f2i_ftz_u32_trunc, encode_hfma2_zero,
-    encode_hmma_f16_f32, encode_hmma_bf16_f32, encode_hmma_tf32_f32,
+    encode_hmma_f16_f32, encode_hmma_f16_f32_k8, encode_hmma_bf16_f32, encode_hmma_tf32_f32,
     encode_imma_s8_s32, encode_dmma_8x8x4,
+    encode_qmma_e4m3_f32, encode_qmma_e5m2_f32,
     encode_ldsm_x4, encode_ldsm_x2, encode_ldsm_x1,
     encode_redux_sum, encode_redux_sum_s32, encode_redux_min_s32, encode_redux_max_s32,
     encode_redux_and_b32, encode_redux_or_b32, encode_redux_xor_b32,
@@ -1462,6 +1463,16 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     if shape == 'm8n8k4' and 'f64' in _types_set:
                         output.append(SassInstr(encode_dmma_8x8x4(d, a, b, c),
                                                 f'DMMA.8x8x4 R{d}, R{a}, R{b}, R{c}'))
+                    elif 'e4m3' in _types_set:
+                        # SM_120 QMMA hardware constraint: dest register == src_a register
+                        # (the A matrix values must be pre-loaded into the D register positions).
+                        # PTX must use the same virtual regs for D and A operands.
+                        output.append(SassInstr(encode_qmma_e4m3_f32(d, d, b, c),
+                                                f'QMMA.16832.F32.E4M3.E4M3 R{d}, R{d}, R{b}, R{c}'))
+                    elif 'e5m2' in _types_set:
+                        # SM_120 QMMA hardware constraint: dest register == src_a register.
+                        output.append(SassInstr(encode_qmma_e5m2_f32(d, d, b, c),
+                                                f'QMMA.16832.F32.E5M2.E5M2 R{d}, R{d}, R{b}, R{c}'))
                     elif 's8' in _types_set or 'u8' in _types_set:
                         output.append(SassInstr(encode_imma_s8_s32(d, a, b, c),
                                                 f'IMMA.16832.S8 R{d}, R{a}, R{b}, R{c}'))
@@ -1471,9 +1482,12 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     elif 'bf16' in _types_set:
                         output.append(SassInstr(encode_hmma_bf16_f32(d, a, b, c),
                                                 f'HMMA.BF16 R{d}, R{a}, R{b}, R{c}'))
-                    else:
+                    elif shape == 'm16n8k8':
+                        output.append(SassInstr(encode_hmma_f16_f32_k8(d, a, b, c),
+                                                f'HMMA.1688.F32 R{d}, R{a}, R{b}, R{c}'))
+                    else:  # m16n8k16 and other shapes
                         output.append(SassInstr(encode_hmma_f16_f32(d, a, b, c),
-                                                f'HMMA.F16 R{d}, R{a}, R{b}, R{c}'))
+                                                f'HMMA.16816.F32 R{d}, R{a}, R{b}, R{c}'))
 
                 elif op == 'ldmatrix' and 'sync' in instr.types and 'aligned' in instr.types:
                     _types_set = set(instr.types)

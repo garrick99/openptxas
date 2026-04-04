@@ -904,5 +904,76 @@ class TestImma:
             cuda_ctx.free(d_out)
 
 
+_PTX_QMMA = """
+.version 8.7
+.target sm_120
+.address_size 64
+
+// qmma_zero_kernel: mma.sync.aligned.m16n8k32.f32.e4m3.e4m3.f32 with zero inputs.
+// All inputs zero -> output must be 0.0. Tests QMMA.16832.F32.E4M3.E4M3 encoding.
+// Must be launched with exactly 32 threads (one warp).
+// Register layout constraints on SM_120 (hardware-verified):
+//   D/A: same 4 regs, 4-aligned. SM_120 QMMA requires dest==src_a in the encoding
+//        (the A matrix values must occupy the D output register positions pre-call).
+//   B: 2 regs, must be in R0..R7 (< 8)
+// Use same virtual regs for D, A, and C (in-place accumulate pattern, matches IMMA).
+// Initialize B first so it gets low register numbers.
+.visible .entry qmma_zero_kernel(
+    .param .u64 p_out
+)
+{
+    .reg .b32 %r<8>;
+    .reg .u64 %rd<1>;
+
+    ld.param.u64    %rd0, [p_out];
+
+    // B first (gets low registers < 8)
+    mov.b32 %r4, 0;
+    mov.b32 %r5, 0;
+    // 2 padding regs to push D/A to next 4-aligned boundary
+    mov.b32 %r6, 0;
+    mov.b32 %r7, 0;
+    // D/A/C registers: same regs, 4-aligned (hw requires dest==src_a for QMMA)
+    mov.b32 %r0, 0;
+    mov.b32 %r1, 0;
+    mov.b32 %r2, 0;
+    mov.b32 %r3, 0;
+
+    mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32
+        {%r0, %r1, %r2, %r3},
+        {%r0, %r1, %r2, %r3},
+        {%r4, %r5},
+        {%r0, %r1, %r2, %r3};
+
+    st.global.u32 [%rd0], %r0;
+    ret;
+}
+"""
+
+
+class TestQmma:
+    @gpu
+    def test_qmma_e4m3_zero_inputs(self, cuda_ctx):
+        """QMMA.16832.F32.E4M3.E4M3: zero A,B,C -> output must be 0.0f."""
+        cubins = _compile(_PTX_QMMA)
+        assert 'qmma_zero_kernel' in cubins, "qmma_zero_kernel not compiled"
+        ok = cuda_ctx.load(cubins['qmma_zero_kernel'])
+        assert ok, "cuModuleLoadData failed for qmma_zero_kernel"
+        func = cuda_ctx.get_func('qmma_zero_kernel')
+
+        d_out = cuda_ctx.alloc(4)
+        try:
+            cuda_ctx.copy_to(d_out, bytes(4))
+            err = cuda_ctx.launch(func, (1, 1, 1), (32, 1, 1), [d_out])
+            assert err == 0, f"launch error {err}"
+            assert cuda_ctx.sync() == 0, "qmma kernel crashed"
+            raw = cuda_ctx.copy_from(d_out, 4)
+            result = struct.unpack('<f', raw)[0]
+            assert result == 0.0, \
+                f"QMMA E4M3 zero-input: expected 0.0, got {result}"
+        finally:
+            cuda_ctx.free(d_out)
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v', '-m', 'gpu'])

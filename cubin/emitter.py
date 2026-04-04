@@ -116,12 +116,19 @@ def _patch_cuinfo_sm(sm_version: int) -> bytes:
     return bytes(buf)
 
 
-def _build_nv_info_global():
-    return bytes.fromhex(
+def _build_nv_info_global(num_gprs: int = 16):
+    # EIATTR_REGCOUNT (0x2f): must be at least the actual register count so that
+    # R16+ instructions are not rejected as out-of-range by the driver.
+    # Previously hard-coded to 0x10 (16), which caused ERR_ILLEGAL_INSTRUCTION
+    # for kernels that use addr-scratch registers R16..R17.
+    rc = max(num_gprs, 16)  # minimum 16 per SM_120 hardware requirement
+    buf = bytearray(bytes.fromhex(
         '042f08000800000010000000'
         '041108000800000000000000'
         '041208000800000000000000'
-    )
+    ))
+    buf[8] = rc & 0xFF
+    return bytes(buf)
 
 
 def _build_nv_info_kernel(num_gprs: int = 8, num_params: int = 2,
@@ -506,7 +513,7 @@ def emit_cubin(kernel: KernelDesc) -> bytes:
         symtab_data,                 # 3
         _NOTE_TKINFO,                # 4
         _patch_cuinfo_sm(kernel.sm_version),  # 5
-        _build_nv_info_global(),     # 6
+        _build_nv_info_global(num_gprs=kernel.num_gprs),  # 6
         _build_nv_compat(),          # 7
         _build_nv_info_kernel(num_gprs=kernel.num_gprs, num_params=kernel.num_params,
                               param_sizes=kernel.param_sizes, exit_offsets=exit_offsets,
@@ -555,7 +562,7 @@ def emit_cubin(kernel: KernelDesc) -> bytes:
     section_datas.extend([
         const0_data,
         capmerc_data,
-        _build_nv_info_global(),
+        _build_nv_info_global(num_gprs=kernel.num_gprs),
         merc_info_data,
         merc_symtab_data,
     ])

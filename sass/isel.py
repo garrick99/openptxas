@@ -2009,12 +2009,16 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                         f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, UR{ur_tmp}, PT'))
                                 else:
                                     br = ctx.ra.r32(b.name)
-                                    # R-R fallback; only works correctly if both operands are GPRs
-                                    # not tracked as param-backed. Note: R-R (0x20c) is broken on
-                                    # SM_120 for the predicated-exit pattern — TODO: fix when needed.
+                                    # SM_120: ISETP R-R (0x20c) silently produces P=FALSE when
+                                    # pred_dest > 0 (same hw bug as R-UR). Force emit_pd=0 and
+                                    # remap so consumers find the result in P0.
+                                    emit_pd = pd
+                                    if ctx.sm_version != 89 and pd > 0 and ctx:
+                                        emit_pd = 0
+                                        ctx.ra.pred_regs[pred.name] = 0
                                     output.append(SassInstr(
-                                        encode_isetp(pd, ar, br, cmp=isetp_cmp),
-                                        f'ISETP.{cmp_name.upper()}.U32.AND P{pd}, PT, R{ar}, R{br}, PT'))
+                                        encode_isetp(emit_pd, ar, br, cmp=isetp_cmp),
+                                        f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, R{br}, PT'))
                             elif isinstance(b, ImmOp):
                                 # Immediate src1: ptxas uses ISETP R-R (0x20c) with RZ for imm=0,
                                 # or materializes the constant in a GPR for non-zero immediates.

@@ -248,6 +248,28 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
             if only_add64:
                 cbuf_only_regs.add(pname)
 
+    # Collect registers that require 4-register alignment (HMMA/DMMA/IMMA dest).
+    # mma.sync.aligned instructions write a 4-register accumulator; hardware
+    # requires dest % 4 == 0.  We note the first register of the dest tuple.
+    # We also mark the 3 following registers in the same .reg declaration as
+    # "quad followers" — they must be allocated consecutively after the base.
+    quad_align_regs: set[str] = set()
+    quad_follow_regs: set[str] = set()
+    from ptx.ir import RegOp as _RegOp
+    for inst in all_instrs:
+        if inst.op == 'mma' and 'sync' in inst.types and inst.dest is not None:
+            if isinstance(inst.dest, _RegOp):
+                quad_align_regs.add(inst.dest.name)
+    # Find the following 3 registers in the same RegDecl for each quad base.
+    for rd in fn.reg_decls:
+        if rd.type.kind == ScalarKind.PRED:
+            continue
+        for i, nm in enumerate(rd.names):
+            if nm in quad_align_regs:
+                for j in range(1, 4):
+                    if i + j < len(rd.names):
+                        quad_follow_regs.add(rd.names[i + j])
+
     # Linear scan register allocation for GPRs
     # Sort registers by first definition order
     reg_info = []  # (name, is_64, first_def, last_use)
@@ -343,7 +365,24 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
             int_regs[name] = phys
             active.append((name, phys, last_use, True))
         else:
-            if free_regs_32:
+            need_quad = name in quad_align_regs
+            if need_quad:
+                # HMMA/DMMA/IMMA dest: must be 4-register aligned.
+                # Align next_gpr to 4; stash skipped slots for later 32-bit use.
+                # Do NOT pull from free_regs_32 (freed slots may not be 4-aligned,
+                # and the next 3 followers must be consecutive after this base).
+                if next_gpr % 4 != 0:
+                    for r in range(next_gpr, _align_up(next_gpr, 4)):
+                        free_regs_32.append(r)
+                    next_gpr = _align_up(next_gpr, 4)
+                phys = next_gpr
+                next_gpr += 1
+            elif name in quad_follow_regs:
+                # Consecutive slot following a quad-aligned base: must use next_gpr
+                # directly so all 4 accumulator registers are contiguous in GPR space.
+                phys = next_gpr
+                next_gpr += 1
+            elif free_regs_32:
                 phys = free_regs_32.pop(0)
             elif free_regs_64:
                 # Borrow the lower half of a freed 64-bit pair.

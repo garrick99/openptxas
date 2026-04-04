@@ -714,5 +714,72 @@ class TestReduxSum:
             cuda_ctx.free(d_out)
 
 
+# ---------------------------------------------------------------------------
+# HMMA (tensor core) GPU correctness test
+# ---------------------------------------------------------------------------
+
+_PTX_HMMA = """
+.version 8.7
+.target sm_120
+.address_size 64
+
+// hmma_zero_kernel: mma.sync.aligned.m16n8k8.f32.f16.f16.f32 with zero inputs.
+// All inputs zero -> output must be zero. Tests HMMA encoding + scoreboard.
+// Must be launched with exactly 32 threads (one warp) for mma.sync.aligned.
+// Regalloc automatically places the 4-register accumulator at a 4-aligned base.
+.visible .entry hmma_zero_kernel(
+    .param .u64 p_out
+)
+{
+    .reg .f32 %f<4>;
+    .reg .b32 %r<2>;
+    .reg .u64 %rd<2>;
+
+    ld.param.u64    %rd0, [p_out];
+
+    mov.b32 %r0, 0;
+    mov.b32 %r1, 0;
+    mov.f32 %f0, 0f00000000;
+    mov.f32 %f1, 0f00000000;
+    mov.f32 %f2, 0f00000000;
+    mov.f32 %f3, 0f00000000;
+
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%f0, %f1, %f2, %f3},
+        {%r0, %r1},
+        {%r0},
+        {%f0, %f1, %f2, %f3};
+
+    st.global.f32 [%rd0], %f0;
+    ret;
+}
+"""
+
+
+class TestHmma:
+    @gpu
+    def test_hmma_zero_inputs(self, cuda_ctx):
+        """HMMA.m16n8k8.f32.f16: zero A,B,C -> output must be 0.0f."""
+        cubins = _compile(_PTX_HMMA)
+        assert 'hmma_zero_kernel' in cubins, "hmma_zero_kernel not compiled"
+        ok = cuda_ctx.load(cubins['hmma_zero_kernel'])
+        assert ok, "cuModuleLoadData failed for hmma_zero_kernel"
+        func = cuda_ctx.get_func('hmma_zero_kernel')
+
+        d_out = cuda_ctx.alloc(4)
+        try:
+            cuda_ctx.copy_to(d_out, bytes(4))
+            # mma.sync.aligned requires exactly 32 threads (one warp)
+            err = cuda_ctx.launch(func, (1, 1, 1), (32, 1, 1), [d_out])
+            assert err == 0, f"launch error {err}"
+            assert cuda_ctx.sync() == 0, "hmma kernel crashed"
+            raw = cuda_ctx.copy_from(d_out, 4)
+            result = struct.unpack('<f', raw)[0]
+            assert result == 0.0, \
+                f"HMMA zero-input: expected 0.0, got {result}"
+        finally:
+            cuda_ctx.free(d_out)
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v', '-m', 'gpu'])

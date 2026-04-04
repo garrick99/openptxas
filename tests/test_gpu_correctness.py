@@ -658,5 +658,61 @@ class TestSelpF64:
             cuda_ctx.free(d_out)
 
 
+# ---------------------------------------------------------------------------
+# REDUX GPU correctness test
+# ---------------------------------------------------------------------------
+
+_PTX_REDUX_SUM = """
+.version 8.7
+.target sm_120
+.address_size 64
+
+// redux_sum_kernel: single-thread launch, redux with all-lane mask.
+// 1 active lane → sum == input value. Tests REDUX.SUM.S32 + MOV R, UR.
+.visible .entry redux_sum_kernel(
+    .param .u64 p_out,
+    .param .u32 p_val
+)
+{
+    .reg .u32 %r<4>;
+    .reg .u64 %rd<2>;
+
+    ld.param.u64    %rd0, [p_out];
+    ld.param.u32    %r0, [p_val];
+
+    redux.sync.add.s32 %r1, %r0, 0xffffffff;
+
+    st.global.u32 [%rd0], %r1;
+    ret;
+}
+"""
+
+
+class TestReduxSum:
+    @gpu
+    def test_redux_sum_correctness(self, cuda_ctx):
+        """redux.sync.add.s32: single thread, sum of 1 lane == input value."""
+        cubins = _compile(_PTX_REDUX_SUM)
+        assert 'redux_sum_kernel' in cubins, "redux_sum_kernel not compiled"
+        ok = cuda_ctx.load(cubins['redux_sum_kernel'])
+        assert ok, "cuModuleLoadData failed for redux_sum_kernel"
+        func = cuda_ctx.get_func('redux_sum_kernel')
+
+        # 1 thread: redux.sync.add.s32 of a single lane == input value
+        p_val = 42
+        d_out = cuda_ctx.alloc(4)
+        try:
+            cuda_ctx.copy_to(d_out, bytes(4))
+            err = cuda_ctx.launch(func, (1, 1, 1), (1, 1, 1), [d_out, p_val])
+            assert err == 0, f"launch error {err}"
+            assert cuda_ctx.sync() == 0, "redux_sum kernel crashed"
+            raw = cuda_ctx.copy_from(d_out, 4)
+            result = struct.unpack('<I', raw)[0]
+            assert result == p_val, \
+                f"redux.sync.add.s32 (1 lane): got {result}, expected {p_val}"
+        finally:
+            cuda_ctx.free(d_out)
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v', '-m', 'gpu'])

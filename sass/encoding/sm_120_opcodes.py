@@ -3242,15 +3242,27 @@ def encode_shf_r_s32_hi(dest, src_lo, shift_reg, src_hi, ctrl=0):
 # ---------------------------------------------------------------------------
 # REDUX.SUM — Warp-wide sum reduction → uniform register
 # ---------------------------------------------------------------------------
-# Ground truth: REDUX.SUM UR6, R0 → 0x00000000000673c4 | 0x001e24000000c000
-# Opcode: 0x3c4 (byte0=0xc4, byte1=0x73), b10=0xc0 (SUM mode)
+# Ground truth (unsigned): REDUX.SUM UR6, R0 → b9=0x00, b10=0xc0
+# Ground truth (signed):   REDUX.SUM.S32 UR6, R0 → b9=0xc2, b10=0x00
+#   ptxas emits REDUX.SUM.S32 for PTX redux.sync.add.s32.
+#   Full bytes at 0x40: c4 73 06 00 00 00 00 00 00 c2 00 00 [ctrl]
+# Opcode: 0x3c4 (byte0=0xc4, byte1=0x73)
 
 def encode_redux_sum(dest_ur, src, ctrl=0):
     """REDUX.SUM URdest, Rsrc — warp-wide unsigned sum into uniform register.
-    Ground truth: REDUX.SUM UR6, R0 → b10=0xc0."""
+    Ground truth: REDUX.SUM UR6, R0 → b9=0x00, b10=0xc0."""
     if ctrl == 0: ctrl = _CTRL_DEFAULT
     return _build(0xc4, 0x73, b2=dest_ur, b3=src, b4=0x00, b8=0x00,
                   b9=0x00, b10=0xc0, b11=0x00, ctrl=ctrl)
+
+
+def encode_redux_sum_s32(dest_ur, src, ctrl=0):
+    """REDUX.SUM.S32 URdest, Rsrc — warp-wide signed sum into uniform register.
+    Ground truth: ptxas redux.sync.add.s32 → b9=0xc2, b10=0x00.
+    Full: c4 73 <dest_ur> <src> 00 00 00 00 00 c2 00 00 [ctrl]"""
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0xc4, 0x73, b2=dest_ur, b3=src, b4=0x00, b8=0x00,
+                  b9=0xc2, b10=0x00, b11=0x00, ctrl=ctrl)
 
 
 def encode_redux_min_s32(dest_ur, src, ctrl=0):
@@ -3291,6 +3303,25 @@ def encode_redux_xor_b32(dest_ur, src, ctrl=0):
     if ctrl == 0: ctrl = _CTRL_DEFAULT
     return _build(0xc4, 0x73, b2=dest_ur, b3=src, b4=0x00, b8=0x00,
                   b9=0x02, b10=0x00, b11=0x00, ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# MOV R, UR — copy uniform register to general register
+# ---------------------------------------------------------------------------
+# Ground truth: MOV R5, UR6 (after REDUX.SUM.S32)
+#   Full bytes: 02 7c 05 00 06 00 00 00 00 0f 00 08 [ctrl]
+#   Opcode: 0xC02 = ((0x7c & 0xF) << 8) | 0x02
+#   b2=dest(GPR), b4=src(UR), b9=0x0f, b11=0x08 (fixed modifiers)
+
+def encode_mov_gpr_from_ur(dest: int, ur_src: int, ctrl: int = 0) -> bytes:
+    """MOV Rdest, URsrc — copy uniform register value to general register.
+    Ground truth: MOV R5, UR6 → 02 7c 05 00 06 00 00 00 00 0f 00 08 [ctrl]"""
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x02, 0x7c,
+                  b2=dest, b3=0x00, b4=ur_src,
+                  b8=0x00,
+                  b9=0x0f, b10=0x00, b11=0x08,
+                  ctrl=ctrl)
 
 
 # ---------------------------------------------------------------------------

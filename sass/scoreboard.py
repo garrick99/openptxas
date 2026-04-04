@@ -89,6 +89,7 @@ _OPCODE_META: dict[int, _OpMeta] = {
     0x23f: _OpMeta('DMMA',      1, 0x3e, 2),  # DMMA FP64 MMA (m8n8k4)
     0x83b: _OpMeta('LDSM',      1, 0x33, 2),  # LDSM load shared→matrix regs (wdep=LDS slot)
     0x3c4: _OpMeta('REDUX',     0, 0x3f, 0),  # REDUX warp reduction → UR (no GPR dest)
+    0xc02: _OpMeta('MOV.UR',   1, 0x3e, 1),  # MOV R, UR — copy uniform reg to GPR
 }
 
 
@@ -172,6 +173,8 @@ _OPCODES_ALU = {
     0x23e,        # F2FP.F16.F32 (FP32→packed FP16)
     # Warp reduction (decoded 2026-04-01) — writes UR, not GPR
     0x3c4,        # REDUX.SUM (warp sum → UR)
+    # MOV R, UR — copy uniform register to GPR (after REDUX)
+    0xc02,        # MOV R, UR
 }
 # Note: IADD.64-UR (0xc35) uses wdep=0x3f (no tracking) + stall=1.
 # The 1-cycle stall ensures the result is ready for the subsequent LDG/STG.
@@ -273,7 +276,7 @@ def _get_src_regs(raw: bytes) -> set[int]:
 def _get_dest_regs(raw: bytes) -> set[int]:
     """Get destination register indices this instruction writes."""
     opcode = _get_opcode(raw)
-    if opcode in (0x7ac, 0x9c3):  # LDCU, S2UR: write UR bank, not GPR
+    if opcode in (0x7ac, 0x9c3, 0x3c4):  # LDCU, S2UR, REDUX: write UR bank, not GPR
         return set()
     if opcode in _OPCODES_DSETP:  # DSETP: writes predicate, not GPR
         return set()
@@ -356,6 +359,8 @@ def _wdep_for_opcode(opcode: int, raw: bytes = None) -> int:
         return 0x33  # DSETP also posts via slot 0x33 (ptxas SM_120 ground truth)
     if opcode in _OPCODES_LDG | _OPCODES_ATOMG:
         return 0x35
+    if opcode == 0x3c4:  # REDUX: writes to UR, posts to slot 0x31 like LDCU (ptxas-verified)
+        return 0x31
     if opcode in _OPCODES_IADD64_UR:
         return 0x3e  # ALU slot — consumer LDG/STG gets rbar via pending_writes
     if opcode in _OPCODES_ALU | _OPCODES_SMEM_SETUP:
@@ -513,6 +518,13 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
         if opcode in _OPCODES_ATOMG:
             rbar = rbar | 0x03
 
+        # MOV R, UR (0xc02): reads UR source from raw[4]; wait for REDUX/LDCU writes
+        if opcode == 0xc02:
+            ur_src = si.raw[4]
+            if ur_src in pending_ur_writes:
+                _, pw = pending_ur_writes[ur_src]
+                if pw in _WDEP_TO_RBAR:
+                    rbar = rbar | _WDEP_TO_RBAR[pw]
         # LDCU consumers: any instruction using UR operands needs rbar for LDCU
         # Check byte 4 for UR source in R-UR instructions
         if opcode in (0xc35, 0xc0c, 0xc24):  # IADD.64-UR, ISETP R-UR, IMAD R-UR
@@ -588,13 +600,16 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
         if wdep != 0x3f:
             for r in dest_regs:
                 pending_writes[r] = (i, wdep)
-        # Track UR writes: LDCU (0x7ac) and S2UR (0x9c3)
+        # Track UR writes: LDCU (0x7ac), S2UR (0x9c3), REDUX (0x3c4)
         if opcode == 0x7ac:
             ur_dest = si.raw[2]  # UR destination index
             pending_ur_writes[ur_dest] = (i, wdep)
             # Also track UR+1 for 64-bit pairs
             pending_ur_writes[ur_dest + 1] = (i, wdep)
         elif opcode == 0x9c3:  # S2UR: writes single UR (dest at byte 2)
+            ur_dest = si.raw[2]
+            pending_ur_writes[ur_dest] = (i, wdep)
+        elif opcode == 0x3c4:  # REDUX: writes result to UR dest (raw[2]), wdep=0x31
             ur_dest = si.raw[2]
             pending_ur_writes[ur_dest] = (i, wdep)
         # ALU writes (wdep=0x3e) DO need to be tracked for GPR-gap enforcement.

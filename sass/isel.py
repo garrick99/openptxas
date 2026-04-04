@@ -76,8 +76,9 @@ from sass.encoding.sm_120_opcodes import (
     encode_hmma_f16_f32, encode_hmma_bf16_f32, encode_hmma_tf32_f32,
     encode_imma_s8_s32, encode_dmma_8x8x4,
     encode_ldsm_x4, encode_ldsm_x2, encode_ldsm_x1,
-    encode_redux_sum, encode_redux_min_s32, encode_redux_max_s32,
+    encode_redux_sum, encode_redux_sum_s32, encode_redux_min_s32, encode_redux_max_s32,
     encode_redux_and_b32, encode_redux_or_b32, encode_redux_xor_b32,
+    encode_mov_gpr_from_ur,
     encode_iadd3_imm32, encode_iadd3_neg_b4, encode_iadd3_neg_b3,
     encode_iadd3_pred_neg_b4, encode_iadd3_pred_small_imm,
     encode_iadd3_pred_neg_b3, encode_lop3_pred,
@@ -1500,29 +1501,38 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                 elif op == 'redux' and 'sync' in instr.types:
                     _types_set = set(instr.types)
                     # redux.sync.add.s32 dest, src, mask
+                    # REDUX writes to a UR; MOV R, UR copies result to GPR.
                     d_nm = instr.dest.name if instr.dest and hasattr(instr.dest, 'name') else None
                     s_nm = (instr.srcs[0].name if instr.srcs and hasattr(instr.srcs[0], 'name')
                             else None)
                     d = ctx.ra.r32(d_nm) if d_nm else RZ
                     a = ctx.ra.r32(s_nm) if s_nm else RZ
+                    # Allocate a UR temp for the REDUX result
+                    ur_tmp = ctx._next_ur if ctx else 6
+                    if ctx:
+                        ctx._next_ur += 1
                     if 'min' in _types_set and 's32' in _types_set:
-                        output.append(SassInstr(encode_redux_min_s32(d, a),
-                                                f'REDUX.MIN.S32 UR{d}, R{a}'))
+                        output.append(SassInstr(encode_redux_min_s32(ur_tmp, a),
+                                                f'REDUX.MIN.S32 UR{ur_tmp}, R{a}'))
                     elif 'max' in _types_set and 's32' in _types_set:
-                        output.append(SassInstr(encode_redux_max_s32(d, a),
-                                                f'REDUX.MAX.S32 UR{d}, R{a}'))
+                        output.append(SassInstr(encode_redux_max_s32(ur_tmp, a),
+                                                f'REDUX.MAX.S32 UR{ur_tmp}, R{a}'))
                     elif 'and' in _types_set:
-                        output.append(SassInstr(encode_redux_and_b32(d, a),
-                                                f'REDUX.AND.B32 UR{d}, R{a}'))
+                        output.append(SassInstr(encode_redux_and_b32(ur_tmp, a),
+                                                f'REDUX.AND.B32 UR{ur_tmp}, R{a}'))
                     elif 'or' in _types_set:
-                        output.append(SassInstr(encode_redux_or_b32(d, a),
-                                                f'REDUX.OR.B32 UR{d}, R{a}'))
+                        output.append(SassInstr(encode_redux_or_b32(ur_tmp, a),
+                                                f'REDUX.OR.B32 UR{ur_tmp}, R{a}'))
                     elif 'xor' in _types_set:
-                        output.append(SassInstr(encode_redux_xor_b32(d, a),
-                                                f'REDUX.XOR.B32 UR{d}, R{a}'))
+                        output.append(SassInstr(encode_redux_xor_b32(ur_tmp, a),
+                                                f'REDUX.XOR.B32 UR{ur_tmp}, R{a}'))
                     else:
-                        output.append(SassInstr(encode_redux_sum(d, a),
-                                                f'REDUX.ADD.S32 UR{d}, R{a}'))
+                        output.append(SassInstr(encode_redux_sum_s32(ur_tmp, a),
+                                                f'REDUX.SUM.S32 UR{ur_tmp}, R{a}'))
+                    # Copy UR result to GPR dest (matches ptxas MOV R, UR pattern)
+                    if d_nm:
+                        output.append(SassInstr(encode_mov_gpr_from_ur(d, ur_tmp),
+                                                f'MOV R{d}, UR{ur_tmp}  // redux result'))
 
                 elif op == 'ld' and 'param' in instr.types:
                     output.extend(_select_ld_param(instr, ctx.ra, ctx.param_offsets, ctx))

@@ -91,13 +91,15 @@ _OPCODE_META: dict[int, _OpMeta] = {
     0x83b: _OpMeta('LDSM',      1, 0x33, 2),  # LDSM load shared→matrix regs (wdep=LDS slot)
     0x3c4: _OpMeta('REDUX',     0, 0x3f, 0),  # REDUX warp reduction → UR (no GPR dest)
     0xc02: _OpMeta('MOV.UR',   1, 0x3e, 1),  # MOV R, UR — copy uniform reg to GPR
+    0x226: _OpMeta('IDP.4A',   1, 0x3e, 1),  # IDP.4A dp4a (integer dot product)
 }
 
 
 # Opcode classification (includes both SM_120 and SM_89 variants)
 _OPCODES_LDG = {0x981}
-_OPCODES_ATOMG = {0x3a9,   # ATOMG.E.CAS.b32
-                 0x9a8}   # ATOMG.E.ADD.u32
+_OPCODES_ATOMG = {0x3a9,   # ATOMG.E.CAS.b32 / CAS.b64
+                 0x9a8,   # ATOMG.E.{ADD|MIN|MAX|EXCH}.u32
+                 0x9a3}   # ATOMG.E.ADD.F32
 _OPCODES_LDC = {0xb82, 0x7ac, 0x919, 0x9c3,  # SM_120: LDC, LDCU, S2R, S2UR
                 0x624, 0xab9, 0xa02}           # SM_89: IMAD.MOV.U32(cbuf), ULDC.64, MOV(cbuf)
 _OPCODES_LDS = {0x984}
@@ -107,7 +109,7 @@ _OPCODES_BAR = {0xb1d}
 _OPCODES_DFPU  = {0xe29, 0xc28, 0xc2b}   # DADD (R-R), DMUL, DFMA (double-precision, wdep=0x33)
 _OPCODES_DSETP = {0x22a}                 # DSETP (FP64 compare → predicate; reads pairs, no GPR dest)
 _OPCODES_F2F   = {0x310}                 # F2F (float-to-float precision conversion; long-latency, wdep=0x33)
-_OPCODES_CTRL = {0x94d, 0x947, 0x918, 0x91a}  # EXIT, BRA, NOP, DEPBAR.LE
+_OPCODES_CTRL = {0x94d, 0x947, 0x918, 0x91a, 0x992}  # EXIT, BRA, NOP, DEPBAR.LE, MEMBAR
 _OPCODES_LDGSTS = {0xfae}  # LDGSTS.E (cp.async global→shared)
 _OPCODES_LDGDEPBAR = {0x9af}  # LDGDEPBAR (cp.async commit)
 _OPCODES_REDUX = {0x3c4}  # REDUX.SUM (warp reduction → UR)
@@ -126,6 +128,7 @@ _OPCODES_ALU = {
     0x248, 0x848, # VIMNMX R-R, R-imm (integer min/max)
     0x309, 0x301, # POPC, BREV
     0x300,        # FLO
+    0x226,        # IDP.4A (dp4a)
     # Float arithmetic
     0x221,        # FADD
     0x223,        # FMUL / FFMA
@@ -217,8 +220,12 @@ def _get_src_regs(raw: bytes) -> set[int]:
         if raw[3] < 255: regs |= {raw[3], raw[3]+1}
         if raw[4] < 255: regs.add(raw[4])
         if opcode == 0x3a9:
-            # ATOMG.CAS only: also reads new_val at b8
+            # ATOMG.CAS: also reads new_val at b8
             if raw[8] < 255: regs.add(raw[8])
+            # CAS.64 (b9=0xe5): compare and new_val are 64-bit pairs
+            if raw[9] == 0xe5:
+                if raw[4] < 255: regs.add(raw[4]+1)
+                if raw[8] < 255: regs.add(raw[8]+1)
     elif opcode in _OPCODES_DFPU:
         # DADD (0xe29): src0=b3(pair), src1=b4(pair); same layout as DMUL
         # DMUL (0xc28): src0=b3(pair), src1=b4(pair)
@@ -276,6 +283,9 @@ def _get_src_regs(raw: bytes) -> set[int]:
         elif opcode == 0x20c:  # ISETP R-R: src0=b3, src1=b4
             if raw[3] < 255: regs.add(raw[3])
             if raw[4] < 255: regs.add(raw[4])
+        elif opcode == 0x226:  # IDP.4A: src_a=b3, src_b=b4, src_c=b8
+            if raw[4] < 255: regs.add(raw[4])
+            if raw[8] < 255: regs.add(raw[8])
     elif opcode in _OPCODES_F2F:
         # F2F: src at b4. F2F.F32.F64 (b9=0x10, narrowing) reads f64 pair;
         # F2F.F64.F32 (b9=0x18, widening) reads single f32.
@@ -310,8 +320,12 @@ def _get_dest_regs(raw: bytes) -> set[int]:
             else:
                 regs.add(dest+1)  # unknown width — assume 64-bit
     elif opcode in _OPCODES_ATOMG:
-        # ATOMG.CAS: writes single dest (b2) — the old value read from memory
-        if dest < 255: regs.add(dest)
+        # ATOMG: writes dest (b2) — the old value read from memory
+        if dest < 255:
+            regs.add(dest)
+            # CAS.64 (b9=0xe5): writes 64-bit dest pair
+            if opcode == 0x3a9 and raw[9] == 0xe5:
+                regs.add(dest+1)
     elif opcode in _OPCODES_DFPU:
         # DADD/DMUL/DFMA: writes 64-bit dest pair (b2, b2+1)
         if dest < 255: regs |= {dest, dest+1}
@@ -415,7 +429,9 @@ _OPCODE_MISC: dict[int, int] = {
                 #   SM_89 ULDC.64). All 4 LDCU.64 in fp64 preamble use misc=7 per ptxas.
                 #   counter gives 1,2,3,4 → ILLEGAL_INSTRUCTION at first LDCU.
     0x3a9: 4,   # ATOMG.CAS: misc=4 (from RTX 5090 probe 2026-03-27)
-    0x9a8: 4,   # ATOMG.ADD.u32: misc=4 (same global-memory category as CAS)
+    0x9a8: 4,   # ATOMG.{ADD|MIN|MAX|EXCH}.u32: misc=4 (global-memory category)
+    0x9a3: 4,   # ATOMG.ADD.F32: misc=4 (global-memory category)
+    0x992: 0,   # MEMBAR: misc=0 (control/fence instruction)
     0xe29: 2,   # DADD R-R: misc=2 (ground truth decode_sass.py: b1=0x7e, src1 in b4)
     0xc28: 2,   # DMUL: misc=2
     0xc2b: 2,   # DFMA: misc=2

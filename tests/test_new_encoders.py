@@ -140,24 +140,92 @@ def test_atomg_add_u32_low64_matches_ground_truth():
     assert lo == 0x80000009020979a8, f"low64={lo:#018x} (expected 0x80000009020979a8)"
 
 def test_atomg_min_u32_uses_0x79():
-    """ATOMG.E.MIN and other non-ADD ops use byte1=0x79."""
+    """ATOMG.E.MIN.S32 uses byte1=0x79 and ptxas-verified mode bits."""
     from sass.encoding.sm_120_opcodes import encode_atomg_u32, ATOMG_MIN
     raw = encode_atomg_u32(dest=11, addr_base=4, offset=0, data=8, atom_op=ATOMG_MIN)
     assert raw[1] == 0x79, f"byte1={raw[1]:#x} (expected 0x79 for MIN)"
-    assert raw[11] == 0x04, f"atom_op field={raw[11]:#x} (expected 0x04 for MIN)"
+    # ptxas ground truth: MIN.S32 uses b9=0xf3, b10=0x9e, b11=0x08
+    assert raw[9] == 0xf3, f"b9={raw[9]:#x} (expected 0xf3 for MIN.S32)"
+    assert raw[10] == 0x9e, f"b10={raw[10]:#x} (expected 0x9e for MIN.S32)"
+    assert raw[11] == 0x08, f"b11={raw[11]:#x} (expected 0x08 for MIN.S32)"
 
 def test_atomg_add_distinct_from_min():
-    """ADD and MIN differ in b11 (operation discriminator); b1 is same (0x79 PT guard)."""
+    """ADD and MIN differ in b9/b10 mode bits (signed vs unsigned); b1 is same."""
     from sass.encoding.sm_120_opcodes import encode_atomg_u32, ATOMG_ADD, ATOMG_MIN
     add_raw = encode_atomg_u32(dest=5, addr_base=2, offset=0, data=3, atom_op=ATOMG_ADD)
     min_raw = encode_atomg_u32(dest=5, addr_base=2, offset=0, data=3, atom_op=ATOMG_MIN)
     # Both use b1=0x79 (PT guard, opcode nibble 9)
     assert add_raw[1] == 0x79
     assert min_raw[1] == 0x79
-    # Discriminator is in b11
-    assert add_raw[11] == 0x08, f"ADD b11={add_raw[11]:#x}"
-    assert min_raw[11] == 0x04, f"MIN b11={min_raw[11]:#x}"
-    assert add_raw[11] != min_raw[11], "ADD and MIN must have different b11"
+    # ADD: b9=0xf1, b10=0x1e; MIN.S32: b9=0xf3, b10=0x9e (ptxas ground truth)
+    assert add_raw[9] == 0xf1, f"ADD b9={add_raw[9]:#x}"
+    assert min_raw[9] == 0xf3, f"MIN b9={min_raw[9]:#x}"
+    assert add_raw[9] != min_raw[9], "ADD and MIN must have different b9 mode bits"
+
+
+def test_membar_gpu_encoding():
+    """MEMBAR.SC.GPU encoding matches ptxas ground truth."""
+    from sass.encoding.sm_120_opcodes import encode_membar, MEMBAR_GPU
+    raw = encode_membar(MEMBAR_GPU)
+    assert raw[0] == 0x92
+    assert raw[1] == 0x79
+    assert raw[9] == 0x20, f"b9={raw[9]:#x} (expected 0x20 for GPU scope)"
+
+def test_membar_cta_encoding():
+    """MEMBAR.SC.CTA encoding matches ptxas ground truth."""
+    from sass.encoding.sm_120_opcodes import encode_membar, MEMBAR_CTA
+    raw = encode_membar(MEMBAR_CTA)
+    assert raw[0] == 0x92
+    assert raw[1] == 0x79
+    assert raw[9] == 0x00, f"b9={raw[9]:#x} (expected 0x00 for CTA scope)"
+
+def test_atomg_exch_encoding():
+    """ATOMG.E.EXCH encoding matches ptxas ground truth."""
+    from sass.encoding.sm_120_opcodes import encode_atomg_u32, ATOMG_EXCH
+    raw = encode_atomg_u32(dest=5, addr_base=2, offset=0, data=5, atom_op=ATOMG_EXCH)
+    assert raw[0] == 0xa8
+    assert raw[1] == 0x79
+    assert raw[9] == 0xf1, f"b9={raw[9]:#x} (expected 0xf1 for EXCH)"
+    assert raw[10] == 0x1e, f"b10={raw[10]:#x} (expected 0x1e for EXCH)"
+    assert raw[11] == 0x0c, f"b11={raw[11]:#x} (expected 0x0c for EXCH)"
+
+def test_atomg_max_s32_encoding():
+    """ATOMG.E.MAX.S32 encoding matches ptxas ground truth."""
+    from sass.encoding.sm_120_opcodes import encode_atomg_u32, ATOMG_MAX
+    raw = encode_atomg_u32(dest=5, addr_base=2, offset=0, data=5, atom_op=ATOMG_MAX)
+    assert raw[9] == 0xf3, f"b9={raw[9]:#x} (expected 0xf3 for MAX.S32)"
+    assert raw[10] == 0x1e, f"b10={raw[10]:#x} (expected 0x1e for MAX.S32)"
+    assert raw[11] == 0x09, f"b11={raw[11]:#x} (expected 0x09 for MAX.S32)"
+
+def test_atomg_add_f32_encoding():
+    """ATOMG.E.ADD.F32 encoding uses opcode 0xa3."""
+    from sass.encoding.sm_120_opcodes import encode_atomg_add_f32
+    raw = encode_atomg_add_f32(dest=3, addr_base=2, offset=0, data=7)
+    assert raw[0] == 0xa3, f"b0={raw[0]:#x} (expected 0xa3 for float atomic)"
+    assert raw[1] == 0x79
+    assert raw[9] == 0xf3, f"b9={raw[9]:#x}"
+    assert raw[10] == 0x1e, f"b10={raw[10]:#x}"
+    assert raw[11] == 0x0c, f"b11={raw[11]:#x}"
+
+def test_atomg_cas_b64_encoding():
+    """ATOMG.E.CAS.64 encoding matches ptxas ground truth."""
+    from sass.encoding.sm_120_opcodes import encode_atomg_cas_b64
+    import struct
+    raw = encode_atomg_cas_b64(dest=4, addr=2, compare=4, new_val=6)
+    lo = struct.unpack_from('<Q', raw, 0)[0]
+    assert lo == 0x00000004020473a9, f"lo={lo:#018x}"
+    assert raw[9] == 0xe5, f"b9={raw[9]:#x} (expected 0xe5 for 64-bit CAS)"
+
+def test_idp4a_encoding():
+    """IDP.4A.U8.U8 encoding matches ptxas ground truth."""
+    from sass.encoding.sm_120_opcodes import encode_idp4a
+    raw = encode_idp4a(dest=9, src_a=4, src_b=7, src_c=0xFF)
+    assert raw[0] == 0x26, f"b0={raw[0]:#x} (expected 0x26)"
+    assert raw[1] == 0x72, f"b1={raw[1]:#x} (expected 0x72)"
+    assert raw[2] == 9   # dest
+    assert raw[3] == 4   # src_a
+    assert raw[4] == 7   # src_b
+    assert raw[8] == 0xFF # src_c = RZ
 
 
 if __name__ == '__main__':

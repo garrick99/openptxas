@@ -2270,34 +2270,30 @@ def encode_atomg_u32(dest: int, addr_base: int, offset: int, data: int,
 
     Ground truth (ptxas sm_120):
       ATOMG.E.ADD.STRONG.GPU PT, R7, desc[UR4][R2.64], R7:
-        lo: a8 09 07 02 07 00 00 80
-        hi: 04 f1 1e 08 00 ...
-      b2=dest, b3=addr, b4=data, b7=0x80(desc flag)
-      b8=UR_desc_idx, b9=0xf1, b10=0x1e, b11=0x08(ADD discriminator)
+        lo: a8 79 07 02 07 00 00 80  hi: 04 f1 1e 08 00 ...
+      ATOMG.E.MIN.S32.STRONG.GPU PT, R5, desc[UR4][R2.64], R5:
+        hi: 04 f3 9e 08 00 ...
+      ATOMG.E.MAX.S32.STRONG.GPU PT, R5, desc[UR4][R2.64], R5:
+        hi: 04 f3 1e 09 00 ...
+      ATOMG.E.EXCH.STRONG.GPU PT, R5, desc[UR4][R2.64], R5:
+        hi: 04 f1 1e 0c 00 ...
 
-    ATOMG.E.ADD uses opcode modifier b1=0x09; other integer ops use b1=0x79.
-    b8 carries the UR descriptor index (typically UR4).
-    b9=0xf1, b10=0x1e are fixed mode bits.
-    b11 carries the operation discriminator.
+      b9/b10 vary per operation (signed ops have different mode bits).
     """
     if ctrl == 0:
         ctrl = _CTRL_DEFAULT
     b13, b14, b15 = _ctrl_to_bytes(ctrl)
-    # b1 lower nibble = 0x9 (opcode variant for all ATOMG integer ops).
-    # b1 upper nibble = predicate guard: 0x7 = PT (unconditional).
-    # ptxas uses 0x09 (@P0 with warp election) for ADD, but we emit
-    # unconditional atomics without election, so always use PT = 0x79.
     b1 = 0x79
-    # b11 encodes the atomic operation type
-    _ATOMG_B11 = {
-        ATOMG_ADD:  0x08,
-        ATOMG_MIN:  0x04,
-        ATOMG_MAX:  0x0c,
-        ATOMG_AND:  0x14,
-        ATOMG_OR:   0x1c,
-        ATOMG_EXCH: 0x24,
+    # Per-operation encoding: (b9, b10, b11) from ptxas ground truth
+    _ATOMG_MODES = {
+        ATOMG_ADD:  (0xf1, 0x1e, 0x08),
+        ATOMG_MIN:  (0xf3, 0x9e, 0x08),  # S32: signed mode bits
+        ATOMG_MAX:  (0xf3, 0x1e, 0x09),  # S32: signed mode bits
+        ATOMG_AND:  (0xf1, 0x1e, 0x14),
+        ATOMG_OR:   (0xf1, 0x1e, 0x1c),
+        ATOMG_EXCH: (0xf1, 0x1e, 0x0c),
     }
-    b11_val = _ATOMG_B11.get(atom_op, 0x08)
+    b9_val, b10_val, b11_val = _ATOMG_MODES.get(atom_op, (0xf1, 0x1e, 0x08))
     raw = bytearray(16)
     raw[0]  = 0xa8
     raw[1]  = b1
@@ -2309,8 +2305,8 @@ def encode_atomg_u32(dest: int, addr_base: int, offset: int, data: int,
     raw[6]  = (offset >> 8) & 0xFF
     raw[7]  = 0x80 | ((offset >> 16) & 0x7F)
     raw[8]  = ur_desc & 0xFF   # UR descriptor index
-    raw[9]  = 0xf1             # fixed mode bits (ptxas ground truth)
-    raw[10] = 0x1e             # fixed mode bits (ptxas ground truth)
+    raw[9]  = b9_val
+    raw[10] = b10_val
     raw[11] = b11_val          # operation discriminator
     raw[12] = 0x00
     raw[13] = b13
@@ -3519,3 +3515,140 @@ def encode_qmma_e5m2_f32(dest: int, src_a: int, src_b: int, src_c: int,
     raw[10] = raw[11] = raw[12] = 0
     raw[13] = b13; raw[14] = b14; raw[15] = b15
     return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# MEMBAR — Memory Barrier (fence)
+# ---------------------------------------------------------------------------
+# Opcode: 0x92, 0x79 → opcode word 0x992.
+# Ground truth (ptxas sm_120):
+#   MEMBAR.SC.GPU: 0x0000000000007992 / 0x000fec0000002000
+#     b8=0x00, b9=0x20 for GPU scope
+#   MEMBAR.SC.CTA: 0x0000000000007992 / 0x000fec0000000000
+#     b8=0x00, b9=0x00 for CTA scope
+
+MEMBAR_GPU = 0x20  # b9 value for GPU scope (membar.gl)
+MEMBAR_CTA = 0x00  # b9 value for CTA scope (membar.cta)
+
+def encode_membar(scope: int = MEMBAR_GPU, ctrl: int = 0) -> bytes:
+    """Encode MEMBAR.SC.{GPU|CTA} — memory fence instruction.
+
+    Args:
+        scope: MEMBAR_GPU (0x20) for global fence, MEMBAR_CTA (0x00) for CTA fence.
+        ctrl: 23-bit scheduling control word.
+
+    Ground truth:
+        MEMBAR.SC.GPU → 92 79 00 00 00 00 00 00 | 00 20 00 00 ...
+        MEMBAR.SC.CTA → 92 79 00 00 00 00 00 00 | 00 00 00 00 ...
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x92, 0x79,
+                  b2=0x00, b3=0x00, b4=0x00,
+                  b8=0x00, b9=scope, b10=0x00, b11=0x00,
+                  ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# ATOMG.E.ADD.F32 — Atomic Float Add (Global Memory)
+# ---------------------------------------------------------------------------
+# Opcode: 0xa3, 0x79 → opcode word 0x9a3.
+# Ground truth (ptxas sm_120):
+#   ATOMG.E.ADD.F32.FTZ.RN.STRONG.GPU PT, R3, desc[UR4][R2.64], R7:
+#     lo=a3 79 03 02 07 00 00 80  hi=04 f3 1e 0c 00 ...
+#   b0=0xa3, b1=0x79, b2=dest, b3=addr, b4=data, b7=0x80(desc)
+#   b8=UR_desc, b9=0xf3, b10=0x1e, b11=0x0c
+
+def encode_atomg_add_f32(dest: int, addr_base: int, offset: int, data: int,
+                          ctrl: int = 0, ur_desc: int = 4) -> bytes:
+    """Encode ATOMG.E.ADD.F32.FTZ.RN: atomic float add on global memory.
+
+    Args:
+        dest:      Destination GPR (receives old value from memory).
+        addr_base: Address base register (lo of 64-bit pair).
+        offset:    Byte offset added to address (24-bit, typically 0).
+        data:      Data register (float value to add).
+        ctrl:      23-bit scheduling control word.
+        ur_desc:   Uniform register index for descriptor (default UR4).
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0]  = 0xa3
+    raw[1]  = 0x79
+    raw[2]  = dest & 0xFF
+    raw[3]  = addr_base & 0xFF
+    raw[4]  = data & 0xFF
+    raw[5]  = offset & 0xFF
+    raw[6]  = (offset >> 8) & 0xFF
+    raw[7]  = 0x80 | ((offset >> 16) & 0x7F)
+    raw[8]  = ur_desc & 0xFF
+    raw[9]  = 0xf3
+    raw[10] = 0x1e
+    raw[11] = 0x0c
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# ATOMG.E.CAS.64 — Atomic Compare-And-Swap 64-bit (Global Memory)
+# ---------------------------------------------------------------------------
+# Opcode: 0xa9, 0x73 → opcode word 0x3a9 (same family as CAS.b32).
+# Ground truth (ptxas sm_120):
+#   ATOMG.E.CAS.64.STRONG.GPU PT, R4, [R2], R4, R6:
+#     lo=a9 73 04 02 04 00 00 00  hi=06 e5 1e 00 ...
+#   b2=dest(pair), b3=addr(pair), b4=compare(pair), b8=new_val(pair)
+#   b9=0xe5 (vs 0xe1 for CAS.b32 — bit2 is 64-bit flag), b10=0x1e, b11=0x00
+
+def encode_atomg_cas_b64(dest: int, addr: int, compare: int, new_val: int,
+                          ctrl: int = 0) -> bytes:
+    """Encode ATOMG.E.CAS.64: atomic 64-bit compare-and-swap on global memory.
+
+    Reads old = *addr (64-bit); if old == compare: *addr = new_val; returns old.
+    All register operands are 64-bit pairs (lo, lo+1).
+
+    Args:
+        dest:    Destination GPR pair base (receives old value).
+        addr:    Address register (lo of 64-bit pair).
+        compare: Compare value register pair base.
+        new_val: New value register pair base.
+        ctrl:    23-bit scheduling control word.
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0xa9, 0x73,
+                  b2=dest, b3=addr, b4=compare,
+                  b8=new_val, b9=0xe5, b10=0x1e, b11=0x00,
+                  ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# IDP.4A — Integer Dot Product and Accumulate (dp4a)
+# ---------------------------------------------------------------------------
+# Opcode: 0x26, 0x72 → opcode word 0x226.
+# Ground truth (ptxas sm_120):
+#   IDP.4A.U8.U8 R9, R4, R7, RZ:
+#     lo=26 72 09 04 07 00 00 00  hi=ff 00 00 00 ...
+#   b2=dest, b3=src_a, b4=src_b, b8=src_c (accumulator, RZ=0xff for zero)
+#   b9=0x00, b10=0x00, b11=0x00
+
+def encode_idp4a(dest: int, src_a: int, src_b: int, src_c: int = 0xFF,
+                  ctrl: int = 0) -> bytes:
+    """Encode IDP.4A.U8.U8: dp4a.u32.u32 integer dot product.
+
+    Computes: dest = src_c + sum(src_a_bytes[i] * src_b_bytes[i]) for i=0..3
+    Each of src_a and src_b is treated as 4 packed unsigned bytes.
+
+    Args:
+        dest:  Destination register.
+        src_a: Source A (4 packed u8 values).
+        src_b: Source B (4 packed u8 values).
+        src_c: Accumulator register (0xFF = RZ = zero).
+        ctrl:  23-bit scheduling control word.
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x26, 0x72,
+                  b2=dest, b3=src_a, b4=src_b,
+                  b8=src_c, b9=0x00, b10=0x00, b11=0x00,
+                  ctrl=ctrl)

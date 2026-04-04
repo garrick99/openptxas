@@ -61,7 +61,10 @@ from sass.encoding.sm_120_opcodes import (
     encode_popc, encode_brev, encode_flo, encode_iabs, encode_bfe_sext,
     encode_shfl, SHFL_IDX, SHFL_UP, SHFL_DOWN, SHFL_BFLY,
     encode_vote_ballot,
-    encode_atomg_cas_b32, encode_atomg_u32, ATOMG_ADD,
+    encode_atomg_cas_b32, encode_atomg_cas_b64, encode_atomg_u32, encode_atomg_add_f32,
+    ATOMG_ADD, ATOMG_MIN, ATOMG_MAX, ATOMG_EXCH,
+    encode_membar, MEMBAR_GPU, MEMBAR_CTA,
+    encode_idp4a,
     encode_dadd, encode_dmul, encode_dfma, encode_dfma_ur_ur,
     encode_dsetp, DSETP_LT, DSETP_EQ, DSETP_LE, DSETP_GT, DSETP_NE, DSETP_GE,
     DSETP_LTU, DSETP_EQU, DSETP_LEU, DSETP_GTU, DSETP_NEU, DSETP_GEU,
@@ -850,6 +853,139 @@ def _select_atom_add_u32(instr: Instruction, ra: RegAlloc,
                      f'ATOMG.E.ADD.u32 R{d}, desc[UR{ur_d}][R{addr}.64], R{data}')]
 
 
+def _select_atom_generic_u32(instr: Instruction, ra: RegAlloc,
+                              ctx: 'ISelContext', atom_op: int,
+                              op_name: str) -> list[SassInstr]:
+    """atom.global.{exch|min|max|and|or}.{b32|s32|u32} → ATOMG.E.{op}."""
+    from ptx.ir import MemOp
+    dest_op = instr.dest
+    addr_op = instr.srcs[0]
+    data_op = instr.srcs[1]
+    if not isinstance(addr_op, MemOp):
+        raise ISelError(f"atom.{op_name} addr must be MemOp")
+    d    = ra.r32(dest_op.name)
+    data = ra.r32(data_op.name)
+
+    prefix = []
+    base_name = addr_op.base if addr_op.base.startswith('%') else f'%{addr_op.base}'
+    ur_params = getattr(ctx, '_ur_params', {}) if ctx else {}
+    gpr_written = getattr(ctx, '_gpr_written', set()) if ctx else set()
+    if base_name in gpr_written and addr_op.base in ra.int_regs:
+        addr = ra.lo(addr_op.base)
+    elif base_name in ur_params:
+        ur_idx = ur_params[base_name]
+        addr = getattr(ctx, '_addr_scratch_lo', None)
+        if addr is None:
+            addr = _alloc_gpr_pair(ctx)
+        prefix.append(SassInstr(encode_iadd64_ur(addr, RZ, ur_idx),
+                                f'IADD.64 R{addr}, RZ, UR{ur_idx}  // UR->GPR addr'))
+    else:
+        addr = RZ
+
+    ur_d = ctx.ur_desc if ctx else 4
+    return prefix + [SassInstr(encode_atomg_u32(d, addr, 0, data, atom_op, ur_desc=ur_d),
+                     f'ATOMG.E.{op_name} R{d}, desc[UR{ur_d}][R{addr}.64], R{data}')]
+
+
+def _select_atom_add_f32(instr: Instruction, ra: RegAlloc,
+                          ctx: 'ISelContext' = None) -> list[SassInstr]:
+    """atom.global.add.f32 → ATOMG.E.ADD.F32."""
+    from ptx.ir import MemOp
+    dest_op = instr.dest
+    addr_op = instr.srcs[0]
+    data_op = instr.srcs[1]
+    if not isinstance(addr_op, MemOp):
+        raise ISelError("atom.add.f32 addr must be MemOp")
+    d    = ra.r32(dest_op.name)
+    data = ra.r32(data_op.name)
+
+    prefix = []
+    base_name = addr_op.base if addr_op.base.startswith('%') else f'%{addr_op.base}'
+    ur_params = getattr(ctx, '_ur_params', {}) if ctx else {}
+    gpr_written = getattr(ctx, '_gpr_written', set()) if ctx else set()
+    if base_name in gpr_written and addr_op.base in ra.int_regs:
+        addr = ra.lo(addr_op.base)
+    elif base_name in ur_params:
+        ur_idx = ur_params[base_name]
+        addr = getattr(ctx, '_addr_scratch_lo', None)
+        if addr is None:
+            addr = _alloc_gpr_pair(ctx)
+        prefix.append(SassInstr(encode_iadd64_ur(addr, RZ, ur_idx),
+                                f'IADD.64 R{addr}, RZ, UR{ur_idx}  // UR->GPR addr'))
+    else:
+        addr = RZ
+
+    ur_d = ctx.ur_desc if ctx else 4
+    return prefix + [SassInstr(encode_atomg_add_f32(d, addr, 0, data, ur_desc=ur_d),
+                     f'ATOMG.E.ADD.F32 R{d}, desc[UR{ur_d}][R{addr}.64], R{data}')]
+
+
+def _select_atom_cas_b64(instr: Instruction, ra: RegAlloc,
+                          ctx: 'ISelContext' = None) -> list[SassInstr]:
+    """atom.cas.b64 → ATOMG.E.CAS.64.
+
+    All three operands (addr, compare, new_val) may be in UR space (loaded via
+    LDCU.64 for kernel parameters). We need to materialize each into GPR pairs
+    via IADD.64 if they're still in UR space.
+    """
+    from ptx.ir import MemOp
+    dest_op = instr.dest
+    addr_op = instr.srcs[0]
+    cmp_op  = instr.srcs[1]
+    new_op  = instr.srcs[2]
+    if not isinstance(addr_op, MemOp):
+        raise ISelError("atom.cas.b64 addr must be MemOp")
+
+    ur_params = getattr(ctx, '_ur_params', {}) if ctx else {}
+    gpr_written = getattr(ctx, '_gpr_written', set()) if ctx else set()
+    prefix = []
+
+    def _materialize_u64(op, label):
+        """Ensure a u64 operand is in GPR pair, materializing from UR if needed."""
+        name = op.name
+        base_name = name if name.startswith('%') else f'%{name}'
+        if base_name in gpr_written and name in ra.int_regs:
+            return ra.lo(name)
+        elif base_name in ur_params:
+            ur_idx = ur_params[base_name]
+            gpr = _alloc_gpr_pair(ctx)
+            prefix.append(SassInstr(encode_iadd64_ur(gpr, RZ, ur_idx),
+                                    f'IADD.64 R{gpr}, RZ, UR{ur_idx}  // UR->GPR {label}'))
+            return gpr
+        else:
+            return ra.lo(name)
+
+    # Materialize addr from MemOp
+    addr_base = addr_op.base if addr_op.base.startswith('%') else f'%{addr_op.base}'
+    if addr_base in gpr_written and addr_op.base in ra.int_regs:
+        addr = ra.lo(addr_op.base)
+    elif addr_base in ur_params:
+        ur_idx = ur_params[addr_base]
+        addr = _alloc_gpr_pair(ctx)
+        prefix.append(SassInstr(encode_iadd64_ur(addr, RZ, ur_idx),
+                                f'IADD.64 R{addr}, RZ, UR{ur_idx}  // UR->GPR addr'))
+    else:
+        addr = RZ
+
+    cmp = _materialize_u64(cmp_op, 'cmp')
+    nv  = _materialize_u64(new_op, 'new')
+    d   = ra.lo(dest_op.name)
+
+    return prefix + [SassInstr(encode_atomg_cas_b64(d, addr, cmp, nv),
+                      f'ATOMG.E.CAS.64 R{d}, [R{addr}], R{cmp}, R{nv}')]
+
+
+def _select_dp4a(instr: Instruction, ra: RegAlloc,
+                  ctx: 'ISelContext' = None) -> list[SassInstr]:
+    """dp4a.u32.u32 → IDP.4A.U8.U8."""
+    d = ra.r32(instr.dest.name)
+    a = ra.r32(instr.srcs[0].name)
+    b = ra.r32(instr.srcs[1].name)
+    c = ra.r32(instr.srcs[2].name)
+    return [SassInstr(encode_idp4a(d, a, b, c),
+                      f'IDP.4A.U8.U8 R{d}, R{a}, R{b}, R{c}')]
+
+
 def _select_st_global(instr: Instruction, ra: RegAlloc,
                       ur_desc: int, ctx: 'ISelContext' = None) -> list[SassInstr]:
     """st.global → STG.E with appropriate width."""
@@ -1605,6 +1741,42 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
 
                 elif op == 'atom' and 'add' in instr.types and 'u32' in instr.types:
                     output.extend(_select_atom_add_u32(instr, ctx.ra, ctx))
+
+                elif op == 'atom' and 'exch' in instr.types and 'b32' in instr.types:
+                    output.extend(_select_atom_generic_u32(instr, ctx.ra, ctx, ATOMG_EXCH, 'EXCH'))
+
+                elif op == 'atom' and 'min' in instr.types and 's32' in instr.types:
+                    output.extend(_select_atom_generic_u32(instr, ctx.ra, ctx, ATOMG_MIN, 'MIN.S32'))
+
+                elif op == 'atom' and 'max' in instr.types and 's32' in instr.types:
+                    output.extend(_select_atom_generic_u32(instr, ctx.ra, ctx, ATOMG_MAX, 'MAX.S32'))
+
+                elif op == 'atom' and 'add' in instr.types and 'f32' in instr.types:
+                    output.extend(_select_atom_add_f32(instr, ctx.ra, ctx))
+
+                elif op == 'atom' and 'cas' in instr.types and 'b64' in instr.types:
+                    output.extend(_select_atom_cas_b64(instr, ctx.ra, ctx))
+
+                elif op == 'membar':
+                    if 'gl' in instr.types:
+                        output.append(SassInstr(encode_membar(MEMBAR_GPU),
+                                                'MEMBAR.SC.GPU  // membar.gl'))
+                    elif 'cta' in instr.types:
+                        output.append(SassInstr(encode_membar(MEMBAR_CTA),
+                                                'MEMBAR.SC.CTA  // membar.cta'))
+                    else:
+                        # Default to GPU scope
+                        output.append(SassInstr(encode_membar(MEMBAR_GPU),
+                                                'MEMBAR.SC.GPU  // membar (default)'))
+
+                elif op == 'dp4a':
+                    output.extend(_select_dp4a(instr, ctx.ra, ctx))
+
+                elif op == 'bfind' and typ in ('u32',):
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
+                    output.append(SassInstr(encode_flo(d, a),
+                                            f'FLO.U32 R{d}, R{a}  // bfind.u32'))
 
                 elif op == 'ret':
                     output.append(SassInstr(encode_exit(ctrl=0x7f5), 'EXIT'))

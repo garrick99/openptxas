@@ -61,7 +61,7 @@ from sass.encoding.sm_120_opcodes import (
     encode_popc, encode_brev, encode_flo, encode_iabs, encode_bfe_sext,
     encode_shfl, SHFL_IDX, SHFL_UP, SHFL_DOWN, SHFL_BFLY,
     encode_vote_ballot,
-    encode_atomg_cas_b32,
+    encode_atomg_cas_b32, encode_atomg_u32, ATOMG_ADD,
     encode_dadd, encode_dmul, encode_dfma, encode_dfma_ur_ur,
     encode_dsetp, DSETP_LT, DSETP_EQ, DSETP_LE, DSETP_GT, DSETP_NE, DSETP_GE,
     DSETP_LTU, DSETP_EQU, DSETP_LEU, DSETP_GTU, DSETP_NEU, DSETP_GEU,
@@ -810,6 +810,43 @@ def _select_atom_cas(instr: Instruction, ra: RegAlloc,
 
     return prefix + [SassInstr(encode_atomg_cas_b32(d, addr, cmp, nv),
                       f'ATOMG.E.CAS.b32 R{d}, [R{addr}], R{cmp}, R{nv}')]
+
+
+def _select_atom_add_u32(instr: Instruction, ra: RegAlloc,
+                         ctx: 'ISelContext' = None) -> list[SassInstr]:
+    """atom.global.add.u32 / atom.add.u32 → ATOMG.E.ADD.u32.
+
+    Emits ATOMG.E.ADD with opcode modifier byte 0x09 (ground-truth verified
+    on RTX 5090).  Address resolution mirrors _select_atom_cas: UR-only
+    pointers are materialized to GPR via IADD.64 first.
+    """
+    from ptx.ir import MemOp
+    dest_op = instr.dest
+    addr_op = instr.srcs[0]
+    data_op = instr.srcs[1]
+    if not isinstance(addr_op, MemOp):
+        raise ISelError("atom.add addr must be MemOp")
+    d    = ra.r32(dest_op.name)
+    data = ra.r32(data_op.name)
+
+    prefix = []
+    base_name = addr_op.base if addr_op.base.startswith('%') else f'%{addr_op.base}'
+    ur_params = getattr(ctx, '_ur_params', {}) if ctx else {}
+    gpr_written = getattr(ctx, '_gpr_written', set()) if ctx else set()
+    if base_name in gpr_written and addr_op.base in ra.int_regs:
+        addr = ra.lo(addr_op.base)
+    elif base_name in ur_params:
+        ur_idx = ur_params[base_name]
+        addr = getattr(ctx, '_addr_scratch_lo', None)
+        if addr is None:
+            addr = _alloc_gpr_pair(ctx)
+        prefix.append(SassInstr(encode_iadd64_ur(addr, RZ, ur_idx),
+                                f'IADD.64 R{addr}, RZ, UR{ur_idx}  // UR->GPR addr'))
+    else:
+        addr = RZ
+
+    return prefix + [SassInstr(encode_atomg_u32(d, addr, 0, data, ATOMG_ADD),
+                     f'ATOMG.E.ADD.u32 R{d}, [R{addr}], R{data}')]
 
 
 def _select_st_global(instr: Instruction, ra: RegAlloc,
@@ -1564,6 +1601,9 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
 
                 elif op == 'atom' and 'cas' in instr.types and 'b32' in instr.types:
                     output.extend(_select_atom_cas(instr, ctx.ra, ctx))
+
+                elif op == 'atom' and 'add' in instr.types and 'u32' in instr.types:
+                    output.extend(_select_atom_add_u32(instr, ctx.ra, ctx))
 
                 elif op == 'ret':
                     output.append(SassInstr(encode_exit(ctrl=0x7f5), 'EXIT'))

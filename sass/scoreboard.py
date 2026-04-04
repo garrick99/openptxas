@@ -96,7 +96,8 @@ _OPCODE_META: dict[int, _OpMeta] = {
 
 # Opcode classification (includes both SM_120 and SM_89 variants)
 _OPCODES_LDG = {0x981}
-_OPCODES_ATOMG = {0x3a9}
+_OPCODES_ATOMG = {0x3a9,   # ATOMG.E.CAS.b32
+                 0x9a8}   # ATOMG.E.ADD.u32
 _OPCODES_LDC = {0xb82, 0x7ac, 0x919, 0x9c3,  # SM_120: LDC, LDCU, S2R, S2UR
                 0x624, 0xab9, 0xa02}           # SM_89: IMAD.MOV.U32(cbuf), ULDC.64, MOV(cbuf)
 _OPCODES_LDS = {0x984}
@@ -211,10 +212,12 @@ def _get_src_regs(raw: bytes) -> set[int]:
         # LDG: src_addr at b3
         if raw[3] < 255: regs |= {raw[3], raw[3]+1}
     elif opcode in _OPCODES_ATOMG:
-        # ATOMG.CAS: addr(b3, 64-bit pair), compare(b4), new_val(b8)
+        # All ATOMG ops: addr at b3 (64-bit pair), data at b4
         if raw[3] < 255: regs |= {raw[3], raw[3]+1}
         if raw[4] < 255: regs.add(raw[4])
-        if raw[8] < 255: regs.add(raw[8])
+        if opcode == 0x3a9:
+            # ATOMG.CAS only: also reads new_val at b8
+            if raw[8] < 255: regs.add(raw[8])
     elif opcode in _OPCODES_DFPU:
         # DADD (0xe29): src0=b3(pair), src1=b4(pair); same layout as DMUL
         # DMUL (0xc28): src0=b3(pair), src1=b4(pair)
@@ -404,6 +407,7 @@ _OPCODE_MISC: dict[int, int] = {
                 #   SM_89 ULDC.64). All 4 LDCU.64 in fp64 preamble use misc=7 per ptxas.
                 #   counter gives 1,2,3,4 → ILLEGAL_INSTRUCTION at first LDCU.
     0x3a9: 4,   # ATOMG.CAS: misc=4 (from RTX 5090 probe 2026-03-27)
+    0x9a8: 4,   # ATOMG.ADD.u32: misc=4 (same global-memory category as CAS)
     0xe29: 2,   # DADD R-R: misc=2 (ground truth decode_sass.py: b1=0x7e, src1 in b4)
     0xc28: 2,   # DMUL: misc=2
     0xc2b: 2,   # DFMA: misc=2

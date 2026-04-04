@@ -1537,3 +1537,45 @@ def test_f64_neg_abs_compiles():
                for off in range(0, len(text), 16)]
     assert 0x212 in opcodes, f"LOP3 (0x212) not found — neg/abs.f64 lowering missing"
     assert 0x810 in opcodes, f"IADD3.IMM (0x810) not found — sign mask load missing"
+
+
+# ---------------------------------------------------------------------------
+# atom.add.u32 pipeline test
+# ---------------------------------------------------------------------------
+
+ATOM_ADD_U32_KERNEL = """\
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry atom_add_u32_kernel(
+    .param .u64 counter,
+    .param .u32 val)
+{
+    .reg .b32  %r<4>;
+    .reg .b64  %rd<2>;
+    ld.param.u64 %rd0, [counter];
+    ld.param.u32 %r0, [val];
+    atom.global.add.u32 %r1, [%rd0], %r0;
+    ret;
+}
+"""
+
+
+def test_atom_add_u32_compiles():
+    """atom.global.add.u32 compiles to ATOMG.E.ADD (opcode 0xa8, byte1=0x09)."""
+    results = compile_ptx_source(ATOM_ADD_U32_KERNEL)
+    cubin = results['atom_add_u32_kernel']
+    assert cubin[:4] == b'\x7fELF'
+    elf = ELF64(cubin)
+    text = elf.section_data('.text.atom_add_u32_kernel')
+    # ATOMG.E.ADD: byte0=0xa8, byte1=0x09 → lo64 opcode field = 0x09a8
+    # Check that at least one 16-byte instruction has byte0=0xa8, byte1=0x09
+    found_atomg_add = False
+    for off in range(0, len(text), 16):
+        if text[off] == 0xa8 and text[off + 1] == 0x09:
+            found_atomg_add = True
+            break
+    assert found_atomg_add, (
+        "ATOMG.E.ADD (byte0=0xa8, byte1=0x09) not found in cubin text section"
+    )

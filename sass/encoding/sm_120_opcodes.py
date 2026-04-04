@@ -2265,20 +2265,32 @@ ATOMG_EXCH = 0x08
 
 def encode_atomg_u32(dest: int, addr_base: int, offset: int, data: int,
                       atom_op: int = ATOMG_ADD, ctrl: int = 0) -> bytes:
-    """Encode ATOMG.E.{op}.STRONG.GPU for u32 atomic operations."""
+    """Encode ATOMG.E.{op}.STRONG.GPU for u32 atomic operations.
+
+    Ground truth (RTX 5090 probe):
+      ADD:  a8 09 d a e 00 00 80  (byte1=0x09)
+      MIN:  a8 79 d a e ...       (byte1=0x79)
+      others: same byte1=0x79 as MIN
+
+    ATOMG.E.ADD uses a distinct opcode modifier byte (0x09) from all other
+    integer atomic ops (0x79).  The raw[11] field carries the op-code
+    discriminator for non-ADD ops.
+    """
     if ctrl == 0:
         ctrl = _CTRL_DEFAULT
     b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    # ADD has opcode modifier 0x09; all other integer ops use 0x79.
+    b1 = 0x09 if atom_op == ATOMG_ADD else 0x79
     raw = bytearray(16)
     raw[0]  = 0xa8
-    raw[1]  = 0x79
+    raw[1]  = b1
     raw[2]  = dest & 0xFF
     raw[3]  = addr_base & 0xFF
     raw[4]  = data & 0xFF
-    # offset in bytes 5-7 (24-bit)
+    # offset in bytes 5-7 (24-bit); bit7 of byte7 = descriptor-mode flag
     raw[5]  = offset & 0xFF
     raw[6]  = (offset >> 8) & 0xFF
-    raw[7]  = 0x80 | ((offset >> 16) & 0x7F)  # high bit = descriptor flag
+    raw[7]  = 0x80 | ((offset >> 16) & 0x7F)
     raw[8]  = 0x00
     raw[9]  = 0x00
     raw[10] = 0x00

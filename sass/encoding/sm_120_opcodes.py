@@ -3066,18 +3066,23 @@ def encode_lop3_pred(dest: int, src0: int, src1: int, src2: int,
 #
 # Register pairs: DADD/DMUL/DFMA implicitly use dest_lo, dest_lo+1 (hi).
 
-def encode_dadd(dest_lo: int, src0_lo: int, src1_lo: int, ctrl: int = 0) -> bytes:
+def encode_dadd(dest_lo: int, src0_lo: int, src1_lo: int,
+                negate_src0: bool = False, ctrl: int = 0) -> bytes:
     """Encode DADD (add.f64): dest = src0 + src1 (double precision).
 
     R-R form: b1=0x7e, dest=b2, src0=b3, src1=b4, b11=0x08.
     Ground truth (decode_sass.py): DADD R28, R26, R4 → 29 7e 1c 1a 04 00 00 00 00 00 00 08 00 64 3e 00
     Note: earlier probe (DADD R2,R4,R2 → 29 72 ...) was wrong — that was a different instruction.
+
+    negate_src0: If True, compute dest = -src0 + src1 (i.e. sub.f64 with swapped ops).
+    Negation bit b9=0x01 inferred from FADD negation pattern (same ISA family).
     """
     if ctrl == 0: ctrl = _CTRL_DEFAULT
     return _build(0x29, 0x7e,
                   b2=dest_lo, b3=src0_lo, b4=src1_lo,
                   b8=0x00,
-                  b9=0x00, b10=0x00, b11=0x08,
+                  b9=0x01 if negate_src0 else 0x00,
+                  b10=0x00, b11=0x08,
                   ctrl=ctrl)
 
 

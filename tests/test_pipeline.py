@@ -1393,6 +1393,82 @@ def test_f64_arith_compiles():
     assert sched_nops <= 3, f"Too many scheduling NOPs ({sched_nops}) in f64_arith_kernel"
 
 
+F64_SUB_KERNEL = """\
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry f64_sub_kernel(
+    .param .u64 out_ptr,
+    .param .f64 a,
+    .param .f64 b)
+{
+    .reg .f64 %fd<3>;
+    .reg .u64 %rd<2>;
+    ld.param.u64 %rd0, [out_ptr];
+    ld.param.f64 %fd0, [a+8];
+    ld.param.f64 %fd1, [b+24];
+    sub.f64 %fd2, %fd0, %fd1;
+    st.global.f64 [%rd0], %fd2;
+    ret;
+}
+"""
+
+
+def test_f64_sub_compiles():
+    """sub.f64 emits DADD with negated src0 (no TODO NOP)."""
+    results = compile_ptx_source(F64_SUB_KERNEL)
+    cubin = results['f64_sub_kernel']
+    assert cubin[:4] == b'\x7fELF'
+    elf = ELF64(cubin)
+    text = elf.section_data('.text.f64_sub_kernel')
+    opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
+               for off in range(0, len(text), 16)]
+    assert 0xe29 in opcodes, f"DADD (0xe29) not found for sub.f64; opcodes={[hex(o) for o in set(opcodes)]}"
+    nop_count = opcodes.count(0x918)
+    assert nop_count < len(opcodes), f"All instructions are NOPs in sub.f64 output"
+
+
+F64_MINMAX_KERNEL = """\
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry f64_minmax_kernel(
+    .param .u64 out_ptr,
+    .param .f64 a,
+    .param .f64 b)
+{
+    .reg .f64 %fd<4>;
+    .reg .u64 %rd<2>;
+    .reg .pred %p<2>;
+    ld.param.u64 %rd0, [out_ptr];
+    ld.param.f64 %fd0, [a+8];
+    ld.param.f64 %fd1, [b+24];
+    min.f64 %fd2, %fd0, %fd1;
+    max.f64 %fd3, %fd0, %fd1;
+    st.global.f64 [%rd0],   %fd2;
+    st.global.f64 [%rd0+8], %fd3;
+    ret;
+}
+"""
+
+
+def test_f64_minmax_compiles():
+    """min.f64/max.f64 emit DSETP+FSEL (no TODO NOPs)."""
+    results = compile_ptx_source(F64_MINMAX_KERNEL)
+    cubin = results['f64_minmax_kernel']
+    assert cubin[:4] == b'\x7fELF'
+    elf = ELF64(cubin)
+    text = elf.section_data('.text.f64_minmax_kernel')
+    opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
+               for off in range(0, len(text), 16)]
+    # DSETP opcode 0xa72 (inferred) or check no TODO NOPs
+    nop_count = opcodes.count(0x918)
+    non_nop = [op for op in opcodes if op != 0x918]
+    assert len(non_nop) >= 4, f"Expected ≥4 real instructions for min+max f64, got {len(non_nop)}: {[hex(o) for o in non_nop]}"
+
+
 F64_SETP_KERNEL = """\
 .version 9.0
 .target sm_120

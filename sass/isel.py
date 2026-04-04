@@ -1418,6 +1418,15 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     output.append(SassInstr(encode_dadd(d, a, b),
                                             f'DADD R{d}, R{a}, R{b}  // add.f64'))
 
+                elif op == 'sub' and typ == 'f64':
+                    # sub.f64 d, a, b → d = a - b = -b + a → DADD d, -b, a
+                    # Mirrors sub.f32 which uses FADD(d, b, a, negate_src0=True).
+                    d = ctx.ra.lo(instr.dest.name)
+                    a = _f64_to_gpr(instr.srcs[0].name, ctx, output)
+                    b = _f64_to_gpr(instr.srcs[1].name, ctx, output)
+                    output.append(SassInstr(encode_dadd(d, b, a, negate_src0=True),
+                                            f'DADD R{d}, -R{b}, R{a}  // sub.f64'))
+
                 elif op == 'mul' and typ == 'f64':
                     d = ctx.ra.lo(instr.dest.name)
                     a = _f64_to_gpr(instr.srcs[0].name, ctx, output)
@@ -2479,6 +2488,36 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     b = _materialize_imm(instr.srcs[1], ctx, ctx.ra, output)
                     output.append(SassInstr(encode_fmnmx(d, a, b, is_max=True),
                                             f'FMNMX R{d}, R{a}, R{b}, !PT  // max.f32'))
+
+                elif op == 'min' and typ == 'f64':
+                    # min.f64 d, a, b → d = (a < b) ? a : b
+                    # DSETP.GEU p, a, b → p_hw = (a >= b, unordered)
+                    # !p_hw = (a < b, ordered when no NaN) → select a when !p_hw
+                    d_lo = ctx.ra.lo(instr.dest.name)
+                    a_lo = _f64_to_gpr(instr.srcs[0].name, ctx, output)
+                    b_lo = _f64_to_gpr(instr.srcs[1].name, ctx, output)
+                    p_tmp = _alloc_scratch_pred(ctx)[0]
+                    output.append(SassInstr(encode_dsetp(p_tmp, a_lo, b_lo, DSETP_GEU),
+                                            f'DSETP.GEU P{p_tmp}, R{a_lo}, R{b_lo}  // min.f64 cmp'))
+                    output.append(SassInstr(encode_fsel(d_lo,   a_lo,   b_lo,   p_tmp, negate_pred=True),
+                                            f'FSEL R{d_lo},   R{a_lo},   R{b_lo},   !P{p_tmp}  // min.f64 lo'))
+                    output.append(SassInstr(encode_fsel(d_lo+1, a_lo+1, b_lo+1, p_tmp, negate_pred=True),
+                                            f'FSEL R{d_lo+1}, R{a_lo+1}, R{b_lo+1}, !P{p_tmp}  // min.f64 hi'))
+
+                elif op == 'max' and typ == 'f64':
+                    # max.f64 d, a, b → d = (a > b) ? a : b
+                    # DSETP.LEU p, a, b → p_hw = (a <= b, unordered)
+                    # !p_hw = (a > b, ordered when no NaN) → select a when !p_hw
+                    d_lo = ctx.ra.lo(instr.dest.name)
+                    a_lo = _f64_to_gpr(instr.srcs[0].name, ctx, output)
+                    b_lo = _f64_to_gpr(instr.srcs[1].name, ctx, output)
+                    p_tmp = _alloc_scratch_pred(ctx)[0]
+                    output.append(SassInstr(encode_dsetp(p_tmp, a_lo, b_lo, DSETP_LEU),
+                                            f'DSETP.LEU P{p_tmp}, R{a_lo}, R{b_lo}  // max.f64 cmp'))
+                    output.append(SassInstr(encode_fsel(d_lo,   a_lo,   b_lo,   p_tmp, negate_pred=True),
+                                            f'FSEL R{d_lo},   R{a_lo},   R{b_lo},   !P{p_tmp}  // max.f64 lo'))
+                    output.append(SassInstr(encode_fsel(d_lo+1, a_lo+1, b_lo+1, p_tmp, negate_pred=True),
+                                            f'FSEL R{d_lo+1}, R{a_lo+1}, R{b_lo+1}, !P{p_tmp}  // max.f64 hi'))
 
                 elif op == 'shfl':
                     d = ctx.ra.r32(instr.dest.name)

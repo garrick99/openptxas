@@ -418,6 +418,10 @@ _OPCODE_MISC: dict[int, int] = {
     0xc24: 1,   # IMAD R-UR: misc=1
     0x810: 1,   # IADD3.IMM: misc=1 (ptxas: all 10 IADD3.IMM in fp64 preamble use 1)
     0x919: 1,   # S2R: misc=1 (ptxas-verified; counter=0 at body start would give 0)
+    # Tensor core MMA: misc=2 (ptxas-verified for SM_120 HMMA, IMMA, DMMA)
+    0x23c: 2,   # HMMA (FP16/BF16/TF32)
+    0x237: 2,   # IMMA (INT8)
+    0x23f: 2,   # DMMA (FP64)
     # LDC (0xb82) and S2UR (0x9c3) intentionally omitted — use counter for correct values
 }
 

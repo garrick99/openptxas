@@ -781,5 +781,128 @@ class TestHmma:
             cuda_ctx.free(d_out)
 
 
+_PTX_DMMA = """
+.version 8.7
+.target sm_120
+.address_size 64
+
+// dmma_zero_kernel: mma.sync.aligned.m8n8k4.f64 with zero inputs.
+// All inputs zero -> output must be 0.0. Tests DMMA.8x8x4 encoding.
+// Must be launched with exactly 32 threads (one warp).
+.visible .entry dmma_zero_kernel(
+    .param .u64 p_out
+)
+{
+    .reg .f64 %fd<4>;
+    .reg .u64 %rd<1>;
+
+    ld.param.u64    %rd0, [p_out];
+
+    mov.f64 %fd0, 0d0000000000000000;
+    mov.f64 %fd1, 0d0000000000000000;
+    mov.f64 %fd2, 0d0000000000000000;
+    mov.f64 %fd3, 0d0000000000000000;
+
+    mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64
+        {%fd0, %fd1},
+        {%fd2},
+        {%fd3},
+        {%fd0, %fd1};
+
+    st.global.f64 [%rd0], %fd0;
+    ret;
+}
+"""
+
+
+class TestDmma:
+    @gpu
+    def test_dmma_zero_inputs(self, cuda_ctx):
+        """DMMA.8x8x4.f64: zero A,B,C -> output must be 0.0."""
+        cubins = _compile(_PTX_DMMA)
+        assert 'dmma_zero_kernel' in cubins, "dmma_zero_kernel not compiled"
+        ok = cuda_ctx.load(cubins['dmma_zero_kernel'])
+        assert ok, "cuModuleLoadData failed for dmma_zero_kernel"
+        func = cuda_ctx.get_func('dmma_zero_kernel')
+
+        d_out = cuda_ctx.alloc(8)
+        try:
+            cuda_ctx.copy_to(d_out, bytes(8))
+            err = cuda_ctx.launch(func, (1, 1, 1), (32, 1, 1), [d_out])
+            assert err == 0, f"launch error {err}"
+            assert cuda_ctx.sync() == 0, "dmma kernel crashed"
+            raw = cuda_ctx.copy_from(d_out, 8)
+            result = struct.unpack('<d', raw)[0]
+            assert result == 0.0, \
+                f"DMMA zero-input: expected 0.0, got {result}"
+        finally:
+            cuda_ctx.free(d_out)
+
+
+_PTX_IMMA = """
+.version 8.7
+.target sm_120
+.address_size 64
+
+// imma_zero_kernel: mma.sync.aligned.m16n8k32.s32.s8.s8.s32 with zero inputs.
+// All inputs zero -> output must be 0. Tests IMMA.16832.S8 encoding.
+// Must be launched with exactly 32 threads (one warp).
+// NOTE: SM_120 IMMA requires B register base < 8. Initialize B (%r4, %r5)
+// BEFORE D/A registers (%r0..%r3) so the allocator assigns B to low GPRs.
+// A = D (overlapping) to keep register count low and match ptxas optimization.
+.visible .entry imma_zero_kernel(
+    .param .u64 p_out
+)
+{
+    .reg .s32 %r<6>;
+    .reg .u64 %rd<1>;
+
+    ld.param.u64    %rd0, [p_out];
+
+    // Initialize B first so it gets low register numbers (< 8)
+    mov.b32 %r4, 0;
+    mov.b32 %r5, 0;
+    // D/A registers (quad-aligned by regalloc)
+    mov.b32 %r0, 0;
+    mov.b32 %r1, 0;
+    mov.b32 %r2, 0;
+    mov.b32 %r3, 0;
+
+    mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32
+        {%r0, %r1, %r2, %r3},
+        {%r0, %r1, %r2, %r3},
+        {%r4, %r5},
+        {%r0, %r1, %r2, %r3};
+
+    st.global.u32 [%rd0], %r0;
+    ret;
+}
+"""
+
+
+class TestImma:
+    @gpu
+    def test_imma_zero_inputs(self, cuda_ctx):
+        """IMMA.16832.S8: zero A,B,C -> output must be 0."""
+        cubins = _compile(_PTX_IMMA)
+        assert 'imma_zero_kernel' in cubins, "imma_zero_kernel not compiled"
+        ok = cuda_ctx.load(cubins['imma_zero_kernel'])
+        assert ok, "cuModuleLoadData failed for imma_zero_kernel"
+        func = cuda_ctx.get_func('imma_zero_kernel')
+
+        d_out = cuda_ctx.alloc(4)
+        try:
+            cuda_ctx.copy_to(d_out, bytes(4))
+            err = cuda_ctx.launch(func, (1, 1, 1), (32, 1, 1), [d_out])
+            assert err == 0, f"launch error {err}"
+            assert cuda_ctx.sync() == 0, "imma kernel crashed"
+            raw = cuda_ctx.copy_from(d_out, 4)
+            result = struct.unpack('<i', raw)[0]
+            assert result == 0, \
+                f"IMMA zero-input: expected 0, got {result}"
+        finally:
+            cuda_ctx.free(d_out)
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v', '-m', 'gpu'])

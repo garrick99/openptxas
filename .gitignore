@@ -13,24 +13,9 @@ __pycache__/
 *.pkl
 *.bin
 
-# PTX scratch files at repo root (generated during testing)
-/test_k.ptx
-/va.ptx
-/vecadd_test.ptx
-/_test_ptxas.ptx
-/probe_work/idx_test.ptx
-/probe_work/imad_debug.ptx
-/probe_work/ldg64_min.ptx
-/probe_work/mad_test.ptx
-/probe_work/opencuda_vecadd_int.ptx
-/probe_work/pred_bra_test.ptx
-/probe_work/vecadd_noif.ptx
-/probe_work/vecadd_reorder.ptx
-/probe_work/vecadd_test.ptx
-/probe_work/vecadd_tight.ptx
-/probe_work/vecadd_tight_int.ptx
-/probe_work/vector_add_safe.ptx
-/probe_work/isetp_rr_test.ptx
+# PTX scratch files at repo root (generated during debugging/testing).
+# /*.ptx covers all future scratch files without touching examples/ or probe_work/.
+/*.ptx
 
 # Misc scratch
 *.bat

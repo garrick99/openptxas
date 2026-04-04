@@ -291,10 +291,30 @@ def _enforce_gpr_latency(instrs: list[SassInstr]) -> list[SassInstr]:
         _get_opcode    as _sc_opc,
     )
 
+    _ISETP_OPCODES = {0x20c, 0xc0c}  # ISETP R-R, ISETP R-UR
+    _FSEL_OPCODE   = 0x208
+
+    def _fsel_pred(raw: bytes) -> int:
+        """Extract pred index from FSEL raw[10..11] operand field."""
+        return ((raw[10] >> 7) & 1) | ((raw[11] & 0x7F) << 1)
+
     result = list(instrs)
     i = 0
     while i < len(result) - 1:
         opc_i = _sc_opc(result[i].raw)
+
+        # ISETP → FSEL pred hazard: ISETP writes pred at raw[2];
+        # FSEL reads pred from raw[10..11]. Needs ≥1 intervening instruction.
+        if opc_i in _ISETP_OPCODES:
+            opc_j = _sc_opc(result[i + 1].raw)
+            if opc_j == _FSEL_OPCODE:
+                isetp_pred = result[i].raw[2]
+                fsel_pred  = _fsel_pred(result[i + 1].raw)
+                if isetp_pred == fsel_pred:
+                    result.insert(i + 1, SassInstr(encode_nop(), 'NOP  // ISETP pred latency'))
+                    i += 2
+                    continue
+
         meta_i = _OPCODE_META.get(opc_i)
         if meta_i is None or meta_i.min_gpr_gap == 0:
             i += 1

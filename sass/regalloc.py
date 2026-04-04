@@ -128,7 +128,7 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
     coalesces = _find_ldg_coalesces(fn)
 
     # Liveness analysis: compute live ranges (first def, last use) per register
-    from ptx.ir import RegOp, MemOp
+    from ptx.ir import RegOp, MemOp, LabelOp
     used_regs: set[str] = set()
     reg_first_def: dict[str, int] = {}  # name → instruction index of first write
     reg_last_use: dict[str, int] = {}   # name → instruction index of last read
@@ -153,6 +153,31 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
                 used_regs.add(bname)
                 reg_last_use[bname] = idx
 
+    # Extend live ranges across loop back-edges.  The linear scan above records
+    # only the last *forward* use; a register read every iteration of a loop is
+    # live until the back-branch, not just until its last textual appearance.
+    # Without this, the allocator wrongly reuses a param register (e.g. fd3/b)
+    # as workspace for an intra-loop temp (e.g. fd24) from the 2nd iteration on.
+    # Labels are on BasicBlock objects; build a map from label → first instr index.
+    label_to_idx: dict[str, int] = {}
+    running_idx = 0
+    for bb in fn.blocks:
+        if bb.label:
+            label_to_idx[bb.label] = running_idx
+        running_idx += len(bb.instructions)
+    for bra_idx, inst in enumerate(all_instrs):
+        if inst.op != 'bra' or not inst.srcs or not isinstance(inst.srcs[0], LabelOp):
+            continue
+        loop_start = label_to_idx.get(inst.srcs[0].name, bra_idx + 1)
+        if loop_start > bra_idx:
+            continue  # forward branch — not a back-edge
+        # Any register defined before the loop and used within the loop body is
+        # loop-carried: its live range must reach at least to the back-branch.
+        for name, last in list(reg_last_use.items()):
+            first = reg_first_def.get(name, 0)
+            if first < loop_start and loop_start <= last <= bra_idx:
+                reg_last_use[name] = bra_idx
+
     next_pred = 0
     next_ur = 4
 
@@ -163,6 +188,37 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
                 if name in used_regs:
                     pred_regs[name] = next_pred
                     next_pred += 1
+
+    # SM_120: identify f64 param registers that will be loaded into UR via LDCU.64.
+    # DFMA R-R-UR-UR handles them directly; no GPR needed.  Keeping these in UR
+    # frees GPR slots so all accumulators fit in R0-R13 (avoiding R14+ restriction).
+    ur_only_f64_regs: set[str] = set()
+    if sm_version == 120:
+        f64_param_names: set[str] = set()
+        for inst in all_instrs:
+            if (inst.op == 'ld' and 'param' in inst.types
+                    and 'f64' in inst.types
+                    and isinstance(inst.dest, RegOp)):
+                f64_param_names.add(inst.dest.name)
+        # Only UR-ify when the register is exclusively used as a source in f64
+        # arithmetic (fma / mul / add / mov with f64 type).
+        for pname in f64_param_names:
+            safe = True
+            for inst in all_instrs:
+                for src in inst.srcs:
+                    src_name = (src.name if isinstance(src, RegOp) else
+                                (src.base if isinstance(src, MemOp) and
+                                 isinstance(src.base, str) else None))
+                    if src_name == pname:
+                        if not (inst.op in ('mul', 'add', 'fma', 'mov')
+                                and any(t == 'f64' for t in inst.types)):
+                            safe = False
+                            break
+                if not safe:
+                    break
+            if safe:
+                ur_only_f64_regs.add(pname)
+
 
     # SM_89 cbuf optimization: identify 64-bit param registers that are ONLY
     # used as sources in add.u64 (where IADD3.cb reads from cbuf directly).
@@ -204,6 +260,8 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
                 continue
             if name in cbuf_only_regs:
                 continue  # SM_89: skip GPR for cbuf-inline params
+            if name in ur_only_f64_regs:
+                continue  # SM_120: skip GPR for UR-loaded f64 params
             first = reg_first_def.get(name, 0)
             last = reg_last_use.get(name, len(all_instrs))
             reg_info.append((name, is_64, first, last))
@@ -241,29 +299,58 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
             if free_regs_64:
                 phys = free_regs_64.pop(0)
             else:
-                if next_gpr % 2 != 0:
-                    next_gpr += 1
-                if next_gpr + 1 >= _MAX_GPR:
-                    # Only evict intervals that DON'T overlap the new one.
-                    # Evicting a still-live register causes silent miscompilation.
-                    safe = [(a, i) for i, (a, ar, al, a64) in enumerate(active)
-                            if a64 and al < first_def]
-                    if safe:
-                        _, idx = min(safe, key=lambda x: active[x[1]][2])
-                        evicted = active.pop(idx)
-                        phys = evicted[1]
+                # Try to form a 64-bit pair from freed 32-bit slots.
+                # When u32 regs free up even-aligned slots, we can pair them with
+                # their odd neighbour (either also freed or the next fresh register),
+                # recovering low GPR slots that the 64-bit allocator would otherwise
+                # skip past due to alignment.
+                formed = False
+                for even_r in sorted(r for r in free_regs_32 if r % 2 == 0):
+                    odd_r = even_r + 1
+                    if odd_r in free_regs_32:
+                        # Both halves available from freed 32-bit slots
+                        free_regs_32.remove(even_r)
+                        free_regs_32.remove(odd_r)
+                        phys = even_r
+                        formed = True
+                        break
+                    elif odd_r == next_gpr:
+                        # Even half freed; odd half is the next fresh GPR
+                        free_regs_32.remove(even_r)
+                        next_gpr += 1  # consume the odd half
+                        phys = even_r
+                        formed = True
+                        break
+                if not formed:
+                    if next_gpr % 2 != 0:
+                        next_gpr += 1
+                    if next_gpr + 1 >= _MAX_GPR:
+                        # Only evict intervals that DON'T overlap the new one.
+                        # Evicting a still-live register causes silent miscompilation.
+                        safe = [(a, i) for i, (a, ar, al, a64) in enumerate(active)
+                                if a64 and al < first_def]
+                        if safe:
+                            _, idx = min(safe, key=lambda x: active[x[1]][2])
+                            evicted = active.pop(idx)
+                            phys = evicted[1]
+                        else:
+                            # No safe eviction — exceed limit (correct code > ERR715 risk)
+                            phys = next_gpr
+                            next_gpr += 2
                     else:
-                        # No safe eviction — exceed limit (correct code > ERR715 risk)
                         phys = next_gpr
                         next_gpr += 2
-                else:
-                    phys = next_gpr
-                    next_gpr += 2
             int_regs[name] = phys
             active.append((name, phys, last_use, True))
         else:
             if free_regs_32:
                 phys = free_regs_32.pop(0)
+            elif free_regs_64:
+                # Borrow the lower half of a freed 64-bit pair.
+                # Put the upper half back into free_regs_32 for future 32-bit use.
+                pair_base = free_regs_64.pop(0)
+                phys = pair_base
+                free_regs_32.append(pair_base + 1)
             elif next_gpr >= _MAX_GPR:
                 # Only evict non-overlapping intervals
                 safe = [(a, i) for i, (a, ar, al, a64) in enumerate(active)

@@ -862,10 +862,27 @@ def encode_isetp_ur(pred_dest: int, src_reg: int, ur_src: int,
 # Opcode: 0x83b, b2=dest_base, b3=addr_reg, b9=0x02
 
 def encode_ldsm_x4(dest: int, addr_reg: int, ctrl: int = 0) -> bytes:
-    """Encode LDSM.16.M88.4 dest, [addr_reg] — load 4 matrix regs from smem."""
+    """Encode LDSM.16.M88.4 dest, [addr_reg] — load 4 matrix regs from smem.
+    Ground truth: opcode 0x83b, b9=0x02 (x4 = 4 matrices)."""
     if ctrl == 0: ctrl = _CTRL_DEFAULT
     return _build(0x3b, 0x78, b2=dest, b3=addr_reg, b4=0x00,
                   b8=0x00, b9=0x02, b10=0x00, b11=0x00, ctrl=ctrl)
+
+
+def encode_ldsm_x2(dest: int, addr_reg: int, ctrl: int = 0) -> bytes:
+    """Encode LDSM.16.M88.2 dest, [addr_reg] — load 2 matrix regs from smem.
+    Layout inferred from x4 (b9=0x01); needs hardware verification."""
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x3b, 0x78, b2=dest, b3=addr_reg, b4=0x00,
+                  b8=0x00, b9=0x01, b10=0x00, b11=0x00, ctrl=ctrl)
+
+
+def encode_ldsm_x1(dest: int, addr_reg: int, ctrl: int = 0) -> bytes:
+    """Encode LDSM.16.M88.1 dest, [addr_reg] — load 1 matrix reg from smem.
+    Layout inferred from x4 (b9=0x00); needs hardware verification."""
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x3b, 0x78, b2=dest, b3=addr_reg, b4=0x00,
+                  b8=0x00, b9=0x00, b10=0x00, b11=0x00, ctrl=ctrl)
 
 
 # ---------------------------------------------------------------------------
@@ -2183,8 +2200,8 @@ def encode_fsel(dest: int, src0: int, src1: int, pred: int = 0,
     raw[4]  = src1 & 0xFF
     raw[8]  = 0x00
     raw[9]  = 0x00
-    raw[10] = 0x00
-    raw[11] = 0x00
+    raw[10] = (pred & 1) << 7
+    raw[11] = ((pred >> 1) & 0x7F) | (0x04 if negate_pred else 0x00)
     raw[12] = 0x00
     raw[13] = b13
     raw[14] = b14
@@ -2750,6 +2767,20 @@ def encode_i2f_f64_s32(dest_lo: int, src: int, ctrl: int = 0) -> bytes:
                   ctrl=ctrl)
 
 
+def encode_i2f_f64_u32(dest_lo: int, src: int, ctrl: int = 0) -> bytes:
+    """Encode I2F.F64.U32 dest_lo, src — convert unsigned int32 to f64 pair.
+
+    Layout inferred from I2F.F64.S32 (b9=0x1c) + F32 u32 pattern (b9 differs by bit).
+    F32 unsigned adds 0x04 to signed; applying same delta: b9=0x1c+0x04=0x20.
+    Needs hardware verification.
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x12, 0x73,
+                  b2=dest_lo, b3=0x00, b4=src,
+                  b8=0x00, b9=0x20, b10=0x20, b11=0x00,
+                  ctrl=ctrl)
+
+
 # ---------------------------------------------------------------------------
 # HFMA2 — Half-precision FMA2 (used as zero-init trick in div.u32)
 # ---------------------------------------------------------------------------
@@ -2988,23 +3019,33 @@ def encode_lop3_pred(dest: int, src0: int, src1: int, src2: int,
 # ---------------------------------------------------------------------------
 # F64 arithmetic — DADD, DMUL, DFMA
 # ---------------------------------------------------------------------------
-# Ground truth from RTX 5090 (sm_120) probe 2026-03-27:
-#   add.f64 R2, R2, R6 → lo=29 7e 02 02 06 00 00 00  hi=00 00 00 08 00 64 1e 00
+# Ground truth from RTX 5090 (sm_120) — CORRECTED 2026-04-02:
+#   DADD R-R (pure GPR): b1=0x72, dest=b2, src0=b3, src1=b8, b11=0x00
+#     Probe: DADD R2, R4, R2 → 29 72 02 04 00 00 00 00 02 00 00 00 00 64 0e 00
+#   DADD R-CBUF (constant pool): b1=0x74, dest=b2, src0=b3, cbuf_idx=b4..b7, b11=0x00
+#   Previous "ground truth" (2026-03-27) with b1=0x7e was WRONG — was not R-R form.
 #   mul.f64 R2, R2, R6 → lo=28 7c 02 02 06 00 00 00  hi=00 00 00 08 00 64 1e 00
 #   fma.f64 R2, R2, R6, R6 → lo=2b 7c 02 02 06 00 00 00  hi=06 00 00 08 00 64 1e 00
 #
-# All use dest_lo=b2, src0_lo=b3, src1_lo=b4, src2_lo=b8 (DFMA only).
-# b11=0x08 is a fixed modifier (64-bit precision flag).
+# DADD layout: dest=b2, src0=b3, src1=b8 (b4 unused/zero for DADD)
+# DFMA layout: dest=b2, src0=b3, mul_src=b4, add_src=b8
+# b11=0x08 precision flag applies to DFMA/DMUL only, NOT DADD.
 # ctrl=0x0f32: rbar=0x03 (wait for LDC result), wdep=0x33 (slow ALU slot), misc=2
 #
 # Register pairs: DADD/DMUL/DFMA implicitly use dest_lo, dest_lo+1 (hi).
 
 def encode_dadd(dest_lo: int, src0_lo: int, src1_lo: int, ctrl: int = 0) -> bytes:
-    """Encode DADD (add.f64): dest = src0 + src1 (double precision)."""
+    """Encode DADD (add.f64): dest = src0 + src1 (double precision).
+
+    R-R form: b1=0x7e, dest=b2, src0=b3, src1=b4, b11=0x08.
+    Ground truth (decode_sass.py): DADD R28, R26, R4 → 29 7e 1c 1a 04 00 00 00 00 00 00 08 00 64 3e 00
+    Note: earlier probe (DADD R2,R4,R2 → 29 72 ...) was wrong — that was a different instruction.
+    """
     if ctrl == 0: ctrl = _CTRL_DEFAULT
     return _build(0x29, 0x7e,
                   b2=dest_lo, b3=src0_lo, b4=src1_lo,
-                  b8=0x00, b9=0x00, b10=0x00, b11=0x08,
+                  b8=0x00,
+                  b9=0x00, b10=0x00, b11=0x08,
                   ctrl=ctrl)
 
 
@@ -3027,6 +3068,25 @@ def encode_dfma(dest_lo: int, src0_lo: int, src1_lo: int, src2_lo: int,
                   ctrl=ctrl)
 
 
+def encode_dfma_ur_ur(dest_lo: int, src0_lo: int, ur_src1: int, ur_src2: int,
+                      ctrl: int = 0) -> bytes:
+    """Encode DFMA R-R-UR-UR: dest = src0 * ur_src1 + ur_src2 (FP64 FMA with UR operands).
+
+    Used when the multiplier (B) and addend (C) params are loaded into uniform
+    registers via LDCU.64.  Keeps all regular GPRs ≤ R13, avoiding the R14+
+    ILLEGAL_INSTRUCTION restriction on SM_120.
+
+    Ground truth from ptxas fp64_bench:
+      DFMA R2, R2, UR8, UR12 → 2b7c020208000000 0c00000800{ctrl}
+      b0=0x2b, b1=0x7c, b2=dest_lo, b3=src0_lo, b4=ur_src1, b8=ur_src2, b11=0x08
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x2b, 0x7c,
+                  b2=dest_lo, b3=src0_lo, b4=ur_src1,
+                  b8=ur_src2, b9=0x00, b10=0x00, b11=0x08,
+                  ctrl=ctrl)
+
+
 # ---------------------------------------------------------------------------
 # DSETP — Double-Precision Set Predicate (comparison)
 # ---------------------------------------------------------------------------
@@ -3039,12 +3099,21 @@ def encode_dfma(dest_lo: int, src0_lo: int, src1_lo: int, src2_lo: int,
 #   b10 = 0xf0 (PT mask, same as FSETP)
 #   b11 = 0x0b = 0x03 (AND combiner) | 0x08 (FP64 precision flag)
 #
-DSETP_LT = 0x01
-DSETP_EQ = 0x02
-DSETP_LE = 0x03
-DSETP_GT = 0x04
-DSETP_NE = 0x05
-DSETP_GE = 0x06
+# Ordered DSETP comparisons — the FIRST output predicate gets NOT(cond).
+# To get P = (a < b), use DSETP_GEU (complement, unordered) so NOT(GEU) = LT.
+DSETP_LT  = 0x01   # ordered less-than
+DSETP_EQ  = 0x02   # ordered equal
+DSETP_LE  = 0x03   # ordered less-or-equal
+DSETP_GT  = 0x04   # ordered greater-than
+DSETP_NE  = 0x05   # ordered not-equal
+DSETP_GE  = 0x06   # ordered greater-or-equal
+# Unordered variants (true if NaN present):
+DSETP_LTU = 0x09
+DSETP_EQU = 0x0a
+DSETP_LEU = 0x0b
+DSETP_GTU = 0x0c
+DSETP_NEU = 0x0d
+DSETP_GEU = 0x0e   # ground-truth: ptxas uses this to implement setp.lt
 
 def encode_dsetp(pred_dest: int, src0_lo: int, src1_lo: int, cmp: int = DSETP_LT,
                  ctrl: int = 0) -> bytes:
@@ -3062,9 +3131,9 @@ def encode_dsetp(pred_dest: int, src0_lo: int, src1_lo: int, cmp: int = DSETP_LT
     raw[2] = 0x00
     raw[3] = src0_lo & 0xFF
     raw[4] = src1_lo & 0xFF
-    raw[9]  = ((cmp & 0x0F) << 4) | (pred_dest & 0x07)
-    raw[10] = 0xf0   # PT in AND mask
-    raw[11] = 0x0b   # AND combiner (0x03) | FP64 flag (0x08)
+    raw[9]  = (cmp & 0x0F) << 4  # comparison code in upper nibble; lower nibble = 0
+    raw[10] = 0xf0 | ((pred_dest & 0x07) << 1)  # pred_dest: same encoding as ISETP (P0→0xf0, P1→0xf2)
+    raw[11] = 0x03   # AND combiner (ground truth: ptxas sm_120)
     raw[13], raw[14], raw[15] = b13, b14, b15
     return bytes(raw)
 
@@ -3177,10 +3246,51 @@ def encode_shf_r_s32_hi(dest, src_lo, shift_reg, src_hi, ctrl=0):
 # Opcode: 0x3c4 (byte0=0xc4, byte1=0x73), b10=0xc0 (SUM mode)
 
 def encode_redux_sum(dest_ur, src, ctrl=0):
-    """REDUX.SUM URdest, Rsrc — warp-wide unsigned sum into uniform register."""
+    """REDUX.SUM URdest, Rsrc — warp-wide unsigned sum into uniform register.
+    Ground truth: REDUX.SUM UR6, R0 → b10=0xc0."""
     if ctrl == 0: ctrl = _CTRL_DEFAULT
     return _build(0xc4, 0x73, b2=dest_ur, b3=src, b4=0x00, b8=0x00,
                   b9=0x00, b10=0xc0, b11=0x00, ctrl=ctrl)
+
+
+def encode_redux_min_s32(dest_ur, src, ctrl=0):
+    """REDUX.MIN.S32 URdest, Rsrc — warp-wide signed min into uniform register.
+    Layout inferred from REDUX.SUM (b10 mode field); needs hardware verification."""
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0xc4, 0x73, b2=dest_ur, b3=src, b4=0x00, b8=0x00,
+                  b9=0x00, b10=0x80, b11=0x00, ctrl=ctrl)
+
+
+def encode_redux_max_s32(dest_ur, src, ctrl=0):
+    """REDUX.MAX.S32 URdest, Rsrc — warp-wide signed max into uniform register.
+    Layout inferred from REDUX.SUM; needs hardware verification."""
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0xc4, 0x73, b2=dest_ur, b3=src, b4=0x00, b8=0x00,
+                  b9=0x00, b10=0x40, b11=0x00, ctrl=ctrl)
+
+
+def encode_redux_and_b32(dest_ur, src, ctrl=0):
+    """REDUX.AND.B32 URdest, Rsrc — warp-wide bitwise AND into uniform register.
+    Layout inferred; needs hardware verification."""
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0xc4, 0x73, b2=dest_ur, b3=src, b4=0x00, b8=0x00,
+                  b9=0x00, b10=0x00, b11=0x00, ctrl=ctrl)
+
+
+def encode_redux_or_b32(dest_ur, src, ctrl=0):
+    """REDUX.OR.B32 URdest, Rsrc — warp-wide bitwise OR into uniform register.
+    Layout inferred; needs hardware verification."""
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0xc4, 0x73, b2=dest_ur, b3=src, b4=0x00, b8=0x00,
+                  b9=0x01, b10=0x00, b11=0x00, ctrl=ctrl)
+
+
+def encode_redux_xor_b32(dest_ur, src, ctrl=0):
+    """REDUX.XOR.B32 URdest, Rsrc — warp-wide bitwise XOR into uniform register.
+    Layout inferred; needs hardware verification."""
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0xc4, 0x73, b2=dest_ur, b3=src, b4=0x00, b8=0x00,
+                  b9=0x02, b10=0x00, b11=0x00, ctrl=ctrl)
 
 
 # ---------------------------------------------------------------------------

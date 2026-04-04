@@ -66,12 +66,18 @@ from sass.encoding.sm_120_opcodes import (
     encode_shfl, SHFL_IDX, SHFL_UP, SHFL_DOWN, SHFL_BFLY,
     encode_vote_ballot,
     encode_atomg_cas_b32,
-    encode_dadd, encode_dmul, encode_dfma,
+    encode_dadd, encode_dmul, encode_dfma, encode_dfma_ur_ur,
     encode_dsetp, DSETP_LT, DSETP_EQ, DSETP_LE, DSETP_GT, DSETP_NE, DSETP_GE,
+    DSETP_LTU, DSETP_EQU, DSETP_LEU, DSETP_GTU, DSETP_NEU, DSETP_GEU,
     encode_i2fp_u32, encode_f2i_u32,
     encode_f2f_f32_f64, encode_f2f_f64_f32,
-    encode_f2i_s32_f64, encode_f2i_u32_f64, encode_i2f_f64_s32,
+    encode_f2i_s32_f64, encode_f2i_u32_f64, encode_i2f_f64_s32, encode_i2f_f64_u32,
     encode_i2f_u32_rp, encode_i2f_s32_rp, encode_f2i_ftz_u32_trunc, encode_hfma2_zero,
+    encode_hmma_f16_f32, encode_hmma_bf16_f32, encode_hmma_tf32_f32,
+    encode_imma_s8_s32, encode_dmma_8x8x4,
+    encode_ldsm_x4, encode_ldsm_x2, encode_ldsm_x1,
+    encode_redux_sum, encode_redux_min_s32, encode_redux_max_s32,
+    encode_redux_and_b32, encode_redux_or_b32, encode_redux_xor_b32,
     encode_iadd3_imm32, encode_iadd3_neg_b4, encode_iadd3_neg_b3,
     encode_iadd3_pred_neg_b4, encode_iadd3_pred_small_imm,
     encode_iadd3_pred_neg_b3, encode_lop3_pred,
@@ -134,6 +140,31 @@ def _get_imm(op: Operand) -> int:
 
 def _nop(comment: str = '') -> SassInstr:
     return SassInstr(encode_nop(), comment or 'NOP')
+
+
+def _f64_to_gpr(name: str, ctx, output: list) -> int:
+    """Return the lo GPR index for an f64 register.
+    If the register is GPR-backed, return it directly.
+    If it is UR-backed (loaded via LDCU.64), emit IADD.64 RZ,UR→tmp and cache + return tmp.
+    Caching ensures each f64 param is only materialized once, reducing NOP insertions."""
+    if name in ctx.ra.int_regs:
+        return ctx.ra.int_regs[name]
+    # Check materialization cache (avoids re-emitting IADD.64-UR for same param)
+    if not hasattr(ctx, '_f64_gpr_cache'):
+        ctx._f64_gpr_cache = {}
+    if name in ctx._f64_gpr_cache:
+        return ctx._f64_gpr_cache[name]
+    ur = ctx._ur_params.get(name)
+    if ur is None:
+        raise ISelError(f'f64 register {name!r} not in GPR or UR')
+    t = _alloc_gpr(ctx)
+    if t % 2 != 0:
+        t = _alloc_gpr(ctx)
+    _alloc_gpr(ctx)  # reserve t+1
+    output.append(SassInstr(encode_iadd64_ur(t, RZ, ur),
+                             f'IADD.64 R{t}, RZ, UR{ur}  // materialize f64 {name}'))
+    ctx._f64_gpr_cache[name] = t
+    return t
 
 
 def _alloc_scratch(ctx: 'ISelContext', count: int = 1) -> list[int]:
@@ -314,6 +345,23 @@ def _select_mov(instr: Instruction, ra: RegAlloc,
                           f'S2R R{d}, SR_{src.name}  // {dest.name} = {src.name}')]
 
     if isinstance(src, ImmOp):
+        if typ in ('u64', 's64', 'b64', 'f64'):
+            # 64-bit immediate: split into lo/hi 32-bit halves
+            bits = src.value & 0xFFFFFFFFFFFFFFFF
+            lo = bits & 0xFFFFFFFF
+            hi = (bits >> 32) & 0xFFFFFFFF
+            d_lo = ra.lo(dest.name)
+            d_hi = d_lo + 1
+            if ctx and hi == 0:
+                if not hasattr(ctx, '_zero_regs'):
+                    ctx._zero_regs = set()
+                ctx._zero_regs.add(d_hi)
+            return [
+                SassInstr(encode_iadd3_imm32(d_lo, RZ, lo, RZ),
+                          f'IADD3 R{d_lo}, RZ, 0x{lo:x}, RZ  // {dest.name}.lo = imm'),
+                SassInstr(encode_iadd3_imm32(d_hi, RZ, hi, RZ),
+                          f'IADD3 R{d_hi}, RZ, 0x{hi:x}, RZ  // {dest.name}.hi = imm'),
+            ]
         raise ISelError("MOV from immediate not yet supported in isel (use LDC for params)")
 
     if not isinstance(src, RegOp):
@@ -472,10 +520,23 @@ def _select_add_u64(instr: Instruction, ra: RegAlloc,
     dest = instr.dest
     a    = instr.srcs[0]
     b    = instr.srcs[1]
+    sm_ver = ctx.sm_version if ctx else 120
+
+    # Handle immediate operand: add.u64 dest, a, imm  (e.g. loop counter increment by 1)
+    if isinstance(b, ImmOp) and isinstance(dest, RegOp) and isinstance(a, RegOp):
+        d_lo = ra.lo(dest.name)
+        a_lo = ra.lo(a.name)
+        imm_lo = b.value & 0xFFFFFFFF
+        # IADD3.IMM lo + IADD3.X hi (carry propagates via hardcoded predicate bits)
+        return [
+            SassInstr(encode_iadd3_imm32(d_lo, a_lo, imm_lo, RZ),
+                      f'IADD3.IMM R{d_lo}, R{a_lo}, {imm_lo:#x}, RZ  // add.u64 lo imm'),
+            SassInstr(encode_iadd3x(d_lo + 1, a_lo + 1, RZ, RZ),
+                      f'IADD3.X R{d_lo+1}, R{a_lo+1}, RZ, RZ  // add.u64 hi carry'),
+        ]
+
     if not isinstance(dest, RegOp) or not isinstance(a, RegOp) or not isinstance(b, RegOp):
         raise ISelError(f"add.u64: all operands must be registers")
-
-    sm_ver = ctx.sm_version if ctx else 120
 
     if sm_ver == 89:
         # SM_89: no IADD.64 instruction. Use IADD3.cb + IADD3.X.cb when one
@@ -620,6 +681,22 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
                               f'IMAD.MOV.U32 R{d}, RZ, RZ, c[0][0x{byte_off:x}]  // {param_name}')]
 
     # SM_120 path (original)
+    if typ == 'f64':
+        # SM_120: Load f64 param into a UR pair via LDCU.64.
+        # DFMA R-R-UR-UR uses the UR operands directly, keeping all regular
+        # GPRs within R0-R13 and avoiding the R14+ ILLEGAL_INSTRUCTION restriction.
+        ur_idx = ctx._next_ur if ctx else 6
+        if ctx:
+            if ur_idx % 2 != 0:
+                ur_idx += 1
+                ctx._next_ur = ur_idx
+            ctx._next_ur += 2
+            ctx._ur_params[dest.name] = ur_idx
+        return [
+            SassInstr(encode_ldcu_64(ur_idx, 0, byte_off),
+                      f'LDCU.64 UR{ur_idx}, c[0][0x{byte_off:x}]  // {param_name} (f64)'),
+        ]
+
     if typ in ('u64', 's64', 'b64'):
         # Load 64-bit param into UR via LDCU.64, materialize to GPR via IADD.64-UR.
         # Avoids LDC.64 single-slot scoreboard collision for 3+ pointer params.
@@ -1248,23 +1325,30 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     output.append(SassInstr(encode_imad_wide_rr(d_lo, a_lo, b_lo, RZ),
                         f'IMAD.WIDE R{d_lo}, R{a_lo}, R{b_lo}, RZ  // mul.lo.{typ} wide'))
                     # IMAD R-R (0x2a4) is broken on SM_120. Use IMAD.WIDE for cross terms:
-                    # cross1 = a_lo * b_hi (only need low 32 bits)
-                    # cross2 = a_hi * b_lo (only need low 32 bits)
-                    # d_hi += cross1 + cross2
-                    t = _alloc_gpr(ctx)
-                    if t % 2 != 0:
+                    # cross1 = a_lo * b_hi; cross2 = a_hi * b_lo; d_hi += cross1 + cross2
+                    # Skip any cross term whose multiplier register is known to be zero.
+                    _zero_regs = getattr(ctx, '_zero_regs', set())
+                    b_hi = b_lo + 1
+                    a_hi = a_lo + 1
+                    need_cross1 = b_hi not in _zero_regs
+                    need_cross2 = a_hi not in _zero_regs
+                    if need_cross1 or need_cross2:
                         t = _alloc_gpr(ctx)
-                    _alloc_gpr(ctx)  # reserve t+1
-                    # cross1: t = a_lo * b_hi (low 32 of wide product)
-                    output.append(SassInstr(encode_imad_wide_rr(t, a_lo, b_lo+1, RZ),
-                        f'IMAD.WIDE R{t}, R{a_lo}, R{b_lo+1}, RZ  // cross a_lo*b_hi'))
-                    output.append(SassInstr(encode_iadd3(d_lo+1, d_lo+1, t, RZ),
-                        f'IADD3 R{d_lo+1}, R{d_lo+1}, R{t}, RZ  // d_hi += cross1'))
-                    # cross2: t = a_hi * b_lo (low 32 of wide product)
-                    output.append(SassInstr(encode_imad_wide_rr(t, a_lo+1, b_lo, RZ),
-                        f'IMAD.WIDE R{t}, R{a_lo+1}, R{b_lo}, RZ  // cross a_hi*b_lo'))
-                    output.append(SassInstr(encode_iadd3(d_lo+1, d_lo+1, t, RZ),
-                        f'IADD3 R{d_lo+1}, R{d_lo+1}, R{t}, RZ  // d_hi += cross2'))
+                        if t % 2 != 0:
+                            t = _alloc_gpr(ctx)
+                        _alloc_gpr(ctx)  # reserve t+1
+                    if need_cross1:
+                        # cross1: t = a_lo * b_hi (low 32 of wide product)
+                        output.append(SassInstr(encode_imad_wide_rr(t, a_lo, b_hi, RZ),
+                            f'IMAD.WIDE R{t}, R{a_lo}, R{b_hi}, RZ  // cross a_lo*b_hi'))
+                        output.append(SassInstr(encode_iadd3(d_lo+1, d_lo+1, t, RZ),
+                            f'IADD3 R{d_lo+1}, R{d_lo+1}, R{t}, RZ  // d_hi += cross1'))
+                    if need_cross2:
+                        # cross2: t = a_hi * b_lo (low 32 of wide product)
+                        output.append(SassInstr(encode_imad_wide_rr(t, a_hi, b_lo, RZ),
+                            f'IMAD.WIDE R{t}, R{a_hi}, R{b_lo}, RZ  // cross a_hi*b_lo'))
+                        output.append(SassInstr(encode_iadd3(d_lo+1, d_lo+1, t, RZ),
+                            f'IADD3 R{d_lo+1}, R{d_lo+1}, R{t}, RZ  // d_hi += cross2'))
 
                 elif op == 'st' and 'shared' in instr.types:
                     from ptx.ir import MemOp
@@ -1331,25 +1415,114 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
 
                 elif op == 'add' and typ == 'f64':
                     d = ctx.ra.lo(instr.dest.name)
-                    a = ctx.ra.lo(instr.srcs[0].name)
-                    b = ctx.ra.lo(instr.srcs[1].name)
+                    a = _f64_to_gpr(instr.srcs[0].name, ctx, output)
+                    b = _f64_to_gpr(instr.srcs[1].name, ctx, output)
                     output.append(SassInstr(encode_dadd(d, a, b),
                                             f'DADD R{d}, R{a}, R{b}  // add.f64'))
 
                 elif op == 'mul' and typ == 'f64':
                     d = ctx.ra.lo(instr.dest.name)
-                    a = ctx.ra.lo(instr.srcs[0].name)
-                    b = ctx.ra.lo(instr.srcs[1].name)
+                    a = _f64_to_gpr(instr.srcs[0].name, ctx, output)
+                    b = _f64_to_gpr(instr.srcs[1].name, ctx, output)
                     output.append(SassInstr(encode_dmul(d, a, b),
                                             f'DMUL R{d}, R{a}, R{b}  // mul.f64'))
 
                 elif op == 'fma' and typ == 'f64':
                     d = ctx.ra.lo(instr.dest.name)
-                    a = ctx.ra.lo(instr.srcs[0].name)
-                    b = ctx.ra.lo(instr.srcs[1].name)
-                    c = ctx.ra.lo(instr.srcs[2].name)
-                    output.append(SassInstr(encode_dfma(d, a, b, c),
-                                            f'DFMA R{d}, R{a}, R{b}, R{c}  // fma.f64'))
+                    a = _f64_to_gpr(instr.srcs[0].name, ctx, output)
+                    b_ur = ctx._ur_params.get(instr.srcs[1].name) if ctx else None
+                    c_ur = ctx._ur_params.get(instr.srcs[2].name) if ctx else None
+                    if b_ur is not None and c_ur is not None:
+                        # Both multiplier and addend are in UR — DFMA R-R-UR-UR
+                        output.append(SassInstr(encode_dfma_ur_ur(d, a, b_ur, c_ur),
+                                                f'DFMA R{d}, R{a}, UR{b_ur}, UR{c_ur}  // fma.f64 (UR×UR)'))
+                    else:
+                        b = _f64_to_gpr(instr.srcs[1].name, ctx, output)
+                        c = _f64_to_gpr(instr.srcs[2].name, ctx, output)
+                        output.append(SassInstr(encode_dfma(d, a, b, c),
+                                                f'DFMA R{d}, R{a}, R{b}, R{c}  // fma.f64'))
+
+                elif op == 'mma' and 'sync' in instr.types and 'aligned' in instr.types:
+                    _types_set = set(instr.types)
+                    shape = next((t for t in instr.types if t.startswith('m')), None)
+                    # PTX tuple operands: extract base register (first element)
+                    def _tuple_base(op_node):
+                        nm = op_node.name if hasattr(op_node, 'name') else str(op_node)
+                        # strip leading '{' and trailing '}' if present
+                        nm = nm.lstrip('{').split(',')[0].rstrip('}').strip()
+                        return nm
+                    d_nm = _tuple_base(instr.dest) if instr.dest else None
+                    srcs = instr.srcs or []
+                    a_nm = _tuple_base(srcs[0]) if len(srcs) > 0 else None
+                    b_nm = _tuple_base(srcs[1]) if len(srcs) > 1 else None
+                    c_nm = _tuple_base(srcs[2]) if len(srcs) > 2 else None
+                    def _r(nm): return ctx.ra.r32(nm) if nm else RZ
+                    d = _r(d_nm); a = _r(a_nm); b = _r(b_nm); c = _r(c_nm)
+                    if shape == 'm8n8k4' and 'f64' in _types_set:
+                        output.append(SassInstr(encode_dmma_8x8x4(d, a, b, c),
+                                                f'DMMA.8x8x4 R{d}, R{a}, R{b}, R{c}'))
+                    elif 's8' in _types_set or 'u8' in _types_set:
+                        output.append(SassInstr(encode_imma_s8_s32(d, a, b, c),
+                                                f'IMMA.16832.S8 R{d}, R{a}, R{b}, R{c}'))
+                    elif 'tf32' in _types_set:
+                        output.append(SassInstr(encode_hmma_tf32_f32(d, a, b, c),
+                                                f'HMMA.TF32 R{d}, R{a}, R{b}, R{c}'))
+                    elif 'bf16' in _types_set:
+                        output.append(SassInstr(encode_hmma_bf16_f32(d, a, b, c),
+                                                f'HMMA.BF16 R{d}, R{a}, R{b}, R{c}'))
+                    else:
+                        output.append(SassInstr(encode_hmma_f16_f32(d, a, b, c),
+                                                f'HMMA.F16 R{d}, R{a}, R{b}, R{c}'))
+
+                elif op == 'ldmatrix' and 'sync' in instr.types and 'aligned' in instr.types:
+                    _types_set = set(instr.types)
+                    # ldmatrix.sync.aligned.x4.m8n8.shared.b16 {d0,d1,d2,d3}, [addr]
+                    # dest is a tuple of 1/2/4 registers; addr is srcs[0]
+                    def _tuple_base(op_node):
+                        nm = op_node.name if hasattr(op_node, 'name') else str(op_node)
+                        nm = nm.lstrip('{').split(',')[0].rstrip('}').strip()
+                        return nm
+                    d_nm = _tuple_base(instr.dest) if instr.dest else None
+                    addr_nm = (instr.srcs[0].name if instr.srcs and hasattr(instr.srcs[0], 'name')
+                               else None)
+                    d = ctx.ra.r32(d_nm) if d_nm else RZ
+                    a = ctx.ra.r32(addr_nm) if addr_nm else RZ
+                    if 'x1' in _types_set:
+                        output.append(SassInstr(encode_ldsm_x1(d, a),
+                                                f'LDSM.x1 R{d}, [R{a}]'))
+                    elif 'x2' in _types_set:
+                        output.append(SassInstr(encode_ldsm_x2(d, a),
+                                                f'LDSM.x2 R{d}, [R{a}]'))
+                    else:  # x4 default
+                        output.append(SassInstr(encode_ldsm_x4(d, a),
+                                                f'LDSM.x4 R{d}, [R{a}]'))
+
+                elif op == 'redux' and 'sync' in instr.types:
+                    _types_set = set(instr.types)
+                    # redux.sync.add.s32 dest, src, mask
+                    d_nm = instr.dest.name if instr.dest and hasattr(instr.dest, 'name') else None
+                    s_nm = (instr.srcs[0].name if instr.srcs and hasattr(instr.srcs[0], 'name')
+                            else None)
+                    d = ctx.ra.r32(d_nm) if d_nm else RZ
+                    a = ctx.ra.r32(s_nm) if s_nm else RZ
+                    if 'min' in _types_set and 's32' in _types_set:
+                        output.append(SassInstr(encode_redux_min_s32(d, a),
+                                                f'REDUX.MIN.S32 UR{d}, R{a}'))
+                    elif 'max' in _types_set and 's32' in _types_set:
+                        output.append(SassInstr(encode_redux_max_s32(d, a),
+                                                f'REDUX.MAX.S32 UR{d}, R{a}'))
+                    elif 'and' in _types_set:
+                        output.append(SassInstr(encode_redux_and_b32(d, a),
+                                                f'REDUX.AND.B32 UR{d}, R{a}'))
+                    elif 'or' in _types_set:
+                        output.append(SassInstr(encode_redux_or_b32(d, a),
+                                                f'REDUX.OR.B32 UR{d}, R{a}'))
+                    elif 'xor' in _types_set:
+                        output.append(SassInstr(encode_redux_xor_b32(d, a),
+                                                f'REDUX.XOR.B32 UR{d}, R{a}'))
+                    else:
+                        output.append(SassInstr(encode_redux_sum(d, a),
+                                                f'REDUX.ADD.S32 UR{d}, R{a}'))
 
                 elif op == 'ld' and 'param' in instr.types:
                     output.extend(_select_ld_param(instr, ctx.ra, ctx.param_offsets, ctx))
@@ -1474,13 +1647,28 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             if not hasattr(ctx, '_cvt_cache'):
                                 ctx._cvt_cache = {}
                             if s.name in ctx._cvt_cache:
-                                # Reuse previous conversion result
-                                prev_lo = ctx._cvt_cache[s.name]
-                                ctx.ra.int_regs[d.name] = prev_lo
-                                output.append(_nop(f'cvt.64.32 {d.name}={s.name} (CSE reuse R{prev_lo})'))
+                                # Source was already widened once. The cached physical
+                                # destination may have been overwritten by now (e.g. by
+                                # a DADD that reused the same register slot). Re-emit
+                                # the widening into d's own allocated physical register
+                                # using the original 32-bit source (s_r still holds r9).
+                                d_lo = ctx.ra.lo(d.name)
+                                if d_lo != s_r:
+                                    output.append(SassInstr(
+                                        encode_iadd3(d_lo, s_r, RZ, RZ),
+                                        f'MOV R{d_lo}, R{s_r}  // cvt.64.32 lo (CSE src)'))
+                                if not hasattr(ctx, '_zero_regs'):
+                                    ctx._zero_regs = set()
+                                ctx._zero_regs.add(d_lo+1)
+                                output.append(SassInstr(
+                                    encode_iadd3(d_lo+1, RZ, RZ, RZ),
+                                    f'MOV R{d_lo+1}, RZ  // cvt.64.32 hi=0 (CSE)'))
                                 continue
                             d_lo = ctx.ra.lo(d.name)
                             ctx._cvt_cache[s.name] = d_lo
+                            if not hasattr(ctx, '_zero_regs'):
+                                ctx._zero_regs = set()
+                            ctx._zero_regs.add(d_lo+1)
                             output.append(SassInstr(encode_iadd3(d_lo, s_r, RZ, RZ),
                                                     f'MOV R{d_lo}, R{s_r}  // cvt.64.32 lo'))
                             output.append(SassInstr(encode_iadd3(d_lo+1, RZ, RZ, RZ),
@@ -1547,6 +1735,12 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 a_r  = ctx.ra.r32(s.name)
                                 output.append(SassInstr(encode_i2f_f64_s32(d_lo, a_r),
                                                         f'I2F.F64.S32 R{d_lo}, R{a_r}'))
+                            elif _dst_t == 'f64' and _src_t == 'u32':
+                                # cvt.rn.f64.u32: unsigned int32 → double
+                                d_lo = ctx.ra.lo(d.name)
+                                a_r  = ctx.ra.r32(s.name)
+                                output.append(SassInstr(encode_i2f_f64_u32(d_lo, a_r),
+                                                        f'I2F.F64.U32 R{d_lo}, R{a_r}'))
                             elif 'f32' in _types_set and ('u32' in _types_set or 's32' in _types_set):
                                 d_r = ctx.ra.r32(d.name)
                                 a_r = ctx.ra.r32(s.name)
@@ -1643,10 +1837,19 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         is_float = is_f64 or 'f32' in instr.types
                         cmp_name = next((t for t in instr.types if t in ('lt','le','gt','ge','eq','ne')), 'ge')
                         if is_f64:
-                            # FP64 comparison: emit DSETP using register pairs
+                            # FP64 comparison: emit DSETP using register pairs.
+                            # SM_120 DSETP only reliably supports unordered comparison
+                            # codes; ordered codes (LT=1..GE=6) give wrong results.
+                            # ptxas ground truth: setp.lt.f64 → DSETP.GEU (unordered
+                            # complement) + predicate marked as negated so @P → @!P.
+                            # We use unordered complements for all ordered comparisons:
+                            #   NOT(ordered LT) = unordered GEU, etc.
                             ar64 = ctx.ra.lo(a.name)
-                            cmp_map64 = {'lt': DSETP_LT, 'le': DSETP_LE, 'gt': DSETP_GT,
-                                         'ge': DSETP_GE, 'eq': DSETP_EQ, 'ne': DSETP_NE}
+                            cmp_map64 = {
+                                'lt': DSETP_GEU, 'le': DSETP_GTU,
+                                'gt': DSETP_LEU, 'ge': DSETP_LTU,
+                                'eq': DSETP_NEU, 'ne': DSETP_EQU,
+                            }
                             if isinstance(b, ImmOp):
                                 # Materialize FP64 immediate as a register pair
                                 imm_bits = b.value & 0xFFFFFFFF
@@ -1661,10 +1864,18 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 br_lo64 = ctx.ra.lo(b.name)
                             else:
                                 br_lo64 = RZ
-                            dsetp_cmp = cmp_map64.get(cmp_name, DSETP_GE)
+                            dsetp_cmp = cmp_map64.get(cmp_name, DSETP_GEU)
+                            # Emit the complemented comparison; mark pred as negated
+                            # so @P guards become @!P (matching ptxas semantics).
+                            cmp_label = {DSETP_GEU:'GEU', DSETP_GTU:'GTU',
+                                         DSETP_LEU:'LEU', DSETP_LTU:'LTU',
+                                         DSETP_NEU:'NEU', DSETP_EQU:'EQU'}.get(dsetp_cmp, 'GEU')
                             output.append(SassInstr(
                                 encode_dsetp(pd, ar64, br_lo64, dsetp_cmp),
-                                f'DSETP.{cmp_name.upper()} P{pd}, R{ar64}, R{br_lo64}  // setp.f64'))
+                                f'DSETP.{cmp_label} P{pd}, R{ar64}, R{br_lo64}  // setp.{cmp_name}.f64'))
+                            if not hasattr(ctx, '_negated_preds'):
+                                ctx._negated_preds = set()
+                            ctx._negated_preds.add(pd)
                         elif is_float:
                             # PEEPHOLE: check if next 2 instructions are @p mov.f32 imm + @!p mov.f32 imm
                             # with values 1.0 and 0.0 (step function). If so, fuse into FSEL.step.
@@ -1745,7 +1956,18 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                     f'ISETP.{cmp_name.upper()}.U32.AND P{pd}, PT, R{ar}, R{br}, PT'))
                             elif isinstance(b, RegOp):
                                 b_param_off = ctx._reg_param_off.get(b.name) if ctx else None
-                                if b_param_off is not None:
+                                b_ur_idx = (ctx._ur_params.get(b.name) if ctx else None)
+                                if b_ur_idx is not None:
+                                    # src1 is a u64 param loaded via LDCU.64 into UR pair.
+                                    # Use lo UR for comparison (valid when values fit in 32 bits).
+                                    emit_pd = pd
+                                    if pd > 0 and ctx:
+                                        emit_pd = 0
+                                        ctx.ra.pred_regs[pred.name] = 0
+                                    output.append(SassInstr(
+                                        encode_isetp_ur(emit_pd, ar, b_ur_idx, cmp=isetp_cmp),
+                                        f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, UR{b_ur_idx}, PT'))
+                                elif b_param_off is not None:
                                     # src1 came from ld.param.u32 — load via LDCU.32 into UR,
                                     # then compare R vs UR. This is the ptxas-verified path.
                                     #
@@ -1774,27 +1996,31 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                         encode_isetp(pd, ar, br, cmp=isetp_cmp),
                                         f'ISETP.{cmp_name.upper()}.U32.AND P{pd}, PT, R{ar}, R{br}, PT'))
                             elif isinstance(b, ImmOp):
-                                # Immediate src1: load into UR via LDCU.32, then ISETP R-UR.
-                                # NOTE: ISETP R-R (0x20c) CLOBBERS ALL predicates on SM_120 —
-                                # it clears the entire predicate register file as a side effect.
-                                # Must use R-UR (0xc0c) path which only writes the target pred.
-                                # For literal immediates, we use the literal pool (LDCU.32 from
-                                # c[0]). This works when the value fits in the param area or when
-                                # the .nv.constant0 section is properly loaded by the driver.
+                                # Immediate src1: ptxas uses ISETP R-R (0x20c) with RZ for imm=0,
+                                # or materializes the constant in a GPR for non-zero immediates.
+                                # The literal-pool path (LDCU.32 from c[0]) is unreliable because
+                                # the driver only initializes the param area — bytes beyond the
+                                # params are uninitialized garbage, so imm=0 from the literal pool
+                                # at c[0][param_end] reads a nonzero value.
                                 imm_val = b.value & 0xFFFFFFFF
-                                lit_off = ctx._alloc_literal(imm_val)
                                 emit_pd = pd
                                 if pd > 0 and ctx:
                                     emit_pd = 0
                                     ctx.ra.pred_regs[pred.name] = 0
-                                ur_tmp = ctx._next_ur
-                                ctx._next_ur += 1
-                                output.append(SassInstr(
-                                    encode_ldcu_32(ur_tmp, 0, lit_off),
-                                    f'LDCU.32 UR{ur_tmp}, c[0][0x{lit_off:x}]  // setp imm={imm_val:#x}'))
-                                output.append(SassInstr(
-                                    encode_isetp_ur(emit_pd, ar, ur_tmp, cmp=isetp_cmp),
-                                    f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, UR{ur_tmp}, PT'))
+                                if imm_val == 0:
+                                    # Use R-R ISETP with RZ (matches ptxas; no literal pool needed)
+                                    output.append(SassInstr(
+                                        encode_isetp(emit_pd, ar, RZ, cmp=isetp_cmp),
+                                        f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, RZ, PT'))
+                                else:
+                                    # Materialize imm in a GPR, then R-R ISETP
+                                    r_tmp = _alloc_gpr(ctx)
+                                    output.append(SassInstr(
+                                        encode_iadd3_imm32(r_tmp, RZ, imm_val, RZ),
+                                        f'IADD3 R{r_tmp}, RZ, {imm_val:#x}, RZ  // setp imm'))
+                                    output.append(SassInstr(
+                                        encode_isetp(emit_pd, ar, r_tmp, cmp=isetp_cmp),
+                                        f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, R{r_tmp}, PT'))
                             else:
                                 output.append(_nop(f'TODO: setp with non-register src1'))
                     else:
@@ -1893,6 +2119,21 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         output.append(SassInstr(encode_iadd3(d, a, RZ, RZ),
                                                 f'IADD3 R{d}, R{a}, RZ, RZ  // abs.f64 lo'))
 
+                elif op == 'selp' and typ == 'f64':
+                    # selp.f64 dest, src0, src1, Pp  →  2×FSEL (lo then hi 32-bit word)
+                    d = ctx.ra.lo(instr.dest.name)
+                    a = ctx.ra.lo(instr.srcs[0].name)
+                    b = ctx.ra.lo(instr.srcs[1].name)
+                    pd = 0
+                    neg = False
+                    if len(instr.srcs) > 2 and isinstance(instr.srcs[2], RegOp):
+                        pd = ctx.ra.pred(instr.srcs[2].name) if instr.srcs[2].name in ctx.ra.pred_regs else 0
+                        neg = hasattr(ctx, '_negated_preds') and pd in ctx._negated_preds
+                    output.append(SassInstr(encode_fsel(d,   a,   b,   pd, neg),
+                                            f'FSEL R{d},   R{a},   R{b},   {"!" if neg else ""}P{pd}  // selp.f64 lo'))
+                    output.append(SassInstr(encode_fsel(d+1, a+1, b+1, pd, neg),
+                                            f'FSEL R{d+1}, R{a+1}, R{b+1}, {"!" if neg else ""}P{pd}  // selp.f64 hi'))
+
                 elif op == 'selp':
                     d = ctx.ra.r32(instr.dest.name)
                     pd = 0
@@ -1971,6 +2212,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 ur_tmp = ctx._next_ur; ctx._next_ur += 1
                                 output.append(SassInstr(encode_ldcu_32(ur_tmp, 0, lit_off),
                                     f'LDCU.32 UR{ur_tmp}, c[0][0x{lit_off:x}]'))
+                                output.append(_nop('ldcu32->imad gap'))
                                 output.append(SassInstr(encode_imad_ur(d, a, ur_tmp, c),
                                     f'IMAD R{d}, R{a}, UR{ur_tmp}, R{c}  // mad.lo imm'))
                         else:
@@ -1978,6 +2220,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             ur_tmp = ctx._next_ur; ctx._next_ur += 1
                             output.append(SassInstr(encode_ldcu_32(ur_tmp, 0, lit_off),
                                 f'LDCU.32 UR{ur_tmp}, c[0][0x{lit_off:x}]'))
+                            output.append(_nop('ldcu32->imad gap'))
                             output.append(SassInstr(encode_imad_ur(d, a, ur_tmp, c),
                                 f'IMAD R{d}, R{a}, UR{ur_tmp}, R{c}  // mad.lo imm'))
                         continue
@@ -2009,12 +2252,14 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             ur_tmp = ctx._next_ur; ctx._next_ur += 1
                             output.append(SassInstr(encode_ldcu_32(ur_tmp, 0, src1_param_off),
                                 f'LDCU.32 UR{ur_tmp}, c[0][0x{src1_param_off:x}]  // mad src1->UR'))
+                            output.append(_nop('ldcu32->imad gap 1'))
                             output.append(SassInstr(encode_imad_ur(d, a, ur_tmp, c),
                                 f'IMAD R{d}, R{a}, UR{ur_tmp}, R{c}  // mad.lo.{typ} R-UR'))
                         elif src0_param_off is not None:
                             ur_tmp = ctx._next_ur; ctx._next_ur += 1
                             output.append(SassInstr(encode_ldcu_32(ur_tmp, 0, src0_param_off),
                                 f'LDCU.32 UR{ur_tmp}, c[0][0x{src0_param_off:x}]  // mad src0->UR'))
+                            output.append(_nop('ldcu32->imad gap 1'))
                             output.append(SassInstr(encode_imad_ur(d, b, ur_tmp, c),
                                 f'IMAD R{d}, R{b}, UR{ur_tmp}, R{c}  // mad.lo.{typ} R-UR'))
                         else:

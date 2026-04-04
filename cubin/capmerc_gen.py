@@ -39,11 +39,56 @@ CAPMERC_MAGIC = bytes.fromhex('0c000000010000c0')
 PROLOGUE_RECORD = bytes.fromhex('010b040af80004000000410000040000')
 
 # STG instruction class descriptor
-STG_DESCRIPTOR = bytes.fromhex('010b0e0afa0005000000030139040000')
+STG_DESCRIPTOR = bytes.fromhex('010b0e0afa0005000000830139040000')
 
 # Standard filler block patterns
 FILLER_WITH_BRANCH = bytes.fromhex('410c5404')   # kernels with branch/conditional exit
 FILLER_NO_BRANCH   = bytes.fromhex('410c5004')   # straight-line kernels
+
+# ---------------------------------------------------------------------------
+# FP64 / DFMA capmerc constants (SM_120)
+# Reverse-engineered from ptxas reference cubin for fp64_bench on SM_120.
+# The driver reads the type-02 sub=0x0c record to set up FP64-capable global
+# memory descriptors in c[0][0x358]; without it, STG.E.64 crashes with
+# CUDA_ERROR_ILLEGAL_ADDRESS.
+# ---------------------------------------------------------------------------
+
+# FP64 capability mask (bits 10,11,16,22,27) — required for driver to set
+# up c[0][0x358] flat global memory descriptor for STG.E.64
+FP64_CAP_MASK = 0x08410c00
+
+# FP64 class descriptor (type-02 sub=0x0c, 32 bytes): tells driver this
+# kernel uses FP64 global memory and needs c[0][0x358] populated.
+FP64_CLASS_DESCRIPTOR = bytes.fromhex(
+    '020c0a0efa000a000000030101f80201'
+    '000b0000000000000100000000000000'
+)
+
+# FP64 body records (exact ptxas output, SM_120)
+_FP64_PRELUDE         = bytes.fromhex('6b8e5000')
+_FP64_REC_ALU2        = bytes.fromhex('010b040af80004000000c10201020000')
+_FP64_BARRIER_A       = bytes.fromhex(
+    '02220806fa005200000083014000020000000000000000000000000010000000')
+_FP64_REC_URALU       = bytes.fromhex('010b060afa0004000000010104020000')
+_FP64_TYPE42          = bytes.fromhex('420b220e')
+_FP64_REC_ALU3        = bytes.fromhex('010b040af80004000000810201040000')
+_FP64_MARKER_7A       = bytes.fromhex('41107a0a')
+_FP64_BARRIER_B       = bytes.fromhex(
+    '02220e06f8005200000003034000020000000000000000000000000020000000')
+_FP64_BARRIER_C       = bytes.fromhex(
+    '02220806fa005200000003024000020000000000000000000000000018000000')
+_FP64_MARKER_28       = bytes.fromhex('410b280a')
+_FP64_MARKER_76       = bytes.fromhex('4110760a')
+_FP64_BARRIER_PRE_STG = bytes.fromhex(
+    '02220806fa005200000003014000020000000000000000000000000008000000')
+_FP64_BARRIER_LAST    = bytes.fromhex(
+    '02220e06f8005200000003014000020000000000000000000000000000000000')
+_FP64_TERMINAL        = bytes.fromhex(
+    '02380e32f80050110000000082020a00'
+    '00820182000000000000000000000000'
+)
+_FP64_D000            = bytes.fromhex('d000')
+_FP64_TRAILER         = bytes.fromhex('d004')
 
 
 # ---------------------------------------------------------------------------
@@ -405,6 +450,90 @@ def compute_filler_count(num_gprs: int, num_type01: int,
 
 
 # ---------------------------------------------------------------------------
+# FP64 capmerc builder
+# ---------------------------------------------------------------------------
+
+def _build_fp64_capmerc(num_gprs: int, text_size: int, has_stg: bool) -> bytes:
+    """Build capmerc for FP64 DFMA kernels (SM_120).
+
+    Uses the ptxas-compatible structure including the type-02 sub=0x0c FP64
+    class descriptor, which tells the driver to populate c[0][0x358] with a
+    valid flat global memory descriptor for STG.E.64.
+
+    byte[8] of header = num_gprs * 4 (ptxas pattern for FP64 kernels:
+    14 GPRs → 0x38 = 56).
+    """
+    # Header
+    header = bytearray(16)
+    header[0:8] = CAPMERC_MAGIC
+    header[8] = num_gprs * 4  # FP64: register count in 4-byte units
+    struct.pack_into('<I', header, 12, FP64_CAP_MASK)
+
+    body = bytearray()
+
+    # Prelude
+    body.extend(_FP64_PRELUDE)
+
+    # Type-01: prologue
+    body.extend(PROLOGUE_RECORD)
+
+    # Type-01: second ALU record (branch path)
+    body.extend(_FP64_REC_ALU2)
+
+    # Type-02 sub=0x22: first barrier region
+    body.extend(_FP64_BARRIER_A)
+
+    # Type-01: UR-ALU record
+    body.extend(_FP64_REC_URALU)
+
+    # Four 0x420b220e scheduling hint entries
+    body.extend(_FP64_TYPE42 * 4)
+
+    # Type-01: third ALU record
+    body.extend(_FP64_REC_ALU3)
+
+    # Marker 0x41107a0a
+    body.extend(_FP64_MARKER_7A)
+
+    # Two type-02 sub=0x22 middle barrier regions
+    body.extend(_FP64_BARRIER_B)
+    body.extend(_FP64_BARRIER_C)
+
+    # Marker 0x410b280a
+    body.extend(_FP64_MARKER_28)
+
+    # Type-02 sub=0x0c: FP64 class descriptor (critical for c[0][0x358])
+    body.extend(FP64_CLASS_DESCRIPTOR)
+
+    # Marker 0x41107a0a
+    body.extend(_FP64_MARKER_7A)
+
+    # 12 × d000 padding
+    body.extend(_FP64_D000 * 12)
+
+    # Type-02 sub=0x22: pre-STG barrier
+    body.extend(_FP64_BARRIER_PRE_STG)
+
+    # Marker 0x4110760a
+    body.extend(_FP64_MARKER_76)
+
+    # Type-01: STG class descriptor
+    if has_stg:
+        body.extend(STG_DESCRIPTOR)
+
+    # Type-02 sub=0x22: last barrier region
+    body.extend(_FP64_BARRIER_LAST)
+
+    # 7 × d000 padding
+    body.extend(_FP64_D000 * 7)
+
+    # Type-02 sub=0x38: terminal record (exact ptxas bytes)
+    body.extend(_FP64_TERMINAL)
+
+    return bytes(header) + bytes(body) + _FP64_TRAILER
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -419,6 +548,7 @@ def build_capmerc(
     has_imad: bool = False,
     has_isetp: bool = False,
     has_fadd: bool = False,
+    has_dfma: bool = False,
     num_barrier_regions: int = 2,
 ) -> bytes:
     """Build a complete .nv.capmerc.text.{kernel} section.
@@ -434,12 +564,20 @@ def build_capmerc(
         has_imad: Kernel uses IMAD instructions.
         has_isetp: Kernel uses ISETP (set predicate) instructions.
         has_fadd: Kernel uses FADD/FFMA (floating point) instructions.
+        has_dfma: Kernel uses DFMA (FP64 fused multiply-add) instructions.
         num_barrier_regions: Number of scoreboard barrier regions in SASS.
 
     Returns:
         Complete capmerc section bytes.
     """
     num_gprs = max(num_gprs, 8)
+
+    # FP64 kernels require a fundamentally different capmerc structure:
+    # the type-02 sub=0x0c FP64 class descriptor must be present for the
+    # driver to populate c[0][0x358] (flat global memory descriptor for
+    # STG.E.64). Without it the kernel crashes with ILLEGAL_ADDRESS.
+    if has_dfma:
+        return _build_fp64_capmerc(num_gprs, text_size, has_stg)
     text_size_pages = max(text_size // 256, 1)
 
     # --- Build body records ---
@@ -577,6 +715,7 @@ def analyze_sass_for_capmerc(sass_bytes: bytes) -> dict:
     has_imad = False
     has_isetp = False
     has_fadd = False
+    has_dfma = False
     max_reg = 0
     barrier_count = 0
     has_predicated_exit = False
@@ -595,10 +734,46 @@ def analyze_sass_for_capmerc(sass_bytes: bytes) -> dict:
         src1 = (lo >> 32) & 0xFF
         src2 = (hi >> 0) & 0xFF
 
-        # Track max register
-        for r in [dest, src0, src1, src2]:
-            if r != 255 and r < 128 and r > max_reg:
-                max_reg = r
+        # Track max regular GPR index.
+        # Skip non-GPR fields:
+        #   ULDC (0x7ac): dest is UR, not GPR
+        #   LDCU/const-load src2: const bank byte offset, not a register
+        #   ISETP dest: predicate register (P0-P7), not GPR
+        #   ISETP src2: comparison mode/predicate field (e.g. 0x70), not GPR
+        #   R-UR form src1: UR register index, not GPR
+        _ISETP_OPCODES_SET = {0x20c, 0x86c, 0xc0c, 0x28c}
+        if opcode == 0x7ac:
+            # ULDC: dest is UR — skip entirely
+            pass
+        elif opcode in _CONST_LOAD_OPCODES:
+            # LDCU: dest is GPR, src2 is const offset — only count dest
+            if dest != 255 and dest < 128 and dest > max_reg:
+                max_reg = dest
+        elif opcode == 0xc0c:
+            # ISETP R-UR: dest=pred, s1=UR, s2=mode — only count src0 (GPR)
+            if src0 != 255 and src0 < 128 and src0 > max_reg:
+                max_reg = src0
+        elif opcode in _ISETP_OPCODES_SET:
+            # ISETP R-R: dest=pred, s2=mode — count src0 and src1 (both GPR)
+            for r in [src0, src1]:
+                if r != 255 and r < 128 and r > max_reg:
+                    max_reg = r
+        elif opcode == 0xc24:
+            # IMAD R-UR: s1 is UR — count dest, src0, src2 (all GPR)
+            for r in [dest, src0, src2]:
+                if r != 255 and r < 128 and r > max_reg:
+                    max_reg = r
+        elif opcode == 0xc2b:
+            # DFMA R-R-UR-UR: b4=ur_src1 and b8=ur_src2 are UR indices, NOT GPRs.
+            # Only count dest (b2) and src0 (b3) as GPRs.
+            has_dfma = True
+            for r in [dest, src0]:
+                if r != 255 and r < 128 and r > max_reg:
+                    max_reg = r
+        else:
+            for r in [dest, src0, src1, src2]:
+                if r != 255 and r < 128 and r > max_reg:
+                    max_reg = r
 
         # Classify opcode
         if opcode in _MEM_STORE_OPCODES:
@@ -618,13 +793,11 @@ def analyze_sass_for_capmerc(sass_bytes: bytes) -> dict:
         if opcode in _FADD_OPCODES:
             has_fadd = True
 
-        # Detect predicated EXIT (conditional branch)
-        if opcode == 0x94d and pred != 7:  # EXIT with predicate != PT
+        # Detect branches
+        if opcode == 0x94d and pred != 7:  # predicated EXIT (not PT)
             has_predicated_exit = True
-        if opcode == 0x947:  # BRA
-            # Check if this is a self-loop (padding) vs real branch
-            # Self-loops go to offset-16 (the previous instruction)
-            pass
+        if opcode == 0x947:  # BRA — any real branch sets has_branch
+            has_branch = True
 
         # Count barrier write operations from control words
         raw24 = sass_bytes[i + 13] | (sass_bytes[i + 14] << 8) | (sass_bytes[i + 15] << 16)
@@ -634,7 +807,7 @@ def analyze_sass_for_capmerc(sass_bytes: bytes) -> dict:
             barrier_count += 1
 
     if has_predicated_exit:
-        has_branch = True
+        has_branch = True  # predicated EXIT also counts as branch
 
     # Number of barrier regions = barrier writes + 1 (initial region)
     # Minimum 2 (prologue region + main body)
@@ -656,6 +829,7 @@ def analyze_sass_for_capmerc(sass_bytes: bytes) -> dict:
         'has_imad': has_imad,
         'has_isetp': has_isetp,
         'has_fadd': has_fadd,
+        'has_dfma': has_dfma,
         'num_barrier_regions': num_barrier_regions,
     }
 

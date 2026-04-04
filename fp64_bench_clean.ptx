@@ -1,0 +1,71 @@
+// FORGE-generated PTX ? SM_120
+// Proofs discharged before emission. Correct by construction.
+// Optimized: fma.rn.f64 fusion, f64 params in UR, in-place loop counter.
+
+.version 8.8
+.target sm_120
+.address_size 64
+
+.visible .entry fp64_bench(
+    .param .u64 fp64_bench_param_out_data,
+    .param .u64 fp64_bench_param_out_len,
+    .param .u64 fp64_bench_param_n_iters,
+    .param .f64 fp64_bench_param_b,
+    .param .f64 fp64_bench_param_c
+)
+{
+    .reg .pred %p16, %p28;
+    .reg .u64 %rd0, %rd1, %rd2, %rd14, %rd29, %rd34, %rd35, %rd36, %rd37;
+    .reg .f64 %fd3, %fd4, %fd10, %fd11, %fd12, %fd13, %fd31, %fd32, %fd33;
+    .reg .u32 %r5, %r6, %r7, %r8, %r9, %r27, %r38, %r39, %r40;
+
+  ld.param.u64 %rd0, [fp64_bench_param_out_data];
+  ld.param.u64 %rd1, [fp64_bench_param_out_len];
+  ld.param.u64 %rd2, [fp64_bench_param_n_iters];
+  ld.param.f64 %fd3, [fp64_bench_param_b];
+  ld.param.f64 %fd4, [fp64_bench_param_c];
+
+  mov.u32 %r5, %ctaid.x;
+  mov.u32 %r6, %ntid.x;
+  mul.lo.u32 %r7, %r5, %r6;
+  mov.u32 %r8, %tid.x;
+  add.u32 %r9, %r7, %r8;
+  mov.u64 %rd14, 0;
+  mov.f64 %fd10, 0d3FF0000000000000; // 1.0
+  mov.f64 %fd11, 0d4000000000000000; // 2.0
+  mov.f64 %fd12, 0d4008000000000000; // 3.0
+  mov.f64 %fd13, 0d4010000000000000; // 4.0
+  fp64_bench_loop_15:
+  setp.lt.u64 %p16, %rd14, %rd2;
+  @!%p16 bra fp64_bench_loop_end_15;
+  fma.rn.f64 %fd10, %fd10, %fd3, %fd4;
+  fma.rn.f64 %fd11, %fd11, %fd3, %fd4;
+  fma.rn.f64 %fd12, %fd12, %fd3, %fd4;
+  fma.rn.f64 %fd13, %fd13, %fd3, %fd4;
+  add.u64 %rd14, %rd14, 1;
+  bra fp64_bench_loop_15;
+  fp64_bench_loop_end_15:
+  mov.u32 %r27, 0; // unit
+  cvt.u64.u32 %rd29, %r9;
+  setp.lt.u64 %p28, %rd29, %rd1;
+  @%p28 bra fp64_bench_then_30;
+  bra fp64_bench_else_30;
+  fp64_bench_then_30:
+  add.f64 %fd31, %fd10, %fd11;
+  add.f64 %fd32, %fd31, %fd12;
+  add.f64 %fd33, %fd32, %fd13;
+  cvt.u64.u32 %rd34, %r9;
+  mov.u64 %rd35, 8;
+  mul.lo.u64 %rd36, %rd34, %rd35;
+  add.u64 %rd37, %rd0, %rd36;
+  st.global.f64 [%rd37], %fd33;
+  mov.u32 %r38, 0; // unit
+  mov.u32 %r39, %r38;
+  bra fp64_bench_end_30;
+  fp64_bench_else_30:
+  mov.u32 %r39, 0; // no else branch
+  fp64_bench_end_30:
+  mov.u32 %r40, 0; // unit
+  ret;
+}
+

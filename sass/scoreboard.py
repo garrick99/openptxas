@@ -83,6 +83,12 @@ _OPCODE_META: dict[int, _OpMeta] = {
     0x312: _OpMeta('I2F.F64',   1, 0x3e, 1),  # I2F.F64 int32-to-float64 conversion (writes pair)
     0x81a: _OpMeta('BFE_SEXT',  1, 0x3e, 1),  # BFE sign-extension step (bfe.s32 lowering)
     0x22a: _OpMeta('DSETP',     0, 0x3e, 0),  # DSETP FP64 compare → predicate (misc=0, like ISETP)
+    # Tensor core MMA: wdep=0x3e (ALU), min_gpr_gap=1, misc from ptxas (2 for HMMA/DMMA)
+    0x23c: _OpMeta('HMMA',      1, 0x3e, 2),  # HMMA FP16/BF16/TF32 MMA (m16n8k*) misc=2 ptxas-observed
+    0x237: _OpMeta('IMMA',      1, 0x3e, 2),  # IMMA INT8 MMA (m16n8k32)
+    0x23f: _OpMeta('DMMA',      1, 0x3e, 2),  # DMMA FP64 MMA (m8n8k4)
+    0x83b: _OpMeta('LDSM',      1, 0x33, 2),  # LDSM load shared→matrix regs (wdep=LDS slot)
+    0x3c4: _OpMeta('REDUX',     0, 0x3f, 0),  # REDUX warp reduction → UR (no GPR dest)
 }
 
 
@@ -95,7 +101,7 @@ _OPCODES_LDS = {0x984}
 _OPCODES_STG = {0x986}
 _OPCODES_STS = {0x988}
 _OPCODES_BAR = {0xb1d}
-_OPCODES_DFPU  = {0xe29, 0xc28, 0xc2b}   # DADD, DMUL, DFMA (double-precision, wdep=0x33)
+_OPCODES_DFPU  = {0xe29, 0xc28, 0xc2b}   # DADD (R-R), DMUL, DFMA (double-precision, wdep=0x33)
 _OPCODES_DSETP = {0x22a}                 # DSETP (FP64 compare → predicate; reads pairs, no GPR dest)
 _OPCODES_CTRL = {0x94d, 0x947, 0x918, 0x91a}  # EXIT, BRA, NOP, DEPBAR.LE
 _OPCODES_LDGSTS = {0xfae}  # LDGSTS.E (cp.async global→shared)
@@ -147,8 +153,8 @@ _OPCODES_ALU = {
     0x216,        # PRMT.REG (register selector, opc=0x216)
     0x589, 0xf89, 0x989,  # SHFL (reg-reg, reg-imm, imm-imm)
     0x806,        # VOTE.ANY
-    # Matrix multiply (HMMA, IMMA)
-    0x23c, 0x237,
+    # Matrix multiply (HMMA, IMMA, DMMA)
+    0x23c, 0x237, 0x23f,
     # Miscellaneous / div.u32 helpers
     0x431,        # HFMA2 (zero-init trick)
     0x810,        # IADD3 immediate form
@@ -206,9 +212,11 @@ def _get_src_regs(raw: bytes) -> set[int]:
         if raw[4] < 255: regs.add(raw[4])
         if raw[8] < 255: regs.add(raw[8])
     elif opcode in _OPCODES_DFPU:
-        # DADD/DMUL: src0(b3, pair), src1(b4, pair); DFMA also src2(b8, pair)
+        # DADD (0xe29): src0=b3(pair), src1=b4(pair); same layout as DMUL
+        # DMUL (0xc28): src0=b3(pair), src1=b4(pair)
+        # DFMA (0xc2b): src0=b3(pair), src1_mul=b4(pair), src2_add=b8(pair)
         if raw[3] < 255: regs |= {raw[3], raw[3]+1}
-        if raw[4] < 255: regs |= {raw[4], raw[4]+1}
+        if raw[4] < 255: regs |= {raw[4], raw[4]+1}  # DADD/DMUL/DFMA src1 in b4
         if opcode == 0xc2b and raw[8] < 255: regs |= {raw[8], raw[8]+1}  # DFMA src2
     elif opcode in _OPCODES_DSETP:
         # DSETP: src0(b3, 64-bit pair), src1(b4, 64-bit pair); no GPR dest
@@ -221,6 +229,9 @@ def _get_src_regs(raw: bytes) -> set[int]:
     elif opcode in _OPCODES_STS:
         # STS: data at b4
         if raw[4] < 255: regs.add(raw[4])
+    elif opcode in _OPCODES_IADD64_UR:
+        # IADD.64-UR: GPR src pair at b3 (b4 is UR, not tracked here)
+        if raw[3] < 255: regs |= {raw[3], raw[3]+1}
     elif opcode in _OPCODES_ALU:
         # ALU: src0 at b3, src1 at b4, src2 at b8 (varies by opcode)
         if raw[3] < 255: regs.add(raw[3])
@@ -331,16 +342,18 @@ def _wdep_for_opcode(opcode: int, raw: bytes = None) -> int:
             slot = slots[(_ldcu_slot_counter[0] - 1) % len(slots)]
             _ldcu_slot_counter[0] += 1
             return slot
-        slots = [0x31, 0x33]
-        slot = slots[_ldcu_slot_counter[0] % len(slots)]
+        # LDCU.32: always use 0x31 (LDC/LDCU scoreboard slot).
+        # rbar bit2 (slot 0x33) stalls for LDCU.64 correctly, but NOT for
+        # LDCU.32 on SM_120 — hardware asymmetry verified by test_imad_chain.
+        # Consumer IMAD R-UR uses rbar bit1 (0x02) which correctly gates on 0x31.
         _ldcu_slot_counter[0] += 1
-        return slot
+        return 0x31
     if opcode == 0x918:  # NOP: even wdep (misc=0 paired with 0x3e is safe)
         return 0x3e
     if opcode in _OPCODES_LDC:
         return 0x31
-    if opcode in _OPCODES_LDS | _OPCODES_DFPU:
-        return 0x33
+    if opcode in _OPCODES_LDS | _OPCODES_DFPU | _OPCODES_DSETP:
+        return 0x33  # DSETP also posts via slot 0x33 (ptxas SM_120 ground truth)
     if opcode in _OPCODES_LDG | _OPCODES_ATOMG:
         return 0x35
     if opcode in _OPCODES_IADD64_UR:
@@ -351,24 +364,56 @@ def _wdep_for_opcode(opcode: int, raw: bytes = None) -> int:
     return 0x3f
 
 
-# Opcode-specific misc nibble (hardware-verified on RTX 5090, 2026-03-25).
-# misc is NOT a counter — each opcode has a fixed value required by hardware.
+# Opcode-specific misc nibble overrides.
+# Hybrid model: some opcodes have strict hardware requirements (override applied),
+# others use the sequential instruction counter (no override).
+#
+# Counter model (verified against ptxas fp64_bench ground truth):
+#   - misc_counter increments for EVERY instruction regardless of override
+#   - For each instruction: misc = override if in _OPCODE_MISC, else misc_counter & 0xF
+#   - Verified sequence for fp64 preamble:
+#       S2R(ctr=0,ovr=1), LDCU×4(ctr=1-4,ovr=7), LDC R2(ctr=5)=5✓,
+#       LDC R3(6)=6✓, LDC R4(7)=7✓, LDC R5(8)=8✓, S2UR(9)=9✓, LDC R7(10)=10✓,
+#       IMAD(11,ovr=1), IADD3×10(12-21,ovr=1), ISETP(22,ovr=0)✓, BRA(23,ovr=1)✓
+#
+# Strict-requirement opcodes (hardware rejects wrong values):
+#   LDCU (0x7ac): misc MUST be 7. SM_120 LDCU = SM_89 ULDC.64 which also requires 7.
+#     Absent from all prior attempts → ILLEGAL_INSTRUCTION at first LDCU in preamble.
+#   ISETP R-UR (0xc0c): misc 1-12 → WRONG PREDICATE on SM_120 (see encode_isetp_ur
+#     docstring). misc=6 from counter at ISETP position (instruction 22) causes
+#     inverted predicate → wrong BRA direction → DMUL/DADD execute → ILLEGAL_INSTRUCTION.
+#   DMUL/DADD/DFMA: misc MUST be 2 (hardware-probed on RTX 5090 2026-03-27).
+#
+# Counter-based opcodes (no override — hardware accepts any counter value):
+#   LDC (0xb82): ptxas uses counter values 5,6,7,8,10 in fp64 preamble.
+#   S2UR (0x9c3): ptxas uses counter value 9 in fp64 preamble.
+#   MOV (0x202): ptxas uses counter value (e.g., misc=4 at position 36).
 _OPCODE_MISC: dict[int, int] = {
-    0x918: 0,   # NOP: misc=0
-    0x947: 0,   # BRA: misc=0
-    # EXIT misc: 5 for unconditional, 0 for predicated (SM_120 hardware rule)
-    # 0x94d: handled per-instance below
-    # LDG misc: 6 (hardware-verified SM_120)
+    0x918: 0,   # NOP: misc=0 (ptxas-verified)
+    0x947: 1,   # BRA: misc=1 (ptxas-verified: @P0 BRA and loop-back BRA both use 1)
+    0x94d: 5,   # EXIT: misc=5 (ptxas-verified: same for predicated and unconditional)
+    0x981: 6,   # LDG.E: misc=6 (hardware-verified SM_120)
+    0x7ac: 7,   # LDCU: misc=7 — CRITICAL FIX. SM_120 LDCU requires misc=7 (same as
+                #   SM_89 ULDC.64). All 4 LDCU.64 in fp64 preamble use misc=7 per ptxas.
+                #   counter gives 1,2,3,4 → ILLEGAL_INSTRUCTION at first LDCU.
     0x3a9: 4,   # ATOMG.CAS: misc=4 (from RTX 5090 probe 2026-03-27)
-    0xe29: 2,   # DADD: misc=2 (from RTX 5090 probe 2026-03-27)
+    0xe29: 2,   # DADD R-R: misc=2 (ground truth decode_sass.py: b1=0x7e, src1 in b4)
     0xc28: 2,   # DMUL: misc=2
     0xc2b: 2,   # DFMA: misc=2
+    0x22a: 2,   # DSETP: misc=2 (ptxas ground truth — all DSETP variants use 2)
     0xc35: 5,   # IADD.64-UR: misc=5 (wide ALU result)
-    0xc0c: 0,   # ISETP R-UR: misc=0 (SM_120: misc 1-12 → wrong predicate)
+    0xc0c: 0,   # ISETP R-UR: misc=0 (SM_120: misc 1-12 → wrong predicate; see
+                #   encode_isetp_ur docstring. Counter value 6 at position 22 → wrong pred.)
     0x20c: 0,   # ISETP R-R: misc=0 (same SM_120 predicate correctness requirement)
-    0x80a: 5,   # FSEL.step: misc=5 (ptxas-verified, combined float compare+select)
+    0x80a: 5,   # FSEL.step: misc=5 (ptxas-verified)
     0x986: 1,   # STG.E: misc=1 (from ptxas ground truth)
     0x988: 4,   # STS.E: misc=4
+    0x225: 1,   # IMAD.WIDE R-R: misc=1
+    0x825: 1,   # IMAD.WIDE R-imm: misc=1
+    0xc24: 1,   # IMAD R-UR: misc=1
+    0x810: 1,   # IADD3.IMM: misc=1 (ptxas: all 10 IADD3.IMM in fp64 preamble use 1)
+    0x919: 1,   # S2R: misc=1 (ptxas-verified; counter=0 at body start would give 0)
+    # LDC (0xb82) and S2UR (0x9c3) intentionally omitted — use counter for correct values
 }
 
 # All opcodes recognised by assign_ctrl.  Unknown opcodes raise ValueError.
@@ -451,20 +496,18 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
                 if r in pending_writes:
                     rbar = 0x09
 
-        # STG: ptxas uses rbar=1 for STG that stores ALU results. Override
-        # the general rbar — STG doesn't need to wait for ALU address registers
-        # (they're available within 1 cycle). Only wait if data came from LDG.
+        # STG: let the general rbar computation handle all source dependencies.
+        # Both the address register (b3) and data register (b4) are included in
+        # src_regs via _get_src_regs, so the loop above already computes the
+        # correct rbar for ALU (wdep=0x3e→rbar=0x03), DFPU (wdep=0x33→rbar=0x05),
+        # and LDG (wdep=0x35→rbar=0x09) dependencies.
+        # Special case: LDG data (wdep=0x35) must use rbar=0x09, not the table default.
         if opcode in _OPCODES_STG:
-            data_reg = si.raw[4]  # b4 = data register for STG
-            pass  # STG rbar tracking
+            data_reg = si.raw[4]
             if data_reg in pending_writes:
                 _, pw = pending_writes[data_reg]
-                if pw in (0x35, 0x37):  # LDG result slots
-                    rbar = 0x09  # wait for LDG data
-                else:
-                    rbar = 0x01
-            else:
-                rbar = 0x01
+                if pw in (0x35, 0x37):
+                    rbar = rbar | 0x09
 
         # ATOMG needs rbar=0x03 (memory ordering, same as STG)
         if opcode in _OPCODES_ATOMG:
@@ -494,14 +537,15 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
         # for the UR descriptor — it's guaranteed ready by the time STG executes.
         # (LDG DOES need rbar for the descriptor — see above.)
 
-        # Check predicate-register hazards: any instruction guarded by @Px must
-        # wait for the instruction that wrote Px to complete.
+        # Check predicate-register hazards: any instruction guarded by @Px or @!Px
+        # must wait for the instruction that wrote Px to complete.
+        # Strip the negation bit (bit 3) to get the pred reg index 0-6.
         guard = (si.raw[1] >> 4) & 0xF
-        if guard != 0x7:  # 0x7 = PT (unconditional)
-            if guard in pending_pred_writes:
-                _, pw = pending_pred_writes[guard]
-                candidate = _WDEP_TO_RBAR.get(pw, 0x01)
-                rbar = rbar | candidate
+        pred_idx = guard & 0x7
+        if guard != 0x7 and pred_idx in pending_pred_writes:  # 0x7 = PT (unconditional)
+            _, pw = pending_pred_writes[pred_idx]
+            candidate = _WDEP_TO_RBAR.get(pw, 0x01)
+            rbar = rbar | candidate
 
         # BAR.SYNC and EXIT get special ctrl
         if opcode in _OPCODES_BAR:
@@ -531,20 +575,11 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
             guard = (si.raw[1] >> 4) & 0xF
             if guard != 0x7:
                 _ldcu_slot_counter[0] = 0
-        # Misc nibble: opcode-specific where hardware requires it, counter elsewhere.
-        if opcode == 0x94d:  # EXIT: always misc=5 (ptxas-verified, same for pred/unpred)
-            misc = 5
-        elif opcode == 0x7ac and si.raw[9] == 0x0a:
-            misc = 7   # LDCU.64: misc=7 (CRITICAL: misc=1 → ILLEGAL_ADDRESS)
-        elif opcode == 0x981:  # LDG: misc=6 (hardware-verified SM_120)
-            misc = 6
-        elif opcode in _OPCODE_MISC:
-            misc = _OPCODE_MISC[opcode]
-        else:
-            misc = misc_counter & 0xF
-        # Hardware rule: odd wdep requires misc != 0 (misc=0 → ILLEGAL_INSTRUCTION)
-        if (wdep & 1) and misc == 0:
-            misc = 1
+        # Misc nibble: hybrid counter+override model.
+        # misc_counter increments for every instruction regardless of override.
+        # Opcodes in _OPCODE_MISC get the override value; all others use the counter.
+        # This matches ptxas ground truth for fp64_bench preamble exactly.
+        misc = _OPCODE_MISC.get(opcode, misc_counter & 0xF)
         ctrl = (stall << 17) | (rbar << 10) | (wdep << 4) | misc
         misc_counter += 1
 
@@ -569,6 +604,11 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
         if opcode in (0xc0c, 0x20c):  # ISETP R-UR, ISETP R-R
             pred_dest = si.raw[2]  # destination predicate index (0..6)
             pending_pred_writes[pred_dest] = (i, wdep)
+        # DSETP: predicate write is long-latency (wdep=0x33, same slot as LDS).
+        # pred_dest encoded in raw[10] as 0xf0|(pred<<1); extract the 0-6 index.
+        if opcode in _OPCODES_DSETP:
+            pred_dest = (si.raw[10] >> 1) & 0x7
+            pending_pred_writes[pred_dest] = (i, 0x33)
         # Note: we do NOT clear pending_writes for consumed SOURCE registers.
         # Multiple instructions may read from the same LDG output, and each
         # needs the rbar wait independently.

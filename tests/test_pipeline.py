@@ -297,15 +297,20 @@ def test_mov_immediate_bakes_constant():
 
 
 def test_setp_immediate_compiles():
-    """setp.lt.u32 with immediate 100 compiles to LDCU.32 + ISETP R-UR."""
+    """setp.lt.u32 with immediate 100 compiles to IADD3_IMM + ISETP R-R.
+
+    The old LDCU.32 + ISETP R-UR path is incorrect: LDCU loads from the literal
+    pool beyond the param area, which is uninitialized. The correct path materializes
+    the constant into a GPR with IADD3_IMM32 and then uses ISETP R-R (0x20c).
+    """
     results = compile_ptx_source(IMM_KERNEL)
     cubin = results["imm_kernel"]
     elf = ELF64(cubin)
     text = elf.section_data('.text.imm_kernel')
     opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
                for off in range(0, len(text), 16)]
-    # ISETP R-UR (0xc0c) must appear (R-R 0x20c clobbers all predicates on SM_120)
-    assert 0xc0c in opcodes, "ISETP R-UR (0xc0c) not found — setp with immediate failed"
+    # ISETP R-R (0x20c) must appear — immediate is materialized via IADD3_IMM32
+    assert 0x20c in opcodes, "ISETP R-R (0x20c) not found — setp with immediate failed"
 
 
 # ---------------------------------------------------------------------------

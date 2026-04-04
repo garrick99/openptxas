@@ -118,7 +118,7 @@ def _patch_cuinfo_sm(sm_version: int) -> bytes:
 
 def _build_nv_info_global():
     return bytes.fromhex(
-        '042f0800080000000a000000'
+        '042f08000800000010000000'
         '041108000800000000000000'
         '041208000800000000000000'
     )
@@ -169,6 +169,10 @@ def _build_nv_info_kernel(num_gprs: int = 8, num_params: int = 2,
     total_param_bytes = sum(param_sizes) if param_sizes else 0
     buf.extend(bytes([0x03, 0x1b, total_param_bytes & 0xFF, 0x00]))
 
+    # EIATTR_0x5f: Mercury compiler version flag — required for SM_120.
+    # ptxas always emits 0x0101 here for SM_120 cubins.
+    buf.extend(bytes([0x03, 0x5f, 0x01, 0x01]))
+
     # EIATTR_EXIT_INSTR_OFFSETS (0x1c): list of EXIT byte offsets in .text
     # Format 0x04: 4-byte header (fmt, tag, size_lo, size_hi) + N*4 bytes payload
     if not exit_offsets:
@@ -181,14 +185,16 @@ def _build_nv_info_kernel(num_gprs: int = 8, num_params: int = 2,
     # EIATTR_CTAID_DIMS (0x4a)
     buf.extend(bytes([0x02, 0x4a, 0x00, 0x00]))
 
-    s2r_offset = s2r_instr_offset
-    buf.extend(bytes([0x03, 0x19, s2r_offset & 0xFF, (s2r_offset >> 8) & 0xFF]))
+    # EIATTR_0x19: total parameter bytes (not s2r offset).
+    buf.extend(bytes([0x03, 0x19, total_param_bytes & 0xFF, (total_param_bytes >> 8) & 0xFF]))
 
-    # EIATTR_EXTERNS (0x0a): external dependencies
-    # Second word's low byte matches S2RCTAID offset
+    # EIATTR_EXTERNS (0x0a): references the .nv.constant0 symtab symbol.
+    # In our symtab layout (no .debug_frame), .nv.constant0 is always at index 7.
+    # ptxas uses index 9 (it has extra .debug_frame symbols shifting the layout).
+    # Last 2 bytes = PARAM_CBANK size = total parameter bytes.
     buf.extend(bytes([0x04, 0x0a, 0x08, 0x00,
-                      0x09, 0x00, 0x00, 0x00, 0x80, 0x03,
-                      s2r_offset & 0xFF, (s2r_offset >> 8) & 0xFF]))
+                      0x07, 0x00, 0x00, 0x00, 0x80, 0x03,
+                      total_param_bytes & 0xFF, (total_param_bytes >> 8) & 0xFF]))
 
     # EIATTR 0x36: always zero payload (matches ptxas)
     buf.extend(bytes([0x04, 0x36, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00]))
@@ -474,6 +480,25 @@ def emit_cubin(kernel: KernelDesc) -> bytes:
     symtab.extend(_sym(sn_kernel, (STB_GLOBAL<<4)|STT_FUNC, 0x10, TEXT_IDX, 0, len(text_data)))  # [8]
     symtab_data = bytes(symtab)
 
+    # Mercury symtab mirrors the regular symtab but entries [3] and [8] point to
+    # the CAPMERC section (not TEXT). In ptxas's Mercury architecture, the "text"
+    # of a kernel is represented by the capmerc section from the merc perspective.
+    # This is critical: the SM_120 hardware reads per-instruction metadata from
+    # the capmerc section referenced through the merc symtab.
+    merc_symtab = bytearray()
+    merc_symtab.extend(_sym(0, 0, 0, 0, 0, 0))  # [0] null
+    merc_symtab.extend(_sym(sn_tkinfo, (STB_LOCAL<<4)|STT_SECTION, 0, TKINFO_IDX, 0, 0))  # [1]
+    merc_symtab.extend(_sym(sn_cuinfo, (STB_LOCAL<<4)|STT_SECTION, 0, CUINFO_IDX, 0, 0))  # [2]
+    # [3]: ".text" symbol points to CAPMERC section in Mercury view
+    merc_symtab.extend(_sym(sn_text, (STB_LOCAL<<4)|STT_SECTION, 0, CAPMERC_IDX, 0, 0))  # [3]
+    merc_symtab.extend(_sym(sn_smem_off, (STB_WEAK<<4)|STT_OBJECT, 0, 0, 0x40, 4))  # [4]
+    merc_symtab.extend(_sym(sn_smem_alias, (STB_WEAK<<4)|STT_NOTYPE, 0xa0, SHARED_IDX, 0x40, 0))  # [5]
+    merc_symtab.extend(_sym(sn_callgraph, (STB_LOCAL<<4)|STT_SECTION, 0, 9, 0, 0))  # [6]
+    merc_symtab.extend(_sym(sn_const0, (STB_LOCAL<<4)|STT_SECTION, 0, CONST0_IDX, 0, 0))  # [7]
+    # [8]: kernel function symbol points to CAPMERC section in Mercury view
+    merc_symtab.extend(_sym(sn_kernel, (STB_GLOBAL<<4)|STT_FUNC, 0x10, CAPMERC_IDX, 0, len(text_data)))  # [8]
+    merc_symtab_data = bytes(merc_symtab)
+
     section_datas = [
         b'',                         # 0
         shstrtab_data,               # 1
@@ -532,7 +557,7 @@ def emit_cubin(kernel: KernelDesc) -> bytes:
         capmerc_data,
         _build_nv_info_global(),
         merc_info_data,
-        symtab_data,
+        merc_symtab_data,
     ])
 
     meta_base.extend([

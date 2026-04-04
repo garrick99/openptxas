@@ -68,10 +68,18 @@ def _sink_param_loads(fn: Function) -> None:
     if not to_sink:
         return
 
-    # For each sinkable ld.param, find the first block that uses the dest register
+    # For each sinkable ld.param, find the first block that uses the dest register.
+    # Skip labeled blocks (loop headers / branch targets): sinking into them causes
+    # the param load to re-execute on every loop iteration.  When a LDCU.64 becomes
+    # the first instruction of a labeled block, _hoist_ldcu64 moves it (and the
+    # block label) to before all entry-block initializations, creating an infinite
+    # loop because the loop back-edge targets the hoisted position instead of the
+    # true loop start.
     for inst, dest_name in to_sink:
         sunk = False
         for bb in fn.blocks[1:]:  # skip entry
+            if bb.label is not None:
+                continue  # never sink into labeled (loop-header / branch-target) blocks
             for other_inst in bb.instructions:
                 # Check if any source operand references this dest
                 for src in other_inst.srcs:
@@ -711,13 +719,64 @@ def compile_function(fn: Function, verbose: bool = False,
                 old_raw[6] = (off32 >> 16) & 0xFF
                 old_raw[7] = (off32 >> 24) & 0xFF
             else:
-                # SM_120: 18-bit instruction offset in bytes 8-11
-                signed_insns = rel_offset // 16
-                offset18 = signed_insns & 0x3FFFF
-                old_raw[8]  = offset18 & 0xFF
-                old_raw[9]  = (offset18 >> 8) & 0xFF
-                old_raw[10] = 0x80 | ((offset18 >> 16) & 0x03)
-                old_raw[11] = 0x03
+                # SM_120 BRA encoding.
+                # b1 upper nibble is set by patch_pred in isel.py:
+                #   0x79 = PT (unconditional)  0x09 = @P0  0x89 = @!P0  etc.
+                # Unconditional forward BRA uses BRA.U !UP0 (UP0 initialises to 0
+                #   so !UP0=1 = always-fire). Predicated BRAs and unconditional
+                #   backward BRAs use the @P/@!P encoding with formula:
+                #     total = delta_instrs_from_next * 4  (signed int)
+                #     b2 = total & 0xFF
+                #     b4 = ((total >> 8) << 2) & 0xFF
+                #     b5-b9 = sign-extension byte (0xFF if b4 >= 0x80 else 0x00)
+                #     b10 = 0x80 | ((total >> 16) & 0x03)
+                #     b11 = 0x03
+                pred_nibble = (old_raw[1] >> 4) & 0xF
+                is_pt = (pred_nibble == 0x7)  # PT = unconditional
+                if is_pt and rel_offset > 0:
+                    # Unconditional forward BRA: BRA.U !UP0.
+                    # offset_instrs counts from the *current* instruction.
+                    offset_instrs = rel_offset // 16 + 1
+                    old_raw[1]  = 0x75
+                    old_raw[2]  = (offset_instrs * 4) & 0xFF
+                    old_raw[3]  = 0x08
+                    old_raw[4]  = (1 + 4 * (offset_instrs >> 6)) & 0xFF
+                    old_raw[5]  = 0x00
+                    old_raw[6]  = 0x00
+                    old_raw[7]  = 0x00
+                    old_raw[8]  = 0x00
+                    old_raw[9]  = 0x00
+                    old_raw[10] = 0x80
+                    old_raw[11] = 0x0b
+                    old_raw[12] = 0x00
+                    old_raw[13] = 0xea
+                    old_raw[14] = 0x0f
+                    old_raw[15] = 0x00
+                else:
+                    # Predicated BRA (any direction) or unconditional backward BRA.
+                    # Convert PT backward → @!P0: loop-back is only reached when
+                    # the loop-exit @P0 BRA was not taken, guaranteeing P0=0.
+                    if is_pt:
+                        old_raw[1] = 0x89  # @!P0
+                    total = (rel_offset // 16) * 4
+                    b2  = total & 0xFF
+                    b4  = ((total >> 8) << 2) & 0xFF
+                    se  = 0xFF if b4 >= 0x80 else 0x00
+                    b10 = 0x80 | ((total >> 16) & 0x03)
+                    old_raw[2]  = b2
+                    old_raw[3]  = 0x00
+                    old_raw[4]  = b4
+                    old_raw[5]  = se
+                    old_raw[6]  = se
+                    old_raw[7]  = se
+                    old_raw[8]  = se
+                    old_raw[9]  = se
+                    old_raw[10] = b10
+                    old_raw[11] = 0x03
+                    old_raw[12] = 0x00
+                    old_raw[13] = 0xea
+                    old_raw[14] = 0x0f
+                    old_raw[15] = 0x00
             pred_prefix = si.comment.split('BRA')[0] if 'BRA' in si.comment else ''
             sass_instrs[i] = SassInstr(
                 bytes(old_raw),
@@ -805,9 +864,12 @@ def compile_function(fn: Function, verbose: bool = False,
         const0_init_data=const0_init,
         exit_offset=exit_offset,
         s2r_offset=s2r_offset,
-        # Don't pass ptxas metadata to emitter — apply as post-process patch instead.
-        # This preserves ELF section structure while only changing data bytes.
-        ptxas_capmerc=None,
+        # Pass ptxas capmerc to emitter for ELF section sizing — UNLESS our kernel
+        # needs more GPRs than ptxas's (high-register kernel). In that case use
+        # None so the emitter calls build_capmerc_from_sass with 0x2000 capability
+        # bit and full-range type-02 barrier records (byte[10]=0x01), which is
+        # required to enable R14+ access on SM_120 Mercury.
+        ptxas_capmerc=_select_capmerc(ptxas_meta, _final_gprs),
         ptxas_merc_info=None,
     )
     if sm_version == 89:
@@ -835,12 +897,37 @@ def compile_function(fn: Function, verbose: bool = False,
     else:
         # SM_120: full emitter with capmerc/merc
         cubin_bytes = emit_cubin(desc)
-        # Post-process: patch capmerc and merc.nv.info with ptxas metadata.
+        # Post-process: patch merc.nv.info with ptxas metadata.
+        # capmerc is already embedded (passed to emitter above).
         if ptxas_meta:
             cubin_bytes = _patch_ptxas_metadata(cubin_bytes, ptxas_meta,
                                                 min_gprs=desc.num_gprs)
 
     return cubin_bytes
+
+
+def _select_capmerc(ptxas_meta: dict | None, kernel_gprs: int) -> bytes | None:
+    """Return ptxas's capmerc for the emitter's ELF section sizing, or None.
+
+    Returns None (→ use generated capmerc) when our kernel needs R14+ access.
+    SM_120 Mercury restricts access to R0-R13 unless the capmerc capability mask
+    has bit 0x2000 (high-register bit) and type-02 barrier byte[10]=0x01.
+    ptxas only sets these flags when it allocates >14 GPRs. If our kernel uses
+    more than 14 GPRs, we must use our generated capmerc (not ptxas's).
+    """
+    if not ptxas_meta or 'capmerc' not in ptxas_meta:
+        return None
+    ptxas_cap = ptxas_meta['capmerc']
+    # Check if ptxas's capmerc already has the 0x2000 high-register capability bit.
+    # If not, and our kernel needs R14+, use generated capmerc instead.
+    if len(ptxas_cap) >= 16:
+        cap_mask = int.from_bytes(ptxas_cap[12:16], 'little')
+        ptxas_has_highreg = bool(cap_mask & 0x2000)
+    else:
+        ptxas_has_highreg = False
+    if kernel_gprs > 14 and not ptxas_has_highreg:
+        return None  # use generated capmerc with 0x2000 + full-range barrier records
+    return ptxas_cap
 
 
 def _patch_ptxas_metadata(cubin_bytes: bytes, ptxas_meta: dict,
@@ -869,17 +956,26 @@ def _patch_ptxas_metadata(cubin_bytes: bytes, ptxas_meta: dict,
         name_end = strtab.index(0, sh_name_idx)
         sname = strtab[sh_name_idx:name_end].decode('ascii', errors='replace')
         if 'capmerc' in sname and 'text' in sname and 'capmerc' in ptxas_meta:
+            # When our kernel uses more registers than ptxas's kernel (min_gprs > ptxas_gprs),
+            # use our generated capmerc so the capability mask includes 0x2000
+            # (high-register bit) and type-02 barrier byte[10]=0x01 (full range).
+            # ptxas's capmerc is for ≤14 GPR kernels and lacks these flags,
+            # causing Mercury to restrict access to R0-R13 at runtime (ERR715).
             ptxas_cap = ptxas_meta['capmerc']
-            # Overwrite section data (pad or truncate to match section size)
-            patch = bytearray(ptxas_cap[:sh_size])
-            if len(patch) < sh_size:
-                patch.extend(bytearray(sh_size - len(patch)))
-            # Ensure GPR count (byte[8]) covers our actual register usage.
-            # ptxas may allocate fewer registers than our isel when it uses
-            # scratch registers beyond the static allocation (e.g. UR→GPR addr).
-            if min_gprs > 0 and len(patch) > 8:
-                patch[8] = max(patch[8], min_gprs)
-            data[sh_offset_val:sh_offset_val + sh_size] = patch
+            cap_mask = int.from_bytes(ptxas_cap[12:16], 'little') if len(ptxas_cap) >= 16 else 0
+            ptxas_has_highreg = bool(cap_mask & 0x2000)
+            if min_gprs > 14 and not ptxas_has_highreg:
+                # Our kernel needs R14+ but ptxas's capmerc lacks 0x2000 bit.
+                # Skip overwriting so the emitter's generated capmerc stays in place.
+                pass
+            else:
+                # ptxas capmerc has required capability bits (or we don't need R14+)
+                patch = bytearray(ptxas_cap[:sh_size])
+                if len(patch) < sh_size:
+                    patch.extend(bytearray(sh_size - len(patch)))
+                if min_gprs > 0 and len(patch) > 8:
+                    patch[8] = max(patch[8], min_gprs)
+                data[sh_offset_val:sh_offset_val + sh_size] = patch
         if 'merc.nv.info.' in sname and 'merc_info' in ptxas_meta:
             # Only use ptxas merc.nv.info when ptxas and our isel agree on
             # register count. If we use more registers (e.g. UR→GPR scratch
@@ -906,8 +1002,12 @@ def _extract_ptxas_metadata(ptx_src: str) -> dict[str, dict]:
     import tempfile, subprocess, struct
     result = {}
     try:
-        with tempfile.NamedTemporaryFile(suffix='.ptx', delete=False, mode='w') as f:
-            f.write(ptx_src)
+        # ptxas requires ASCII-only input — strip non-ASCII characters
+        # (e.g. em-dash U+2014 in Forge-generated comments) before passing to ptxas.
+        ptx_ascii = ptx_src.encode('ascii', errors='replace').decode('ascii')
+        with tempfile.NamedTemporaryFile(suffix='.ptx', delete=False, mode='w',
+                                         encoding='ascii') as f:
+            f.write(ptx_ascii)
             ptx_path = f.name
         cubin_path = ptx_path.replace('.ptx', '.cubin')
         r = subprocess.run(['ptxas', '-arch', 'sm_120', '-o', cubin_path, ptx_path],

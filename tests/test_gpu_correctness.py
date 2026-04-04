@@ -464,5 +464,199 @@ class TestDivergentWarp:
                 f"idle idx {i}: got {results[i]:#010x}, expected sentinel {sentinel:#010x}"
 
 
+# ---------------------------------------------------------------------------
+# DSETP correctness test
+# ---------------------------------------------------------------------------
+
+_PTX_DSETP = """
+.version 9.0
+.target sm_120
+.address_size 64
+
+// dsetp_test: out[i] = (a[i] < b[i]) ? 1 : 0  using DSETP
+// Params: out (u64), a (u64 ptr to f64 array), b (u64 ptr to f64 array), n (u32)
+.visible .entry dsetp_test(
+    .param .u64 out, .param .u64 a, .param .u64 b, .param .u32 n)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<16>;
+    .reg .f64 %fd<4>;
+    .reg .pred %p0, %p1;
+
+    mov.u32   %r0, %tid.x;
+    mov.u32   %r1, %ctaid.x;
+    mov.u32   %r2, %ntid.x;
+    mad.lo.s32 %r3, %r1, %r2, %r0;
+    ld.param.u32 %r4, [n];
+    setp.ge.u32 %p0, %r3, %r4;
+    @%p0 bra DONE;
+
+    cvt.u64.u32 %rd0, %r3;
+    shl.b64   %rd0, %rd0, 3;          // *8 for f64
+
+    ld.param.u64 %rd1, [a];  add.u64 %rd2, %rd1, %rd0;
+    ld.param.u64 %rd3, [b];  add.u64 %rd4, %rd3, %rd0;
+    ld.global.f64 %fd0, [%rd2];
+    ld.global.f64 %fd1, [%rd4];
+
+    setp.lt.f64 %p1, %fd0, %fd1;      // DSETP: p1 = (a[i] < b[i])
+
+    mov.u32   %r5, 0;
+    @%p1 mov.u32 %r5, 1;
+
+    ld.param.u64 %rd5, [out];
+    cvt.u64.u32 %rd6, %r3;
+    shl.b64   %rd6, %rd6, 2;          // *4 for u32 output
+    add.u64   %rd7, %rd5, %rd6;
+    st.global.u32 [%rd7], %r5;
+DONE:
+    ret;
+}
+"""
+
+
+class TestDsetp:
+    @gpu
+    def test_dsetp_correctness(self, cuda_ctx):
+        """DSETP F64 compare: out[i] = (a[i] < b[i]) ? 1 : 0."""
+        import struct, math
+        cubins = _compile(_PTX_DSETP)
+        assert 'dsetp_test' in cubins, "dsetp_test kernel not compiled"
+        ok = cuda_ctx.load(cubins['dsetp_test'])
+        assert ok, "cuModuleLoadData failed for dsetp_test"
+        func = cuda_ctx.get_func('dsetp_test')
+
+        N = 16
+        a_vals = [1.0, 2.0, 3.0, -1.0, 0.0, 5.0, 1e100, -1e100,
+                  0.5, 1.0, math.pi, math.e, 1.0, 2.0, 3.0, 4.0]
+        b_vals = [2.0, 2.0, 2.0,  0.0, 0.0, 3.0, 1e100,  1e100,
+                  1.0, 0.5, 3.0, 3.0, 1.0, 1.0, 4.0, 3.0]
+        expected = [1 if a < b else 0 for a, b in zip(a_vals, b_vals)]
+
+        a_bytes = struct.pack(f'<{N}d', *a_vals)
+        b_bytes = struct.pack(f'<{N}d', *b_vals)
+        out_bytes = struct.pack(f'<{N}I', *([0xDEADBEEF] * N))
+
+        d_a   = cuda_ctx.alloc(8 * N)
+        d_b   = cuda_ctx.alloc(8 * N)
+        d_out = cuda_ctx.alloc(4 * N)
+        try:
+            cuda_ctx.copy_to(d_a, a_bytes)
+            cuda_ctx.copy_to(d_b, b_bytes)
+            cuda_ctx.copy_to(d_out, out_bytes)
+            err = cuda_ctx.launch(func, (1, 1, 1), (N, 1, 1),
+                                  [d_out, d_a, d_b, N])
+            assert err == 0, f"launch error {err}"
+            assert cuda_ctx.sync() == 0, "DSETP kernel crashed"
+            raw = cuda_ctx.copy_from(d_out, 4 * N)
+            results = list(struct.unpack(f'<{N}I', raw))
+            for i in range(N):
+                assert results[i] == expected[i], \
+                    f"idx {i}: a={a_vals[i]} b={b_vals[i]} got {results[i]} expected {expected[i]}"
+        finally:
+            cuda_ctx.free(d_a)
+            cuda_ctx.free(d_b)
+            cuda_ctx.free(d_out)
+
+
+# ---------------------------------------------------------------------------
+# selp.f64 correctness test (2×FSEL implementation)
+# ---------------------------------------------------------------------------
+
+_PTX_SELP_F64 = """
+.version 9.0
+.target sm_120
+.address_size 64
+
+// selp_f64_test: out[i] = (cond[i] != 0) ? a[i] : b[i]  using selp.f64
+// Params: out (u64 ptr to f64), a (u64 ptr to f64), b (u64 ptr to f64),
+//         cond (u64 ptr to u32), n (u32)
+.visible .entry selp_f64_test(
+    .param .u64 out, .param .u64 a, .param .u64 b,
+    .param .u64 cond, .param .u32 n)
+{
+    .reg .b32  %r<8>;
+    .reg .b64  %rd<16>;
+    .reg .f64  %fd<4>;
+    .reg .pred %p0, %p1;
+
+    mov.u32    %r0, %tid.x;
+    mov.u32    %r1, %ctaid.x;
+    mov.u32    %r2, %ntid.x;
+    mad.lo.s32 %r3, %r1, %r2, %r0;
+    ld.param.u32 %r4, [n];
+    setp.ge.u32 %p0, %r3, %r4;
+    @%p0 bra DONE;
+
+    cvt.u64.u32 %rd0, %r3;
+    shl.b64    %rd0, %rd0, 3;           // *8 for f64
+
+    ld.param.u64 %rd1, [a];    add.u64 %rd2, %rd1, %rd0;
+    ld.param.u64 %rd3, [b];    add.u64 %rd4, %rd3, %rd0;
+    ld.global.f64 %fd0, [%rd2];         // a[i]
+    ld.global.f64 %fd1, [%rd4];         // b[i]
+
+    cvt.u64.u32 %rd8, %r3;
+    shl.b64    %rd8, %rd8, 2;           // *4 for u32 cond
+    ld.param.u64 %rd9, [cond]; add.u64 %rd10, %rd9, %rd8;
+    ld.global.u32 %r5, [%rd10];         // cond[i]
+
+    setp.ne.u32 %p1, %r5, 0;
+    selp.f64 %fd2, %fd0, %fd1, %p1;    // fd2 = p1 ? fd0 : fd1
+
+    ld.param.u64 %rd5, [out]; add.u64 %rd6, %rd5, %rd0;
+    st.global.f64 [%rd6], %fd2;
+DONE:
+    ret;
+}
+"""
+
+
+class TestSelpF64:
+    @gpu
+    def test_selp_f64_correctness(self, cuda_ctx):
+        """selp.f64: out[i] = cond[i] ? a[i] : b[i] — tests 2×FSEL predicate encoding."""
+        import struct, math
+        cubins = _compile(_PTX_SELP_F64)
+        assert 'selp_f64_test' in cubins, "selp_f64_test kernel not compiled"
+        ok = cuda_ctx.load(cubins['selp_f64_test'])
+        assert ok, "cuModuleLoadData failed for selp_f64_test"
+        func = cuda_ctx.get_func('selp_f64_test')
+
+        N = 16
+        a_vals  = [1.0, 2.0, 3.0, math.pi, 1e100, -1.5, 0.0, math.e,
+                   -2.0, 0.5, 99.9, -99.9, 1.0, 2.0, 3.0, 4.0]
+        b_vals  = [9.0, 8.0, 7.0, 6.28, 0.0,  2.5, 1.0, 1.0,
+                    3.0, 4.0,  0.1,   0.1, 5.0, 6.0, 7.0, 8.0]
+        cond    = [1, 0, 1, 0, 1, 0, 1, 0,
+                   0, 1, 0, 1, 1, 0, 1, 0]
+        expected = [a if c else b for a, b, c in zip(a_vals, b_vals, cond)]
+
+        d_a    = cuda_ctx.alloc(8 * N)
+        d_b    = cuda_ctx.alloc(8 * N)
+        d_cond = cuda_ctx.alloc(4 * N)
+        d_out  = cuda_ctx.alloc(8 * N)
+        try:
+            cuda_ctx.copy_to(d_a,    struct.pack(f'<{N}d', *a_vals))
+            cuda_ctx.copy_to(d_b,    struct.pack(f'<{N}d', *b_vals))
+            cuda_ctx.copy_to(d_cond, struct.pack(f'<{N}I', *cond))
+            cuda_ctx.copy_to(d_out,  bytes(8 * N))
+            err = cuda_ctx.launch(func, (1, 1, 1), (N, 1, 1),
+                                  [d_out, d_a, d_b, d_cond, N])
+            assert err == 0, f"launch error {err}"
+            assert cuda_ctx.sync() == 0, "selp_f64 kernel crashed"
+            raw = cuda_ctx.copy_from(d_out, 8 * N)
+            results = list(struct.unpack(f'<{N}d', raw))
+            for i in range(N):
+                assert results[i] == expected[i], \
+                    f"idx {i}: cond={cond[i]} a={a_vals[i]} b={b_vals[i]} " \
+                    f"got {results[i]} expected {expected[i]}"
+        finally:
+            cuda_ctx.free(d_a)
+            cuda_ctx.free(d_b)
+            cuda_ctx.free(d_cond)
+            cuda_ctx.free(d_out)
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v', '-m', 'gpu'])

@@ -1,34 +1,30 @@
 """
-sass/isel.py — PTX-to-SASS instruction selector for SM_120.
+sass/isel.py — PTX-to-SASS instruction selector for SM_120 (and SM_89).
 
-Maps PTX IR instructions to sequences of 16-byte SM_120 SASS instructions.
-This is a targeted selector, not a general PTX compiler: it handles the
-instruction patterns needed to correctly compile the ptxas bug cases and a
-minimal computation kernel.
+Maps PTX IR instructions to sequences of 16-byte SASS instructions.
+Handles 60+ instruction encodings verified byte-for-byte against ptxas 13.0.
 
 Architecture:
-  - Input: ptx.ir.Function with allocated physical registers
-  - Output: list of (16-byte bytes, comment) pairs
+  - Input: ptx.ir.Function with allocated physical registers (from regalloc.py)
+  - Output: list of SassInstr (16-byte bytes + comment string)
 
 Register mapping convention (set by regalloc, read here):
-  PTX %rd0..%rdN → SASS R0..R(N*2+1)  (64-bit pairs: lo=even, hi=odd)
-  PTX %r0..%rN   → SASS R(BASE+N)     (32-bit singles)
-  PTX %p0..%pN   → SASS P0..P5        (predicates)
+  PTX %rd0..%rdN → SASS R0..R(N*2+1)   (64-bit pairs: lo=even, hi=odd)
+  PTX %r0..%rN   → SASS R(BASE+N)      (32-bit singles)
+  PTX %f0..%fN   → SASS R(BASE+N)      (float, same bank as int32)
+  PTX %fd0..%fdN → SASS R(BASE+N*2)    (f64, 64-bit pairs like rd)
+  PTX %p0..%pN   → SASS P0..P5         (predicates)
+  PTX %ur0..%urN → SASS UR0..UR63      (uniform registers, LDCU/S2UR targets)
 
-Supported PTX instructions → SASS mappings:
-  mov.u32           → MOV
-  mov.u64           → MOV (low) + MOV (high) if reg-reg; NOP if same
-  shl.b64           → SHF.L.U32 (lo) + SHF.L.U64.HI (hi)
-  shr.u64           → SHF.R.U64 (TODO: right-shift encoder pending RE)
-  sub.u64/s64       → IADD3 (lo, negated) + IADD3.X (hi, with carry)
-  add.u64           → IADD3 (lo) + IADD3.X (hi)
-  ld.param.u64      → LDC.64
-  ld.param.u32      → LDC
-  ld.global.u64     → LDG.E.64
-  st.global.u64     → STG.E.64
-  ret               → EXIT
-  @p bra target     → BRA (with predicate, placeholder offset)
-  setp.ge.u32       → ISETP.GE.AND
+Key SM_120 encoding constraints (see ARCHITECTURE.md for full details):
+  - IMAD R-R (0x2a4) is BROKEN; use IMAD R-UR (0xc24) for all 32-bit mul
+  - ISETP (0x20c/0xc0c) corrupts FSETP; use FSEL.step (0x80a) for int+float pred
+  - rbar is a bitmask (OR-combine): bit1=LDC, bit2=LDS, bit3=LDG
+  - S2R / S2UR are asynchronous (wdep=0x31 required)
+  - SM_120 uses predicated execution for warp divergence (no intra-kernel BRA)
+  - DSETP ordered comparison codes silently give P=false; use unordered (GEU etc.)
+  - QMMA requires dest==src_a in encoding (in-place accumulate)
+  - IMMA B register base must be < 8
 """
 
 from __future__ import annotations

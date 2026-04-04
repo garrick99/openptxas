@@ -950,6 +950,38 @@ def encode_hmma_f16_f32(dest: int, src_a: int, src_b: int, src_c: int,
     return bytes(raw)
 
 
+# HMMA.1688.F32 — FP16 tensor core m16n8k8 shape (k=8 variant, ptxas-verified)
+# Ground truth: HMMA.1688.F32 R4, R4, RZ, RZ → 3c 72 04 04 ff 00 00 00 ff 10 00 00 [ctrl]
+#   b9=0x10 (vs 0x18 for k16); A: 2 regs, B: 1 reg, C/D: 4 regs
+
+def encode_hmma_f16_f32_k8(dest: int, src_a: int, src_b: int, src_c: int,
+                             ctrl: int = 0) -> bytes:
+    """HMMA.1688.F32 dest, src_a, src_b, src_c — m16n8k8 FP16→FP32 tensor core.
+    A uses 2 regs, B uses 1 reg, C/D use 4 regs. Ground truth: b9=0x10.
+    HMMA.1688.F32 R4, R4, RZ, RZ → 3c72 04 04 ff 00 00 00 ff 10 00 00 [ctrl]"""
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0x3c
+    raw[1] = 0x72
+    raw[2] = dest & 0xFF
+    raw[3] = src_a & 0xFF
+    raw[4] = src_b & 0xFF
+    raw[5] = 0x00
+    raw[6] = 0x00
+    raw[7] = 0x00
+    raw[8] = src_c & 0xFF
+    raw[9] = 0x10       # m16n8k8 + F32 accum (vs 0x18 for k16)
+    raw[10] = 0x00
+    raw[11] = 0x00
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
 # HMMA.16816.F32.BF16 — BF16 tensor core (decoded 2026-04-01)
 # Ground truth: hi=0x008fe2000004180c → raw[9]=0x18, raw[10]=0x04
 
@@ -3385,3 +3417,68 @@ def encode_f2fp_f16_f32(dest, src, ctrl=0):
     if ctrl == 0: ctrl = _CTRL_DEFAULT
     return _build(0x3e, 0x72, b2=dest, b3=RZ, b4=src, b8=0xFF,
                   b9=0x00, b10=0x00, b11=0x00, ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# QMMA — Blackwell MXF8 FP8 matrix multiply-accumulate (SM_120 only)
+# ---------------------------------------------------------------------------
+# Shape: m16n8k32, FP8 inputs, FP32 accumulation.
+# Opcode: 0x27a (raw[0]=0x7a, raw[1]=0x72)
+# Ground truth from ptxas (SM_120):
+#   QMMA.16832.F32.E4M3.E4M3 R4, R4, R2, RZ
+#   → 7a72040402000000ff2c000000e20f00  (b9=0x2c = E4M3.E4M3)
+#   QMMA.16832.F32.E5M2.E5M2 R4, R4, R2, RZ
+#   → 7a72040402000000ffec000000e20f00  (b9=0xec = E5M2.E5M2)
+# Register constraints (SM_120 hardware, empirically verified):
+#   D: 4-register group, base must be 4-aligned (d%4==0)
+#   A: 4-register group, base must be 4-aligned (a%4==0)
+#   B: 2-register group, base must be < 8 (b in R0..R7)
+#   C: 4-register group (same as D for in-place accumulation, or RZ=255 for no accumulation)
+
+def encode_qmma_e4m3_f32(dest: int, src_a: int, src_b: int, src_c: int,
+                          ctrl: int = 0) -> bytes:
+    """
+    QMMA.16832.F32.E4M3.E4M3 dest, src_a, src_b, src_c
+
+    FP8 E4M3 matrix multiply-accumulate on SM_120 (Blackwell MXF8).
+    D[dest:dest+3] = A[src_a:src_a+3] * B[src_b:src_b+1] + C[src_c:src_c+3]
+    b9=0x2c encodes E4M3 × E4M3 with FP32 accumulation.
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0x7a; raw[1] = 0x72
+    raw[2] = dest & 0xFF
+    raw[3] = src_a & 0xFF
+    raw[4] = src_b & 0xFF
+    raw[5] = raw[6] = raw[7] = 0
+    raw[8] = src_c & 0xFF
+    raw[9] = 0x2c      # E4M3 × E4M3 FP8 format
+    raw[10] = raw[11] = raw[12] = 0
+    raw[13] = b13; raw[14] = b14; raw[15] = b15
+    return bytes(raw)
+
+
+def encode_qmma_e5m2_f32(dest: int, src_a: int, src_b: int, src_c: int,
+                          ctrl: int = 0) -> bytes:
+    """
+    QMMA.16832.F32.E5M2.E5M2 dest, src_a, src_b, src_c
+
+    FP8 E5M2 matrix multiply-accumulate on SM_120 (Blackwell MXF8).
+    b9=0xec encodes E5M2 × E5M2 with FP32 accumulation.
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0x7a; raw[1] = 0x72
+    raw[2] = dest & 0xFF
+    raw[3] = src_a & 0xFF
+    raw[4] = src_b & 0xFF
+    raw[5] = raw[6] = raw[7] = 0
+    raw[8] = src_c & 0xFF
+    raw[9] = 0xec      # E5M2 × E5M2 FP8 format
+    raw[10] = raw[11] = raw[12] = 0
+    raw[13] = b13; raw[14] = b14; raw[15] = b15
+    return bytes(raw)

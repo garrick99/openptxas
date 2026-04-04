@@ -87,6 +87,7 @@ _OPCODE_META: dict[int, _OpMeta] = {
     0x23c: _OpMeta('HMMA',      1, 0x3e, 2),  # HMMA FP16/BF16/TF32 MMA (m16n8k*) misc=2 ptxas-observed
     0x237: _OpMeta('IMMA',      1, 0x3e, 2),  # IMMA INT8 MMA (m16n8k32)
     0x23f: _OpMeta('DMMA',      1, 0x3e, 2),  # DMMA FP64 MMA (m8n8k4)
+    0x27a: _OpMeta('QMMA',      1, 0x3e, 2),  # QMMA FP8 E4M3/E5M2 MMA (m16n8k32)
     0x83b: _OpMeta('LDSM',      1, 0x33, 2),  # LDSM load shared→matrix regs (wdep=LDS slot)
     0x3c4: _OpMeta('REDUX',     0, 0x3f, 0),  # REDUX warp reduction → UR (no GPR dest)
     0xc02: _OpMeta('MOV.UR',   1, 0x3e, 1),  # MOV R, UR — copy uniform reg to GPR
@@ -154,8 +155,8 @@ _OPCODES_ALU = {
     0x216,        # PRMT.REG (register selector, opc=0x216)
     0x589, 0xf89, 0x989,  # SHFL (reg-reg, reg-imm, imm-imm)
     0x806,        # VOTE.ANY
-    # Matrix multiply (HMMA, IMMA, DMMA)
-    0x23c, 0x237, 0x23f,
+    # Matrix multiply (HMMA, IMMA, DMMA, QMMA)
+    0x23c, 0x237, 0x23f, 0x27a,
     # Miscellaneous / div.u32 helpers
     0x431,        # HFMA2 (zero-init trick)
     0x810,        # IADD3 immediate form
@@ -249,10 +250,11 @@ def _get_src_regs(raw: bytes) -> set[int]:
         elif opcode in (0x299,):  # SHF.VAR: src0=b3, k_reg=b4(reg), src1=b8
             if raw[4] < 255: regs.add(raw[4])   # shift-amount register
             if raw[8] < 255: regs.add(raw[8])
-        elif opcode in (0x23c, 0x237):  # HMMA/IMMA: a=b3(4 regs), b=b4(2), c=b8(4)
+        elif opcode in (0x23c, 0x237, 0x27a):  # HMMA/IMMA/QMMA: a=b3(4 regs), b=b4(2), c=b8(4)
             for r in range(4): regs.add(raw[3]+r)
             for r in range(2): regs.add(raw[4]+r)
-            for r in range(4): regs.add(raw[8]+r)
+            if raw[8] < 255:
+                for r in range(4): regs.add(raw[8]+r)
         elif opcode in (0x820, 0x823, 0x80a):  # FMUL.IMM/FFMA.IMM/FSEL: src0=b3, b4-b7=imm
             if raw[3] < 255: regs.add(raw[3])
             if opcode == 0x823 and raw[8] < 255: regs.add(raw[8])  # FFMA addend
@@ -311,7 +313,7 @@ def _get_dest_regs(raw: bytes) -> set[int]:
         if dest < 255: regs.add(dest)
     elif opcode in (0x235, 0xc35):  # IADD.64 / IADD.64-UR: writes GPR pair
         if dest < 255: regs |= {dest, dest+1}
-    elif opcode in (0x23c, 0x237):  # HMMA/IMMA: writes 4 regs
+    elif opcode in (0x23c, 0x237, 0x27a):  # HMMA/IMMA/QMMA: writes 4 regs
         if dest < 255: regs |= {dest, dest+1, dest+2, dest+3}
     elif opcode in (0x825, 0x225):  # IMAD.WIDE: writes dest pair
         if dest < 255: regs |= {dest, dest+1}
@@ -422,6 +424,7 @@ _OPCODE_MISC: dict[int, int] = {
     0x23c: 2,   # HMMA (FP16/BF16/TF32)
     0x237: 2,   # IMMA (INT8)
     0x23f: 2,   # DMMA (FP64)
+    0x27a: 2,   # QMMA (FP8 E4M3/E5M2)
     # LDC (0xb82) and S2UR (0x9c3) intentionally omitted — use counter for correct values
 }
 

@@ -78,7 +78,7 @@ _OPCODE_META: dict[int, _OpMeta] = {
     0x810: _OpMeta('IADD3.IMM',  1, 0x3e, 1),  # IADD3 with 32-bit immediate operand
     0x306: _OpMeta('I2F.U32.RP', 1, 0x3e, 1),  # I2F unsigned int to float, round toward +inf
     0x305: _OpMeta('F2I.FTZ.U32',1, 0x3e, 1),  # F2I float to unsigned int, truncate
-    0x310: _OpMeta('F2F',        1, 0x3e, 1),  # F2F float-to-float precision conversion (F32↔F64)
+    0x310: _OpMeta('F2F',        1, 0x33, 1),  # F2F float-to-float precision conversion (F32↔F64), long-latency wdep=0x33
     0x311: _OpMeta('F2I.F64',   1, 0x3e, 1),  # F2I.F64 float64-to-int32 conversion
     0x312: _OpMeta('I2F.F64',   1, 0x3e, 1),  # I2F.F64 int32-to-float64 conversion (writes pair)
     0x81a: _OpMeta('BFE_SEXT',  1, 0x3e, 1),  # BFE sign-extension step (bfe.s32 lowering)
@@ -106,6 +106,7 @@ _OPCODES_STS = {0x988}
 _OPCODES_BAR = {0xb1d}
 _OPCODES_DFPU  = {0xe29, 0xc28, 0xc2b}   # DADD (R-R), DMUL, DFMA (double-precision, wdep=0x33)
 _OPCODES_DSETP = {0x22a}                 # DSETP (FP64 compare → predicate; reads pairs, no GPR dest)
+_OPCODES_F2F   = {0x310}                 # F2F (float-to-float precision conversion; long-latency, wdep=0x33)
 _OPCODES_CTRL = {0x94d, 0x947, 0x918, 0x91a}  # EXIT, BRA, NOP, DEPBAR.LE
 _OPCODES_LDGSTS = {0xfae}  # LDGSTS.E (cp.async global→shared)
 _OPCODES_LDGDEPBAR = {0x9af}  # LDGDEPBAR (cp.async commit)
@@ -164,7 +165,7 @@ _OPCODES_ALU = {
     0x306,        # I2F.U32.RP
     0x305,        # F2I.FTZ.U32.TRUNC
     # Float precision conversion / integer↔float F64
-    0x310,        # F2F (F32↔F64)
+    # NOTE: F2F (0x310) moved to _OPCODES_F2F — long-latency, wdep=0x33
     0x311,        # F2I.F64 (F64→int32)
     0x312,        # I2F.F64 (int32→F64)
     # BFE helpers
@@ -275,6 +276,13 @@ def _get_src_regs(raw: bytes) -> set[int]:
         elif opcode == 0x20c:  # ISETP R-R: src0=b3, src1=b4
             if raw[3] < 255: regs.add(raw[3])
             if raw[4] < 255: regs.add(raw[4])
+    elif opcode in _OPCODES_F2F:
+        # F2F: src at b4. F2F.F32.F64 (b9=0x10, narrowing) reads f64 pair;
+        # F2F.F64.F32 (b9=0x18, widening) reads single f32.
+        if raw[4] < 255:
+            regs.add(raw[4])
+            if raw[9] == 0x10:  # F2F.F32.F64: src is f64 pair
+                regs.add(raw[4] + 1)
     return regs
 
 
@@ -360,8 +368,8 @@ def _wdep_for_opcode(opcode: int, raw: bytes = None) -> int:
         return 0x3e
     if opcode in _OPCODES_LDC:
         return 0x31
-    if opcode in _OPCODES_LDS | _OPCODES_DFPU | _OPCODES_DSETP:
-        return 0x33  # DSETP also posts via slot 0x33 (ptxas SM_120 ground truth)
+    if opcode in _OPCODES_LDS | _OPCODES_DFPU | _OPCODES_DSETP | _OPCODES_F2F:
+        return 0x33  # DSETP, F2F also post via slot 0x33 (ptxas SM_120 ground truth)
     if opcode in _OPCODES_LDG | _OPCODES_ATOMG:
         return 0x35
     if opcode == 0x3c4:  # REDUX: writes to UR, posts to slot 0x31 like LDCU (ptxas-verified)
@@ -437,7 +445,8 @@ _ALL_KNOWN_OPCODES: frozenset = frozenset(
     _OPCODES_LDG | _OPCODES_LDC | _OPCODES_LDS |
     _OPCODES_STG | _OPCODES_STS | _OPCODES_BAR |
     _OPCODES_CTRL | _OPCODES_ALU | _OPCODES_IADD64_UR |
-    _OPCODES_SMEM_SETUP | _OPCODES_ATOMG | _OPCODES_DFPU
+    _OPCODES_SMEM_SETUP | _OPCODES_ATOMG | _OPCODES_DFPU |
+    _OPCODES_F2F
 )
 
 
@@ -626,9 +635,15 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
         # ALU writes (wdep=0x3e) DO need to be tracked for GPR-gap enforcement.
         # The min_gpr_gap ensures ≥1 instruction between ALU write and consumer.
         # Do NOT clear pending_writes here — consumers need the dependency info.
-        # Track predicate writes from ISETP: pred dest at raw[2], wdep tells consumers when ready
-        if opcode in (0xc0c, 0x20c):  # ISETP R-UR, ISETP R-R
+        # Track predicate writes from ISETP/FSETP: pred dest location varies by opcode
+        if opcode == 0xc0c:  # ISETP R-UR: pred_dest at raw[2]
             pred_dest = si.raw[2]  # destination predicate index (0..6)
+            pending_pred_writes[pred_dest] = (i, wdep)
+        elif opcode == 0x20c:  # ISETP R-R: pred_dest at (raw[10]>>1) & 0x7
+            pred_dest = (si.raw[10] >> 1) & 0x7
+            pending_pred_writes[pred_dest] = (i, wdep)
+        elif opcode == 0x20b:  # FSETP: pred_dest at raw[9] & 0x7
+            pred_dest = si.raw[9] & 0x7
             pending_pred_writes[pred_dest] = (i, wdep)
         # DSETP: predicate write is long-latency (wdep=0x33, same slot as LDS).
         # pred_dest encoded in raw[10] as 0xf0|(pred<<1); extract the 0-6 index.

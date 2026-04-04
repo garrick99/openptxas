@@ -115,17 +115,20 @@ def test_cs2r_opcode():
 #   bytes5-6=0x00 (offset=0), byte7=0x80 (descriptor flag)
 
 def test_atomg_add_u32_opcode():
-    """ATOMG.E.ADD.u32 uses opcode bytes a8/09 (not a8/79 like other ATOMG ops)."""
+    """ATOMG.E.ADD.u32 encoding with PT guard and correct modifier bytes."""
     from sass.encoding.sm_120_opcodes import encode_atomg_u32, ATOMG_ADD
     raw = encode_atomg_u32(dest=9, addr_base=2, offset=0, data=9, atom_op=ATOMG_ADD)
     assert raw[0] == 0xa8, f"byte0={raw[0]:#x}"
-    assert raw[1] == 0x09, f"byte1={raw[1]:#x} (expected 0x09 for ADD, not 0x79)"
+    assert raw[1] == 0x79, f"byte1={raw[1]:#x} (expected 0x79: PT guard + opcode nibble 9)"
     assert raw[2] == 9,    f"dest={raw[2]}"   # dest=R9
     assert raw[3] == 2,    f"addr={raw[3]}"   # addr=R2
     assert raw[4] == 9,    f"data={raw[4]}"   # data=R9
     assert raw[5] == 0,    f"offset_lo={raw[5]}"
     assert raw[7] == 0x80, f"byte7={raw[7]:#x} (descriptor flag)"
-    assert raw[11] == 0x00, f"atom_op field={raw[11]:#x}"
+    assert raw[8] == 4,    f"ur_desc={raw[8]} (expected UR4 default)"
+    assert raw[9] == 0xf1, f"b9={raw[9]:#x} (expected 0xf1 mode bits)"
+    assert raw[10] == 0x1e, f"b10={raw[10]:#x} (expected 0x1e mode bits)"
+    assert raw[11] == 0x08, f"atom_op field={raw[11]:#x} (expected 0x08 for ADD)"
 
 def test_atomg_add_u32_low64_matches_ground_truth():
     """Low 64 bits of ATOMG.E.ADD.u32 R9,[R2],R9 must match ground truth."""
@@ -133,24 +136,28 @@ def test_atomg_add_u32_low64_matches_ground_truth():
     import struct
     raw = encode_atomg_u32(dest=9, addr_base=2, offset=0, data=9, atom_op=ATOMG_ADD)
     lo = struct.unpack_from('<Q', raw, 0)[0]
-    # Ground truth: 0x80000009020909a8
-    assert lo == 0x80000009020909a8, f"low64={lo:#018x} (expected 0x80000009020909a8)"
+    # Ground truth: 0x80000009020979a8 (PT guard, b1=0x79)
+    assert lo == 0x80000009020979a8, f"low64={lo:#018x} (expected 0x80000009020979a8)"
 
 def test_atomg_min_u32_uses_0x79():
     """ATOMG.E.MIN and other non-ADD ops use byte1=0x79."""
     from sass.encoding.sm_120_opcodes import encode_atomg_u32, ATOMG_MIN
     raw = encode_atomg_u32(dest=11, addr_base=4, offset=0, data=8, atom_op=ATOMG_MIN)
     assert raw[1] == 0x79, f"byte1={raw[1]:#x} (expected 0x79 for MIN)"
-    assert raw[11] == ATOMG_MIN, f"atom_op field={raw[11]:#x}"
+    assert raw[11] == 0x04, f"atom_op field={raw[11]:#x} (expected 0x04 for MIN)"
 
 def test_atomg_add_distinct_from_min():
-    """ADD and MIN must differ in byte1 (opcode modifier)."""
+    """ADD and MIN differ in b11 (operation discriminator); b1 is same (0x79 PT guard)."""
     from sass.encoding.sm_120_opcodes import encode_atomg_u32, ATOMG_ADD, ATOMG_MIN
     add_raw = encode_atomg_u32(dest=5, addr_base=2, offset=0, data=3, atom_op=ATOMG_ADD)
     min_raw = encode_atomg_u32(dest=5, addr_base=2, offset=0, data=3, atom_op=ATOMG_MIN)
-    assert add_raw[1] != min_raw[1], "ADD and MIN must have different byte1"
-    assert add_raw[1] == 0x09
+    # Both use b1=0x79 (PT guard, opcode nibble 9)
+    assert add_raw[1] == 0x79
     assert min_raw[1] == 0x79
+    # Discriminator is in b11
+    assert add_raw[11] == 0x08, f"ADD b11={add_raw[11]:#x}"
+    assert min_raw[11] == 0x04, f"MIN b11={min_raw[11]:#x}"
+    assert add_raw[11] != min_raw[11], "ADD and MIN must have different b11"
 
 
 if __name__ == '__main__':

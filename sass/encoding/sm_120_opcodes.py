@@ -2264,23 +2264,40 @@ ATOMG_XOR  = 0x06
 ATOMG_EXCH = 0x08
 
 def encode_atomg_u32(dest: int, addr_base: int, offset: int, data: int,
-                      atom_op: int = ATOMG_ADD, ctrl: int = 0) -> bytes:
+                      atom_op: int = ATOMG_ADD, ctrl: int = 0,
+                      ur_desc: int = 4) -> bytes:
     """Encode ATOMG.E.{op}.STRONG.GPU for u32 atomic operations.
 
-    Ground truth (RTX 5090 probe):
-      ADD:  a8 09 d a e 00 00 80  (byte1=0x09)
-      MIN:  a8 79 d a e ...       (byte1=0x79)
-      others: same byte1=0x79 as MIN
+    Ground truth (ptxas sm_120):
+      ATOMG.E.ADD.STRONG.GPU PT, R7, desc[UR4][R2.64], R7:
+        lo: a8 09 07 02 07 00 00 80
+        hi: 04 f1 1e 08 00 ...
+      b2=dest, b3=addr, b4=data, b7=0x80(desc flag)
+      b8=UR_desc_idx, b9=0xf1, b10=0x1e, b11=0x08(ADD discriminator)
 
-    ATOMG.E.ADD uses a distinct opcode modifier byte (0x09) from all other
-    integer atomic ops (0x79).  The raw[11] field carries the op-code
-    discriminator for non-ADD ops.
+    ATOMG.E.ADD uses opcode modifier b1=0x09; other integer ops use b1=0x79.
+    b8 carries the UR descriptor index (typically UR4).
+    b9=0xf1, b10=0x1e are fixed mode bits.
+    b11 carries the operation discriminator.
     """
     if ctrl == 0:
         ctrl = _CTRL_DEFAULT
     b13, b14, b15 = _ctrl_to_bytes(ctrl)
-    # ADD has opcode modifier 0x09; all other integer ops use 0x79.
-    b1 = 0x09 if atom_op == ATOMG_ADD else 0x79
+    # b1 lower nibble = 0x9 (opcode variant for all ATOMG integer ops).
+    # b1 upper nibble = predicate guard: 0x7 = PT (unconditional).
+    # ptxas uses 0x09 (@P0 with warp election) for ADD, but we emit
+    # unconditional atomics without election, so always use PT = 0x79.
+    b1 = 0x79
+    # b11 encodes the atomic operation type
+    _ATOMG_B11 = {
+        ATOMG_ADD:  0x08,
+        ATOMG_MIN:  0x04,
+        ATOMG_MAX:  0x0c,
+        ATOMG_AND:  0x14,
+        ATOMG_OR:   0x1c,
+        ATOMG_EXCH: 0x24,
+    }
+    b11_val = _ATOMG_B11.get(atom_op, 0x08)
     raw = bytearray(16)
     raw[0]  = 0xa8
     raw[1]  = b1
@@ -2291,10 +2308,10 @@ def encode_atomg_u32(dest: int, addr_base: int, offset: int, data: int,
     raw[5]  = offset & 0xFF
     raw[6]  = (offset >> 8) & 0xFF
     raw[7]  = 0x80 | ((offset >> 16) & 0x7F)
-    raw[8]  = 0x00
-    raw[9]  = 0x00
-    raw[10] = 0x00
-    raw[11] = atom_op & 0xFF
+    raw[8]  = ur_desc & 0xFF   # UR descriptor index
+    raw[9]  = 0xf1             # fixed mode bits (ptxas ground truth)
+    raw[10] = 0x1e             # fixed mode bits (ptxas ground truth)
+    raw[11] = b11_val          # operation discriminator
     raw[12] = 0x00
     raw[13] = b13
     raw[14] = b14
@@ -2336,43 +2353,43 @@ def encode_atomg_cas_b32(dest: int, addr: int, compare: int, new_val: int,
 # ---------------------------------------------------------------------------
 # POPC — Population Count (count set bits)
 # ---------------------------------------------------------------------------
-# Opcode: 0x09, 0x73.  Ground truth: POPC R13, R0 → 0x00000000000d7309
+# Opcode: 0x09, 0x73.
+# Ground truth (ptxas sm_120): POPC R7, R2 → 0x0000000200077309 / 0x004e240000000000
+#   b0=0x09, b1=0x73, b2=dest, b3=0x00, b4=src
 def encode_popc(dest: int, src: int, ctrl: int = 0) -> bytes:
     if ctrl == 0: ctrl = _CTRL_DEFAULT
-    b13, b14, b15 = _ctrl_to_bytes(ctrl)
-    raw = bytearray(16)
-    raw[0], raw[1] = 0x09, 0x73
-    raw[2], raw[3] = dest & 0xFF, src & 0xFF
-    raw[13], raw[14], raw[15] = b13, b14, b15
-    return bytes(raw)
+    return _build(0x09, 0x73,
+                  b2=dest, b3=0x00, b4=src,
+                  b8=0x00, b9=0x00, b10=0x00, b11=0x00,
+                  ctrl=ctrl)
 
 
 # ---------------------------------------------------------------------------
 # BREV — Bit Reverse
 # ---------------------------------------------------------------------------
-# Opcode: 0x01, 0x73.  Ground truth: BREV R15, R0 → 0x00000000000f7301
+# Opcode: 0x01, 0x73.
+# Ground truth (ptxas sm_120): BREV R7, R2 → 0x0000000200077301 / 0x004e240000000000
+#   b0=0x01, b1=0x73, b2=dest, b3=0x00, b4=src
 def encode_brev(dest: int, src: int, ctrl: int = 0) -> bytes:
     if ctrl == 0: ctrl = _CTRL_DEFAULT
-    b13, b14, b15 = _ctrl_to_bytes(ctrl)
-    raw = bytearray(16)
-    raw[0], raw[1] = 0x01, 0x73
-    raw[2], raw[3] = dest & 0xFF, src & 0xFF
-    raw[13], raw[14], raw[15] = b13, b14, b15
-    return bytes(raw)
+    return _build(0x01, 0x73,
+                  b2=dest, b3=0x00, b4=src,
+                  b8=0x00, b9=0x00, b10=0x00, b11=0x00,
+                  ctrl=ctrl)
 
 
 # ---------------------------------------------------------------------------
 # FLO — Find Leading One (CLZ = 31 - FLO for non-zero)
 # ---------------------------------------------------------------------------
-# Opcode: 0x00, 0x73.  Ground truth: FLO.U32 R6, R0 → 0x0000000000067300
+# Opcode: 0x00, 0x73.
+# Ground truth (ptxas sm_120): FLO.U32 R0, R2 → 0x0000000200007300 / 0x004e6400000e0000
+#   b0=0x00, b1=0x73, b2=dest, b3=0x00, b4=src, b10=0x0e
 def encode_flo(dest: int, src: int, ctrl: int = 0) -> bytes:
     if ctrl == 0: ctrl = _CTRL_DEFAULT
-    b13, b14, b15 = _ctrl_to_bytes(ctrl)
-    raw = bytearray(16)
-    raw[0], raw[1] = 0x00, 0x73
-    raw[2], raw[3] = dest & 0xFF, src & 0xFF
-    raw[13], raw[14], raw[15] = b13, b14, b15
-    return bytes(raw)
+    return _build(0x00, 0x73,
+                  b2=dest, b3=0x00, b4=src,
+                  b8=0x00, b9=0x00, b10=0x0e, b11=0x00,
+                  ctrl=ctrl)
 
 
 # ---------------------------------------------------------------------------
@@ -2538,15 +2555,18 @@ def encode_shfl(dest: int, src: int, lane_or_delta: int, clamp: int,
 # ---------------------------------------------------------------------------
 # VOTE — Warp Vote
 # ---------------------------------------------------------------------------
-# Opcode: 0x06, 0x78.  Ground truth: VOTE.ANY R13, PT, PT → 0x00000000000d7806
+# Opcode: 0x06, 0x78.
+# Ground truth (ptxas sm_120): VOTE.ANY R5, PT, PT → 0x0000000000057806 / 0x000fca00038e0100
+#   b0=0x06, b1=0x78, b2=dest, b9=0x01, b10=0x8e, b11=0x03
+#   b9=0x01: ballot flag (return bitmask of voting threads)
+#   b10=0x8e: predicate source (PT=7 → 0x8e encodes always-true input predicate)
+#   b11=0x03: AND combiner mode
 def encode_vote_ballot(dest: int, ctrl: int = 0) -> bytes:
     if ctrl == 0: ctrl = _CTRL_DEFAULT
-    b13, b14, b15 = _ctrl_to_bytes(ctrl)
-    raw = bytearray(16)
-    raw[0], raw[1] = 0x06, 0x78
-    raw[2] = dest & 0xFF
-    raw[13], raw[14], raw[15] = b13, b14, b15
-    return bytes(raw)
+    return _build(0x06, 0x78,
+                  b2=dest, b3=0x00, b4=0x00,
+                  b8=0x00, b9=0x01, b10=0x8e, b11=0x03,
+                  ctrl=ctrl)
 
 
 # ---------------------------------------------------------------------------

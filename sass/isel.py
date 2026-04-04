@@ -816,9 +816,9 @@ def _select_atom_add_u32(instr: Instruction, ra: RegAlloc,
                          ctx: 'ISelContext' = None) -> list[SassInstr]:
     """atom.global.add.u32 / atom.add.u32 → ATOMG.E.ADD.u32.
 
-    Emits ATOMG.E.ADD with opcode modifier byte 0x09 (ground-truth verified
-    on RTX 5090).  Address resolution mirrors _select_atom_cas: UR-only
-    pointers are materialized to GPR via IADD.64 first.
+    Emits ATOMG.E.ADD with PT guard (b1=0x79). Uses descriptor-based
+    addressing via UR descriptor. Address resolution mirrors _select_atom_cas:
+    UR-only pointers are materialized to GPR via IADD.64 first.
     """
     from ptx.ir import MemOp
     dest_op = instr.dest
@@ -845,8 +845,9 @@ def _select_atom_add_u32(instr: Instruction, ra: RegAlloc,
     else:
         addr = RZ
 
-    return prefix + [SassInstr(encode_atomg_u32(d, addr, 0, data, ATOMG_ADD),
-                     f'ATOMG.E.ADD.u32 R{d}, [R{addr}], R{data}')]
+    ur_d = ctx.ur_desc if ctx else 4
+    return prefix + [SassInstr(encode_atomg_u32(d, addr, 0, data, ATOMG_ADD, ur_desc=ur_d),
+                     f'ATOMG.E.ADD.u32 R{d}, desc[UR{ur_d}][R{addr}.64], R{data}')]
 
 
 def _select_st_global(instr: Instruction, ra: RegAlloc,

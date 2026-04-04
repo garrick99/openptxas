@@ -228,6 +228,202 @@ def test_idp4a_encoding():
     assert raw[8] == 0xFF # src_c = RZ
 
 
+# ===========================================================================
+# Phase 3 encoder tests — 2026-04-04
+# ===========================================================================
+
+from sass.encoding.sm_120_opcodes import (
+    encode_lea, encode_lea_imm,
+    encode_imnmx,
+    encode_p2r, encode_r2p,
+    encode_bmsk,
+    encode_sgxt,
+    encode_plop3,
+    encode_i2ip,
+    encode_fswzadd,
+)
+
+
+# --- LEA ---
+
+def test_lea_opcode():
+    raw = encode_lea(dest=5, base=2, index=3, scale=2)
+    assert _opcode(raw) == 0x211, f"opcode={_opcode(raw):#x}"
+    assert raw[2] == 5   # dest
+    assert raw[3] == 2   # base
+    assert raw[4] == 3   # index
+    assert raw[9] == 2   # scale
+    assert raw[8] == 0xFF  # RZ
+
+def test_lea_scale_0():
+    raw = encode_lea(dest=10, base=0, index=7, scale=0)
+    assert raw[9] == 0   # scale=0 means no shift
+
+def test_lea_scale_4():
+    raw = encode_lea(dest=4, base=1, index=6, scale=4)
+    assert raw[9] == 4   # scale=4 means <<4
+
+def test_lea_imm_opcode():
+    raw = encode_lea_imm(dest=5, base=2, imm=0x100, scale=3)
+    lo = struct.unpack_from('<Q', raw, 0)[0]
+    assert (lo & 0xFFF) == 0x811, f"opcode={lo & 0xFFF:#x}"
+    assert raw[2] == 5   # dest
+    assert raw[3] == 2   # base
+    # imm in bytes 4-7 (little-endian)
+    imm_val = struct.unpack_from('<I', raw, 4)[0]
+    assert imm_val == 0x100
+    assert raw[9] == 3   # scale
+
+
+# --- IMNMX ---
+
+def test_imnmx_min_signed_opcode():
+    raw = encode_imnmx(dest=5, src0=2, src1=3, is_max=False, is_unsigned=False)
+    assert _opcode(raw) == 0x217, f"opcode={_opcode(raw):#x}"
+    assert raw[2] == 5
+    assert raw[3] == 2
+    assert raw[4] == 3
+    assert raw[9] == 0x01  # signed, min
+
+def test_imnmx_max_signed():
+    raw = encode_imnmx(dest=5, src0=2, src1=3, is_max=True, is_unsigned=False)
+    assert raw[9] == 0x05  # signed, max
+
+def test_imnmx_min_unsigned():
+    raw = encode_imnmx(dest=5, src0=2, src1=3, is_max=False, is_unsigned=True)
+    assert raw[9] == 0x00  # unsigned, min
+
+def test_imnmx_max_unsigned():
+    raw = encode_imnmx(dest=5, src0=2, src1=3, is_max=True, is_unsigned=True)
+    assert raw[9] == 0x04  # unsigned, max
+
+
+# --- P2R ---
+
+def test_p2r_opcode():
+    raw = encode_p2r(dest=5, mask=0xFF)
+    assert _opcode(raw) == 0x203, f"opcode={_opcode(raw):#x}"
+    assert raw[2] == 5   # dest
+    assert raw[4] == 0xFF  # mask=all
+
+def test_p2r_partial_mask():
+    raw = encode_p2r(dest=10, mask=0x03)
+    assert raw[4] == 0x03  # only P0, P1
+
+
+# --- R2P ---
+
+def test_r2p_opcode():
+    raw = encode_r2p(src=7, mask=0xFF)
+    assert _opcode(raw) == 0x204, f"opcode={_opcode(raw):#x}"
+    assert raw[2] == 0   # no GPR dest
+    assert raw[3] == 7   # src GPR
+    assert raw[4] == 0xFF  # mask=all
+
+def test_r2p_partial_mask():
+    raw = encode_r2p(src=3, mask=0x0F)
+    assert raw[3] == 3
+    assert raw[4] == 0x0F
+
+
+# --- BMSK ---
+
+def test_bmsk_opcode():
+    raw = encode_bmsk(dest=5, pos=2, width=3)
+    assert _opcode(raw) == 0x21b, f"opcode={_opcode(raw):#x}"
+    assert raw[2] == 5   # dest
+    assert raw[3] == 2   # pos
+    assert raw[4] == 3   # width
+    assert raw[8] == 0xFF  # RZ
+
+def test_bmsk_different_operands():
+    raw = encode_bmsk(dest=10, pos=0, width=7)
+    assert raw[2] == 10
+    assert raw[3] == 0
+    assert raw[4] == 7
+
+
+# --- SGXT ---
+
+def test_sgxt_opcode():
+    raw = encode_sgxt(dest=5, src=2, bit_pos=8)
+    assert _opcode(raw) == 0x21a, f"opcode={_opcode(raw):#x}"
+    assert raw[2] == 5   # dest
+    assert raw[3] == 2   # src
+    assert raw[4] == 8   # bit_pos
+    assert raw[9] == 0x02  # signed mode
+
+def test_sgxt_wide_extend():
+    raw = encode_sgxt(dest=7, src=7, bit_pos=16)
+    assert raw[2] == 7
+    assert raw[4] == 16
+
+
+# --- PLOP3 ---
+
+def test_plop3_opcode():
+    raw = encode_plop3(pred_dest=0, pred_src0=1, pred_src1=2, pred_src2=7, lut=0x80)
+    assert _opcode(raw) == 0x21e, f"opcode={_opcode(raw):#x}"
+    assert raw[2] == 0  # pred_dest P0
+    assert raw[9] == 0x80  # LUT
+
+def test_plop3_and_lut():
+    # AND of 3 predicates = LUT 0x80 (only true when all 3 inputs true)
+    raw = encode_plop3(pred_dest=1, pred_src0=0, pred_src1=1, pred_src2=2, lut=0x80)
+    assert raw[2] == 1  # pred_dest P1
+    assert raw[9] == 0x80
+
+def test_plop3_or_lut():
+    # OR of 3 predicates = LUT 0xFE (true when any input true)
+    raw = encode_plop3(pred_dest=2, pred_src0=0, pred_src1=1, pred_src2=2, lut=0xFE)
+    assert raw[9] == 0xFE
+
+
+# --- I2IP ---
+
+def test_i2ip_opcode():
+    raw = encode_i2ip(dest=5, src=2)
+    assert _opcode(raw) == 0x239, f"opcode={_opcode(raw):#x}"
+    assert raw[2] == 5   # dest
+    assert raw[3] == 2   # src
+    assert raw[8] == 0xFF  # RZ (no merge)
+
+def test_i2ip_with_merge():
+    raw = encode_i2ip(dest=5, src=2, src2=10)
+    assert raw[8] == 10  # merge register
+
+
+# --- FSWZADD ---
+
+def test_fswzadd_opcode():
+    raw = encode_fswzadd(dest=5, src0=2, src1=3, swizzle=0x1234)
+    lo = struct.unpack_from('<Q', raw, 0)[0]
+    assert (lo & 0xFFF) == 0x822, f"opcode={lo & 0xFFF:#x}"
+    assert raw[2] == 5   # dest
+    assert raw[3] == 2   # src0
+    assert raw[8] == 3   # src1
+    swz = struct.unpack_from('<I', raw, 4)[0]
+    assert swz == 0x1234  # swizzle pattern
+
+def test_fswzadd_zero_swizzle():
+    raw = encode_fswzadd(dest=0, src0=1, src1=2, swizzle=0)
+    swz = struct.unpack_from('<I', raw, 4)[0]
+    assert swz == 0
+
+
+# --- IDP variants check ---
+
+def test_idp4a_already_correct():
+    """Verify IDP.4A encoder from Phase 2 still works correctly."""
+    from sass.encoding.sm_120_opcodes import encode_idp4a
+    raw = encode_idp4a(dest=9, src_a=4, src_b=7, src_c=0xFF)
+    assert _opcode(raw) == 0x226
+    assert raw[2] == 9
+    assert raw[3] == 4
+    assert raw[4] == 7
+    assert raw[8] == 0xFF
+
+
 if __name__ == '__main__':
     tests = [v for k, v in sorted(globals().items()) if k.startswith('test_')]
     passed = 0

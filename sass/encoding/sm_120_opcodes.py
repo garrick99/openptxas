@@ -3203,6 +3203,316 @@ def encode_dsetp(pred_dest: int, src0_lo: int, src1_lo: int, cmp: int = DSETP_LT
     return bytes(raw)
 
 
+# ===========================================================================
+# Phase 3 encoders — 2026-04-04
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# LEA — Load Effective Address (0x211)
+# ---------------------------------------------------------------------------
+# Computes: dest = base + (index << scale)
+# Opcode: 0x211 (byte0=0x11, byte1=0x72)
+# Layout (inferred from IADD3/IMAD family patterns):
+#   b2=dest, b3=base, b4=index, b8=RZ, b9=scale (shift amount)
+# Also has 0x811 (B-imm) and 0xc11 (UR) forms.
+# The scale encodes in b9 as a shift amount (0..4 typical: 0,1,2,3).
+
+def encode_lea(dest: int, base: int, index: int, scale: int = 0,
+               ctrl: int = 0) -> bytes:
+    """Encode LEA: dest = base + (index << scale).
+
+    Opcode 0x211. Used by ptxas for address computation in array indexing.
+
+    Args:
+        dest:  Destination register.
+        base:  Base address register.
+        index: Index register.
+        scale: Shift amount (0-4, encodes the multiplier as 1/2/4/8/16).
+        ctrl:  23-bit scheduling control word.
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x11, 0x72,
+                  b2=dest, b3=base, b4=index,
+                  b8=RZ, b9=(scale & 0x1F), b10=0x00, b11=0x00,
+                  ctrl=ctrl)
+
+
+def encode_lea_imm(dest: int, base: int, imm: int, scale: int = 0,
+                   ctrl: int = 0) -> bytes:
+    """Encode LEA with 32-bit immediate index (opcode 0x811).
+
+    dest = base + (imm << scale).
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0x11; raw[1] = 0x78
+    raw[2] = dest & 0xFF
+    raw[3] = base & 0xFF
+    struct.pack_into('<I', raw, 4, imm & 0xFFFFFFFF)
+    raw[8] = RZ
+    raw[9] = scale & 0x1F
+    raw[13] = b13; raw[14] = b14; raw[15] = b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# IMNMX — Integer Min/Max (0x217)
+# ---------------------------------------------------------------------------
+# Computes: dest = min(a, b) or max(a, b) based on predicate/mode.
+# Opcode: 0x217 (byte0=0x17, byte1=0x72) — R-R form
+# Opcode: 0x817 (byte0=0x17, byte1=0x78) — B-imm form
+# The opcode map says "IMNMX.S64" for 0x217 and "IMNMX.U64" for 0x817.
+# For 32-bit min/max, SM_120 uses VIMNMX (0x248). IMNMX is the 64-bit form.
+# Since VIMNMX already handles 32-bit, we encode IMNMX for completeness.
+# b2=dest, b3=src0, b4=src1, b9=mode (signed/unsigned + min/max)
+# Encoding inferred from VIMNMX patterns and the opcode family.
+
+def encode_imnmx(dest: int, src0: int, src1: int,
+                 is_max: bool = False, is_unsigned: bool = False,
+                 ctrl: int = 0) -> bytes:
+    """Encode IMNMX: integer min/max (register-register).
+
+    Opcode 0x217 for signed, 0x817 encoding differs by b9 modifier.
+    Note: For 32-bit min/max, use VIMNMX instead (encode_vimnmx_s32/u32).
+
+    Args:
+        dest:        Destination register.
+        src0:        Source register A.
+        src1:        Source register B.
+        is_max:      True for max, False for min.
+        is_unsigned: True for unsigned comparison.
+        ctrl:        23-bit scheduling control word.
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    # Mode byte: bit 0 = signed(1)/unsigned(0), bit 2 = max(1)/min(0)
+    b9 = 0x00
+    if not is_unsigned:
+        b9 |= 0x01  # signed
+    if is_max:
+        b9 |= 0x04  # max
+    return _build(0x17, 0x72,
+                  b2=dest, b3=src0, b4=src1,
+                  b8=0x00, b9=b9, b10=0x00, b11=0x00,
+                  ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# P2R — Predicate to Register (0x203)
+# ---------------------------------------------------------------------------
+# Moves predicate register bits into a GPR.
+# Opcode: 0x203 (byte0=0x03, byte1=0x72) — R-R form
+# Also 0x803 (byte0=0x03, byte1=0x78) — B-imm form
+# b2=dest, b3=0x00 (no GPR source), b4=mask (which pred bits to include)
+# b9 encodes the predicate source selection.
+# Layout inferred from opcode family patterns (sweep_disasm source).
+
+def encode_p2r(dest: int, mask: int = 0xFF, ctrl: int = 0) -> bytes:
+    """Encode P2R: move predicate register bits into GPR.
+
+    Opcode 0x203. Packs predicate register state into dest GPR.
+
+    Args:
+        dest: Destination GPR (receives predicate bits).
+        mask: Bitmask selecting which predicates to include (default 0xFF = all).
+        ctrl: 23-bit scheduling control word.
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x03, 0x72,
+                  b2=dest, b3=0x00, b4=mask & 0xFF,
+                  b8=RZ, b9=0x00, b10=0x00, b11=0x00,
+                  ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# R2P — Register to Predicate (0x204)
+# ---------------------------------------------------------------------------
+# Moves GPR bits into predicate registers.
+# Opcode: 0x204 (byte0=0x04, byte1=0x72) — R-R form
+# Also 0x804 (byte0=0x04, byte1=lib)
+# b2=0x00 (no GPR dest), b3=src GPR, b4=mask (which pred bits to write)
+
+def encode_r2p(src: int, mask: int = 0xFF, ctrl: int = 0) -> bytes:
+    """Encode R2P: move GPR bits into predicate registers.
+
+    Opcode 0x204. Unpacks GPR bits into predicate register state.
+
+    Args:
+        src:  Source GPR (bits become predicate values).
+        mask: Bitmask selecting which predicates to write (default 0xFF = all).
+        ctrl: 23-bit scheduling control word.
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x04, 0x72,
+                  b2=0x00, b3=src & 0xFF, b4=mask & 0xFF,
+                  b8=RZ, b9=0x00, b10=0x00, b11=0x00,
+                  ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# BMSK — Bitmask Generation (0x21b)
+# ---------------------------------------------------------------------------
+# Generates: dest = ((1 << width) - 1) << position
+# Opcode: 0x21b (byte0=0x1b, byte1=0x72) — R-R form
+# Also 0x81b (byte0=0x1b, byte1=0x78) — B-imm form
+# b2=dest, b3=position_reg, b4=width_reg
+# Used by ptxas for BFE/BFI lowering patterns.
+
+def encode_bmsk(dest: int, pos: int, width: int, ctrl: int = 0) -> bytes:
+    """Encode BMSK: generate bitmask from position and width registers.
+
+    Opcode 0x21b. dest = ((1 << width) - 1) << pos.
+
+    Args:
+        dest:  Destination register.
+        pos:   Position register (shift amount).
+        width: Width register (number of bits).
+        ctrl:  23-bit scheduling control word.
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x1b, 0x72,
+                  b2=dest, b3=pos, b4=width,
+                  b8=RZ, b9=0x00, b10=0x00, b11=0x00,
+                  ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# SGXT — Sign Extend (0x21a)
+# ---------------------------------------------------------------------------
+# Sign-extends from a specified bit position.
+# Opcode: 0x21a (byte0=0x1a, byte1=0x72) — R-R form
+# Also 0x81a (byte0=0x1a, byte1=0x78) — B-imm form (already as encode_bfe_sext)
+# b2=dest, b3=src, b4=bit_position (sign-extend from bit N)
+# b9=0x02 for signed mode (matches BFE_SEXT ground truth).
+# Note: encode_bfe_sext (0x81a) is the immediate form already implemented.
+# This is the register-register form (0x21a).
+
+def encode_sgxt(dest: int, src: int, bit_pos: int, ctrl: int = 0) -> bytes:
+    """Encode SGXT: sign-extend src from bit position (register form).
+
+    Opcode 0x21a (R-R). Sign-extends: dest = sign_extend(src, bit_pos).
+    The immediate form (0x81a) is already implemented as encode_bfe_sext.
+
+    Args:
+        dest:    Destination register.
+        src:     Source register.
+        bit_pos: Bit position register (sign-extend from this bit).
+        ctrl:    23-bit scheduling control word.
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x1a, 0x72,
+                  b2=dest, b3=src, b4=bit_pos,
+                  b8=RZ, b9=0x02, b10=0x00, b11=0x00,
+                  ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# PLOP3 — Predicate LOP3 (0x21e / 0x21f)
+# ---------------------------------------------------------------------------
+# Logical operation on 3 predicate inputs using a LUT (look-up table).
+# Opcode: 0x21e (byte0=0x1e, byte1=0x72) — first variant
+# Opcode: 0x21f (byte0=0x1f, byte1=0x72) — second variant
+# Also 0x81c (byte0=0x1c, byte1=0x78) — B-imm form
+# Used internally by ptxas for complex predicate logic.
+# b2 low bits encode dest pred, b3/b4 encode source predicates,
+# b9 encodes the LUT truth table.
+
+def encode_plop3(pred_dest: int, pred_src0: int, pred_src1: int, pred_src2: int,
+                 lut: int = 0x80, ctrl: int = 0) -> bytes:
+    """Encode PLOP3: 3-input predicate logical operation with LUT.
+
+    Opcode 0x21e. Computes pred_dest from 3 predicate inputs using truth table.
+
+    Args:
+        pred_dest: Destination predicate register (0-5).
+        pred_src0: Source predicate 0 (0-7, 7=PT).
+        pred_src1: Source predicate 1 (0-7, 7=PT).
+        pred_src2: Source predicate 2 (0-7, 7=PT).
+        lut:       8-bit truth table (like LOP3 but for predicates).
+        ctrl:      23-bit scheduling control word.
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0x1e; raw[1] = 0x72
+    # Predicate encoding: dest in low bits of b2, sources in b3/b4
+    raw[2] = (pred_dest & 0x07)
+    raw[3] = (pred_src0 & 0x07) | ((pred_src1 & 0x07) << 3)
+    raw[4] = (pred_src2 & 0x07)
+    raw[8] = 0x00
+    raw[9] = lut & 0xFF  # truth table
+    raw[10] = 0xf0 | ((pred_dest & 0x07) << 1)  # mirrors ISETP pred encoding
+    raw[11] = 0x00
+    raw[13] = b13; raw[14] = b14; raw[15] = b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# I2IP — Integer to Integer Pack (0x239)
+# ---------------------------------------------------------------------------
+# Packs integers with optional saturation. Used in type conversion chains.
+# Opcode: 0x239 (byte0=0x39, byte1=0x72)
+# Also 0x839 (byte0=0x39, byte1=0x78)
+# The opcode map says "I2IP.U8.S32" — packs S32 → U8 with saturation.
+# b2=dest, b3=src, b4=pack selector (which byte lane to write)
+
+def encode_i2ip(dest: int, src: int, src2: int = 0xFF,
+                ctrl: int = 0) -> bytes:
+    """Encode I2IP.U8.S32: pack S32 to U8 with saturation.
+
+    Opcode 0x239. Used in integer type narrowing chains.
+
+    Args:
+        dest: Destination register (packed byte result).
+        src:  Source register (S32 value to pack).
+        src2: Second source (existing packed value to merge into, RZ=0xFF).
+        ctrl: 23-bit scheduling control word.
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x39, 0x72,
+                  b2=dest, b3=src, b4=0x00,
+                  b8=src2, b9=0x00, b10=0x00, b11=0x00,
+                  ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# FSWZADD — Float Swizzle-Add (0x822)
+# ---------------------------------------------------------------------------
+# Specialized warp-level float add with lane swizzle.
+# Opcode: 0x822 (byte0=0x22, byte1=0x78)
+# Used in warp-level reductions by ptxas.
+# b2=dest, b3=src0 (lane's own value), b4-b7=swizzle mask (32-bit)
+# b8=src1 (swizzled input from another lane)
+# Encoding is a B-imm form (opcode 0x822 = base 0x22 + 0x600 B-imm offset).
+
+def encode_fswzadd(dest: int, src0: int, src1: int, swizzle: int = 0,
+                   ctrl: int = 0) -> bytes:
+    """Encode FSWZADD: warp-level float add with lane swizzle.
+
+    Opcode 0x822. Used by ptxas for efficient warp-level reductions.
+    dest = src0 + swizzle(src1, mask).
+
+    Args:
+        dest:    Destination register.
+        src0:    Source 0 (own lane value).
+        src1:    Source 1 (value from swizzled lane).
+        swizzle: 32-bit swizzle selector pattern.
+        ctrl:    23-bit scheduling control word.
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0x22; raw[1] = 0x78
+    raw[2] = dest & 0xFF
+    raw[3] = src0 & 0xFF
+    struct.pack_into('<I', raw, 4, swizzle & 0xFFFFFFFF)
+    raw[8] = src1 & 0xFF
+    raw[9] = 0x00; raw[10] = 0x00; raw[11] = 0x00
+    raw[13] = b13; raw[14] = b14; raw[15] = b15
+    return bytes(raw)
+
+
 if __name__ == "__main__":
     ok = roundtrip_verify_opcodes(verbose=True)
     print()

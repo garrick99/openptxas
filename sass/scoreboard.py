@@ -92,6 +92,17 @@ _OPCODE_META: dict[int, _OpMeta] = {
     0x3c4: _OpMeta('REDUX',     0, 0x3f, 0),  # REDUX warp reduction → UR (no GPR dest)
     0xc02: _OpMeta('MOV.UR',   1, 0x3e, 1),  # MOV R, UR — copy uniform reg to GPR
     0x226: _OpMeta('IDP.4A',   1, 0x3e, 1),  # IDP.4A dp4a (integer dot product)
+    # Phase 3 opcodes
+    0x211: _OpMeta('LEA',      1, 0x3e, 1),  # LEA load effective address
+    0x811: _OpMeta('LEA.IMM',  1, 0x3e, 1),  # LEA with immediate index
+    0x217: _OpMeta('IMNMX',    1, 0x3e, 1),  # IMNMX integer min/max
+    0x203: _OpMeta('P2R',      1, 0x3e, 1),  # P2R predicate to register
+    0x204: _OpMeta('R2P',      0, 0x3f, 0),  # R2P register to predicate (no GPR dest)
+    0x21b: _OpMeta('BMSK',     1, 0x3e, 1),  # BMSK bitmask generation
+    0x21a: _OpMeta('SGXT',     1, 0x3e, 1),  # SGXT sign extend (register form)
+    0x21e: _OpMeta('PLOP3',    0, 0x3f, 0),  # PLOP3 predicate LOP3 (pred dest only)
+    0x239: _OpMeta('I2IP',     1, 0x3e, 1),  # I2IP integer pack
+    0x822: _OpMeta('FSWZADD',  1, 0x3e, 1),  # FSWZADD float swizzle-add
 }
 
 

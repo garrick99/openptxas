@@ -159,7 +159,7 @@ _OPCODES_LDC = {0xb82, 0x7ac, 0x919, 0x9c3,  # SM_120: LDC, LDCU, S2R, S2UR
                 0x624, 0xab9, 0xa02}           # SM_89: IMAD.MOV.U32(cbuf), ULDC.64, MOV(cbuf)
 _OPCODES_LDS = {0x984, 0x83b}  # LDS, LDSM (load shared to matrix)
 _OPCODES_STG = {0x986, 0xf9d}  # STG, SUST
-_OPCODES_STS = {0x988}
+_OPCODES_STS = {0x988, 0x388}
 _OPCODES_BAR = {0xb1d}
 _OPCODES_DFPU  = {0x229, 0x228, 0x22b, 0xc2b}  # DADD, DMUL, DFMA (R-R b1=0x72), DFMA-UR-UR (b1=0x7c)
 _OPCODES_DSETP = {0x22a}                 # DSETP (FP64 compare → predicate; reads pairs, no GPR dest)
@@ -336,16 +336,22 @@ def _get_src_regs(raw: bytes) -> set[int]:
         if raw[3] < 255: regs |= {raw[3], raw[3]+1}
         if raw[4] < 255: regs.add(raw[4])
     elif opcode in _OPCODES_STS:
-        # STS: data at b4
+        # STS: addr_reg at b3, data at b4 (UR variant has addr via UR descriptor + R addr)
+        if raw[3] < 255: regs.add(raw[3])
         if raw[4] < 255: regs.add(raw[4])
+    elif opcode in _OPCODES_LDS:
+        # LDS: addr_reg at b3 (when GPR-addressed via encode_lds_r); immediate-only variants
+        # set b3=0xFF.
+        if raw[3] < 255: regs.add(raw[3])
     elif opcode in _OPCODES_IADD64_UR:
         # IADD.64-UR: GPR src pair at b3 (b4 is UR, not tracked here)
         if raw[3] < 255: regs |= {raw[3], raw[3]+1}
     elif opcode in _OPCODES_ALU:
         # ALU: src0 at b3, src1 at b4, src2 at b8 (varies by opcode)
         # Unary ops (MUFU, POPC, BREV, FLO, IABS): src at b4, b3=0x00 (not a real source)
-        if opcode in (0x308, 0x309, 0x301, 0x300, 0x213):
-            # MUFU/POPC/BREV/FLO/IABS: single src at b4 only
+        if opcode in (0x308, 0x309, 0x301, 0x300, 0x213,
+                       0x245, 0x305, 0x306, 0x311, 0x312):
+            # MUFU/POPC/BREV/FLO/IABS/I2FP/F2I (both F32/F64): single src at b4 only
             if raw[4] < 255: regs.add(raw[4])
         elif opcode in (0x210, 0x212, 0x810):  # IADD3/LOP3/IADD3.IMM: src0=b3, src1=b4, src2=b8
             if raw[3] < 255: regs.add(raw[3])
@@ -484,12 +490,13 @@ def _wdep_for_opcode(opcode: int, raw: bytes = None) -> int:
             slot = slots[(_ldcu_slot_counter[0] - 1) % len(slots)]
             _ldcu_slot_counter[0] += 1
             return slot
-        # LDCU.32: always use 0x31 (LDC/LDCU scoreboard slot).
-        # rbar bit2 (slot 0x33) stalls for LDCU.64 correctly, but NOT for
-        # LDCU.32 on SM_120 — hardware asymmetry verified by test_imad_chain.
-        # Consumer IMAD R-UR uses rbar bit1 (0x02) which correctly gates on 0x31.
+        # LDCU.32: ptxas-verified uses slot 0x35 on SM_120 (same slot as LDG).
+        # Consumer IMAD R-UR (and similar UR consumers) waits with rbar=0x09
+        # (bit 3, same as LDG). Using wdep=0x31 here caused IMAD R-UR to
+        # read stale 0 from the UR destination → mul.lo with non-power-of-2
+        # immediate returned wrong results.
         _ldcu_slot_counter[0] += 1
-        return 0x31
+        return 0x35
     if opcode == 0x918:  # NOP: even wdep (misc=0 paired with 0x3e is safe)
         return 0x3e
     if opcode in _OPCODES_LDC:

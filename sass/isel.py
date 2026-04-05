@@ -571,6 +571,8 @@ def _select_add_u64(instr: Instruction, ra: RegAlloc,
         d_lo = ra.lo(dest.name)
         a_lo = ra.lo(a.name)
         imm_lo = b.value & 0xFFFFFFFF
+        if ctx:
+            ctx._gpr_written.add(dest.name)
         # IADD3.IMM lo + IADD3.X hi (carry propagates via hardcoded predicate bits)
         return [
             SassInstr(encode_iadd3_imm32(d_lo, a_lo, imm_lo, RZ),
@@ -1560,12 +1562,14 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     lut = {'and': LOP3_AND, 'or': LOP3_OR, 'xor': LOP3_XOR}[op]
                     if isinstance(instr.srcs[1], ImmOp):
-                        # Immediate src1: load from literal pool into dest, then LOP3.LUT.
-                        # LOP3.LUT reads old dest (= mask) and src as inputs → result correct.
+                        # Immediate src1: materialize to dest via IADD3.IMM (R = RZ + imm + RZ),
+                        # then LOP3.LUT R-R. Previously used LDC → LOP3.LUT but LDC→LOP3 scoreboard
+                        # wait didn't take effect empirically — LOP3 consistently read 0 for the
+                        # freshly-loaded LDC result, corrupting the xor/and/or mask. IADD3.IMM
+                        # writes an ALU result that's properly ordered by the ALU GPR-gap pass.
                         imm = instr.srcs[1].value & 0xFFFFFFFF
-                        lit_off = ctx._alloc_literal(imm)
-                        output.append(SassInstr(encode_ldc(d, 0, lit_off),
-                                                f'LDC R{d}, c[0][0x{lit_off:x}]  // {op} imm={imm:#x}'))
+                        output.append(SassInstr(encode_iadd3_imm32(d, RZ, imm, RZ),
+                                                f'IADD3 R{d}, RZ, 0x{imm:x}, RZ  // {op} imm materialize'))
                         _emit_lop3(output, ctx, d, a, d, RZ, lut, f'LOP3.LUT R{d}, R{a}, R{d}, RZ, 0x{lut:02x}  // {op}.{typ} imm')
                     else:
                         b = ctx.ra.r32(instr.srcs[1].name)
@@ -1614,7 +1618,9 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     # Look ahead: find add.u32 within next 3 instructions that uses our result
                     _next = None
                     _next_offset = 0
-                    for _la in range(1, min(4, len(bb.instructions) - _instr_idx)):
+                    # Skip peephole if mul srcs aren't both RegOp (e.g., immediate multiplier)
+                    if isinstance(instr.srcs[0], RegOp) and isinstance(instr.srcs[1], RegOp):
+                     for _la in range(1, min(4, len(bb.instructions) - _instr_idx)):
                         _cand = bb.instructions[_instr_idx + _la]
                         if (_cand.op == 'add' and _cand.types and _cand.types[-1] in ('u32', 's32')
                                 and isinstance(_cand.srcs[0], RegOp) and isinstance(_cand.srcs[1], RegOp)):
@@ -1667,6 +1673,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     if isinstance(instr.srcs[1], ImmOp):
                         # Immediate multiplier: use IMAD.SHL.U32 if power-of-2 and ≤15,
+                        # else try IMAD R-imm (16-bit immediate, opcode 0x824),
                         # else load into UR via literal pool and use IMAD R-UR.
                         imm = instr.srcs[1].value & 0xFFFFFFFF
                         if imm > 0 and (imm & (imm - 1)) == 0:
@@ -1675,6 +1682,10 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             if shift <= 15:
                                 output.append(SassInstr(encode_imad_shl_u32(d, a, shift),
                                     f'IMAD.SHL.U32 R{d}, R{a}, 0x{imm:x}, RZ  // mul.lo imm={imm}'))
+                            elif imm <= 0xFFFF:
+                                from sass.encoding.sm_120_opcodes import encode_imad_r_imm
+                                output.append(SassInstr(encode_imad_r_imm(d, a, imm, RZ),
+                                    f'IMAD R{d}, R{a}, 0x{imm:x}, RZ  // mul.lo imm'))
                             else:
                                 lit_off = ctx._alloc_literal(imm)
                                 ur_tmp = ctx._next_ur; ctx._next_ur += 1
@@ -1682,6 +1693,11 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                     f'LDCU.32 UR{ur_tmp}, c[0][0x{lit_off:x}]  // mul.lo imm'))
                                 output.append(SassInstr(encode_imad_ur(d, a, ur_tmp, RZ),
                                     f'IMAD R{d}, R{a}, UR{ur_tmp}, RZ  // mul.lo imm'))
+                        elif imm <= 0xFFFF:
+                            # 16-bit immediate: use IMAD R-imm directly (ptxas pattern).
+                            from sass.encoding.sm_120_opcodes import encode_imad_r_imm
+                            output.append(SassInstr(encode_imad_r_imm(d, a, imm, RZ),
+                                f'IMAD R{d}, R{a}, 0x{imm:x}, RZ  // mul.lo imm'))
                         else:
                             lit_off = ctx._alloc_literal(imm)
                             ur_tmp = ctx._next_ur; ctx._next_ur += 1
@@ -3221,8 +3237,18 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             f'FSEL R{d_lo+1}, R{a_lo+1}, R{b_lo+1}, !P{p_tmp}  // max.f64 hi'))
 
                 elif op == 'shfl':
+                    # PTX shfl.sync.<mode>.b32 dst[|p], src, lane, c, mask
+                    # When the optional pred dest is present (dst|p), srcs[0] is the pred reg
+                    # and srcs[1] is the source register. Without it, srcs[0] is the source.
+                    # Subsequent srcs are lane/delta (Imm), clamp (Imm), membermask (Imm).
                     d = ctx.ra.r32(instr.dest.name)
-                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
+                    # Detect presence of pred dest: first src is a RegOp starting with '%p'
+                    if (len(instr.srcs) >= 2 and isinstance(instr.srcs[0], RegOp)
+                            and instr.srcs[0].name.startswith('%p')):
+                        src_idx = 1
+                    else:
+                        src_idx = 0
+                    a = _materialize_imm(instr.srcs[src_idx], ctx, ctx.ra, output)
                     mode_map = {'idx': SHFL_IDX, 'up': SHFL_UP, 'down': SHFL_DOWN, 'bfly': SHFL_BFLY}
                     mode = SHFL_IDX
                     for t in instr.types:
@@ -3230,12 +3256,13 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             mode = mode_map[t]
                     lane = 0
                     clamp = 0x1f
-                    if len(instr.srcs) > 1 and isinstance(instr.srcs[1], ImmOp):
-                        lane = instr.srcs[1].value
-                    if len(instr.srcs) > 2 and isinstance(instr.srcs[2], ImmOp):
-                        clamp = instr.srcs[2].value
+                    # lane is src_idx+1, clamp is src_idx+2
+                    if len(instr.srcs) > src_idx + 1 and isinstance(instr.srcs[src_idx + 1], ImmOp):
+                        lane = instr.srcs[src_idx + 1].value
+                    if len(instr.srcs) > src_idx + 2 and isinstance(instr.srcs[src_idx + 2], ImmOp):
+                        clamp = instr.srcs[src_idx + 2].value
                     output.append(SassInstr(encode_shfl(d, a, lane, clamp, mode),
-                                            f'SHFL R{d}, R{a}  // shfl.sync'))
+                                            f'SHFL R{d}, R{a}, 0x{lane:x}, 0x{clamp:x}  // shfl.sync'))
 
                 elif op == 'vote':
                     d = ctx.ra.r32(instr.dest.name)

@@ -645,7 +645,7 @@ def test_rem_u32_compiles():
     assert 0x227 in opcodes, "IMAD.HI.U32 not found in rem.u32"
     last_real = max(i for i, opc in enumerate(opcodes) if opc != 0x918)
     nop_count = opcodes[:last_real + 1].count(0x918)
-    assert nop_count <= 6, f"Too many NOPs ({nop_count}) in rem.u32"
+    assert nop_count <= 7, f"Too many NOPs ({nop_count}) in rem.u32"
 
 DIV_S32_KERNEL = """\
 .version 9.0

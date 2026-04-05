@@ -1137,7 +1137,10 @@ def encode_lds(dest: int, ur_addr: int, offset: int, ctrl: int = 0) -> bytes:
 
 
 def encode_lds_r(dest: int, ur_addr: int, addr_reg: int, offset: int = 0, ctrl: int = 0) -> bytes:
-    """Encode LDS dest, [UR_addr + addr_reg + offset] (32-bit shared load, GPR-addressed)."""
+    """Encode LDS dest, [addr_reg + offset] (32-bit shared load, GPR-addressed).
+    ur_addr is ignored — plain LDS uses direct GPR addressing.
+    Ground truth: ptxas LDS R5, [R0] → 0x0000000000057984 / 0x000ea80000000800
+    """
     if ctrl == 0:
         ctrl = _CTRL_DEFAULT
     b13, b14, b15 = _ctrl_to_bytes(ctrl)
@@ -1146,14 +1149,14 @@ def encode_lds_r(dest: int, ur_addr: int, addr_reg: int, offset: int = 0, ctrl: 
     raw[1] = 0x79
     raw[2] = dest & 0xFF
     raw[3] = addr_reg & 0xFF
-    raw[4] = ur_addr & 0xFF
+    raw[4] = 0x00
     raw[5] = offset & 0xFF
     raw[6] = (offset >> 8) & 0xFF
     raw[7] = 0x00
     raw[8] = 0x00
     raw[9] = 0x08
     raw[10] = 0x00
-    raw[11] = 0x08
+    raw[11] = 0x00
     raw[12] = 0x00
     raw[13] = b13
     raw[14] = b14
@@ -1162,23 +1165,28 @@ def encode_lds_r(dest: int, ur_addr: int, addr_reg: int, offset: int = 0, ctrl: 
 
 
 def encode_sts_r(ur_addr: int, addr_reg: int, data_reg: int, offset: int = 0, ctrl: int = 0) -> bytes:
-    """Encode STS [UR_addr + addr_reg + offset], data_reg (32-bit shared store, GPR-addressed)."""
+    """Encode STS [addr_reg + offset], data_reg (32-bit shared store, GPR-addressed).
+    Ground truth: ptxas STS [R0], R7 → 0x0000000700007388 / 0x000fe20000000800
+    Uses opcode 0x388 (b1=0x73), matching ptxas plain-STS form. The ur_addr parameter is
+    retained for backwards compatibility but ignored — shared memory addressing is via
+    GPR only.
+    """
     if ctrl == 0:
         ctrl = _CTRL_DEFAULT
     b13, b14, b15 = _ctrl_to_bytes(ctrl)
     raw = bytearray(16)
     raw[0] = 0x88
-    raw[1] = 0x79
+    raw[1] = 0x73
     raw[2] = 0x00
     raw[3] = addr_reg & 0xFF
     raw[4] = data_reg & 0xFF
     raw[5] = offset & 0xFF
     raw[6] = (offset >> 8) & 0xFF
     raw[7] = 0x00
-    raw[8] = ur_addr & 0xFF
+    raw[8] = 0x00
     raw[9] = 0x08
     raw[10] = 0x00
-    raw[11] = 0x08
+    raw[11] = 0x00
     raw[12] = 0x00
     raw[13] = b13
     raw[14] = b14
@@ -1569,6 +1577,37 @@ def encode_ldcu_64(dest_ur: int, const_bank: int, const_offset_bytes: int,
     raw[9] = 0x0a    # 64-bit
     raw[10] = 0x00
     raw[11] = 0x08   # LDCU-specific
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+def encode_imad_r_imm(dest: int, src0: int, imm: int, src2: int,
+                       ctrl: int = 0) -> bytes:
+    """Encode IMAD dest, src0, imm, src2 (non-WIDE, 32-bit result).
+    dest = src0 * imm + src2 (low 32 bits).
+    Ground truth (ptxas sm_120): IMAD R5, R5, 0x7, RZ
+      lo=0x0000000705057824  hi=0x000fc800078e02ff
+      b0=0x24 b1=0x78 (opcode 0x824), b2=dest, b3=src0, b4:b5=imm16, b8=src2.
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0x24
+    raw[1] = 0x78
+    raw[2] = dest & 0xFF
+    raw[3] = src0 & 0xFF
+    raw[4] = imm & 0xFF
+    raw[5] = (imm >> 8) & 0xFF
+    raw[6] = 0x00
+    raw[7] = 0x00
+    raw[8] = src2 & 0xFF
+    raw[9] = 0x02
+    raw[10] = 0x8e
+    raw[11] = 0x07
     raw[12] = 0x00
     raw[13] = b13
     raw[14] = b14
@@ -2584,17 +2623,27 @@ SHFL_BFLY = 0x0c
 
 def encode_shfl(dest: int, src: int, lane_or_delta: int, clamp: int,
                 mode: int = SHFL_IDX, ctrl: int = 0) -> bytes:
-    """Encode SHFL with immediate lane/delta and clamp."""
+    """Encode SHFL with immediate lane/delta and clamp.
+    Ground truth ptxas (SM_120):
+      SHFL.DOWN PT, R9, R0, 0x1, 0x1f  → b6=0x20, b7=0x08
+      SHFL.DOWN PT, R5, R0, 0x10, 0x1f → b6=0x00, b7=0x0a
+    Encoding: (b7<<8)|b6 = (delta<<5) | mode, where delta is the 5-bit
+    lane/delta and mode is one of SHFL_{IDX,UP,DOWN,BFLY}. Clamp lives at b5
+    plus the upper two bits of b6 (b6[4:3]).
+    """
     if ctrl == 0: ctrl = _CTRL_DEFAULT
     b13, b14, b15 = _ctrl_to_bytes(ctrl)
     raw = bytearray(16)
     raw[0], raw[1] = 0x89, 0x7f  # imm-imm variant
     raw[2] = dest & 0xFF
     raw[3] = src & 0xFF
-    raw[4] = lane_or_delta & 0xFF
+    raw[4] = 0x00
+    # clamp occupies low 5 bits of b5 + spills into b6 low bits
     raw[5] = clamp & 0xFF
-    raw[6] = (clamp >> 8) & 0xFF
-    raw[7] = mode & 0xFF
+    # Combine (delta<<5) | (mode<<8) into a 16-bit field stored as b7:b6.
+    packed = ((lane_or_delta & 0x1F) << 5) | ((mode & 0x0F) << 8)
+    raw[6] = packed & 0xFF
+    raw[7] = (packed >> 8) & 0xFF
     raw[13], raw[14], raw[15] = b13, b14, b15
     return bytes(raw)
 

@@ -891,10 +891,11 @@ def encode_ldsm_x1(dest: int, addr_reg: int, ctrl: int = 0) -> bytes:
 
 def encode_i2f_f32_s32(dest: int, src: int, ctrl: int = 0) -> bytes:
     """Encode I2FP.F32.S32 dest, src (signed int32 to float32).
-    Ground truth: ptxas cvt.rn.f32.s32 → b9=0x10, b10=0x20."""
+    Ground truth: ptxas cvt.rn.f32.s32 → b9=0x14, b10=0x20.
+    Bit 2 of b9 is the signed flag (0x14=signed, 0x10=unsigned)."""
     if ctrl == 0: ctrl = _CTRL_DEFAULT
     return _build(0x45, 0x72, b2=dest, b3=0x00, b4=src,
-                  b8=0x00, b9=0x10, b10=0x20, b11=0x00, ctrl=ctrl)
+                  b8=0x00, b9=0x14, b10=0x20, b11=0x00, ctrl=ctrl)
 
 
 def encode_f2i_s32_f32(dest: int, src: int, ctrl: int = 0) -> bytes:
@@ -2624,10 +2625,11 @@ def encode_vote_ballot(dest: int, ctrl: int = 0) -> bytes:
 
 def encode_i2fp_u32(dest: int, src: int, ctrl: int = 0) -> bytes:
     """Encode I2FP.F32.U32 — unsigned int to float.
-    Ground truth: ptxas cvt.rn.f32.u32 → b9=0x14, b10=0x20."""
+    Ground truth: ptxas cvt.rn.f32.u32 → b9=0x10, b10=0x20.
+    Bit 2 of b9 is the signed flag (0x14=signed, 0x10=unsigned)."""
     if ctrl == 0: ctrl = _CTRL_DEFAULT
     return _build(0x45, 0x72, b2=dest, b3=0x00, b4=src,
-                  b8=0x00, b9=0x14, b10=0x20, b11=0x00, ctrl=ctrl)
+                  b8=0x00, b9=0x10, b10=0x20, b11=0x00, ctrl=ctrl)
     return bytes(raw)
 
 
@@ -3770,13 +3772,14 @@ def encode_mov_gpr_from_ur(dest: int, ur_src: int, ctrl: int = 0) -> bytes:
 # Opcode: 0xfae (byte0=0xae, byte1=0x7f)
 
 def encode_ldgsts_e(smem_addr, glob_addr, ur_desc, ctrl=0):
-    """LDGSTS.E [Rsmem], desc[URd][Rglob.64] — async global→shared 4B copy."""
+    """LDGSTS.E [Rsmem], desc[URd][Rglob.64] — async global→shared 4B copy.
+    b2=smem GPR, b3=glob GPR (lo of 64-bit pair), b8=UR descriptor index."""
     if ctrl == 0: ctrl = _CTRL_DEFAULT
     b13, b14, b15 = _ctrl_to_bytes(ctrl)
     raw = bytearray(16)
     raw[0] = 0xae; raw[1] = 0x7f
-    raw[2] = smem_addr & 0xFF; raw[3] = glob_addr & 0xFF; raw[4] = ur_desc & 0xFF
-    raw[8] = 0x04; raw[9] = 0x10; raw[10] = 0x9a; raw[11] = 0x0b
+    raw[2] = smem_addr & 0xFF; raw[3] = glob_addr & 0xFF
+    raw[8] = ur_desc & 0xFF; raw[9] = 0x10; raw[10] = 0x9a; raw[11] = 0x0b
     raw[13] = b13; raw[14] = b14; raw[15] = b15
     return bytes(raw)
 
@@ -3801,12 +3804,14 @@ def encode_ldgdepbar(ctrl=0):
 # Opcode: 0x91a (byte0=0x1a, byte1=0x79)
 
 def encode_depbar_le(sb=0, count=0, ctrl=0):
-    """DEPBAR.LE SBn, count — wait for async copies: pending <= count."""
+    """DEPBAR.LE SBn, count — wait for async copies: pending <= count.
+    Ground truth: DEPBAR.LE SB0, 0x0 → 0x000080000000791a | 0x000fc80000000000
+    The SB/count fields are at b5, not b4."""
     if ctrl == 0: ctrl = _CTRL_DEFAULT
     b13, b14, b15 = _ctrl_to_bytes(ctrl)
     raw = bytearray(16)
     raw[0] = 0x1a; raw[1] = 0x79
-    raw[4] = 0x80 | ((sb & 0x7) << 4) | (count & 0xF)
+    raw[5] = 0x80 | ((sb & 0x7) << 4) | (count & 0xF)
     raw[13] = b13; raw[14] = b14; raw[15] = b15
     return bytes(raw)
 

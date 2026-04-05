@@ -79,6 +79,7 @@ from sass.encoding.sm_120_opcodes import (
     encode_ldsm_x4, encode_ldsm_x2, encode_ldsm_x1,
     encode_redux_sum, encode_redux_sum_s32, encode_redux_min_s32, encode_redux_max_s32,
     encode_redux_and_b32, encode_redux_or_b32, encode_redux_xor_b32,
+    encode_ldgsts_e, encode_ldgdepbar, encode_depbar_le,
     encode_mov_gpr_from_ur,
     encode_iadd3_imm32, encode_iadd3_neg_b4, encode_iadd3_neg_b3,
     encode_iadd3_pred_neg_b4, encode_iadd3_pred_small_imm,
@@ -1827,6 +1828,55 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         output.append(SassInstr(encode_membar(MEMBAR_GPU),
                                                 'MEMBAR.SC.GPU  // membar (default)'))
 
+                elif op == 'cp' and 'async' in instr.types:
+                    from ptx.ir import MemOp
+                    if 'commit_group' in instr.types:
+                        # cp.async.commit_group → LDGDEPBAR
+                        output.append(SassInstr(encode_ldgdepbar(),
+                                                'LDGDEPBAR  // cp.async.commit_group'))
+                    elif 'wait_group' in instr.types:
+                        # cp.async.wait_group N → DEPBAR.LE SB0, N
+                        count = 0
+                        if instr.srcs and isinstance(instr.srcs[0], ImmOp):
+                            count = instr.srcs[0].value
+                        output.append(SassInstr(encode_depbar_le(sb=0, count=count),
+                                                f'DEPBAR.LE SB0, {count}  // cp.async.wait_group {count}'))
+                    elif 'ca' in instr.types and 'shared' in instr.types and 'global' in instr.types:
+                        # cp.async.ca.shared.global [smem], [gmem], size
+                        # srcs[0] = MemOp (shared dest), srcs[1] = MemOp (global src), srcs[2] = ImmOp (size)
+                        smem_op = instr.srcs[0]
+                        gmem_op = instr.srcs[1]
+                        # Get shared memory address register
+                        if isinstance(smem_op, MemOp):
+                            base = smem_op.base
+                            if base.startswith('%') and base in ctx.ra.int_regs:
+                                smem_r = ctx.ra.r32(base)
+                            else:
+                                smem_r = 0
+                        else:
+                            smem_r = 0
+                        # Resolve global address: same logic as _select_ld_global
+                        glob_r = RZ
+                        if isinstance(gmem_op, MemOp):
+                            gbase = gmem_op.base
+                            gbase_n = gbase if gbase.startswith('%') else f'%{gbase}'
+                            ur_params = getattr(ctx, '_ur_params', {})
+                            gpr_written = getattr(ctx, '_gpr_written', set())
+                            if gbase_n in gpr_written and gbase in ctx.ra.int_regs:
+                                glob_r = ctx.ra.lo(gbase)
+                            elif gbase_n in ur_params:
+                                ur_idx = ur_params[gbase_n]
+                                addr = getattr(ctx, '_addr_scratch_lo', None)
+                                if addr is None:
+                                    addr = _alloc_gpr_pair(ctx)
+                                output.append(SassInstr(encode_iadd64_ur(addr, RZ, ur_idx),
+                                    f'IADD.64 R{addr}, RZ, UR{ur_idx}  // cp.async UR->GPR addr'))
+                                glob_r = addr
+                            elif gbase in ctx.ra.int_regs:
+                                glob_r = ctx.ra.lo(gbase)
+                        output.append(SassInstr(encode_ldgsts_e(smem_r, glob_r, ctx.ur_desc),
+                            f'LDGSTS.E [R{smem_r}], desc[UR{ctx.ur_desc}][R{glob_r}.64]  // cp.async.ca.shared.global'))
+
                 elif op == 'dp4a':
                     output.extend(_select_dp4a(instr, ctx.ra, ctx))
 
@@ -2056,11 +2106,12 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 _is_signed = 's32' in _types_set
                                 if _fi < _ii:
                                     # int → float
-                                    # NOTE: I2FP.F32.S32 (b9=0x10) not GPU-verified for negative values;
-                                    # use GPU-verified unsigned encoder for both signed/unsigned.
-                                    # Signed negative inputs will produce incorrect results (known limitation).
-                                    output.append(SassInstr(encode_i2fp_u32(d_r, a_r),
-                                                            f'I2FP.F32 R{d_r}, R{a_r}  // cvt.f32.{_src_t}'))
+                                    if _is_signed:
+                                        output.append(SassInstr(encode_i2f_f32_s32(d_r, a_r),
+                                                                f'I2FP.F32.S32 R{d_r}, R{a_r}  // cvt.f32.s32'))
+                                    else:
+                                        output.append(SassInstr(encode_i2fp_u32(d_r, a_r),
+                                                                f'I2FP.F32.U32 R{d_r}, R{a_r}  // cvt.f32.u32'))
                                 else:
                                     # float → int
                                     if _is_signed:

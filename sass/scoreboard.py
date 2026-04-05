@@ -426,6 +426,10 @@ def _wdep_for_opcode(opcode: int, raw: bytes = None) -> int:
         return 0x35
     if opcode == 0x3c4:  # REDUX: writes to UR, posts to slot 0x31 like LDCU (ptxas-verified)
         return 0x31
+    if opcode in _OPCODES_LDGSTS:
+        return 0x3f  # LDGSTS: async copy writes to shared mem, not GPR — no scoreboard slot
+    if opcode in _OPCODES_LDGDEPBAR:
+        return 0x31  # LDGDEPBAR: commit group, posts to LDC slot (ptxas-verified)
     if opcode in _OPCODES_IADD64_UR:
         return 0x3e  # ALU slot — consumer LDG/STG gets rbar via pending_writes
     if opcode in _OPCODES_ALU | _OPCODES_SMEM_SETUP:
@@ -487,6 +491,8 @@ _OPCODE_MISC: dict[int, int] = {
     0xc24: 1,   # IMAD R-UR: misc=1
     0x810: 1,   # IADD3.IMM: misc=1 (ptxas: all 10 IADD3.IMM in fp64 preamble use 1)
     0x919: 1,   # S2R: misc=1 (ptxas-verified; counter=0 at body start would give 0)
+    0xfae: 4,   # LDGSTS.E: misc=4 (ptxas-verified: async global→shared copy)
+    0x9af: 1,   # LDGDEPBAR: misc=1 (ptxas-verified: cp.async commit group)
     # Tensor core MMA: misc=2 (ptxas-verified for SM_120 HMMA, IMMA, DMMA)
     0x23c: 2,   # HMMA (FP16/BF16/TF32)
     0x237: 2,   # IMMA (INT8)
@@ -501,7 +507,7 @@ _ALL_KNOWN_OPCODES: frozenset = frozenset(
     _OPCODES_STG | _OPCODES_STS | _OPCODES_BAR |
     _OPCODES_CTRL | _OPCODES_ALU | _OPCODES_IADD64_UR |
     _OPCODES_SMEM_SETUP | _OPCODES_ATOMG | _OPCODES_DFPU |
-    _OPCODES_F2F
+    _OPCODES_F2F | _OPCODES_LDGSTS | _OPCODES_LDGDEPBAR
 )
 
 

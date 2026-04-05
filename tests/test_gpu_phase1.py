@@ -1038,5 +1038,166 @@ class TestAtomgAdd:
             cuda_ctx.free(d_out)
 
 
+# ===========================================================================
+# 14. I2F.F32.S32 — signed int32 to float32 (negative values)
+# ===========================================================================
+
+_PTX_I2F_S32 = """
+.version 8.7
+.target sm_120
+.address_size 64
+
+.visible .entry i2f_s32_test(
+    .param .u64 p_out,
+    .param .u64 p_in,
+    .param .u32 p_n
+) {
+    .reg .u32 %r0, %r1, %r2;
+    .reg .s32 %r3;
+    .reg .f32 %f0;
+    .reg .u64 %rd0, %rd1, %rd2, %rd3, %rd4;
+    .reg .pred %p0;
+
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [p_n];
+    setp.ge.u32 %p0, %r0, %r1;
+    @%p0 bra DONE;
+
+    cvt.u64.u32 %rd0, %r0;
+    shl.b64 %rd0, %rd0, 2;
+
+    ld.param.u64 %rd1, [p_in]; add.u64 %rd2, %rd1, %rd0;
+    ld.global.s32 %r3, [%rd2];
+
+    cvt.rn.f32.s32 %f0, %r3;
+
+    ld.param.u64 %rd3, [p_out]; add.u64 %rd4, %rd3, %rd0;
+    st.global.f32 [%rd4], %f0;
+DONE:
+    ret;
+}
+"""
+
+
+class TestI2fS32:
+    @gpu
+    def test_i2f_s32_negative(self, cuda_ctx):
+        """cvt.rn.f32.s32: signed integers including negatives convert correctly."""
+        import math
+        cubins = _compile(_PTX_I2F_S32)
+        assert 'i2f_s32_test' in cubins
+        ok = cuda_ctx.load(cubins['i2f_s32_test'])
+        assert ok
+        func = cuda_ctx.get_func('i2f_s32_test')
+
+        # Test values: negatives, zero, positives, extremes
+        # Note: values outside [-2^24, 2^24] may lose precision in float32 (IEEE 754)
+        inputs_signed = [-42, -1000000, -2147483648, -1, 0, 1, 42, 2147483647]
+        N = len(inputs_signed)
+        # Pack as signed int32
+        in_bytes = struct.pack(f'<{N}i', *inputs_signed)
+
+        d_in = cuda_ctx.alloc(4 * N)
+        d_out = cuda_ctx.alloc(4 * N)
+        try:
+            cuda_ctx.copy_to(d_in, in_bytes)
+            cuda_ctx.copy_to(d_out, bytes(4 * N))
+            err = cuda_ctx.launch(func, (1, 1, 1), (N, 1, 1), [d_out, d_in, N])
+            assert err == 0
+            assert cuda_ctx.sync() == 0, "i2f_s32 crashed"
+            raw = cuda_ctx.copy_from(d_out, 4 * N)
+            results = list(struct.unpack(f'<{N}f', raw))
+            for i in range(N):
+                # Use struct to get the same rounding as hardware: pack as f32, unpack
+                expected_bits = struct.pack('<f', float(inputs_signed[i]))
+                expected = struct.unpack('<f', expected_bits)[0]
+                assert results[i] == expected, \
+                    f"i2f_s32 idx {i}: input={inputs_signed[i]}, got {results[i]}, expected {expected}"
+        finally:
+            cuda_ctx.free(d_in)
+            cuda_ctx.free(d_out)
+
+
+# ===========================================================================
+# 15. cp.async — async global→shared copy
+# ===========================================================================
+
+_PTX_CP_ASYNC = """
+.version 8.7
+.target sm_120
+.address_size 64
+
+.visible .entry cp_async_test(
+    .param .u64 p_out,
+    .param .u64 p_in
+)
+{
+    .reg .u32 %r<8>;
+    .reg .u64 %rd<8>;
+    .reg .pred %p0;
+    .shared .align 4 .b32 smem[256];
+
+    mov.u32 %r0, %tid.x;
+
+    // Thread 0 initiates async copy of 4 bytes from global to shared
+    setp.ne.u32 %p0, %r0, 0;
+    @%p0 bra SKIP_COPY;
+
+    // smem byte offset for thread 0 = 0
+    mov.u32 %r1, 0;
+    ld.param.u64 %rd0, [p_in];
+    cp.async.ca.shared.global [%r1], [%rd0], 4;
+
+SKIP_COPY:
+    cp.async.commit_group;
+    cp.async.wait_group 0;
+    bar.sync 0;
+
+    // All threads read from shared offset 0
+    mov.u32 %r2, 0;
+    ld.shared.b32 %r3, [%r2];
+
+    // Write to global output at [tid*4]
+    shl.b32 %r4, %r0, 2;
+    cvt.u64.u32 %rd1, %r4;
+    ld.param.u64 %rd2, [p_out];
+    add.u64 %rd3, %rd2, %rd1;
+    st.global.u32 [%rd3], %r3;
+    ret;
+}
+"""
+
+
+class TestCpAsync:
+    @gpu
+    def test_cp_async_basic(self, cuda_ctx):
+        """cp.async: async copy 4B from global to shared, all threads read it."""
+        cubins = _compile(_PTX_CP_ASYNC)
+        assert 'cp_async_test' in cubins
+        ok = cuda_ctx.load(cubins['cp_async_test'])
+        assert ok, "cuModuleLoadData failed for cp_async_test"
+        func = cuda_ctx.get_func('cp_async_test')
+
+        N = 32  # one warp
+        magic = 0xDEADBEEF
+        d_in = cuda_ctx.alloc(4)
+        d_out = cuda_ctx.alloc(N * 4)
+        try:
+            cuda_ctx.copy_to(d_in, struct.pack('<I', magic))
+            cuda_ctx.copy_to(d_out, b'\x00' * (N * 4))
+            err = cuda_ctx.launch(func, (1, 1, 1), (N, 1, 1),
+                                  [d_out, d_in], smem=1024)
+            assert err == 0
+            assert cuda_ctx.sync() == 0, "cp_async crashed"
+            raw = cuda_ctx.copy_from(d_out, N * 4)
+            results = list(struct.unpack(f'<{N}I', raw))
+            for i in range(N):
+                assert results[i] == magic, \
+                    f"cp_async thread {i}: got {results[i]:#x}, expected {magic:#x}"
+        finally:
+            cuda_ctx.free(d_in)
+            cuda_ctx.free(d_out)
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v', '-m', 'gpu'])

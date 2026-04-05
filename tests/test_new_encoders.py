@@ -55,7 +55,7 @@ def test_ldgsts_e_opcode():
     assert _opcode(raw) == 0xfae, f"opcode={_opcode(raw):#x}"
     assert raw[2] == 5  # smem addr
     assert raw[3] == 2  # glob addr
-    assert raw[4] == 4  # UR descriptor
+    assert raw[8] == 4  # UR descriptor (in b8, not b4)
 
 def test_ldgdepbar_opcode():
     raw = encode_ldgdepbar()
@@ -64,7 +64,7 @@ def test_ldgdepbar_opcode():
 def test_depbar_le_opcode():
     raw = encode_depbar_le(sb=0, count=0)
     assert _opcode(raw) == 0x91a, f"opcode={_opcode(raw):#x}"
-    assert raw[4] == 0x80  # SB0, count=0
+    assert raw[5] == 0x80  # SB0, count=0 (at b5, not b4)
 
 def test_f2fp_opcode():
     raw = encode_f2fp_f16_f32(dest=0, src=2)

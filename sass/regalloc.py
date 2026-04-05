@@ -91,15 +91,19 @@ class AllocResult:
     num_uniform: int                  # uniform regs used
 
 
-def _find_ldg_coalesces(fn: Function) -> dict[str, str]:
+def _find_ldg_coalesces(fn: Function) -> dict[str, tuple[str, int]]:
     """
     Find ld.global patterns where dest and addr can share registers.
 
-    Returns a dict mapping dest_reg_name → addr_reg_name for coalescing.
-    e.g. {'%rd1': '%rd0'} means %rd1 should share %rd0's physical register.
+    Returns a dict mapping dest_reg_name → (addr_reg_name, load_instr_idx).
+    e.g. {'%rd1': ('%rd0', 4)} means %rd1 can share %rd0's phys reg at instr 4.
+
+    The caller must still verify liveness: addr's last use must be the load
+    itself, and dest's first def must be the load itself.
     """
     from ptx.ir import RegOp, MemOp
-    coalesces: dict[str, str] = {}
+    coalesces: dict[str, tuple[str, int]] = {}
+    idx = 0
     for bb in fn.blocks:
         for inst in bb.instructions:
             if inst.op == 'ld' and 'global' in inst.types:
@@ -107,7 +111,9 @@ def _find_ldg_coalesces(fn: Function) -> dict[str, str]:
                     dest = inst.dest
                     src = inst.srcs[0]
                     if isinstance(dest, RegOp) and isinstance(src, MemOp):
-                        coalesces[dest.name] = f'%{src.base}' if not src.base.startswith('%') else src.base
+                        base = f'%{src.base}' if not src.base.startswith('%') else src.base
+                        coalesces[dest.name] = (base, idx)
+            idx += 1
     return coalesces
 
 
@@ -407,9 +413,67 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
             int_regs[name] = phys
             active.append((name, phys, last_use, False))
 
-    # LDG coalescing disabled — causes live range conflicts when multiple loads
-    # are active simultaneously. The linear scan allocator handles register reuse.
-    # TODO: re-enable with interference graph check
+    # LDG coalescing: when `ld.global %dest, [%addr]` is the *last* use of %addr
+    # and the *first* def of %dest, the two regs can share a physical slot.
+    # The load instruction reads %addr then writes %dest; hardware already
+    # supports same-reg src/dst. This saves 1 GPR per such pair.
+    #
+    # Safety: require that %addr's final use is exactly the load, %dest's first
+    # def is exactly the load, and the types/widths match. If any of these fail
+    # (e.g. %addr is alive past the load, %dest was already written), live
+    # ranges interfere and we skip this pair.
+    _ordered = sorted(coalesces.items(), key=lambda kv: kv[1][1])
+    for dest_name, (addr_name, load_idx) in _ordered:
+        if dest_name not in int_regs or addr_name not in int_regs:
+            continue
+        if int_regs[dest_name] == int_regs[addr_name]:
+            continue  # already shared
+        addr_last = reg_last_use.get(addr_name, -1)
+        dest_first = reg_first_def.get(dest_name, -1)
+        if addr_last != load_idx or dest_first != load_idx:
+            continue  # interference — live ranges overlap
+        # Width check: both must match so we don't stomp a 64-bit pair with a
+        # 32-bit reg (or vice versa).
+        def _width(nm: str) -> int:
+            for rd in fn.reg_decls:
+                if nm in rd.names:
+                    return rd.type.width
+            return 0
+        if _width(dest_name) != _width(addr_name):
+            continue
+        # Ensure no other live register currently maps to addr's phys reg that
+        # would be displaced — conservative check: no other name shares the
+        # addr phys AND has first_def > load_idx.
+        addr_phys = int_regs[addr_name]
+        dest_phys = int_regs[dest_name]
+        conflict = False
+        dest_last = reg_last_use.get(dest_name, load_idx)
+        for other, p in int_regs.items():
+            if other in (dest_name, addr_name):
+                continue
+            if p == addr_phys:
+                other_first = reg_first_def.get(other, -1)
+                other_last  = reg_last_use.get(other, -1)
+                # `other` conflicts iff its range strictly overlaps the dest
+                # range (load_idx, dest_last]. We allow `other_last == load_idx`
+                # (other dies at the load — same cycle as addr) and
+                # `other_first > dest_last` (starts after dest ends).
+                if not (other_last <= load_idx or other_first > dest_last):
+                    conflict = True
+                    break
+        if conflict:
+            continue
+        # Safe: point dest_name at addr's phys reg. Note: for 64-bit regs the
+        # phys slot already represents the pair base, so nothing extra needed.
+        int_regs[dest_name] = addr_phys
+        # Free dest's original phys reg for future use by shrinking next_gpr
+        # when dest was the last allocation. This only trims the trivially
+        # freeable tail; the more general case is handled implicitly by the
+        # fact that dest_phys won't be looked up anymore.
+        if dest_phys == next_gpr - 1:
+            next_gpr -= 1
+        elif _width(dest_name) >= 64 and dest_phys == next_gpr - 2:
+            next_gpr -= 2
 
     # Note: nv.info EIATTR_MAX_REG_COUNT limits available registers.
     # Default template uses 0x80 (8 GPR groups). For > 8 GPRs, the emitter

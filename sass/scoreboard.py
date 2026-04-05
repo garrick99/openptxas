@@ -649,6 +649,26 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
                     candidate_rbar = 0x09
                 rbar = rbar | candidate_rbar
 
+        # WAW (write-after-write) hazard: if this instruction writes to a register
+        # that has a pending long-latency write, we must wait for the prior write
+        # to complete before overwriting. Otherwise the prior slot may post its
+        # result *after* this one, clobbering the new value. RAW handling above
+        # only covers cases where this instruction also reads the register as a
+        # source — it misses pure-overwrite cases (e.g. reload LDG → different
+        # destination, or ALU write to a register that previously held an LDG
+        # result that's still in flight).
+        dest_regs_now = _get_dest_regs(si.raw)
+        for r in dest_regs_now:
+            if r in pending_writes:
+                _, pending_wdep = pending_writes[r]
+                # ALU writes (wdep=0x3e) retire in-order so no WAW wait needed
+                # against another ALU write. Only long-latency prior writes matter.
+                if pending_wdep in _WDEP_TO_RBAR and pending_wdep != 0x3e:
+                    candidate_rbar = _WDEP_TO_RBAR[pending_wdep]
+                    if pending_wdep == 0x35:
+                        candidate_rbar = 0x09
+                    rbar = rbar | candidate_rbar
+
         # STS needs rbar=0x09 if writing data that came from LDG
         if opcode in _OPCODES_STS:
             for r in src_regs:

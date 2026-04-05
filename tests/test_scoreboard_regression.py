@@ -431,5 +431,85 @@ class TestBarSyncClearsPending:
             f"should not wait for pre-barrier LDG"
 
 
+# -------------------------------------------------------------------------
+# WAW (write-after-write) hazard tracking
+# -------------------------------------------------------------------------
+
+class TestWAWHazards:
+    """When an instruction overwrites a register with an outstanding long-latency
+    write, we must wait for the prior write to retire. Otherwise the slower
+    write may arrive AFTER the new one and clobber the new value."""
+
+    def test_ldg_then_overwrite_without_read_waits(self):
+        """LDG writes R4. Later an IADD3 writes R4 (same dest, not read).
+        Without a WAW rbar the LDG could retire after the IADD3, clobbering it.
+        The IADD3 must have rbar 0x09 (LDG slot) set even though it does not
+        read R4."""
+        body = [
+            SassInstr(encode_s2r(0, SR_TID_X),   'S2R'),
+            SassInstr(encode_ldcu_64(4, 0, 0x358), 'LDCU UR4'),
+            SassInstr(encode_iadd64_ur(2, RZ, 4), 'IADD64-UR'),
+            SassInstr(encode_ldg_e_64(4, 4, 2),  'LDG.E.64 → R4/R5'),
+            # Overwrite R4 without reading it — pure WAW on slot 0x35
+            SassInstr(encode_iadd3(4, 0, 0, 0),  'IADD3 R4 overwrite'),
+            SassInstr(encode_exit(),             'EXIT'),
+        ]
+        result = assign_ctrl(body)
+        overwrite_ctrl = decode_ctrl(result[4].raw)
+        assert overwrite_ctrl['rbar'] & 0x08, (
+            f"WAW: IADD3 overwrites R4 after LDG but rbar="
+            f"0x{overwrite_ctrl['rbar']:02x} does not wait on LDG slot (0x08)."
+        )
+
+    def test_ldc_then_overwrite_waits(self):
+        """LDC writes R3 (slot 0x31). A later IADD3 overwrites R3 with no read."""
+        body = [
+            SassInstr(encode_ldc(3, 0, 0x160), 'LDC R3'),
+            SassInstr(encode_iadd3(3, 0, 0, 0), 'IADD3 R3 overwrite'),
+            SassInstr(encode_exit(), 'EXIT'),
+        ]
+        result = assign_ctrl(body)
+        overwrite_ctrl = decode_ctrl(result[1].raw)
+        assert overwrite_ctrl['rbar'] & 0x02, (
+            f"WAW: IADD3 overwrites R3 after LDC but rbar="
+            f"0x{overwrite_ctrl['rbar']:02x} does not wait on LDC slot (0x02)."
+        )
+
+    def test_alu_then_alu_overwrite_no_waw_needed(self):
+        """ALU→ALU WAW does NOT need rbar since ALU retires in-order.
+        min_gpr_gap handles the hazard; rbar stays at 0x01."""
+        body = [
+            SassInstr(encode_iadd3(3, 0, 0, 0), 'IADD3 R3 (1)'),
+            SassInstr(encode_iadd3(4, 0, 0, 0), 'IADD3 R4 (filler)'),
+            SassInstr(encode_iadd3(3, 0, 0, 0), 'IADD3 R3 (2)'),
+            SassInstr(encode_exit(), 'EXIT'),
+        ]
+        result = assign_ctrl(body)
+        overwrite_ctrl = decode_ctrl(result[2].raw)
+        # ALU→ALU WAW: no LDG/LDC/LDS bits set
+        assert not (overwrite_ctrl['rbar'] & 0x0e), (
+            f"ALU→ALU WAW should not set long-latency rbar, got "
+            f"0x{overwrite_ctrl['rbar']:02x}"
+        )
+
+    def test_raw_still_works_after_waw_addition(self):
+        """Sanity: RAW dependency detection still works after WAW addition."""
+        body = [
+            SassInstr(encode_s2r(0, SR_TID_X),   'S2R'),
+            SassInstr(encode_ldcu_64(4, 0, 0x358), 'LDCU UR4'),
+            SassInstr(encode_iadd64_ur(2, RZ, 4), 'IADD64-UR'),
+            SassInstr(encode_ldg_e_64(4, 4, 2),  'LDG.E.64 → R4/R5'),
+            SassInstr(encode_nop(),              'NOP gap'),
+            # Read R4 (RAW) — must wait for LDG
+            SassInstr(encode_iadd3(6, 4, 0, 0),  'IADD3 R6 = R4+0'),
+            SassInstr(encode_exit(),             'EXIT'),
+        ]
+        result = assign_ctrl(body)
+        consumer_ctrl = decode_ctrl(result[5].raw)
+        assert consumer_ctrl['rbar'] & 0x08, (
+            f"RAW: IADD3 consumes R4 from LDG but rbar=0x{consumer_ctrl['rbar']:02x}"
+        )
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

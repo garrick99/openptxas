@@ -115,3 +115,63 @@ def test_64bit_alignment():
         if name in result.ra.int_regs:
             lo = result.ra.lo(name)
             assert lo % 2 == 0, f"{name} lo={lo} not even-aligned"
+
+
+# ---------------------------------------------------------------------------
+# LDG coalescing tests — reclaim address reg as destination when safe
+# ---------------------------------------------------------------------------
+
+COALESCE_SAFE_PTX = """\
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry coalesce_safe(.param .u64 a)
+{
+    .reg .b64 %rd<10>;
+    .reg .u64 %res;
+    ld.param.u64 %rd1, [a];
+    ld.global.u64 %rd2, [%rd1];
+    add.u64 %res, %rd2, %rd2;
+    ret;
+}
+"""
+
+COALESCE_UNSAFE_PTX = """\
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry coalesce_unsafe(.param .u64 a)
+{
+    .reg .b64 %rd<10>;
+    ld.param.u64 %rd1, [a];
+    ld.global.u64 %rd2, [%rd1];
+    add.u64 %rd3, %rd2, 1;
+    st.global.u64 [%rd1], %rd3;
+    ret;
+}
+"""
+
+
+def test_ldg_coalesce_saves_register():
+    """When addr dies at the load, dest should share addr's phys reg."""
+    mod = parse(COALESCE_SAFE_PTX)
+    fn = mod.functions[0]
+    result = allocate(fn, sm_version=120)
+    # %rd1 and %rd2 should share the same physical register
+    assert "%rd1" in result.ra.int_regs
+    assert "%rd2" in result.ra.int_regs
+    assert result.ra.int_regs["%rd1"] == result.ra.int_regs["%rd2"], (
+        f"coalesce failed: %rd1={result.ra.int_regs['%rd1']} "
+        f"%rd2={result.ra.int_regs['%rd2']}"
+    )
+
+
+def test_ldg_coalesce_respects_interference():
+    """When addr is used AFTER the load, coalescing must not fire."""
+    mod = parse(COALESCE_UNSAFE_PTX)
+    fn = mod.functions[0]
+    result = allocate(fn, sm_version=120)
+    # %rd1 is alive past the load (used in st.global), must NOT share with %rd2
+    assert result.ra.int_regs["%rd1"] != result.ra.int_regs["%rd2"], (
+        "coalesce fired despite interference: %rd1 alive past load"
+    )

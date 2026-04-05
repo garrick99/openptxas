@@ -59,7 +59,7 @@ Verified over 500,000 iterations. Same kernel, same GPU, same input.
 git clone https://github.com/garrick99/openptxas
 cd openptxas
 python demo.py                      # compile + run vector_add on GPU
-pytest tests/ -x -q                 # 205 tests
+pytest tests/ -x -q                 # 281 tests
 ```
 
 ## What's Inside
@@ -89,6 +89,11 @@ Reverse-engineered during development. Not documented publicly elsewhere:
 | **SM_120 uses predicated execution** | No BRA-based warp divergence; ptxas if-converts everything |
 | **Capmerc DRM system** | 0x5a universal ptxas signature authenticates register metadata |
 | **Literal pool broken** | Driver doesn't init .nv.constant0 beyond params; all immediates inline |
+| **LDG shares single scoreboard slot** | All LDG instructions use wdep=0x35; slot 0x37 has no rbar bit |
+| **BAR.SYNC resets scoreboard state** | Pending writes must be cleared after barrier; stale deps corrupt post-barrier LDC |
+| **DADD/DMUL/DFMA use b1=0x72** | The b1=0x7e/0x7c forms (from decode_sass.py) silently produce wrong results |
+| **LOP3 reads 3 source registers** | b3, b4, b8 all tracked for dependency; missing b4/b8 causes stale-data hazards |
+| **DADD src1 at b8, not b4** | Unlike DMUL/DFMA, DADD places second operand at byte 8 |
 
 ## Instruction Coverage (60+)
 
@@ -97,7 +102,7 @@ All encoders byte-verified against ptxas 13.0 on SM_120.
 | Category | Instructions |
 |----------|-------------|
 | Integer | IADD3, IMAD, IMAD.WIDE, IMAD.SHL, IADD.64, IABS |
-| Float | FADD, FMUL, FFMA, FMUL.IMM, FFMA.IMM, FSEL.step |
+| Float | FADD, FMUL, FFMA, FMUL.IMM, FFMA.IMM, FSEL.step, DADD, DMUL, DFMA |
 | Transcendentals | MUFU (RCP, SQRT, RSQ, SIN, COS, EX2, LG2) |
 | Shifts | SHF (L/R, U32/U64/S32, HI/LO, const/var) |
 | Bitwise | LOP3.LUT (AND/OR/XOR/NOT), POPC, BREV, FLO |

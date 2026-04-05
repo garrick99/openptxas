@@ -324,5 +324,112 @@ class TestUnknownOpcodeAssertion:
             assign_ctrl([SassInstr(bytes(raw), 'fake')])
 
 
+# -------------------------------------------------------------------------
+# Rule 5: All LDG instructions share wdep=0x35 (no slot rotation)
+# -------------------------------------------------------------------------
+
+class TestDualLdgSlotSharing:
+    def test_dual_ldg_both_use_0x35(self):
+        """Both LDG.E.64 instructions must use wdep=0x35.
+        ptxas SM_120 ground truth (2026-04-04): slot 0x37 has no rbar bit,
+        so consumers never wait for it. Both LDGs must share slot 0x35."""
+        body = [
+            SassInstr(encode_s2r(0, SR_TID_X), 'S2R R0'),
+            SassInstr(encode_ldcu_64(4, 0, 0x358), 'LDCU.64 UR4 (desc)'),
+            SassInstr(encode_ldcu_64(6, 0, 0x380), 'LDCU.64 UR6'),
+            SassInstr(encode_ldcu_64(8, 0, 0x388), 'LDCU.64 UR8'),
+            SassInstr(encode_iadd64_ur(2, RZ, 6), 'IADD.64-UR R2 (addr_a)'),
+            SassInstr(encode_iadd64_ur(6, RZ, 8), 'IADD.64-UR R6 (addr_b)'),
+            SassInstr(encode_ldg_e_64(8, 4, 2), 'LDG.E.64 R8 (first)'),
+            SassInstr(encode_nop(), 'NOP'),
+            SassInstr(encode_ldg_e_64(10, 4, 6), 'LDG.E.64 R10 (second)'),
+            SassInstr(encode_exit(), 'EXIT'),
+        ]
+        result = assign_ctrl(body)
+        ldg1 = decode_ctrl(result[6].raw)
+        ldg2 = decode_ctrl(result[8].raw)
+        assert ldg1['wdep'] == 0x35, \
+            f"First LDG wdep=0x{ldg1['wdep']:02x}, expected 0x35"
+        assert ldg2['wdep'] == 0x35, \
+            f"Second LDG wdep=0x{ldg2['wdep']:02x}, expected 0x35 (NOT 0x37)"
+
+    def test_dual_ldg_consumer_waits_for_both(self):
+        """Consumer of both LDG.E.64 results must get rbar=0x09 (LDG wait)."""
+        from sass.encoding.sm_120_opcodes import encode_dadd
+        body = [
+            SassInstr(encode_s2r(0, SR_TID_X), 'S2R R0'),
+            SassInstr(encode_ldcu_64(4, 0, 0x358), 'LDCU.64 UR4 (desc)'),
+            SassInstr(encode_ldcu_64(6, 0, 0x380), 'LDCU.64 UR6'),
+            SassInstr(encode_ldcu_64(8, 0, 0x388), 'LDCU.64 UR8'),
+            SassInstr(encode_iadd64_ur(2, RZ, 6), 'IADD.64-UR R2'),
+            SassInstr(encode_iadd64_ur(6, RZ, 8), 'IADD.64-UR R6'),
+            SassInstr(encode_ldg_e_64(8, 4, 2), 'LDG.E.64 R8'),
+            SassInstr(encode_nop(), 'NOP'),
+            SassInstr(encode_ldg_e_64(10, 4, 6), 'LDG.E.64 R10'),
+            SassInstr(encode_nop(), 'NOP'),
+            SassInstr(encode_dadd(12, 8, 10), 'DADD R12, R8, R10'),
+            SassInstr(encode_exit(), 'EXIT'),
+        ]
+        result = assign_ctrl(body)
+        dadd_ctrl = decode_ctrl(result[10].raw)
+        assert dadd_ctrl['rbar'] & 0x08, \
+            f"DADD rbar=0x{dadd_ctrl['rbar']:02x} — missing LDG wait bit (0x08)"
+
+
+# -------------------------------------------------------------------------
+# Rule 6: BAR.SYNC clears pending scoreboard state
+# -------------------------------------------------------------------------
+
+class TestBarSyncClearsPending:
+    def test_bar_sync_clears_pending_writes(self):
+        """Instructions after BAR.SYNC must not inherit stale rbar from pre-barrier ops."""
+        from sass.encoding.sm_120_opcodes import encode_bar_sync
+        body = [
+            SassInstr(encode_s2r(0, SR_TID_X), 'S2R R0'),
+            SassInstr(encode_ldcu_64(4, 0, 0x358), 'LDCU.64 UR4 (desc)'),
+            SassInstr(encode_ldcu_64(6, 0, 0x380), 'LDCU.64 UR6'),
+            SassInstr(encode_iadd64_ur(2, RZ, 6), 'IADD.64-UR R2'),
+            SassInstr(encode_ldg_e_64(4, 4, 2), 'LDG.E.64 R4 (pre-barrier)'),
+            SassInstr(encode_nop(), 'NOP'),
+            SassInstr(encode_bar_sync(0), 'BAR.SYNC 0'),
+            # After barrier: new LDC/param load should have clean rbar
+            SassInstr(encode_ldc(10, 0, 0x380), 'LDC R10 (post-barrier)'),
+            # Consumer of R10 should only wait for LDC, not pre-barrier LDG
+            SassInstr(encode_iadd3(11, 10, RZ, RZ), 'IADD3 R11, R10, RZ'),
+            SassInstr(encode_exit(), 'EXIT'),
+        ]
+        result = assign_ctrl(body)
+        ldc_ctrl = decode_ctrl(result[7].raw)
+        # LDC after BAR should NOT have rbar=0x09 (LDG wait) — barrier cleared it
+        assert not (ldc_ctrl['rbar'] & 0x08), \
+            f"LDC after BAR.SYNC has rbar=0x{ldc_ctrl['rbar']:02x} — " \
+            f"stale LDG wait not cleared by barrier"
+
+    def test_bar_sync_resets_ldg_tracking(self):
+        """Post-barrier LDG must start fresh — not inherit pre-barrier slot state."""
+        from sass.encoding.sm_120_opcodes import encode_bar_sync
+        body = [
+            SassInstr(encode_s2r(0, SR_TID_X), 'S2R R0'),
+            SassInstr(encode_ldcu_64(4, 0, 0x358), 'LDCU.64 UR4 (desc)'),
+            SassInstr(encode_ldcu_64(6, 0, 0x380), 'LDCU.64 UR6'),
+            SassInstr(encode_iadd64_ur(2, RZ, 6), 'IADD.64-UR R2'),
+            SassInstr(encode_ldg_e_64(4, 4, 2), 'LDG.E.64 R4 (pre-barrier)'),
+            SassInstr(encode_nop(), 'NOP'),
+            SassInstr(encode_bar_sync(0), 'BAR.SYNC 0'),
+            # New IADD.64-UR after barrier — should be tracked fresh
+            SassInstr(encode_iadd64_ur(2, RZ, 6), 'IADD.64-UR R2 (post-barrier)'),
+            SassInstr(encode_ldg_e_64(8, 4, 2), 'LDG.E.64 R8 (post-barrier)'),
+            SassInstr(encode_nop(), 'NOP'),
+            SassInstr(encode_stg_e_64(4, 2, 8), 'STG.E.64'),
+            SassInstr(encode_exit(), 'EXIT'),
+        ]
+        result = assign_ctrl(body)
+        # Post-barrier IADD.64-UR should have rbar=0x01 (no stale deps)
+        iadd_ctrl = decode_ctrl(result[7].raw)
+        assert not (iadd_ctrl['rbar'] & 0x08), \
+            f"Post-barrier IADD.64-UR has rbar=0x{iadd_ctrl['rbar']:02x} — " \
+            f"should not wait for pre-barrier LDG"
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

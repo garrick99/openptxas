@@ -15,8 +15,7 @@ SM_120 ctrl word (23 bits):
 Scoreboard slots (from ptxas RE):
   0x31 = LDC/LDCU result slot
   0x33 = LDS result slot
-  0x35 = LDG result slot (first)
-  0x37 = LDG result slot (second)
+  0x35 = LDG result slot (all LDGs share; ptxas-verified 2026-04-04)
   0x3e = ALU result slot (SHF, IADD, FADD, etc.)
   0x3f = no write tracking (EXIT, BRA, STG, BAR)
 
@@ -25,6 +24,7 @@ Read barrier encoding (BITMASK — combine with OR, not max):
   bit 1 (0x02) = wait for LDC/LDCU scoreboard slot
   bit 2 (0x04) = wait for LDS scoreboard slot
   bit 3 (0x08) = wait for LDG scoreboard slot
+  bit 4 (0x10) = reserved (slot 0x37 does NOT have an rbar bit — never use wdep=0x37)
   Common values: 0x01=no wait, 0x03=LDC, 0x05=LDS, 0x09=LDG, 0x0B=LDC+LDG
 """
 
@@ -117,7 +117,7 @@ _OPCODES_LDS = {0x984}
 _OPCODES_STG = {0x986}
 _OPCODES_STS = {0x988}
 _OPCODES_BAR = {0xb1d}
-_OPCODES_DFPU  = {0xe29, 0xc28, 0xc2b}   # DADD (R-R), DMUL, DFMA (double-precision, wdep=0x33)
+_OPCODES_DFPU  = {0x229, 0x228, 0x22b, 0xc2b}  # DADD, DMUL, DFMA (R-R b1=0x72), DFMA-UR-UR (b1=0x7c)
 _OPCODES_DSETP = {0x22a}                 # DSETP (FP64 compare → predicate; reads pairs, no GPR dest)
 _OPCODES_F2F   = {0x310}                 # F2F (float-to-float precision conversion; long-latency, wdep=0x33)
 _OPCODES_CTRL = {0x94d, 0x947, 0x918, 0x91a, 0x992}  # EXIT, BRA, NOP, DEPBAR.LE, MEMBAR
@@ -238,12 +238,18 @@ def _get_src_regs(raw: bytes) -> set[int]:
                 if raw[4] < 255: regs.add(raw[4]+1)
                 if raw[8] < 255: regs.add(raw[8]+1)
     elif opcode in _OPCODES_DFPU:
-        # DADD (0xe29): src0=b3(pair), src1=b4(pair); same layout as DMUL
-        # DMUL (0xc28): src0=b3(pair), src1=b4(pair)
-        # DFMA (0xc2b): src0=b3(pair), src1_mul=b4(pair), src2_add=b8(pair)
+        # DADD (0x229, b1=0x72): src0=b3(pair), src1=b8(pair) — ptxas-verified 2026-04-04
+        # DMUL (0x228, b1=0x72): src0=b3(pair), src1=b4(pair)
+        # DFMA (0x22b, b1=0x72): src0=b3(pair), src1=b4(pair), src2=b8(pair) — all GPR
+        # DFMA-UR-UR (0xc2b, b1=0x7c): src0=b3(pair), b4=UR, b8=UR — only src0 is GPR
         if raw[3] < 255: regs |= {raw[3], raw[3]+1}
-        if raw[4] < 255: regs |= {raw[4], raw[4]+1}  # DADD/DMUL/DFMA src1 in b4
-        if opcode == 0xc2b and raw[8] < 255: regs |= {raw[8], raw[8]+1}  # DFMA src2
+        if opcode == 0x229:  # DADD: src1 at b8 (NOT b4)
+            if raw[8] < 255: regs |= {raw[8], raw[8]+1}
+        elif opcode == 0xc2b:  # DFMA-UR-UR: b4/b8 are UR indices, not GPR
+            pass  # only src0 (b3) is a GPR
+        else:
+            if raw[4] < 255: regs |= {raw[4], raw[4]+1}  # DMUL/DFMA src1 in b4
+            if opcode == 0x22b and raw[8] < 255: regs |= {raw[8], raw[8]+1}  # DFMA R-R src2
     elif opcode in _OPCODES_DSETP:
         # DSETP: src0(b3, 64-bit pair), src1(b4, 64-bit pair); no GPR dest
         if raw[3] < 255: regs |= {raw[3], raw[3]+1}
@@ -261,9 +267,12 @@ def _get_src_regs(raw: bytes) -> set[int]:
     elif opcode in _OPCODES_ALU:
         # ALU: src0 at b3, src1 at b4, src2 at b8 (varies by opcode)
         if raw[3] < 255: regs.add(raw[3])
-        if opcode == 0x210:  # IADD3: src0=b3, src1=b4, src2=b8
+        if opcode in (0x210, 0x212, 0x810):  # IADD3/LOP3/IADD3.IMM: src0=b3, src1=b4, src2=b8
             if raw[4] < 255: regs.add(raw[4])
             if raw[8] < 255: regs.add(raw[8])
+        elif opcode in (0x207, 0x20b, 0x416, 0x216):  # SEL/FSETP/PRMT/PRMT.REG: src0=b3, src1=b4
+            if raw[4] < 255: regs.add(raw[4])
+            if opcode == 0x216 and raw[8] < 255: regs.add(raw[8])  # PRMT.REG also reads b8
         elif opcode == 0x235:  # IADD.64: src0=b3 pair, src1=b4 pair
             if raw[3] < 255: regs.add(raw[3]+1)
             if raw[4] < 255: regs |= {raw[4], raw[4]+1}
@@ -443,9 +452,10 @@ _OPCODE_MISC: dict[int, int] = {
     0x9a8: 4,   # ATOMG.{ADD|MIN|MAX|EXCH}.u32: misc=4 (global-memory category)
     0x9a3: 4,   # ATOMG.ADD.F32: misc=4 (global-memory category)
     0x992: 0,   # MEMBAR: misc=0 (control/fence instruction)
-    0xe29: 2,   # DADD R-R: misc=2 (ground truth decode_sass.py: b1=0x7e, src1 in b4)
-    0xc28: 2,   # DMUL: misc=2
-    0xc2b: 2,   # DFMA: misc=2
+    0x229: 2,   # DADD R-R: misc=2 (ptxas-verified: b1=0x72, src1 at b8)
+    0x228: 2,   # DMUL: misc=2
+    0x22b: 2,   # DFMA R-R: misc=2
+    0xc2b: 2,   # DFMA R-UR-UR: misc=2 (b1=0x7c form)
     0x22a: 2,   # DSETP: misc=2 (ptxas ground truth — all DSETP variants use 2)
     0xc35: 5,   # IADD.64-UR: misc=5 (wide ALU result)
     0xc0c: 0,   # ISETP R-UR: misc=0 (SM_120: misc 1-12 → wrong predicate; see
@@ -505,13 +515,11 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
     _WDEP_TO_RBAR = {
         0x31: 0x03,   # LDC/LDCU slot → rbar=0x03
         0x33: 0x05,   # LDS/LDCU.32 slot → rbar=0x05
-        0x35: 0x09,   # LDG first slot → rbar=0x09
-        0x37: 0x09,   # LDG second slot → rbar=0x09 (same as first — ptxas verified)
+        0x35: 0x09,   # LDG slot → rbar=0x09 (all LDGs share this slot, ptxas-verified)
         0x3e: 0x03,   # ALU → rbar=0x03
     }
 
     misc_counter = 0
-    ldg_count = 0
     _ldcu_slot_counter[0] = 0  # reset per kernel
     _ldc_slot_counter[0] = 0   # reset per kernel
     result = []
@@ -524,11 +532,12 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
         # Determine wdep for this instruction
         wdep = _wdep_for_opcode(opcode, si.raw)
 
-        # For second LDG, use a different slot
-        if opcode in _OPCODES_LDG:
-            ldg_count += 1
-            if ldg_count > 1:
-                wdep = 0x37
+        # All LDG instructions share wdep=0x35 (ptxas-verified: both LDG.E.64
+        # in dual-load patterns use wdep=0x35). The hardware scoreboard tracks
+        # the LAST write to a slot; consumer rbar=0x09 waits until the final
+        # LDG posting to slot 0x35 completes. FIFO ordering in the load pipeline
+        # guarantees earlier LDGs also complete. Using wdep=0x37 for the second
+        # LDG is WRONG — slot 0x37 has no rbar bit, so consumers never wait for it.
 
         # Determine rbar: check if any source register has a pending long-latency write
         rbar = 0x01  # default: no wait
@@ -558,7 +567,7 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
             data_reg = si.raw[4]
             if data_reg in pending_writes:
                 _, pw = pending_writes[data_reg]
-                if pw in (0x35, 0x37):
+                if pw == 0x35:
                     rbar = rbar | 0x09
 
         # ATOMG needs rbar=0x03 (memory ordering, same as STG)
@@ -606,10 +615,19 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
             candidate = _WDEP_TO_RBAR.get(pw, 0x01)
             rbar = rbar | candidate
 
-        # BAR.SYNC and EXIT get special ctrl
+        # BAR.SYNC: all threads synchronize, so all prior memory operations
+        # are guaranteed complete. Clear pending_writes so post-barrier
+        # instructions start with a clean scoreboard. Without this, stale
+        # pending_writes entries from pre-barrier LDG/LDC could cause
+        # post-barrier consumers to wait on already-resolved slots, or worse,
+        # confuse the scoreboard when a post-barrier LDG reuses slot 0x35
+        # that was tracked for a pre-barrier LDG.
         if opcode in _OPCODES_BAR:
             wdep = 0x3f
             rbar = 0x01
+            pending_writes.clear()
+            pending_ur_writes.clear()
+            pending_pred_writes.clear()
         if opcode == 0x94d:  # EXIT — always wdep=0x3f, misc=5 (ptxas-verified)
             # ptxas uses identical ctrl for both predicated and unconditional EXIT
             rbar = 0x01

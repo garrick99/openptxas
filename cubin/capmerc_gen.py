@@ -763,11 +763,10 @@ def analyze_sass_for_capmerc(sass_bytes: bytes) -> dict:
             for r in [dest, src0, src2]:
                 if r != 255 and r < 128 and r > max_reg:
                     max_reg = r
-        elif opcode == 0xc2b:
-            # DFMA R-R-UR-UR: b4=ur_src1 and b8=ur_src2 are UR indices, NOT GPRs.
-            # Only count dest (b2) and src0 (b3) as GPRs.
+        elif opcode == 0x22b:
+            # DFMA R-R-R-R (b1=0x72 form): dest=b2, src0=b3, src1=b4, src2=b8 — all GPRs.
             has_dfma = True
-            for r in [dest, src0]:
+            for r in [dest, src0, src1, src2]:
                 if r != 255 and r < 128 and r > max_reg:
                     max_reg = r
         else:

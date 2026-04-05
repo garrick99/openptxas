@@ -3148,38 +3148,51 @@ def encode_dadd(dest_lo: int, src0_lo: int, src1_lo: int,
                 negate_src0: bool = False, ctrl: int = 0) -> bytes:
     """Encode DADD (add.f64): dest = src0 + src1 (double precision).
 
-    R-R form: b1=0x7e, dest=b2, src0=b3, src1=b4, b11=0x08.
-    Ground truth (decode_sass.py): DADD R28, R26, R4 → 29 7e 1c 1a 04 00 00 00 00 00 00 08 00 64 3e 00
-    Note: earlier probe (DADD R2,R4,R2 → 29 72 ...) was wrong — that was a different instruction.
+    R-R form: b1=0x72, dest=b2, src0=b3, src1=b8.
+    ptxas ground truth (SM_120, 2026-04-04):
+      DADD R2, R4, R6 -> 29 72 02 04 00 00 00 00 06 00 00 00 ...
+    The b1=0x7e form puts src1 at b4 but hardware reads from b8, producing
+    garbage (b8=0 -> DADD returns src0+0). The b1=0x72 form is correct.
 
     negate_src0: If True, compute dest = -src0 + src1 (i.e. sub.f64 with swapped ops).
     Negation bit b9=0x01 inferred from FADD negation pattern (same ISA family).
     """
     if ctrl == 0: ctrl = _CTRL_DEFAULT
-    return _build(0x29, 0x7e,
-                  b2=dest_lo, b3=src0_lo, b4=src1_lo,
-                  b8=0x00,
+    return _build(0x29, 0x72,
+                  b2=dest_lo, b3=src0_lo, b4=0x00,
+                  b8=src1_lo,
                   b9=0x01 if negate_src0 else 0x00,
-                  b10=0x00, b11=0x08,
+                  b10=0x00, b11=0x00,
                   ctrl=ctrl)
 
 
 def encode_dmul(dest_lo: int, src0_lo: int, src1_lo: int, ctrl: int = 0) -> bytes:
-    """Encode DMUL (mul.f64): dest = src0 * src1 (double precision)."""
+    """Encode DMUL (mul.f64): dest = src0 * src1 (double precision).
+
+    ptxas ground truth (SM_120, 2026-04-04):
+      DMUL R2, R4, R6 -> 28 72 02 04 06 00 00 00 00 00 00 00 ...
+    b1=0x72, src0=b3, src1=b4, b11=0x00. The b1=0x7c form (opcode 0xc28)
+    with b11=0x08 produces wrong results on hardware.
+    """
     if ctrl == 0: ctrl = _CTRL_DEFAULT
-    return _build(0x28, 0x7c,
+    return _build(0x28, 0x72,
                   b2=dest_lo, b3=src0_lo, b4=src1_lo,
-                  b8=0x00, b9=0x00, b10=0x00, b11=0x08,
+                  b8=0x00, b9=0x00, b10=0x00, b11=0x00,
                   ctrl=ctrl)
 
 
 def encode_dfma(dest_lo: int, src0_lo: int, src1_lo: int, src2_lo: int,
                 ctrl: int = 0) -> bytes:
-    """Encode DFMA (fma.rn.f64): dest = src0 * src1 + src2 (double precision FMA)."""
+    """Encode DFMA (fma.rn.f64): dest = src0 * src1 + src2 (double precision FMA).
+
+    ptxas ground truth (SM_120, 2026-04-04):
+      DFMA R2, R4, R6, R8 -> 2b 72 02 04 06 00 00 00 08 00 00 00 ...
+    b1=0x72, src0=b3, src1=b4, src2=b8, b11=0x00.
+    """
     if ctrl == 0: ctrl = _CTRL_DEFAULT
-    return _build(0x2b, 0x7c,
+    return _build(0x2b, 0x72,
                   b2=dest_lo, b3=src0_lo, b4=src1_lo,
-                  b8=src2_lo, b9=0x00, b10=0x00, b11=0x08,
+                  b8=src2_lo, b9=0x00, b10=0x00, b11=0x00,
                   ctrl=ctrl)
 
 

@@ -214,6 +214,17 @@ class BasicBlock:
 
 
 @dataclass
+@dataclass
+class SharedDecl:
+    """A .shared variable declaration."""
+    name:      str
+    align:     int   # alignment in bytes
+    elem_type: str   # e.g. 'b32', 'b8', 'f32'
+    count:     int   # number of elements
+    size:      int   # total size in bytes (elem_size * count)
+
+
+@dataclass
 class Function:
     """A PTX kernel (.entry) or device function (.func)."""
     name:      str
@@ -221,6 +232,7 @@ class Function:
     params:    list[ParamDecl]       = field(default_factory=list)
     reg_decls: list[RegDecl]         = field(default_factory=list)
     blocks:    list[BasicBlock]      = field(default_factory=list)
+    shared_decls: list[SharedDecl]   = field(default_factory=list)
 
     def all_instructions(self):
         for bb in self.blocks:

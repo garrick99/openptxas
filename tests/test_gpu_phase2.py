@@ -709,8 +709,6 @@ _PTX_ATOM_CAS64 = """
 
 class TestAtomCas64:
     @gpu
-    @pytest.mark.skip(reason="CAS.b64 encoder is correct (ptxas-verified) but requires "
-                             "LDC.64 for non-pointer u64 params (pipeline limitation)")
     def test_atom_cas64_success(self, cuda_ctx):
         """atom.global.cas.b64: successful CAS returns old value and updates."""
         cubins = _compile(_PTX_ATOM_CAS64)
@@ -746,8 +744,6 @@ class TestAtomCas64:
             cuda_ctx.free(d_out)
 
     @gpu
-    @pytest.mark.skip(reason="CAS.b64 encoder is correct (ptxas-verified) but requires "
-                             "LDC.64 for non-pointer u64 params (pipeline limitation)")
     def test_atom_cas64_fail(self, cuda_ctx):
         """atom.global.cas.b64: failed CAS (mismatch) leaves memory unchanged."""
         cubins = _compile(_PTX_ATOM_CAS64)

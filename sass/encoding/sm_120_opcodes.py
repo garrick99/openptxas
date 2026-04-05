@@ -1135,6 +1135,56 @@ def encode_lds(dest: int, ur_addr: int, offset: int, ctrl: int = 0) -> bytes:
     return bytes(raw)
 
 
+def encode_lds_r(dest: int, ur_addr: int, addr_reg: int, offset: int = 0, ctrl: int = 0) -> bytes:
+    """Encode LDS dest, [UR_addr + addr_reg + offset] (32-bit shared load, GPR-addressed)."""
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0x84
+    raw[1] = 0x79
+    raw[2] = dest & 0xFF
+    raw[3] = addr_reg & 0xFF
+    raw[4] = ur_addr & 0xFF
+    raw[5] = offset & 0xFF
+    raw[6] = (offset >> 8) & 0xFF
+    raw[7] = 0x00
+    raw[8] = 0x00
+    raw[9] = 0x08
+    raw[10] = 0x00
+    raw[11] = 0x08
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+def encode_sts_r(ur_addr: int, addr_reg: int, data_reg: int, offset: int = 0, ctrl: int = 0) -> bytes:
+    """Encode STS [UR_addr + addr_reg + offset], data_reg (32-bit shared store, GPR-addressed)."""
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0x88
+    raw[1] = 0x79
+    raw[2] = 0x00
+    raw[3] = addr_reg & 0xFF
+    raw[4] = data_reg & 0xFF
+    raw[5] = offset & 0xFF
+    raw[6] = (offset >> 8) & 0xFF
+    raw[7] = 0x00
+    raw[8] = ur_addr & 0xFF
+    raw[9] = 0x08
+    raw[10] = 0x00
+    raw[11] = 0x08
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
 def encode_bar_sync(barrier_id: int = 0, ctrl: int = 0) -> bytes:
     """Encode BAR.SYNC barrier_id (thread barrier synchronization)."""
     if ctrl == 0:

@@ -563,6 +563,16 @@ def compile_function(fn: Function, verbose: bool = False,
     # SM_120: capmerc byte[10] fix (0x81→0x01, 0xc1→0x01) unlocks R12+.
     # Verified 2026-04-01 (commit 8d516ca).
     ctx._gpr_limit = 255
+
+    # Compute shared memory variable offsets for isel
+    ctx._smem_offsets = {}
+    if hasattr(fn, 'shared_decls') and fn.shared_decls:
+        offset = 0
+        for sd in fn.shared_decls:
+            offset = (offset + sd.align - 1) & ~(sd.align - 1)
+            ctx._smem_offsets[sd.name] = offset
+            offset += sd.size
+
     body_instrs = select_function(fn, ctx)
 
     # SM_120 requires at least one S2R before LDCU param loads.
@@ -853,6 +863,16 @@ def compile_function(fn: Function, verbose: bool = False,
     if verbose:
         print(f"[pipeline] final num_gprs: alloc={alloc.num_gprs} ctx._next_gpr={ctx._next_gpr} "
               f"highwater={getattr(ctx, '_scratch_highwater', 0)} -> {_final_gprs}")
+    # Compute shared memory size from declarations
+    smem_size = 0
+    if hasattr(fn, 'shared_decls') and fn.shared_decls:
+        offset = 0
+        for sd in fn.shared_decls:
+            # Align offset to declaration alignment
+            offset = (offset + sd.align - 1) & ~(sd.align - 1)
+            offset += sd.size
+        smem_size = offset
+
     desc = KernelDesc(
         name=fn.name,
         sass_bytes=sass_bytes,
@@ -864,6 +884,7 @@ def compile_function(fn: Function, verbose: bool = False,
         const0_init_data=const0_init,
         exit_offset=exit_offset,
         s2r_offset=s2r_offset,
+        smem_size=smem_size,
         # Pass ptxas capmerc to emitter for ELF section sizing — UNLESS our kernel
         # needs more GPRs than ptxas's (high-register kernel). In that case use
         # None so the emitter calls build_capmerc_from_sass with 0x2000 capability

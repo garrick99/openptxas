@@ -20,7 +20,7 @@ except ImportError:
 from .ir import (
     Module, Function, BasicBlock, Instruction, RegDecl, ParamDecl,
     TypeSpec, RegOp, ImmOp, LabelOp, MemOp, ConstBankOp, FpImmOp,
-    Operand, ScalarKind,
+    Operand, ScalarKind, SharedDecl,
 )
 
 # ---------------------------------------------------------------------------
@@ -367,9 +367,10 @@ class _Parser:
             return Function(name=name, is_kernel=is_kernel, params=params)
 
         if self._peek() and self._peek().value == "{":
-            reg_decls, blocks = self._parse_func_body()
+            reg_decls, blocks, shared_decls = self._parse_func_body()
             return Function(name=name, is_kernel=is_kernel, params=params,
-                            reg_decls=reg_decls, blocks=blocks)
+                            reg_decls=reg_decls, blocks=blocks,
+                            shared_decls=shared_decls)
 
         return Function(name=name, is_kernel=is_kernel, params=params)
 
@@ -433,9 +434,10 @@ class _Parser:
         except ValueError:
             return None
 
-    def _parse_func_body(self) -> tuple[list[RegDecl], list[BasicBlock]]:
+    def _parse_func_body(self) -> tuple[list[RegDecl], list[BasicBlock], list]:
         self._expect("PUNCT", "{")
         reg_decls: list[RegDecl]   = []
+        shared_decls: list         = []
         blocks:    list[BasicBlock] = []
         current_block = BasicBlock(label=None)
         blocks.append(current_block)
@@ -455,7 +457,14 @@ class _Parser:
                     reg_decls.extend(rds)
                 continue
 
-            # .local / .shared / other body-level directives
+            # .shared declaration: .shared .align N .bNN name[COUNT]
+            if tok.kind == "IDENT" and tok.value == ".shared":
+                sdecl = self._parse_shared_decl()
+                if sdecl:
+                    shared_decls.append(sdecl)
+                continue
+
+            # .local / other body-level directives
             if tok.kind == "IDENT" and tok.value.startswith("."):
                 self._consume_to_semicolon()
                 continue
@@ -476,7 +485,38 @@ class _Parser:
 
         # Drop empty leading block with no label
         blocks = [b for b in blocks if b.label or b.instructions]
-        return reg_decls, blocks
+        return reg_decls, blocks, shared_decls
+
+    def _parse_shared_decl(self) -> Optional[SharedDecl]:
+        """Parse .shared .align N .bNN name[COUNT]; declaration."""
+        self._expect("IDENT", ".shared")
+        align = 4  # default alignment
+        if self._peek() and self._peek().value == ".align":
+            self._advance()
+            align_tok = self._expect("INT")
+            align = int(align_tok.value)
+        # Type: .b32, .b8, .f32, etc.
+        type_spec = self._parse_type_spec()
+        if type_spec is None:
+            self._consume_to_semicolon()
+            return None
+        # Name and optional [COUNT]
+        tok = self._peek()
+        if tok is None:
+            self._consume_to_semicolon()
+            return None
+        name = tok.value
+        self._advance()
+        count = 1
+        if self._match("PUNCT", "["):
+            count_tok = self._expect("INT")
+            count = int(count_tok.value)
+            self._expect("PUNCT", "]")
+        self._match("PUNCT", ";")
+        elem_size = type_spec.width // 8
+        total_size = elem_size * count
+        return SharedDecl(name=name, align=align,
+                         elem_type=str(type_spec), count=count, size=total_size)
 
     def _parse_reg_decl(self) -> Optional[list]:
         """Parse a .reg declaration, returning a list of RegDecl (handles comma lists)."""

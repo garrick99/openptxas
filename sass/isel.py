@@ -44,7 +44,7 @@ from sass.encoding.sm_120_opcodes import (
     encode_s2ur,
     encode_ldg_e, encode_ldg_e_64,
     encode_stg_e, encode_stg_e_64,
-    encode_lds, encode_sts,
+    encode_lds, encode_sts, encode_lds_r, encode_sts_r,
     encode_ldcu_64, encode_ldcu_32,
     encode_iadd64_ur,
     encode_bar_sync,
@@ -525,6 +525,36 @@ def _select_add_u64(instr: Instruction, ra: RegAlloc,
 
     # Handle immediate operand: add.u64 dest, a, imm  (e.g. loop counter increment by 1)
     if isinstance(b, ImmOp) and isinstance(dest, RegOp) and isinstance(a, RegOp):
+        # If 'a' is in UR space (loaded via LDCU.64), must materialize first
+        a_in_ur = ctx and a.name in ctx._ur_params
+        if a_in_ur:
+            ur_idx = ctx._ur_params[a.name]
+            d_lo = ra.lo(dest.name)
+            limit = getattr(ctx, '_gpr_limit', _GPR_HARD_LIMIT_DEFAULT)
+            if d_lo >= limit:
+                if not hasattr(ctx, '_addr_scratch'):
+                    ctx._addr_scratch = 10
+                d_lo = ctx._addr_scratch
+                ra.int_regs[dest.name] = d_lo
+            if ctx:
+                ctx._gpr_written.add(dest.name)
+            if b.value == 0:
+                # add.u64 dest, ur_param, 0 → just materialize UR to GPR
+                return [
+                    SassInstr(encode_iadd64_ur(d_lo, RZ, ur_idx),
+                              f'IADD.64 R{d_lo}, RZ, UR{ur_idx}  // add.u64 imm0 (UR->GPR)'),
+                ]
+            else:
+                # Materialize UR→GPR, then add immediate
+                imm_lo = b.value & 0xFFFFFFFF
+                return [
+                    SassInstr(encode_iadd64_ur(d_lo, RZ, ur_idx),
+                              f'IADD.64 R{d_lo}, RZ, UR{ur_idx}  // materialize UR->GPR'),
+                    SassInstr(encode_iadd3_imm32(d_lo, d_lo, imm_lo, RZ),
+                              f'IADD3.IMM R{d_lo}, R{d_lo}, {imm_lo:#x}, RZ  // add.u64 lo imm'),
+                    SassInstr(encode_iadd3x(d_lo + 1, d_lo + 1, RZ, RZ),
+                              f'IADD3.X R{d_lo+1}, R{d_lo+1}, RZ, RZ  // add.u64 hi carry'),
+                ]
         d_lo = ra.lo(dest.name)
         a_lo = ra.lo(a.name)
         imm_lo = b.value & 0xFFFFFFFF
@@ -1526,19 +1556,42 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     from ptx.ir import MemOp
                     addr_op = instr.srcs[0]
                     data_op = instr.srcs[1]
-                    offset = addr_op.offset if isinstance(addr_op, MemOp) else 0
                     data_r = ctx.ra.r32(data_op.name) if isinstance(data_op, RegOp) else RZ
-                    # UR4 is the smem base on Blackwell
-                    output.append(SassInstr(encode_sts(4, offset, data_r),
-                                            f'STS [UR4+{offset:#x}], R{data_r}  // st.shared'))
+                    if isinstance(addr_op, MemOp):
+                        offset = addr_op.offset
+                        base = addr_op.base
+                        # Check if base is a register (starts with %) → GPR-addressed
+                        if base.startswith('%') and base in ctx.ra.int_regs:
+                            addr_r = ctx.ra.r32(base)
+                            output.append(SassInstr(encode_sts_r(4, addr_r, data_r, offset),
+                                f'STS [UR4+R{addr_r}+{offset:#x}], R{data_r}  // st.shared'))
+                        else:
+                            # Shared variable name or fixed offset → immediate-only
+                            smem_off = ctx._smem_offsets.get(base, 0) + offset if hasattr(ctx, '_smem_offsets') else offset
+                            output.append(SassInstr(encode_sts(4, smem_off, data_r),
+                                f'STS [UR4+{smem_off:#x}], R{data_r}  // st.shared'))
+                    else:
+                        output.append(SassInstr(encode_sts(4, 0, data_r),
+                                                f'STS [UR4+0x0], R{data_r}  // st.shared'))
 
                 elif op == 'ld' and 'shared' in instr.types:
                     from ptx.ir import MemOp
                     dest_r = ctx.ra.r32(instr.dest.name)
                     addr_op = instr.srcs[0]
-                    offset = addr_op.offset if isinstance(addr_op, MemOp) else 0
-                    output.append(SassInstr(encode_lds(dest_r, 4, offset),
-                                            f'LDS R{dest_r}, [UR4+{offset:#x}]  // ld.shared'))
+                    if isinstance(addr_op, MemOp):
+                        offset = addr_op.offset
+                        base = addr_op.base
+                        if base.startswith('%') and base in ctx.ra.int_regs:
+                            addr_r = ctx.ra.r32(base)
+                            output.append(SassInstr(encode_lds_r(dest_r, 4, addr_r, offset),
+                                f'LDS R{dest_r}, [UR4+R{addr_r}+{offset:#x}]  // ld.shared'))
+                        else:
+                            smem_off = ctx._smem_offsets.get(base, 0) + offset if hasattr(ctx, '_smem_offsets') else offset
+                            output.append(SassInstr(encode_lds(dest_r, 4, smem_off),
+                                f'LDS R{dest_r}, [UR4+{smem_off:#x}]  // ld.shared'))
+                    else:
+                        output.append(SassInstr(encode_lds(dest_r, 4, 0),
+                                                f'LDS R{dest_r}, [UR4+0x0]  // ld.shared'))
 
                 elif op == 'bar':
                     output.append(SassInstr(encode_bar_sync(0),

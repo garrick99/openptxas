@@ -275,15 +275,13 @@ def section_stats():
     openptxas_tests = 398
     opencuda_tests = 31631
     forge_demos = 1042
-    vortex_tests = 326
 
-    total_tests = openptxas_tests + opencuda_tests + forge_demos + vortex_tests
+    total_tests = openptxas_tests + opencuda_tests + forge_demos
 
     print_boot_line(OK, "OpenPTXas tests",           f"{openptxas_tests:,}")
     print_boot_line(OK, "OpenCUDA tests",            f"{opencuda_tests:,}")
     print_boot_line(OK, "FORGE verified demos",      f"{forge_demos:,}")
-    print_boot_line(OK, "VortexSTARK tests",         f"{vortex_tests:,}")
-    print_boot_line(OK, "Total regression coverage", f"{total_tests:,} tests")
+    print_boot_line(OK, "Total toolchain coverage",  f"{total_tests:,} tests")
     print()
 
 

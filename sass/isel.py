@@ -93,6 +93,12 @@ from sass.encoding.sm_120_opcodes import (
     SR_CTAID_X, SR_CTAID_Y, SR_CTAID_Z,
     SR_NTID_X, SR_NTID_Y, SR_NTID_Z,
     SR_NCTAID_X, SR_NCTAID_Y, SR_NCTAID_Z,
+    encode_tex, encode_tld_lz, encode_tld4, encode_txq,
+    encode_suld, encode_sust,
+    TEX_DIM_1D, TEX_DIM_2D, TEX_DIM_3D,
+    SURF_DIM_1D, SURF_DIM_2D,
+    SURF_MODE_B32, SURF_MODE_B64,
+    TXQ_WIDTH, TXQ_HEIGHT, TXQ_DEPTH,
 )
 from sass.encoding.sm_120_encode import (
     encode_shf_l_w_u32_hi,
@@ -1136,6 +1142,225 @@ class ISelContext:
             offset = self._const_pool_base + len(self._const_pool) * 4
             self._const_pool[value] = offset
         return self._const_pool[value]
+
+
+# ---------------------------------------------------------------------------
+# Texture/surface instruction selectors
+# ---------------------------------------------------------------------------
+
+def _select_tex(instr: 'Instruction', ctx: 'ISelContext') -> list[SassInstr]:
+    """Select TEX or TLD.LZ for PTX tex.* instructions.
+
+    PTX syntax: tex.{1d|2d|3d}.v4.{f32|u32|s32}.{s32|f32} {d0,d1,d2,d3}, [tex_desc, {coords}]
+    For 1D integer coords → TLD.LZ (level-zero fetch)
+    For 2D/3D float coords → TEX
+    """
+    from ptx.ir import MemOp
+    result = []
+
+    # Determine dimension from types
+    dim_str = '1d'
+    for t in instr.types:
+        if t in ('1d', '2d', '3d'):
+            dim_str = t
+            break
+
+    # Dest is the first register in the vector (parser extracts first from {})
+    d = _get_reg(instr.dest, ctx.ra) if instr.dest else _alloc_gpr(ctx)
+
+    # Source: texture descriptor (UR) and coordinate register
+    # The parser gives us srcs[0] as MemOp (the [tex_desc, {coord}] part)
+    # Since the parser consumed the coordinate vector inside the brackets,
+    # the MemOp base is the texture descriptor register.
+    # For bindless textures, the descriptor is a u64 in a UR pair.
+    # We need the UR register allocated for the texture param.
+
+    # Get the texture descriptor UR from the source memory operand
+    coord = d  # Default: coord collocated with dest (ptxas pattern)
+    ur_desc = 4  # Default UR4 (standard texture descriptor slot)
+
+    if instr.srcs:
+        src = instr.srcs[0]
+        if isinstance(src, MemOp):
+            # base is the texture descriptor register name
+            name = src.base
+            if name in ctx._ur_params:
+                ur_desc = ctx._ur_params[name]
+            elif name in ctx.ra.int_regs:
+                # Texture descriptor loaded into a GPR — need to copy to UR
+                ur_desc = 4  # Use UR4 as default slot
+        elif isinstance(src, RegOp):
+            name = src.name
+            if name in ctx._ur_params:
+                ur_desc = ctx._ur_params[name]
+
+    # For 1D with integer coords → TLD.LZ
+    if dim_str == '1d':
+        mask = 0x0f  # Default RGBA
+        # Check if we only use 1 component (optimization)
+        result.append(SassInstr(
+            encode_tld_lz(d, d, ur_desc, mask=mask),
+            f'TLD.LZ R{d}, R{d}, UR{ur_desc}, 1D  // tex.1d'))
+    elif dim_str == '2d':
+        mask = 0x0f
+        result.append(SassInstr(
+            encode_tex(d, d, ur_desc, TEX_DIM_2D, mask=mask),
+            f'TEX R{d}, R{d}, UR{ur_desc}, 2D  // tex.2d'))
+    elif dim_str == '3d':
+        mask = 0x0f
+        result.append(SassInstr(
+            encode_tex(d, d, ur_desc, TEX_DIM_3D, mask=mask),
+            f'TEX R{d}, R{d}, UR{ur_desc}, 3D  // tex.3d'))
+
+    return result
+
+
+def _select_tld4(instr: 'Instruction', ctx: 'ISelContext') -> list[SassInstr]:
+    """Select TLD4.R for PTX tld4.* instructions.
+
+    PTX syntax: tld4.{r|g|b|a}.2d.v4.f32.f32 {d0,d1,d2,d3}, [tex_desc, {cx, cy}]
+    """
+    from ptx.ir import MemOp
+    result = []
+
+    d = _get_reg(instr.dest, ctx.ra) if instr.dest else _alloc_gpr(ctx)
+    ur_desc = 4
+
+    if instr.srcs:
+        src = instr.srcs[0]
+        if isinstance(src, MemOp):
+            name = src.base
+            if name in ctx._ur_params:
+                ur_desc = ctx._ur_params[name]
+
+    # TLD4 always returns 4 values; dest_hi = dest+2
+    dest_hi = (d + 2) & 0xFF
+    result.append(SassInstr(
+        encode_tld4(d, d, ur_desc, dest_hi=dest_hi),
+        f'TLD4.R R{d}, R{d}, UR{ur_desc}, 2D  // tld4'))
+
+    return result
+
+
+def _select_txq(instr: 'Instruction', ctx: 'ISelContext') -> list[SassInstr]:
+    """Select TXQ for PTX txq.* instructions.
+
+    PTX syntax: txq.{width|height|depth}.b32 %r, [tex_desc]
+    """
+    from ptx.ir import MemOp
+    result = []
+
+    d = _get_reg(instr.dest, ctx.ra) if instr.dest else _alloc_gpr(ctx)
+    ur_desc = 4
+
+    # Determine query type from modifiers
+    query = TXQ_WIDTH  # default
+    for t in instr.types:
+        if t == 'width':
+            query = TXQ_WIDTH
+        elif t == 'height':
+            query = TXQ_HEIGHT
+        elif t == 'depth':
+            query = TXQ_DEPTH
+
+    if instr.srcs:
+        src = instr.srcs[0]
+        if isinstance(src, MemOp):
+            name = src.base
+            if name in ctx._ur_params:
+                ur_desc = ctx._ur_params[name]
+
+    query_name = {TXQ_WIDTH: 'width', TXQ_HEIGHT: 'height', TXQ_DEPTH: 'depth'}[query]
+    result.append(SassInstr(
+        encode_txq(d, ur_desc, query),
+        f'TXQ R{d}, UR{ur_desc}, {query_name}  // txq'))
+
+    return result
+
+
+def _select_suld(instr: 'Instruction', ctx: 'ISelContext') -> list[SassInstr]:
+    """Select SULD for PTX suld.* instructions.
+
+    PTX syntax: suld.b.{1d|2d}.{b32|v2.b32}.trap {d}, [surf_desc, {coord}]
+    """
+    from ptx.ir import MemOp
+    result = []
+
+    d = _get_reg(instr.dest, ctx.ra) if instr.dest else _alloc_gpr(ctx)
+    ur_desc = 4
+
+    # Dimension
+    dim = SURF_DIM_1D
+    for t in instr.types:
+        if t == '2d':
+            dim = SURF_DIM_2D
+
+    # Data width
+    mode = SURF_MODE_B32
+    if 'v2' in instr.types:
+        mode = SURF_MODE_B64
+
+    if instr.srcs:
+        src = instr.srcs[0]
+        if isinstance(src, MemOp):
+            name = src.base
+            if name in ctx._ur_params:
+                ur_desc = ctx._ur_params[name]
+
+    dim_name = '1D' if dim == SURF_DIM_1D else '2D'
+    mode_name = 'b32' if mode == SURF_MODE_B32 else 'b64'
+    result.append(SassInstr(
+        encode_suld(d, d, ur_desc, dim, mode),
+        f'SULD R{d}, [R{d}], UR{ur_desc}, {dim_name}, {mode_name}  // suld'))
+
+    return result
+
+
+def _select_sust(instr: 'Instruction', ctx: 'ISelContext') -> list[SassInstr]:
+    """Select SUST for PTX sust.* instructions.
+
+    PTX syntax: sust.b.{1d|2d}.{b32|v2.b32}.trap [surf_desc, {coord}], {data}
+    """
+    from ptx.ir import MemOp
+    result = []
+
+    ur_desc = 4
+
+    # Dimension
+    dim = SURF_DIM_1D
+    for t in instr.types:
+        if t == '2d':
+            dim = SURF_DIM_2D
+
+    # Data width
+    mode = SURF_MODE_B32
+    if 'v2' in instr.types:
+        mode = SURF_MODE_B64
+
+    # srcs[0] = MemOp (surface descriptor + coord)
+    # srcs[1] = RegOp (data register)
+    coord = 0
+    data = 0
+
+    if len(instr.srcs) >= 1:
+        src = instr.srcs[0]
+        if isinstance(src, MemOp):
+            name = src.base
+            if name in ctx._ur_params:
+                ur_desc = ctx._ur_params[name]
+            elif name in ctx.ra.int_regs:
+                coord = ctx.ra.int_regs[name]
+
+    if len(instr.srcs) >= 2:
+        data = _get_reg(instr.srcs[1], ctx.ra)
+
+    dim_name = '1D' if dim == SURF_DIM_1D else '2D'
+    mode_name = 'b32' if mode == SURF_MODE_B32 else 'b64'
+    result.append(SassInstr(
+        encode_sust(data, coord, ur_desc, dim, mode),
+        f'SUST [R{coord}], R{data}, UR{ur_desc}, {dim_name}, {mode_name}  // sust'))
+
+    return result
 
 
 def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
@@ -3443,6 +3668,24 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     output.append(SassInstr(
                         encode_lop3(d, t1, t2, RZ, LOP3_OR),
                         f'LOP3.LUT R{d}, R{t1}, R{t2}, RZ, 0xFC  // bfi insert'))
+
+                # ---------------------------------------------------------------
+                # Texture/surface instructions
+                # ---------------------------------------------------------------
+                elif op == 'tex':
+                    output.extend(_select_tex(instr, ctx))
+
+                elif op == 'tld4':
+                    output.extend(_select_tld4(instr, ctx))
+
+                elif op == 'txq':
+                    output.extend(_select_txq(instr, ctx))
+
+                elif op == 'suld':
+                    output.extend(_select_suld(instr, ctx))
+
+                elif op == 'sust':
+                    output.extend(_select_sust(instr, ctx))
 
                 else:
                     # Unrecognized PTX instruction — emit NOP placeholder

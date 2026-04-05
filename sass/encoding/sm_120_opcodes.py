@@ -5521,3 +5521,344 @@ def encode_flo_sh(dest: int, src: int, ctrl: int = 0) -> bytes:
                   b2=dest & 0xFF, b3=0x00, b4=src & 0xFF,
                   b8=0x00, b9=0x04, b10=0x0e, b11=0x00,
                   ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# Internal helper for texture/surface instructions
+# ---------------------------------------------------------------------------
+# These instructions use bytes 5-7 (which _build always zeros).
+# b5 = UR descriptor register low index
+# b6 = UR descriptor register high (0xff = URZ for paired ops)
+# b7 = dimension / flags byte
+
+def _build_tex(b0: int, b1: int,
+               b2: int, b3: int, b4: int,
+               b5: int, b6: int, b7: int,
+               b8: int,
+               b9: int, b10: int, b11: int,
+               ctrl: int) -> bytes:
+    """
+    16-byte instruction builder for texture/surface ops.
+    Unlike _build(), does NOT zero bytes 5-7.
+    """
+    b13, b14, b15_ctrl = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0]  = b0
+    raw[1]  = b1
+    raw[2]  = b2 & 0xFF
+    raw[3]  = b3 & 0xFF
+    raw[4]  = b4 & 0xFF
+    raw[5]  = b5 & 0xFF
+    raw[6]  = b6 & 0xFF
+    raw[7]  = b7 & 0xFF
+    raw[8]  = b8 & 0xFF
+    raw[9]  = b9 & 0xFF
+    raw[10] = b10 & 0xFF
+    raw[11] = b11 & 0xFF
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15_ctrl
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# Texture/Surface dimension constants
+# ---------------------------------------------------------------------------
+
+TEX_DIM_1D = 0x00
+TEX_DIM_2D = 0x20
+TEX_DIM_3D = 0x40
+
+SURF_DIM_1D = 0x10
+SURF_DIM_2D = 0x70
+
+# SULD/SUST mode byte (b9) — encodes data width and access pattern
+SURF_MODE_B32 = 0xa9    # .b32 (32-bit per element)
+SURF_MODE_B64 = 0xab    # .v2.b32 / 64-bit per element
+
+# TXQ query type codes (b9)
+TXQ_WIDTH  = 0x01
+TXQ_HEIGHT = 0x02
+TXQ_DEPTH  = 0x03
+
+
+# ---------------------------------------------------------------------------
+# TEX — Texture Fetch (opcode 0xf60)
+# ---------------------------------------------------------------------------
+# SASS: TEX RZ, Rcoord, Rcoord, URdesc, {2D|3D}, mask
+#
+# Encoding (128-bit):
+#   b[0:1]  = 0x60, 0x7f  (opcode 0xf60, pred=PT)
+#   b[2]    = dest_base (result register base)
+#   b[3]    = coord_base (coordinate register base)
+#   b[4]    = 0xff (RZ — unused source slot)
+#   b[5]    = UR desc register low (e.g. 4 for UR4)
+#   b[6]    = 0xff (UR companion, always URZ)
+#   b[7]    = dimension: 0x20=2D, 0x40=3D
+#   b[8]    = 0xff (dest report register, typically RZ)
+#   b[9]    = component mask (0x01=R, 0x03=RG, 0x07=RGB, 0x0f=RGBA)
+#   b[10]   = 0x1e (fixed)
+#   b[11]   = 0x08 (fixed)
+#
+# Ground truth:
+#   TEX RZ, R4, R4, UR4, 2D, 0x3 → 0x20ff04ff04047f60 | 0x00116c00081e03ff
+#   TEX RZ, R5, R4, UR4, 3D, 0x1 → 0x40ff04ff04057f60 | 0x00116c00081e01ff
+
+def encode_tex(dest: int, coord: int, ur_desc: int, dim: int,
+               mask: int = 0x0f, ctrl: int = 0) -> bytes:
+    """Encode TEX dest, coord, ur_desc, dim, mask.
+
+    Args:
+        dest:    Result register base (results in dest..dest+popcount(mask)-1).
+        coord:   Coordinate register base (1 reg for 2D, 2 regs for 3D).
+        ur_desc: Uniform register holding texture descriptor (e.g. 4 for UR4).
+        dim:     TEX_DIM_2D or TEX_DIM_3D.
+        mask:    Component mask (0x01=R, 0x03=RG, 0x0f=RGBA).
+        ctrl:    23-bit scheduling control word.
+
+    Ground truth:
+        encode_tex(4, 4, 4, TEX_DIM_2D, 0x03, ctrl=0x0008b6)
+            → bytes.fromhex('607f0404ff04ff20ff031e0800 ...')
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    return _build_tex(0x60, 0x7f,
+                      b2=dest, b3=coord, b4=RZ,
+                      b5=ur_desc, b6=RZ, b7=dim,
+                      b8=RZ,
+                      b9=mask, b10=0x1e, b11=0x08,
+                      ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# TLD.LZ — Texture Load, Level Zero (opcode 0xf66)
+# ---------------------------------------------------------------------------
+# SASS: TLD.LZ {RZ|Rdest_hi}, Rdest, Rcoord, URdesc, 1D, {mask}
+#
+# Used for tex.1d with integer coordinates (tex1Dfetch).
+# The ".LZ" means level-zero (no LOD calculation).
+#
+# Encoding:
+#   b[0:1]  = 0x66, 0x7f  (opcode 0xf66, pred=PT)
+#   b[2]    = dest_base
+#   b[3]    = coord_base (same as dest_base when ptxas coalesces)
+#   b[4]    = 0xff (RZ)
+#   b[5]    = UR desc register low
+#   b[6]    = 0xff (URZ)
+#   b[7]    = 0x00 (1D)
+#   b[8]    = dest report reg (RZ=0xff when <4 results, actual reg when 4)
+#   b[9]    = component mask
+#   b[10]   = 0x1e (fixed)
+#   b[11]   = 0x08 (fixed)
+#
+# Ground truth:
+#   TLD.LZ RZ, R5, R5, UR4, 1D, 0x1 → 0x00ff04ff05057f66 | 0x00116800081e01ff
+#   TLD.LZ R6, R4, R4, UR4, 1D      → 0x00ff04ff04047f66 | 0x00116800081e0f06
+
+def encode_tld_lz(dest: int, coord: int, ur_desc: int,
+                  mask: int = 0x0f, dest_hi: int = RZ, ctrl: int = 0) -> bytes:
+    """Encode TLD.LZ dest, coord, ur_desc, 1D, mask.
+
+    Args:
+        dest:    Result register base.
+        coord:   Coordinate register (integer, single reg for 1D).
+        ur_desc: Uniform register holding texture descriptor.
+        mask:    Component mask (0x01=R, 0x0f=RGBA).
+        dest_hi: High dest report register (RZ if <4 components used).
+        ctrl:    23-bit scheduling control word.
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    return _build_tex(0x66, 0x7f,
+                      b2=dest, b3=coord, b4=RZ,
+                      b5=ur_desc, b6=RZ, b7=TEX_DIM_1D,
+                      b8=dest_hi,
+                      b9=mask, b10=0x1e, b11=0x08,
+                      ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# TLD4.R — Texture Gather (opcode 0xf63)
+# ---------------------------------------------------------------------------
+# SASS: TLD4.R Rdest_hi, Rcoord, Rdest, URdesc, 2D
+#
+# Gathers 4 texels from a 2D texture at fractional coordinates.
+# Always returns 4 values (the component specified by .R/.G/.B/.A from
+# each of the 4 neighboring texels).
+#
+# Encoding:
+#   b[0:1]  = 0x63, 0x7f  (opcode 0xf63, pred=PT)
+#   b[2]    = dest_base (result regs dest..dest+3)
+#   b[3]    = coord_base (float coords in coord, coord+1)
+#   b[4]    = 0xff (RZ)
+#   b[5]    = UR desc register low
+#   b[6]    = 0xff (URZ)
+#   b[7]    = 0x20 (2D — TLD4 is always 2D)
+#   b[8]    = dest report reg (actual reg for 4-component gather)
+#   b[9]    = 0x0f (always full 4-component mask for gather)
+#   b[10]   = 0x1e (fixed)
+#   b[11]   = 0x08 (fixed)
+#
+# Ground truth:
+#   TLD4.R R6, R4, R4, UR4, 2D → 0x20ff04ff04047f63 | 0x00116c00081e0f06
+
+def encode_tld4(dest: int, coord: int, ur_desc: int,
+                dest_hi: int = RZ, ctrl: int = 0) -> bytes:
+    """Encode TLD4.R dest, coord, ur_desc — 2D texture gather.
+
+    Always gathers 4 texels (R component) from a 2D texture.
+
+    Args:
+        dest:    Result register base (4 consecutive regs: dest..dest+3).
+        coord:   Coordinate register base (2 float regs: coord, coord+1).
+        ur_desc: Uniform register holding texture descriptor.
+        dest_hi: Dest report register (typically dest+2 for 4-component).
+        ctrl:    23-bit scheduling control word.
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    return _build_tex(0x63, 0x7f,
+                      b2=dest, b3=coord, b4=RZ,
+                      b5=ur_desc, b6=RZ, b7=TEX_DIM_2D,
+                      b8=dest_hi,
+                      b9=0x0f, b10=0x1e, b11=0x08,
+                      ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# TXQ — Texture Query (opcode 0xf6f)
+# ---------------------------------------------------------------------------
+# SASS: TXQ RZ, Rdest, Rdest, TEX_HEADER_DIMENSION, URdesc, 0x0, {query}
+#
+# Queries texture metadata (width, height, depth).
+#
+# Encoding:
+#   b[0:1]  = 0x6f, 0x7f  (opcode 0xf6f, pred=PT)
+#   b[2]    = dest register
+#   b[3]    = dest register (same as b2)
+#   b[4]    = 0x00
+#   b[5]    = UR desc register low
+#   b[6]    = 0x00
+#   b[7]    = 0x00
+#   b[8]    = 0xff (RZ)
+#   b[9]    = query type: 0x01=width, 0x02=height, 0x03=depth
+#   b[10]   = 0x00
+#   b[11]   = 0x08
+#
+# Ground truth:
+#   TXQ RZ, R5, R5, TEX_HEADER_DIMENSION, UR4, 0x0, 0x1 → 0x0000040005057f6f | 0x001f6200080001ff
+#   TXQ RZ, R7, R7, TEX_HEADER_DIMENSION, UR4, 0x0, 0x2 → 0x0000040007077f6f | 0x000f6200080002ff
+
+def encode_txq(dest: int, ur_desc: int, query: int, ctrl: int = 0) -> bytes:
+    """Encode TXQ dest, ur_desc, query — texture dimension query.
+
+    Args:
+        dest:    Destination register for query result.
+        ur_desc: Uniform register holding texture descriptor.
+        query:   Query type: TXQ_WIDTH=1, TXQ_HEIGHT=2, TXQ_DEPTH=3.
+        ctrl:    23-bit scheduling control word.
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    return _build_tex(0x6f, 0x7f,
+                      b2=dest, b3=dest, b4=0x00,
+                      b5=ur_desc, b6=0x00, b7=0x00,
+                      b8=RZ,
+                      b9=query, b10=0x00, b11=0x08,
+                      ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# SULD — Surface Load (opcode 0xf99)
+# ---------------------------------------------------------------------------
+# SASS: SULD.D.BA.{1D|2D}.{|64}.STRONG.SM.TRAP Rdest, [Rcoord], URdesc
+#
+# Loads data from a surface object.
+#
+# Encoding:
+#   b[0:1]  = 0x99, 0x7f  (opcode 0xf99, pred=PT)
+#   b[2]    = dest_base
+#   b[3]    = coord_base
+#   b[4]    = 0x00
+#   b[5]    = UR desc register low
+#   b[6]    = 0xff (URZ)
+#   b[7]    = SURF_DIM_1D(0x10) or SURF_DIM_2D(0x70)
+#   b[8]    = 0x00
+#   b[9]    = mode: SURF_MODE_B32(0xa9) or SURF_MODE_B64(0xab)
+#   b[10]   = 0x1e (fixed)
+#   b[11]   = 0x08 (fixed)
+#
+# Ground truth:
+#   SULD.D.BA.1D.STRONG.SM.TRAP R5, [R5], UR4       → 0x10ff040005057f99 | 0x00116a00081ea900
+#   SULD.D.BA.1D.64.STRONG.SM.TRAP R4, [R4], UR4    → 0x10ff040004047f99 | 0x00116a00081eab00
+
+def encode_suld(dest: int, coord: int, ur_desc: int,
+                dim: int = SURF_DIM_1D, mode: int = SURF_MODE_B32,
+                ctrl: int = 0) -> bytes:
+    """Encode SULD dest, [coord], ur_desc — surface load.
+
+    Args:
+        dest:    Destination register base.
+        coord:   Coordinate register (1 reg for 1D, 2 for 2D).
+        ur_desc: Uniform register holding surface descriptor.
+        dim:     SURF_DIM_1D or SURF_DIM_2D.
+        mode:    SURF_MODE_B32 or SURF_MODE_B64.
+        ctrl:    23-bit scheduling control word.
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    return _build_tex(0x99, 0x7f,
+                      b2=dest, b3=coord, b4=0x00,
+                      b5=ur_desc, b6=RZ, b7=dim,
+                      b8=0x00,
+                      b9=mode, b10=0x1e, b11=0x08,
+                      ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# SUST — Surface Store (opcode 0xf9d)
+# ---------------------------------------------------------------------------
+# SASS: SUST.D.BA.{1D|2D}.{|64}.STRONG.SM.TRAP [Rcoord], Rdata, URdesc
+#
+# Stores data to a surface object.
+#
+# Encoding:
+#   b[0:1]  = 0x9d, 0x7f  (opcode 0xf9d, pred=PT)
+#   b[2]    = 0x00 (always zero)
+#   b[3]    = coord_base
+#   b[4]    = data_base
+#   b[5]    = UR desc register low
+#   b[6]    = 0xff (URZ)
+#   b[7]    = SURF_DIM_1D(0x10) or SURF_DIM_2D(0x70)
+#   b[8]    = 0x00
+#   b[9]    = mode: SURF_MODE_B32(0xa9) or SURF_MODE_B64(0xab)
+#   b[10]   = 0x10 (fixed — differs from SULD's 0x1e)
+#   b[11]   = 0x08 (fixed)
+#
+# Ground truth:
+#   SUST.D.BA.1D.STRONG.SM.TRAP [R3], R0, UR4      → 0x10ff040003007f9d | 0x0011e4000810a900
+#   SUST.D.BA.1D.64.STRONG.SM.TRAP [R0], R2, UR4   → 0x10ff040200007f9d | 0x0011e4000810ab00
+#   SUST.D.BA.2D.STRONG.SM.TRAP [R2], R0, UR4      → 0x70ff040002007f9d | 0x0011e4000810a900
+
+def encode_sust(data: int, coord: int, ur_desc: int,
+                dim: int = SURF_DIM_1D, mode: int = SURF_MODE_B32,
+                ctrl: int = 0) -> bytes:
+    """Encode SUST [coord], data, ur_desc — surface store.
+
+    Args:
+        data:    Source data register base.
+        coord:   Coordinate register (1 reg for 1D, 2 for 2D).
+        ur_desc: Uniform register holding surface descriptor.
+        dim:     SURF_DIM_1D or SURF_DIM_2D.
+        mode:    SURF_MODE_B32 or SURF_MODE_B64.
+        ctrl:    23-bit scheduling control word.
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    return _build_tex(0x9d, 0x7f,
+                      b2=0x00, b3=coord, b4=data,
+                      b5=ur_desc, b6=RZ, b7=dim,
+                      b8=0x00,
+                      b9=mode, b10=0x10, b11=0x08,
+                      ctrl=ctrl)

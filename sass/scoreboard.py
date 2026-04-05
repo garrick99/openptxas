@@ -136,6 +136,7 @@ _OPCODE_META: dict[int, _OpMeta] = {
     # Texture/surface opcodes (identified, encoders TBD)
     0xf60: _OpMeta('TEX',          1, 0x35, 2),  # texture fetch (long-latency like LDG)
     0xf63: _OpMeta('TLD4',         1, 0x35, 2),  # texture gather
+    0xf66: _OpMeta('TLD',          1, 0x35, 2),  # texture load (TLD.LZ) (long-latency like LDG)
     0xf6f: _OpMeta('TXQ',          1, 0x35, 2),  # texture query
     0xf99: _OpMeta('SULD',         1, 0x35, 2),  # surface load
     0xf9d: _OpMeta('SUST',         0, 0x3f, 2),  # surface store (no GPR dest)
@@ -146,7 +147,7 @@ _OPCODE_META: dict[int, _OpMeta] = {
 
 
 # Opcode classification (includes both SM_120 and SM_89 variants)
-_OPCODES_LDG = {0x981, 0xf60, 0xf63, 0xf6f, 0xf99}  # LDG, TEX, TLD4, TXQ, SULD
+_OPCODES_LDG = {0x981, 0xf60, 0xf63, 0xf66, 0xf6f, 0xf99}  # LDG, TEX, TLD, TLD4, TXQ, SULD
 _OPCODES_ATOMG = {0x3a9,   # ATOMG.E.CAS.b32 / CAS.b64
                  0x9a8,   # ATOMG.E.{ADD|MIN|MAX|EXCH}.u32
                  0x9a3}   # ATOMG.E.ADD.F32

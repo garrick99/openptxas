@@ -617,7 +617,8 @@ class _Parser:
 
         # Ops that have no destination (void)
         VOID_OPS = {"ret", "bra", "call", "bar", "membar", "exit", "trap",
-                    "st", "prefetch", "prefetchu", "wgmma", "cp", "mbarrier"}
+                    "st", "prefetch", "prefetchu", "wgmma", "cp", "mbarrier",
+                    "sust"}
         if op in VOID_OPS:
             dest = None
             srcs = operands

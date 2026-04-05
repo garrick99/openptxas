@@ -113,24 +113,57 @@ _OPCODE_META: dict[int, _OpMeta] = {
     0x9b7: _OpMeta('UTMACMDFLUSH', 0, 0x0f, 1),  # TMA command flush (wdep=0x0f)
     0x82f: _OpMeta('ELECT',        0, 0x3f, 1),  # elect leader thread (no GPR dest)
     0x98f: _OpMeta('CCTL',         0, 0x3f, 1),  # cache control invalidate all
+    # Rare opcodes batch (2026-04-04)
+    0x9ab: _OpMeta('ERRBAR',       0, 0x3f, 0),  # error barrier (no GPR dest)
+    0x5ab: _OpMeta('CGAERRBAR',    0, 0x3f, 0),  # CGA error barrier (no GPR dest)
+    0x801: _OpMeta('PMTRIG',       0, 0x3f, 0),  # performance monitor trigger (no GPR dest)
+    0x944: _OpMeta('CALL.REL',     0, 0x3f, 1),  # relative function call (control flow)
+    0x950: _OpMeta('RET.REL',      0, 0x3f, 1),  # return from function (control flow)
+    0x547: _OpMeta('BRA.U',        0, 0x3f, 1),  # uniform branch (control flow)
+    0x882: _OpMeta('UMOV',         0, 0x3f, 1),  # uniform register move (writes UR, not GPR)
+    0x890: _OpMeta('UIADD3',       0, 0x3f, 1),  # uniform 3-input add (writes UR)
+    0x28c: _OpMeta('UISETP',       0, 0x3f, 0),  # uniform integer set predicate (writes UP)
+    0x887: _OpMeta('USEL',         0, 0x3f, 1),  # uniform select (writes UR)
+    0x31c: _OpMeta('B2R',          1, 0x3e, 1),  # barrier result to register/predicate
+    0x853: _OpMeta('UFSETP',       0, 0x3f, 0),  # uniform FP set predicate (writes UP)
+    0x856: _OpMeta('UFMUL',        0, 0x3f, 1),  # uniform FP multiply (writes UR)
+    0xc26: _OpMeta('IDP.4A.UR',    1, 0x3e, 1),  # IDP.4A with UR source
+    # Cluster operations (2026-04-04)
+    0x9c7: _OpMeta('UCGABAR_ARV',  0, 0x3f, 0),  # cluster barrier arrive (no GPR dest)
+    0xdc7: _OpMeta('UCGABAR_WAIT', 0, 0x3f, 0),  # cluster barrier wait (no GPR dest)
+    0x291: _OpMeta('ULEA',         0, 0x3f, 1),  # uniform LEA (writes UR)
+    0xc82: _OpMeta('UMOV.RR',      0, 0x3f, 1),  # uniform reg-reg move (writes UR)
+    # Texture/surface opcodes (identified, encoders TBD)
+    0xf60: _OpMeta('TEX',          1, 0x35, 2),  # texture fetch (long-latency like LDG)
+    0xf63: _OpMeta('TLD4',         1, 0x35, 2),  # texture gather
+    0xf6f: _OpMeta('TXQ',          1, 0x35, 2),  # texture query
+    0xf99: _OpMeta('SULD',         1, 0x35, 2),  # surface load
+    0xf9d: _OpMeta('SUST',         0, 0x3f, 2),  # surface store (no GPR dest)
+    # Additional rare opcodes (2026-04-04 batch 2)
+    0x3a1: _OpMeta('MATCH',        1, 0x3e, 1),  # warp match (any/all)
+    0x95d: _OpMeta('NANOSLEEP',    0, 0x3f, 1),  # thread sleep
 }
 
 
 # Opcode classification (includes both SM_120 and SM_89 variants)
-_OPCODES_LDG = {0x981}
+_OPCODES_LDG = {0x981, 0xf60, 0xf63, 0xf6f, 0xf99}  # LDG, TEX, TLD4, TXQ, SULD
 _OPCODES_ATOMG = {0x3a9,   # ATOMG.E.CAS.b32 / CAS.b64
                  0x9a8,   # ATOMG.E.{ADD|MIN|MAX|EXCH}.u32
                  0x9a3}   # ATOMG.E.ADD.F32
 _OPCODES_LDC = {0xb82, 0x7ac, 0x919, 0x9c3,  # SM_120: LDC, LDCU, S2R, S2UR
                 0x624, 0xab9, 0xa02}           # SM_89: IMAD.MOV.U32(cbuf), ULDC.64, MOV(cbuf)
 _OPCODES_LDS = {0x984, 0x83b}  # LDS, LDSM (load shared to matrix)
-_OPCODES_STG = {0x986}
+_OPCODES_STG = {0x986, 0xf9d}  # STG, SUST
 _OPCODES_STS = {0x988}
 _OPCODES_BAR = {0xb1d}
 _OPCODES_DFPU  = {0x229, 0x228, 0x22b, 0xc2b}  # DADD, DMUL, DFMA (R-R b1=0x72), DFMA-UR-UR (b1=0x7c)
 _OPCODES_DSETP = {0x22a}                 # DSETP (FP64 compare → predicate; reads pairs, no GPR dest)
 _OPCODES_F2F   = {0x310}                 # F2F (float-to-float precision conversion; long-latency, wdep=0x33)
-_OPCODES_CTRL = {0x94d, 0x947, 0x918, 0x91a, 0x992}  # EXIT, BRA, NOP, DEPBAR.LE, MEMBAR
+_OPCODES_CTRL = {0x94d, 0x947, 0x918, 0x91a, 0x992,  # EXIT, BRA, NOP, DEPBAR.LE, MEMBAR
+                 0x9ab, 0x5ab, 0x801,                 # ERRBAR, CGAERRBAR, PMTRIG
+                 0x944, 0x950, 0x547,                  # CALL.REL, RET.REL, BRA.U
+                 0x9c7, 0xdc7,                          # UCGABAR_ARV, UCGABAR_WAIT
+                 0x95d}                                # NANOSLEEP
 _OPCODES_LDGSTS = {0xfae}  # LDGSTS.E (cp.async global→shared)
 _OPCODES_LDGDEPBAR = {0x9af}  # LDGDEPBAR (cp.async commit)
 _OPCODES_REDUX = {0x3c4}  # REDUX.SUM (warp reduction → UR)
@@ -223,11 +256,19 @@ _OPCODES_ALU = {
     0x3c4,        # REDUX.SUM (warp sum → UR)
     # MOV R, UR — copy uniform register to GPR (after REDUX)
     0xc02,        # MOV R, UR
+    # Rare opcodes batch (2026-04-04)
+    0xc26,        # IDP.4A with UR source
+    0x31c,        # B2R (barrier result to register)
+    0x807,        # SEL (immediate form, already in SM_89 set)
+    0x28c,        # UISETP (uniform integer set predicate)
+    0x3a1,        # MATCH (warp match any/all)
 }
 # Note: IADD.64-UR (0xc35) uses wdep=0x3f (no tracking) + stall=1.
 # The 1-cycle stall ensures the result is ready for the subsequent LDG/STG.
 _OPCODES_IADD64_UR = {0xc35}
-_OPCODES_SMEM_SETUP = {0x9c3, 0x882, 0x291}  # S2UR, UMOV, ULEA
+_OPCODES_SMEM_SETUP = {0x9c3, 0x882, 0x291,  # S2UR, UMOV, ULEA
+                       0x890, 0x887, 0x853, 0x856,  # UIADD3, USEL, UFSETP, UFMUL
+                       0x291, 0xc82}               # ULEA, UMOV.RR
 
 # SM_89-specific opcodes that map to SM_120 equivalents in ALU set
 # ISETP (SM_89 cbuf): 0xa0c — already handled if in _OPCODES_ALU

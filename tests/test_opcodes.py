@@ -140,3 +140,170 @@ def test_roundtrip_all():
     """Bulk verify: all 21 ground truth samples via roundtrip_verify_opcodes()."""
     assert roundtrip_verify_opcodes(verbose=False), \
         "roundtrip_verify_opcodes() reported failures"
+
+
+# ---------------------------------------------------------------------------
+# New encoder tests (2026-04-04 batch: rare opcodes)
+# ---------------------------------------------------------------------------
+
+from sass.encoding.sm_120_opcodes import (
+    encode_errbar, encode_cgaerrbar, encode_membar_sys,
+    encode_pmtrig, encode_call_rel, encode_ret_rel,
+    encode_bra_u, encode_umov_imm, encode_uiadd3_imm,
+    encode_uisetp, encode_uisetp_imm, encode_usel_imm,
+    encode_b2r_result, encode_bar_red_or, encode_sel_imm,
+    encode_ufsetp_imm, encode_ufmul_imm,
+    encode_redux_min_u32, encode_redux_max_u32,
+    encode_idp4a_ur,
+    encode_ucgabar_arv, encode_ucgabar_wait,
+    encode_ulea, encode_membar_all_gpu, encode_umov_rr,
+    encode_match_any, encode_nanosleep,
+    encode_vote_all, encode_vote_any, encode_flo_sh,
+    UISETP_NE,
+)
+
+
+def test_errbar():
+    """ERRBAR ground truth from ptxas membar kernel."""
+    _chk("ERRBAR", encode_errbar(ctrl=0x7f6),
+         "ab790000000000000000000000ec0f00")
+
+
+def test_cgaerrbar():
+    """CGAERRBAR ground truth from ptxas membar kernel."""
+    _chk("CGAERRBAR", encode_cgaerrbar(ctrl=0x7f6),
+         "ab750000000000000000000000ec0f00")
+
+
+def test_membar_sys():
+    """MEMBAR.SC.SYS ground truth from ptxas membar kernel."""
+    _chk("MEMBAR.SC.SYS", encode_membar_sys(ctrl=0x7f6),
+         "92790000000000000040000000ec0f00")
+
+
+def test_pmtrig():
+    """PMTRIG 0x1 ground truth from ptxas pmevent kernel."""
+    _chk("PMTRIG 0x1", encode_pmtrig(event=1, ctrl=0x7f1),
+         "01780000010000000000000000e20f00")
+
+
+def test_call_rel():
+    """CALL.REL.NOINC ground truth from ptxas call kernel."""
+    _chk("CALL.REL 0x30", encode_call_rel(pc_offset_bytes=0x30, ctrl=0xff5),
+         "44790c00000000000000c00300ea1f00")
+
+
+def test_ret_rel():
+    """RET.REL.NODEC ground truth from ptxas call kernel."""
+    _chk("RET.REL R2", encode_ret_rel(ret_addr_reg=2, ctrl=0x7f6),
+         "5079d002fcffffffffffc30300ec0f00")
+
+
+def test_umov_imm():
+    """UMOV UR6, 0x10002 ground truth from ptxas packed kernel."""
+    _chk("UMOV UR6,0x10002", encode_umov_imm(dest_ur=6, imm32=0x10002, ctrl=0x7f1),
+         "8278060002000100000f000000e20f00")
+
+
+def test_uiadd3_imm():
+    """UIADD3 UR4, UPT, UPT, UR4, 0x2a, URZ ground truth."""
+    _chk("UIADD3 UR4,UR4,0x2a,URZ",
+         encode_uiadd3_imm(dest_ur=4, src0_ur=4, imm32=0x2a, src2_ur=0xFF, ctrl=0xfe6),
+         "907804042a000000ffe0ff0f00cc1f00")
+
+
+def test_uisetp_ne_rr():
+    """UISETP.NE.U32.AND UP0, UPT, UR6, URZ, UPT ground truth."""
+    _chk("UISETP.NE RR", encode_uisetp(0, 6, 0xFF, UISETP_NE, ctrl=0x711),
+         "8c720006ff0000007050f00300220e00")
+
+
+def test_uisetp_ne_imm():
+    """UISETP.NE.U32.AND UP0, UPT, UR6, 0x1, UPT ground truth."""
+    _chk("UISETP.NE imm", encode_uisetp_imm(0, 6, 1, UISETP_NE, ctrl=0x711),
+         "8c780006010000007050f00300220e00")
+
+
+def test_usel_imm():
+    """USEL UR6, URZ, 0x190, UP0 ground truth."""
+    _chk("USEL UR6,URZ,0x190,UP0",
+         encode_usel_imm(dest_ur=6, src0_ur=0xFF, imm32=0x190, upred=0, ctrl=0x7e4),
+         "877806ff900100000000000000c80f00")
+
+
+def test_b2r_result():
+    """B2R.RESULT RZ, P0 ground truth."""
+    _chk("B2R.RESULT RZ,P0", encode_b2r_result(pred_dest=0, ctrl=0x712),
+         "1c73ff00000000000040000000240e00")
+
+
+def test_bar_red_or():
+    """BAR.RED.OR.DEFER_BLOCKING 0x0, !P0 ground truth."""
+    _chk("BAR.RED.OR 0,!P0",
+         encode_bar_red_or(0, pred=0, pred_neg=True, ctrl=0x7f6),
+         "1d7b0000000000000048010400ec0f00")
+
+
+def test_sel_imm():
+    """SEL R5, RZ, 0x1, !P0 ground truth."""
+    _chk("SEL R5,RZ,0x1,!P0",
+         encode_sel_imm(dest=5, src0=0xFF, imm32=1, pred=0, pred_neg=True, ctrl=0xfe5),
+         "077805ff010000000000000400ca1f00")
+
+
+# ---------------------------------------------------------------------------
+# Cluster operation tests (2026-04-04)
+# ---------------------------------------------------------------------------
+
+def test_ucgabar_arv():
+    """UCGABAR_ARV ground truth from ptxas cluster kernel."""
+    _chk("UCGABAR_ARV", encode_ucgabar_arv(ctrl=0x7f1),
+         "c7790000000000000000000800e20f00")
+
+def test_ucgabar_wait():
+    """UCGABAR_WAIT ground truth from ptxas cluster kernel."""
+    _chk("UCGABAR_WAIT", encode_ucgabar_wait(ctrl=0x7f1),
+         "c77d0000000000000000000800e20f00")
+
+def test_membar_all_gpu():
+    """MEMBAR.ALL.GPU ground truth from ptxas cluster kernel."""
+    _chk("MEMBAR.ALL.GPU", encode_membar_all_gpu(ctrl=0x7f6),
+         "927900000000000000a0000000ec0f00")
+
+def test_umov_rr():
+    """UMOV UR5, URZ (register-to-register) ground truth."""
+    _chk("UMOV UR5,URZ", encode_umov_rr(dest_ur=5, src_ur=0xFF, ctrl=0x7f1),
+         "827c0500ff0000000000000800e20f00")
+
+def test_ulea():
+    """ULEA UR4, UR5, UR4, 0x18 ground truth."""
+    _chk("ULEA UR4,UR5,UR4,0x18",
+         encode_ulea(dest_ur=4, base_ur=5, index_ur=4, scale=0x18, acc_ur=0xFF, ctrl=0xff1),
+         "9172040504000000ffc08e0f00e21f00")
+
+
+def test_match_any():
+    """MATCH.ANY R0, R4 ground truth."""
+    got = encode_match_any(dest=0, src=4, ctrl=0xf18)
+    lo = int.from_bytes(got[0:8], 'little')
+    hi = int.from_bytes(got[8:16], 'little')
+    assert lo == 0x00000000040073a1, f"lo={lo:#018x}"
+    assert hi == 0x001e3000000e8000, f"hi={hi:#018x}"
+
+
+def test_nanosleep():
+    """NANOSLEEP 0x64 ground truth."""
+    got = encode_nanosleep(duration_ns=100, ctrl=0x7f5)
+    lo = int.from_bytes(got[0:8], 'little')
+    hi = int.from_bytes(got[8:16], 'little')
+    assert lo == 0x000000640000795d, f"lo={lo:#018x}"
+    assert hi == 0x000fea0003800000, f"hi={hi:#018x}"
+
+
+def test_flo_sh():
+    """FLO.U32.SH R2, R6 ground truth."""
+    got = encode_flo_sh(dest=2, src=6, ctrl=0x712)
+    lo = int.from_bytes(got[0:8], 'little')
+    hi = int.from_bytes(got[8:16], 'little')
+    assert lo == 0x0000000600027300, f"lo={lo:#018x}"
+    assert hi == 0x000e2400000e0400, f"hi={hi:#018x}"

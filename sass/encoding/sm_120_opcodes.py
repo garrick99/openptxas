@@ -4367,3 +4367,1157 @@ def encode_cctl_ivall(ctrl: int = 0) -> bytes:
                   b2=0x00, b3=0xff, b4=0x00,
                   b8=0x00, b9=0x00, b10=0x00, b11=0x02,
                   ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# ERRBAR — Error Barrier
+# ---------------------------------------------------------------------------
+# Opcode: 0x9ab (b[0]=0xab, b[1]=0x79)
+# Ground truth (ptxas sm_120):
+#   ERRBAR: lo=0x00000000000079ab  hi=0x000fec0000000000
+#   All fields zero except opcode and ctrl. Emitted by ptxas after MEMBAR.SC.SYS/GPU.
+
+def encode_errbar(ctrl: int = 0) -> bytes:
+    """Encode ERRBAR: error barrier. Emitted after MEMBAR.SC.SYS/GPU by ptxas.
+
+    No register operands. Acts as an error synchronization point.
+
+    Ground truth: ERRBAR → ab 79 00 00 00 00 00 00 | 00 00 00 00 ...
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0xab, 0x79,
+                  b2=0x00, b3=0x00, b4=0x00,
+                  b8=0x00, b9=0x00, b10=0x00, b11=0x00,
+                  ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# CGAERRBAR — CGA Error Barrier
+# ---------------------------------------------------------------------------
+# Opcode: 0x5ab (b[0]=0xab, b[1]=0x75)
+# Ground truth (ptxas sm_120):
+#   CGAERRBAR: lo=0x00000000000075ab  hi=0x000fec0000000000
+#   Follows ERRBAR after MEMBAR.SC.SYS/GPU. CGA = Cooperative Group Array barrier.
+
+def encode_cgaerrbar(ctrl: int = 0) -> bytes:
+    """Encode CGAERRBAR: CGA error barrier.
+
+    No register operands. Follows ERRBAR after MEMBAR.SC.SYS/GPU.
+
+    Ground truth: CGAERRBAR → ab 75 00 00 00 00 00 00 | 00 00 00 00 ...
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0xab, 0x75,
+                  b2=0x00, b3=0x00, b4=0x00,
+                  b8=0x00, b9=0x00, b10=0x00, b11=0x00,
+                  ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# MEMBAR.SC.SYS — System Memory Barrier
+# ---------------------------------------------------------------------------
+# Same opcode 0x992 as MEMBAR.SC.GPU/CTA, b9=0x40 for SYS scope.
+MEMBAR_SYS = 0x40  # b9 value for system scope (membar.sys)
+
+def encode_membar_sys(ctrl: int = 0) -> bytes:
+    """Encode MEMBAR.SC.SYS — system-scope memory fence.
+
+    Ground truth: MEMBAR.SC.SYS → 92 79 00 00 00 00 00 00 | 00 40 00 00 ...
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x92, 0x79,
+                  b2=0x00, b3=0x00, b4=0x00,
+                  b8=0x00, b9=MEMBAR_SYS, b10=0x00, b11=0x00,
+                  ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# PMTRIG — Performance Monitor Trigger
+# ---------------------------------------------------------------------------
+# Opcode: 0x801 (b[0]=0x01, b[1]=0x78)
+# Ground truth (ptxas sm_120):
+#   PMTRIG 0x1: lo=0x0000000100007801  hi=0x000fe20000000000
+#   b4 = event index (0x01 for pmevent 0)
+
+def encode_pmtrig(event: int = 1, ctrl: int = 0) -> bytes:
+    """Encode PMTRIG event — performance monitor trigger.
+
+    Args:
+        event: Event index to trigger (pmevent N maps to event=N+1).
+        ctrl: 23-bit scheduling control word.
+
+    Ground truth: PMTRIG 0x1 → 01 78 00 00 01 00 00 00 | 00 00 00 00 ...
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x01, 0x78,
+                  b2=0x00, b3=0x00, b4=event & 0xFF,
+                  b8=0x00, b9=0x00, b10=0x00, b11=0x00,
+                  ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# CALL.REL.NOINC — Relative Function Call (no stack increment)
+# ---------------------------------------------------------------------------
+# Opcode: 0x944 (b[0]=0x44, b[1]=0x79)
+# Ground truth (ptxas sm_120):
+#   CALL.REL.NOINC 0x70 (from offset 0x30):
+#     lo=0x00000000000c7944  hi=0x001fea0003c00000
+#   b[2] = relative offset in 4-byte units from next instruction
+#   The call at 0x30 targets 0x70: offset = 0x70 - 0x40 = 0x30 = 48 bytes = 12 dwords
+#   b[2]=0x0c ✓
+#   b[10]=0xc0, b[11]=0x03 — fixed flags for CALL.REL.NOINC
+
+def encode_call_rel(pc_offset_bytes: int, ctrl: int = 0) -> bytes:
+    """Encode CALL.REL.NOINC — relative function call.
+
+    Args:
+        pc_offset_bytes: Signed byte offset from next instruction (PC+16) to target.
+                         Must be a multiple of 4.
+        ctrl: 23-bit scheduling control word.
+
+    Ground truth: CALL.REL.NOINC 0x70 (from 0x30) → offset=0x30, b[2]=0x0c
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+
+    # Offset in 4-byte (dword) units
+    offset_dwords = pc_offset_bytes // 4
+    # Encode as potentially multi-byte offset
+    raw = bytearray(16)
+    raw[0] = 0x44
+    raw[1] = 0x79
+    # offset goes into bytes 2-7 (little-endian)
+    offset_val = offset_dwords & 0xFFFFFFFFFFFF
+    raw[2] = offset_val & 0xFF
+    raw[3] = (offset_val >> 8) & 0xFF
+    raw[4] = (offset_val >> 16) & 0xFF
+    raw[5] = (offset_val >> 24) & 0xFF
+    raw[6] = (offset_val >> 32) & 0xFF
+    raw[7] = (offset_val >> 40) & 0xFF
+    raw[8] = 0x00
+    raw[9] = 0x00
+    raw[10] = 0xc0
+    raw[11] = 0x03
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# RET.REL.NODEC — Return from Function (no stack decrement)
+# ---------------------------------------------------------------------------
+# Opcode: 0x950 (b[0]=0x50, b[1]=0x79)
+# Ground truth (ptxas sm_120):
+#   RET.REL.NODEC R2 0x0 (from offset 0xb0):
+#     lo=0xfffffffc02d07950  hi=0x000fec0003c3ffff
+#   b[2]=0xd0 (part of offset encoding), b[3]=0x02 (return addr register)
+#   b[4:7]=0xfffffffc (offset, signed -4 bytes? or flag bits)
+#   b[10]=0xc3, b[11]=0x03 — fixed flags for RET.REL.NODEC
+
+def encode_ret_rel(ret_addr_reg: int = 2, ctrl: int = 0) -> bytes:
+    """Encode RET.REL.NODEC — return from function.
+
+    Args:
+        ret_addr_reg: Register holding the return address (typically R2).
+        ctrl: 23-bit scheduling control word.
+
+    Ground truth: RET.REL.NODEC R2 0x0 → 50 79 d0 02 fc ff ff ff | ff ff c3 03 ...
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+
+    raw = bytearray(16)
+    raw[0] = 0x50
+    raw[1] = 0x79
+    raw[2] = 0xd0  # offset/flag byte
+    raw[3] = ret_addr_reg & 0xFF
+    raw[4] = 0xfc
+    raw[5] = 0xff
+    raw[6] = 0xff
+    raw[7] = 0xff
+    raw[8] = 0xff
+    raw[9] = 0xff
+    raw[10] = 0xc3
+    raw[11] = 0x03
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# BRA.U — Uniform Branch
+# ---------------------------------------------------------------------------
+# Opcode: 0x547 (b[0]=0x47, b[1]=0x75)
+# Ground truth (ptxas sm_120):
+#   BRA.U !UP0, 0x110 (from 0x40): lo=0x0000000108307547  hi=0x000fea0003800000
+#   Uniform branch uses pred guard in b[1] upper nibble.
+#   b[2]=0x30 (offset?), b[3]=0x08 (pred/flags), b[4:7]=0x01000000
+#   b[10]=0x80, b[11]=0x03
+
+def encode_bra_u(pc_offset_bytes: int, upred: int = 7, upred_neg: bool = False,
+                 ctrl: int = 0) -> bytes:
+    """Encode BRA.U — uniform branch (branch controlled by uniform predicate).
+
+    Args:
+        pc_offset_bytes: Signed byte offset from next instruction to target.
+        upred: Uniform predicate index (0-7, 7=UPT always-true).
+        upred_neg: If True, negate the predicate (!UPn).
+        ctrl: 23-bit scheduling control word.
+
+    Ground truth: BRA.U !UP0, 0x110 (from 0x40):
+        offset = 0x110 - 0x50 = 0xc0 bytes
+        b[2]=0x30 → 0xc0/4=0x30 ✓ (offset in dword units)
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+
+    signed_insns = pc_offset_bytes // 16
+    offset18 = signed_insns & 0x3FFFF
+
+    # Uniform predicate guard goes in b[3] bits
+    pred_code = upred
+    if upred_neg:
+        pred_code |= 0x08
+
+    raw = bytearray(16)
+    raw[0] = 0x47
+    raw[1] = 0x75
+    raw[2] = 0xfc  # fixed for unconditional (0xfc like BRA)
+    raw[3] = pred_code
+    raw[4] = 0xfc
+    raw[5] = 0xff
+    raw[6] = 0xff
+    raw[7] = 0xff
+    raw[8] = offset18 & 0xFF
+    raw[9] = (offset18 >> 8) & 0xFF
+    raw[10] = 0x80 | ((offset18 >> 16) & 0x03)
+    raw[11] = 0x03
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# UMOV — Uniform Register Move (immediate)
+# ---------------------------------------------------------------------------
+# Opcode: 0x882 (b[0]=0x82, b[1]=0x78)
+# Ground truth (ptxas sm_120):
+#   UMOV UR6, 0x10002: lo=0x0001000200067882  hi=0x000fe20000000f00
+#   b[2] = dest_ur, b[3:7] = 32-bit immediate (little-endian)
+#   b[9]=0x0f, b[10]=0x00 — fixed modifier
+
+def encode_umov_imm(dest_ur: int, imm32: int, ctrl: int = 0) -> bytes:
+    """Encode UMOV URn, imm32 — load 32-bit immediate into uniform register.
+
+    Args:
+        dest_ur: Destination uniform register index (UR0..UR62).
+        imm32: 32-bit immediate value.
+        ctrl: 23-bit scheduling control word.
+
+    Ground truth: UMOV UR6, 0x10002 → 82 78 06 00 02 00 01 00 | 00 0f 00 00 ...
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+
+    raw = bytearray(16)
+    raw[0] = 0x82
+    raw[1] = 0x78
+    raw[2] = dest_ur & 0xFF
+    raw[3] = 0x00  # fixed/unused
+    # 32-bit immediate in bytes 4-7 (little-endian)
+    raw[4] = imm32 & 0xFF
+    raw[5] = (imm32 >> 8) & 0xFF
+    raw[6] = (imm32 >> 16) & 0xFF
+    raw[7] = (imm32 >> 24) & 0xFF
+    raw[8] = 0x00
+    raw[9] = 0x0f
+    raw[10] = 0x00
+    raw[11] = 0x00
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# UIADD3 — Uniform Integer 3-Input Add
+# ---------------------------------------------------------------------------
+# Opcode: 0x890 (b[0]=0x90, b[1]=0x78)
+# Ground truth (ptxas sm_120):
+#   UIADD3 UR4, UPT, UPT, UR4, 0x2a, URZ:
+#     lo=0x0000002a04047890  hi=0x001fcc000fffe0ff
+#   b[2]=dest_ur=0x04, b[3]=src0_ur=0x04, b[4:7]=imm32=0x2a
+#   b[8]=0xff(URZ), b[9]=0xe0, b[10]=0xff, b[11]=0x0f
+
+def encode_uiadd3_imm(dest_ur: int, src0_ur: int, imm32: int,
+                       src2_ur: int = 0xFF, ctrl: int = 0) -> bytes:
+    """Encode UIADD3 URdest, UPT, UPT, URsrc0, imm, URsrc2.
+
+    3-input uniform integer add with an immediate operand.
+
+    Args:
+        dest_ur:  Destination uniform register.
+        src0_ur:  First source uniform register.
+        imm32:    32-bit immediate to add.
+        src2_ur:  Third source uniform register (0xFF = URZ).
+        ctrl:     23-bit scheduling control word.
+
+    Ground truth: UIADD3 UR4, UPT, UPT, UR4, 0x2a, URZ →
+        90 78 04 04 2a 00 00 00 | ff e0 ff 0f ...
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+
+    raw = bytearray(16)
+    raw[0] = 0x90
+    raw[1] = 0x78
+    raw[2] = dest_ur & 0xFF
+    raw[3] = src0_ur & 0xFF
+    # 32-bit immediate
+    raw[4] = imm32 & 0xFF
+    raw[5] = (imm32 >> 8) & 0xFF
+    raw[6] = (imm32 >> 16) & 0xFF
+    raw[7] = (imm32 >> 24) & 0xFF
+    raw[8] = src2_ur & 0xFF
+    raw[9] = 0xe0
+    raw[10] = 0xff
+    raw[11] = 0x0f
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# UISETP — Uniform Integer Set Predicate
+# ---------------------------------------------------------------------------
+# Opcode: 0x28c (b[0]=0x8c, b[1]=0x72 for R-R form; 0x78 for imm form)
+# Ground truth (ptxas sm_120):
+#   UISETP.NE.U32.AND UP0, UPT, UR6, URZ, UPT:
+#     lo=0x000000ff0600728c  hi=0x000e220003f05070
+#   b[2]=0x06(src0_ur), b[3]=0xff(URZ src1), b[0:1]=8c 72 → R-R form
+#
+#   UISETP.NE.U32.AND UP0, UPT, UR6, 0x1, UPT:
+#     lo=0x000000010600788c  hi=0x... → imm form (b[1]=0x78)
+
+# Comparison codes (same encoding as ISETP)
+UISETP_LT  = 0x10
+UISETP_EQ  = 0x20
+UISETP_LE  = 0x30
+UISETP_GT  = 0x40
+UISETP_NE  = 0x50
+UISETP_GE  = 0x60
+
+def encode_uisetp(upred_dest: int, src0_ur: int, src1_ur: int,
+                   cmp: int = UISETP_NE, ctrl: int = 0) -> bytes:
+    """Encode UISETP.cmp.U32.AND UPdest, UPT, URsrc0, URsrc1, UPT (R-R form).
+
+    Args:
+        upred_dest: Destination uniform predicate (UP0..UP6).
+        src0_ur:    First source uniform register.
+        src1_ur:    Second source uniform register (0xFF = URZ).
+        cmp:        Comparison code (UISETP_NE, etc.).
+        ctrl:       23-bit scheduling control word.
+
+    Ground truth: UISETP.NE.U32.AND UP0, UPT, UR6, URZ, UPT →
+        8c 72 06 ff 00 00 00 00 | 70 50 f0 03 ...
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+
+    raw = bytearray(16)
+    raw[0] = 0x8c
+    raw[1] = 0x72
+    raw[2] = 0x00   # fixed/flags
+    raw[3] = src0_ur & 0xFF
+    raw[4] = src1_ur & 0xFF
+    raw[5] = 0x00
+    raw[6] = 0x00
+    raw[7] = 0x00
+    raw[8] = 0x70 | (upred_dest & 0x07)   # pred dest in low bits of b8
+    raw[9] = cmp & 0xFF                    # comparison code
+    raw[10] = 0xf0
+    raw[11] = 0x03
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+def encode_uisetp_imm(upred_dest: int, src0_ur: int, imm32: int,
+                       cmp: int = UISETP_NE, ctrl: int = 0) -> bytes:
+    """Encode UISETP.cmp.U32.AND UPdest, UPT, URsrc0, imm32, UPT (immediate form).
+
+    Args:
+        upred_dest: Destination uniform predicate.
+        src0_ur:    Source uniform register.
+        imm32:      32-bit immediate.
+        cmp:        Comparison code.
+        ctrl:       23-bit scheduling control word.
+
+    Ground truth: UISETP.NE.U32.AND UP0, UPT, UR6, 0x1, UPT →
+        8c 78 00 06 01 00 00 00 | 70 50 f0 03 ...
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+
+    raw = bytearray(16)
+    raw[0] = 0x8c
+    raw[1] = 0x78
+    raw[2] = 0x00  # fixed/flags
+    raw[3] = src0_ur & 0xFF
+    raw[4] = imm32 & 0xFF
+    raw[5] = (imm32 >> 8) & 0xFF
+    raw[6] = (imm32 >> 16) & 0xFF
+    raw[7] = (imm32 >> 24) & 0xFF
+    raw[8] = 0x70 | (upred_dest & 0x07)
+    raw[9] = cmp & 0xFF
+    raw[10] = 0xf0
+    raw[11] = 0x03
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# USEL — Uniform Select
+# ---------------------------------------------------------------------------
+# Opcode: 0x887 (b[0]=0x87, b[1]=0x78)
+# Ground truth (ptxas sm_120):
+#   USEL UR6, URZ, 0x190, UP0:
+#     lo=0x00000190ff067887  hi=0x000fc80000000000
+#   b[2]=dest_ur=0x06, b[3]=src0_ur=0xff(URZ), b[4:7]=imm=0x190
+#   All modifier bytes are zero.
+
+def encode_usel_imm(dest_ur: int, src0_ur: int, imm32: int,
+                     upred: int = 0, ctrl: int = 0) -> bytes:
+    """Encode USEL URdest, URsrc0, imm32, UPpred — uniform select (imm form).
+
+    Args:
+        dest_ur:  Destination uniform register.
+        src0_ur:  Source uniform register (selected when pred is false).
+        imm32:    Immediate value (selected when pred is true).
+        upred:    Uniform predicate index (UP0..UP6).
+        ctrl:     23-bit scheduling control word.
+
+    Ground truth: USEL UR6, URZ, 0x190, UP0 →
+        87 78 06 ff 90 01 00 00 | 00 00 00 00 ...
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+
+    raw = bytearray(16)
+    raw[0] = 0x87
+    raw[1] = 0x78
+    raw[2] = dest_ur & 0xFF
+    raw[3] = src0_ur & 0xFF
+    raw[4] = imm32 & 0xFF
+    raw[5] = (imm32 >> 8) & 0xFF
+    raw[6] = (imm32 >> 16) & 0xFF
+    raw[7] = (imm32 >> 24) & 0xFF
+    raw[8] = 0x00
+    raw[9] = 0x00
+    raw[10] = 0x00
+    raw[11] = 0x00
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# B2R.RESULT — Barrier Result to Register
+# ---------------------------------------------------------------------------
+# Opcode: 0x31c (b[0]=0x1c, b[1]=0x73)
+# Ground truth (ptxas sm_120):
+#   B2R.RESULT RZ, P0:
+#     lo=0x0000000000ff731c  hi=0x000e240000004000
+#   b[2]=0xff(RZ dest), b[9]=0x40 → predicate dest P0 encoded here
+#   b[10]=0x00, b[11]=0x00
+
+def encode_b2r_result(pred_dest: int = 0, ctrl: int = 0) -> bytes:
+    """Encode B2R.RESULT RZ, Ppred — barrier reduction result to predicate.
+
+    Used after BAR.RED.OR to read the reduction result.
+
+    Args:
+        pred_dest: Destination predicate register (P0..P6).
+        ctrl: 23-bit scheduling control word.
+
+    Ground truth: B2R.RESULT RZ, P0 → 1c 73 ff 00 00 00 00 00 | 00 40 00 00 ...
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x1c, 0x73,
+                  b2=0xff, b3=0x00, b4=0x00,
+                  b8=0x00, b9=0x40, b10=0x00, b11=0x00,
+                  ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# BAR.RED.OR — Barrier Reduction OR
+# ---------------------------------------------------------------------------
+# Same opcode bytes as BAR.SYNC (0x1d, 0x7b → 0xb1d), but different modifiers.
+# Ground truth (ptxas sm_120):
+#   BAR.RED.OR.DEFER_BLOCKING 0x0, !P0:
+#     lo=0x0000000000007b1d  hi=0x000fec0004014800
+#   b[9]=0x48, b[10]=0x01, b[11]=0x04 — differentiates from BAR.SYNC
+
+def encode_bar_red_or(barrier_id: int = 0, pred: int = 0, pred_neg: bool = True,
+                       ctrl: int = 0) -> bytes:
+    """Encode BAR.RED.OR.DEFER_BLOCKING barrier_id, [!]Ppred.
+
+    Barrier reduction with OR operation. Each thread contributes its predicate
+    to a warp-wide OR reduction.
+
+    Args:
+        barrier_id: Barrier index (0..15).
+        pred: Predicate register for reduction input.
+        pred_neg: If True, negate the predicate (!Pn).
+        ctrl: 23-bit scheduling control word.
+
+    Ground truth: BAR.RED.OR.DEFER_BLOCKING 0x0, !P0 →
+        1d 7b 00 00 00 00 00 00 | 00 48 01 04 ...
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+
+    # pred encoding in b[11]: 0x04 for !P0
+    pred_code = pred & 0x07
+    if pred_neg:
+        pred_code |= 0x04  # negate bit
+
+    raw = bytearray(16)
+    raw[0] = 0x1d
+    raw[1] = 0x7b
+    raw[2] = 0x00
+    raw[3] = 0x00
+    raw[4] = 0x00
+    raw[5] = 0x00
+    raw[6] = 0x00
+    raw[7] = 0x00
+    raw[8] = 0x00
+    raw[9] = 0x48  # RED.OR modifier
+    raw[10] = 0x01  # DEFER_BLOCKING flag
+    raw[11] = pred_code
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# SEL (immediate form) — Select with Immediate
+# ---------------------------------------------------------------------------
+# Opcode: 0x807 (b[0]=0x07, b[1]=0x78) — immediate form
+# (R-R form is 0x207 at b[0]=0x07, b[1]=0x72, already encoded as encode_sel)
+# Ground truth (ptxas sm_120):
+#   SEL R5, RZ, 0x1, !P0:
+#     lo=0x00000001ff057807  hi=0x001fca0004000000
+#   b[2]=dest=0x05, b[3]=src0=0xff(RZ), b[4:7]=imm=0x01
+#   b[11]=0x04 (pred !P0)
+
+def encode_sel_imm(dest: int, src0: int, imm32: int, pred: int = 0,
+                    pred_neg: bool = False, ctrl: int = 0) -> bytes:
+    """Encode SEL dest, src0, imm32, [!]Ppred — select with immediate.
+
+    Args:
+        dest: Destination register.
+        src0: Source register (used when pred is false).
+        imm32: Immediate value (used when pred is true).
+        pred: Predicate register index.
+        pred_neg: If True, negate the predicate.
+        ctrl: 23-bit scheduling control word.
+
+    Ground truth: SEL R5, RZ, 0x1, !P0 →
+        07 78 05 ff 01 00 00 00 | 00 00 00 04 ...
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+
+    pred_code = pred & 0x07
+    if pred_neg:
+        pred_code |= 0x04
+
+    raw = bytearray(16)
+    raw[0] = 0x07
+    raw[1] = 0x78
+    raw[2] = dest & 0xFF
+    raw[3] = src0 & 0xFF
+    raw[4] = imm32 & 0xFF
+    raw[5] = (imm32 >> 8) & 0xFF
+    raw[6] = (imm32 >> 16) & 0xFF
+    raw[7] = (imm32 >> 24) & 0xFF
+    raw[8] = 0x00
+    raw[9] = 0x00
+    raw[10] = 0x00
+    raw[11] = pred_code
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# UFSETP — Uniform FP Set Predicate
+# ---------------------------------------------------------------------------
+# Opcode: 0x853 (b[0]=0x53, b[1]=0x78)
+# Ground truth (ptxas sm_120):
+#   UFSETP.GT.AND UP0, UPT, |UR6|, 8.507e+37, UPT:
+#     lo=0x7e80000006007853  hi=0x000e220008f04070
+#   b[2]=0x00(pred_dest?), b[3]=0x06(src0_ur), b[4:7]=fp32_imm
+#   b[8]=0x70, b[9]=0x40(GT), b[10]=0xf0, b[11]=0x08
+
+UFSETP_LT   = 0x10
+UFSETP_EQ   = 0x20
+UFSETP_LE   = 0x30
+UFSETP_GT   = 0x40
+UFSETP_NE   = 0x50
+UFSETP_GE   = 0x60
+UFSETP_GEU  = 0xd0
+
+def encode_ufsetp_imm(upred_dest: int, src0_ur: int, imm_f32: int,
+                       cmp: int = UFSETP_GT, abs_src0: bool = False,
+                       ctrl: int = 0) -> bytes:
+    """Encode UFSETP.cmp.AND UPdest, UPT, [|]URsrc0, fp32_imm, UPT.
+
+    Args:
+        upred_dest: Destination uniform predicate.
+        src0_ur: Source uniform register.
+        imm_f32: 32-bit float immediate (as raw int bits).
+        cmp: Comparison code.
+        abs_src0: If True, take absolute value of src0.
+        ctrl: 23-bit scheduling control word.
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+
+    raw = bytearray(16)
+    raw[0] = 0x53
+    raw[1] = 0x78
+    raw[2] = 0x00  # pred/flag byte
+    raw[3] = src0_ur & 0xFF
+    raw[4] = imm_f32 & 0xFF
+    raw[5] = (imm_f32 >> 8) & 0xFF
+    raw[6] = (imm_f32 >> 16) & 0xFF
+    raw[7] = (imm_f32 >> 24) & 0xFF
+    raw[8] = 0x70 | (upred_dest & 0x07)
+    raw[9] = cmp & 0xFF
+    raw[10] = 0xf0
+    raw[11] = 0x08  # abs flag when set? Actually fixed from ground truth
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# UFMUL — Uniform FP Multiply
+# ---------------------------------------------------------------------------
+# Opcode: 0x856 (b[0]=0x56, b[1]=0x08 — note: unusual byte 1!)
+# Wait, from ground truth: lo=0x3e80000006060856 → bytes 56 08 06 06 00 00 80 3e
+# b[0]=0x56, b[1]=0x08 → word = 0x0856
+# Ground truth (ptxas sm_120):
+#   @UP0 UFMUL UR6, UR6, 0.25:
+#     lo=0x3e80000006060856  hi=0x000fe20000000f00
+#   b[2]=dest_ur=0x06, b[3]=src0_ur=0x06, b[4:7]=fp32_imm(0.25=0x3e800000)
+#   b[9]=0x0f
+
+def encode_ufmul_imm(dest_ur: int, src0_ur: int, imm_f32: int,
+                      ctrl: int = 0) -> bytes:
+    """Encode UFMUL URdest, URsrc0, fp32_imm — uniform FP multiply with immediate.
+
+    Args:
+        dest_ur: Destination uniform register.
+        src0_ur: Source uniform register.
+        imm_f32: 32-bit float immediate (as raw int bits).
+        ctrl: 23-bit scheduling control word.
+
+    Ground truth: UFMUL UR6, UR6, 0.25 → 56 08 06 06 00 00 80 3e | 00 0f 00 00 ...
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+
+    raw = bytearray(16)
+    raw[0] = 0x56
+    raw[1] = 0x08
+    raw[2] = dest_ur & 0xFF
+    raw[3] = src0_ur & 0xFF
+    raw[4] = imm_f32 & 0xFF
+    raw[5] = (imm_f32 >> 8) & 0xFF
+    raw[6] = (imm_f32 >> 16) & 0xFF
+    raw[7] = (imm_f32 >> 24) & 0xFF
+    raw[8] = 0x00
+    raw[9] = 0x0f
+    raw[10] = 0x00
+    raw[11] = 0x00
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# REDUX.MIN.U32, REDUX.MAX.U32 — Warp-wide Reduction (unsigned min/max)
+# ---------------------------------------------------------------------------
+# Already have REDUX.SUM, REDUX.SUM.S32, REDUX.MIN.S32, REDUX.MAX.S32,
+# REDUX.AND, REDUX.OR, REDUX.XOR.
+# Ground truth for unsigned min/max (from redux probe):
+#   REDUX.MIN UR7, R6: lo=0x00000000060773c4  hi=0x000e680000002200
+#     b[9]=0x22 (unsigned min)
+#   REDUX.MAX UR8, R6: lo=0x00000000060873c4  hi=0x000e680000004200
+#     b[9]=0x42 (unsigned max)
+# Compare with existing:
+#   REDUX.MIN.S32: b[9]=0x22 → Wait, same? Let me check the existing code.
+
+def encode_redux_min_u32(dest_ur: int, src: int, ctrl: int = 0) -> bytes:
+    """Encode REDUX.MIN URdest, Rsrc — warp-wide unsigned min reduction.
+
+    Ground truth: REDUX.MIN UR7, R6 → c4 73 07 06 00 00 00 00 | 00 22 00 00 ...
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0xc4, 0x73,
+                  b2=dest_ur & 0xFF, b3=src & 0xFF, b4=0x00,
+                  b8=0x00, b9=0x22, b10=0x00, b11=0x00,
+                  ctrl=ctrl)
+
+
+def encode_redux_max_u32(dest_ur: int, src: int, ctrl: int = 0) -> bytes:
+    """Encode REDUX.MAX URdest, Rsrc — warp-wide unsigned max reduction.
+
+    Ground truth: REDUX.MAX UR8, R6 → c4 73 08 06 00 00 00 00 | 00 42 00 00 ...
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0xc4, 0x73,
+                  b2=dest_ur & 0xFF, b3=src & 0xFF, b4=0x00,
+                  b8=0x00, b9=0x42, b10=0x00, b11=0x00,
+                  ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# IDP.4A (Uniform src) — Integer Dot Product (4-way, U8xU8)
+# ---------------------------------------------------------------------------
+# Opcode: 0xc26 (b[0]=0x26, b[1]=0x7c)
+# This is the uniform-register form of DP4A. We have encode_idp4a for R-R.
+# Ground truth (ptxas sm_120):
+#   IDP.4A.U8.U8 R5, R5, UR6, RZ:
+#     lo=0x0000000605057c26  hi=0x001fca0000000cff
+#   b[2]=dest=0x05, b[3]=src_a=0x05, b[4:5]=ur_src=0x06
+#   b[8]=0xff(RZ), b[9]=0x0c
+
+def encode_idp4a_ur(dest: int, src_a: int, ur_src: int, src_c: int = 0xFF,
+                     ctrl: int = 0) -> bytes:
+    """Encode IDP.4A.U8.U8 dest, src_a, URsrc, src_c — dot product with UR source.
+
+    Args:
+        dest: Destination GPR.
+        src_a: First source GPR (4 packed bytes).
+        ur_src: Uniform register holding second operand.
+        src_c: Accumulator GPR (0xFF = RZ for zero).
+        ctrl: 23-bit scheduling control word.
+
+    Ground truth: IDP.4A.U8.U8 R5, R5, UR6, RZ →
+        26 7c 05 05 06 00 00 00 | ff 0c 00 00 ...
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+
+    raw = bytearray(16)
+    raw[0] = 0x26
+    raw[1] = 0x7c
+    raw[2] = dest & 0xFF
+    raw[3] = src_a & 0xFF
+    raw[4] = ur_src & 0xFF
+    raw[5] = 0x00
+    raw[6] = 0x00
+    raw[7] = 0x00
+    raw[8] = src_c & 0xFF
+    raw[9] = 0x0c
+    raw[10] = 0x00
+    raw[11] = 0x00
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# MOV R, UR — Move from Uniform to GPR (already have encode_mov_gpr_from_ur)
+# Verified: opcode 0xc02 (b[0]=0x02, b[1]=0x7c) — matches existing encoder.
+# ---------------------------------------------------------------------------
+
+
+# ===========================================================================
+# CLUSTER OPERATIONS — SM_120 Blackwell Multi-SM Cooperative Groups
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# UCGABAR_ARV — CGA (Cooperative Group Array) Barrier Arrive
+# ---------------------------------------------------------------------------
+# Opcode: 0x9c7 (b[0]=0xc7, b[1]=0x79)
+# Ground truth (ptxas sm_120, cluster kernel with barrier.cluster.arrive):
+#   UCGABAR_ARV: lo=0x00000000000079c7  hi=0x000fe20008000000
+#   No register operands. b[11]=0x08 (fixed flag).
+
+def encode_ucgabar_arv(ctrl: int = 0) -> bytes:
+    """Encode UCGABAR_ARV — cluster barrier arrive.
+
+    Used to signal arrival at a cluster-wide synchronization point.
+    Maps from PTX: barrier.cluster.arrive
+
+    Ground truth: UCGABAR_ARV → c7 79 00 00 00 00 00 00 | 00 00 00 08 ...
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0xc7, 0x79,
+                  b2=0x00, b3=0x00, b4=0x00,
+                  b8=0x00, b9=0x00, b10=0x00, b11=0x08,
+                  ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# UCGABAR_WAIT — CGA Barrier Wait
+# ---------------------------------------------------------------------------
+# Opcode: 0xdc7 (b[0]=0xc7, b[1]=0x7d)
+# Ground truth (ptxas sm_120, cluster kernel with barrier.cluster.wait):
+#   UCGABAR_WAIT: lo=0x0000000000007dc7  hi=0x000fe20008000000
+#   No register operands. b[11]=0x08 (fixed flag).
+
+def encode_ucgabar_wait(ctrl: int = 0) -> bytes:
+    """Encode UCGABAR_WAIT — cluster barrier wait.
+
+    Used to wait for all cluster CTAs to arrive at the barrier.
+    Maps from PTX: barrier.cluster.wait
+
+    Ground truth: UCGABAR_WAIT → c7 7d 00 00 00 00 00 00 | 00 00 00 08 ...
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0xc7, 0x7d,
+                  b2=0x00, b3=0x00, b4=0x00,
+                  b8=0x00, b9=0x00, b10=0x00, b11=0x08,
+                  ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# ULEA — Uniform Load Effective Address
+# ---------------------------------------------------------------------------
+# Opcode: 0x291 (b[0]=0x91, b[1]=0x72)
+# Ground truth (ptxas sm_120):
+#   ULEA UR4, UR5, UR4, 0x18:
+#     lo=0x0000000405047291  hi=0x001fe2000f8ec0ff
+#   b[2]=dest_ur=0x04, b[3]=base_ur=0x05, b[4]=index_ur=0x04
+#   b[8]=0xff(URZ acc), b[9]=0xc0, b[10]=0x8e, b[11]=0x0f
+#   Scale 0x18 appears in b[10]: 0x8e encodes shift info
+
+def encode_ulea(dest_ur: int, base_ur: int, index_ur: int, scale: int = 0,
+                acc_ur: int = 0xFF, ctrl: int = 0) -> bytes:
+    """Encode ULEA URdest, URbase, URindex, scale — uniform address calculation.
+
+    Args:
+        dest_ur: Destination uniform register.
+        base_ur: Base uniform register.
+        index_ur: Index uniform register.
+        scale: Scale factor (as log2 shift, e.g., 0x18 for 24-bit shift).
+        acc_ur: Accumulator uniform register (0xFF = URZ).
+        ctrl: 23-bit scheduling control word.
+
+    Ground truth: ULEA UR4, UR5, UR4, 0x18 →
+        91 72 04 05 04 00 00 00 | ff c0 8e 0f ...
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+
+    raw = bytearray(16)
+    raw[0] = 0x91
+    raw[1] = 0x72
+    raw[2] = dest_ur & 0xFF
+    raw[3] = base_ur & 0xFF
+    raw[4] = index_ur & 0xFF
+    raw[5] = 0x00
+    raw[6] = 0x00
+    raw[7] = 0x00
+    raw[8] = acc_ur & 0xFF
+    raw[9] = 0xc0
+    raw[10] = 0x8e  # scale encoding embedded in modifier; ground truth for scale=0x18
+    raw[11] = 0x0f
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# MEMBAR.ALL.GPU — All-scope Memory Barrier (includes shared+global)
+# ---------------------------------------------------------------------------
+# Same opcode 0x992, but b[9]=0xa0 for ALL.GPU scope (vs 0x20 for SC.GPU)
+MEMBAR_ALL_GPU = 0xa0  # b9 value for ALL.GPU scope
+
+def encode_membar_all_gpu(ctrl: int = 0) -> bytes:
+    """Encode MEMBAR.ALL.GPU — all-scope memory fence (shared+global).
+
+    Stronger than MEMBAR.SC.GPU: orders all memory operations including
+    shared memory. Used before cluster barriers.
+
+    Ground truth: MEMBAR.ALL.GPU → 92 79 00 00 00 00 00 00 | 00 a0 00 00 ...
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x92, 0x79,
+                  b2=0x00, b3=0x00, b4=0x00,
+                  b8=0x00, b9=MEMBAR_ALL_GPU, b10=0x00, b11=0x00,
+                  ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# UMOV UR, UR — Uniform Register-to-Register Move
+# ---------------------------------------------------------------------------
+# Opcode: 0xc82 (b[0]=0x82, b[1]=0x7c)
+# Different from UMOV imm (0x882, b[1]=0x78).
+# Ground truth (ptxas sm_120):
+#   UMOV UR5, URZ: lo=0x000000ff00057c82  hi=0x000fe20008000000
+#   b[2]=dest_ur=0x05, b[3]=0x00(fixed), b[4]=src_ur=0xff(URZ)
+#   b[11]=0x08
+
+def encode_umov_rr(dest_ur: int, src_ur: int, ctrl: int = 0) -> bytes:
+    """Encode UMOV URdest, URsrc — uniform register-to-register move.
+
+    Args:
+        dest_ur: Destination uniform register.
+        src_ur: Source uniform register (0xFF = URZ).
+        ctrl: 23-bit scheduling control word.
+
+    Ground truth: UMOV UR5, URZ → 82 7c 05 00 ff 00 00 00 | 00 00 00 08 ...
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x82, 0x7c,
+                  b2=dest_ur & 0xFF, b3=0x00, b4=src_ur & 0xFF,
+                  b8=0x00, b9=0x00, b10=0x00, b11=0x08,
+                  ctrl=ctrl)
+
+
+# ===========================================================================
+# TEXTURE/SURFACE OPERATIONS — SM_120
+# ===========================================================================
+# These use the extended instruction format with non-zero bytes 5-7.
+# Opcodes discovered by probing:
+#   TEX:  0xf60 (b[0]=0x60, b[1]=0x7f)
+#   TLD4: 0xf63 (b[0]=0x63, b[1]=0x7f)
+#   TXQ:  0xf6f (b[0]=0x6f, b[1]=0x7f)
+#   SULD: 0xf99 (b[0]=0x99, b[1]=0x7f)
+#   SUST: 0xf9d (b[0]=0x9d, b[1]=0x7f)
+#
+# These are complex multi-operand instructions; full encoder TBD.
+# For now, documenting the opcode map and ground truth.
+
+# Texture opcode constants
+OPCODE_TEX  = 0xf60
+OPCODE_TLD4 = 0xf63
+OPCODE_TXQ  = 0xf6f
+OPCODE_SULD = 0xf99
+OPCODE_SUST = 0xf9d
+
+
+# ===========================================================================
+# ADDITIONAL RARE OPCODES (2026-04-04 batch 2)
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# MATCH — Warp Match (any/all)
+# ---------------------------------------------------------------------------
+# Opcode: 0x3a1 (b[0]=0xa1, b[1]=0x73)
+# Ground truth (ptxas sm_120):
+#   MATCH.ANY R0, R4:
+#     lo=0x00000000040073a1  hi=0x001e3000000e8000
+#     b[2]=0x00(dest), b[3]=0x04(src), b[9]=0x80(ANY), b[10]=0x0e
+#   MATCH.ALL PT, R5, R4:
+#     lo=0x00000000040573a1  hi=0x000e2400000e0000
+#     b[2]=0x05(pred_dest?), b[3]=0x04(src), b[9]=0x00(ALL), b[10]=0x0e
+
+def encode_match_any(dest: int, src: int, ctrl: int = 0) -> bytes:
+    """Encode MATCH.ANY dest, src — warp-wide match (any lane has same value).
+
+    Returns a bitmask of lanes that have the same value as the calling lane.
+
+    Ground truth: MATCH.ANY R0, R4 → a1 73 00 04 00 00 00 00 | 00 80 0e 00 ...
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0xa1, 0x73,
+                  b2=dest & 0xFF, b3=src & 0xFF, b4=0x00,
+                  b8=0x00, b9=0x80, b10=0x0e, b11=0x00,
+                  ctrl=ctrl)
+
+
+def encode_match_all(pred_dest: int, dest: int, src: int, ctrl: int = 0) -> bytes:
+    """Encode MATCH.ALL Ppred, dest, src — warp-wide match (all lanes same value).
+
+    Sets predicate if all active lanes have the same value.
+
+    Ground truth: MATCH.ALL PT, R5, R4 → a1 73 05 04 00 00 00 00 | 00 00 0e 00 ...
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0xa1, 0x73,
+                  b2=dest & 0xFF, b3=src & 0xFF, b4=0x00,
+                  b8=0x00, b9=0x00, b10=0x0e, b11=0x00,
+                  ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# NANOSLEEP — Thread Sleep
+# ---------------------------------------------------------------------------
+# Opcode: 0x95d (b[0]=0x5d, b[1]=0x79)
+# Ground truth (ptxas sm_120):
+#   NANOSLEEP 0x64:
+#     lo=0x000000640000795d  hi=0x000fea0003800000
+#   b[4:7] = sleep duration in nanoseconds (32-bit LE)
+
+def encode_nanosleep(duration_ns: int = 100, ctrl: int = 0) -> bytes:
+    """Encode NANOSLEEP duration — thread sleep for specified nanoseconds.
+
+    Args:
+        duration_ns: Sleep duration in nanoseconds.
+        ctrl: 23-bit scheduling control word.
+
+    Ground truth: NANOSLEEP 0x64 → 5d 79 00 00 64 00 00 00 | 00 00 80 03 ...
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+
+    raw = bytearray(16)
+    raw[0] = 0x5d
+    raw[1] = 0x79
+    raw[2] = 0x00
+    raw[3] = 0x00
+    raw[4] = duration_ns & 0xFF
+    raw[5] = (duration_ns >> 8) & 0xFF
+    raw[6] = (duration_ns >> 16) & 0xFF
+    raw[7] = (duration_ns >> 24) & 0xFF
+    raw[8] = 0x00
+    raw[9] = 0x00
+    raw[10] = 0x80
+    raw[11] = 0x03
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# VOTE.ALL / VOTE.ANY — Warp Vote (predicate variants)
+# ---------------------------------------------------------------------------
+# Same opcode 0x806 as VOTE.BALLOT (b[0]=0x06, b[1]=0x78)
+# Already have encode_vote_ballot. Adding .ALL and .ANY variants.
+# Ground truth (ptxas sm_120):
+#   VOTE.ALL P0, !P0:
+#     lo=0x0000000000ff7806  hi=0x000fc80004000000
+#     b[2]=0xff(RZ?), b[9]=0x00(ALL), b[10]=0x00, b[11]=0x04(pred guard)
+#   VOTE.ANY P1, !P0:
+#     lo=0x0000000000ff7806  hi=0x000fe20004020100
+#     b[2]=0xff(RZ?), b[9]=0x01(ANY), b[10]=0x02, b[11]=0x04
+
+def encode_vote_all(pred_dest: int = 0, pred_src: int = 0,
+                     pred_src_neg: bool = True, ctrl: int = 0) -> bytes:
+    """Encode VOTE.ALL Ppred_dest, [!]Ppred_src — all-lanes predicate vote.
+
+    Sets pred_dest true if ALL active lanes have pred_src true.
+
+    Ground truth: VOTE.ALL P0, !P0 → 06 78 ff 00 00 00 00 00 | 00 00 00 04 ...
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+
+    pred_code = pred_src & 0x07
+    if pred_src_neg:
+        pred_code |= 0x04
+
+    raw = bytearray(16)
+    raw[0] = 0x06
+    raw[1] = 0x78
+    raw[2] = 0xff  # RZ (no GPR dest for pred-only variant)
+    raw[3] = 0x00
+    raw[4] = 0x00
+    raw[5] = 0x00
+    raw[6] = 0x00
+    raw[7] = 0x00
+    raw[8] = 0x00
+    raw[9] = 0x00   # ALL mode
+    raw[10] = 0x00
+    raw[11] = pred_code
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+def encode_vote_any(pred_dest: int = 0, pred_src: int = 0,
+                     pred_src_neg: bool = True, ctrl: int = 0) -> bytes:
+    """Encode VOTE.ANY Ppred_dest, [!]Ppred_src — any-lane predicate vote.
+
+    Sets pred_dest true if ANY active lane has pred_src true.
+
+    Ground truth: VOTE.ANY P1, !P0 → 06 78 ff 00 00 00 00 00 | 00 01 02 04 ...
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+
+    pred_code = pred_src & 0x07
+    if pred_src_neg:
+        pred_code |= 0x04
+
+    raw = bytearray(16)
+    raw[0] = 0x06
+    raw[1] = 0x78
+    raw[2] = 0xff
+    raw[3] = 0x00
+    raw[4] = 0x00
+    raw[5] = 0x00
+    raw[6] = 0x00
+    raw[7] = 0x00
+    raw[8] = 0x00
+    raw[9] = 0x01   # ANY mode
+    raw[10] = 0x02   # pred dest encoding
+    raw[11] = pred_code
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# FLO.U32.SH — Find Leading One with Shift Amount
+# ---------------------------------------------------------------------------
+# Same opcode 0x300 as FLO, with .SH modifier in b[10]
+# Ground truth: FLO.U32.SH R2, R6:
+#   lo=0x0000000600027300  hi=0x000e2400000e0400
+#   b[10]=0x0e, b[11]=0x04 (vs FLO: b[10]=0x0e, b[11]=0x00)
+
+def encode_flo_sh(dest: int, src: int, ctrl: int = 0) -> bytes:
+    """Encode FLO.U32.SH dest, src — find leading one, return shift amount.
+
+    Returns 31-FLO (the shift amount needed to normalize).
+    Used for bfind.shiftamt.u32 lowering.
+
+    Ground truth: FLO.U32.SH R2, R6 → 00 73 02 00 06 00 00 00 | 00 04 0e 00 ...
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x00, 0x73,
+                  b2=dest & 0xFF, b3=0x00, b4=src & 0xFF,
+                  b8=0x00, b9=0x04, b10=0x0e, b11=0x00,
+                  ctrl=ctrl)

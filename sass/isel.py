@@ -80,6 +80,10 @@ from sass.encoding.sm_120_opcodes import (
     encode_redux_sum, encode_redux_sum_s32, encode_redux_min_s32, encode_redux_max_s32,
     encode_redux_and_b32, encode_redux_or_b32, encode_redux_xor_b32,
     encode_ldgsts_e, encode_ldgdepbar, encode_depbar_le,
+    encode_syncs_exch_64, encode_syncs_arrive, encode_syncs_trywait,
+    encode_ublkcp_s_g, encode_ublkcp_g_s,
+    encode_utmaldg_1d, encode_utmaldg_2d, encode_utmastg_1d,
+    encode_utmacmdflush, encode_elect, encode_cctl_ivall,
     encode_mov_gpr_from_ur,
     encode_iadd3_imm32, encode_iadd3_neg_b4, encode_iadd3_neg_b3,
     encode_iadd3_pred_neg_b4, encode_iadd3_pred_small_imm,
@@ -1876,6 +1880,112 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 glob_r = ctx.ra.lo(gbase)
                         output.append(SassInstr(encode_ldgsts_e(smem_r, glob_r, ctx.ur_desc),
                             f'LDGSTS.E [R{smem_r}], desc[UR{ctx.ur_desc}][R{glob_r}.64]  // cp.async.ca.shared.global'))
+                    elif 'bulk' in instr.types:
+                        # cp.async.bulk.* — TMA instructions
+                        from ptx.ir import MemOp
+                        types_set = set(instr.types)
+                        if 'commit_group' in types_set:
+                            # cp.async.bulk.commit_group → UTMACMDFLUSH
+                            output.append(SassInstr(encode_utmacmdflush(),
+                                                    'UTMACMDFLUSH  // cp.async.bulk.commit_group'))
+                        elif 'wait_group' in types_set:
+                            # cp.async.bulk.wait_group N → DEPBAR.LE SB0, N
+                            count = 0
+                            if instr.srcs and isinstance(instr.srcs[0], ImmOp):
+                                count = instr.srcs[0].value
+                            output.append(SassInstr(encode_depbar_le(sb=0, count=count),
+                                                    f'DEPBAR.LE SB0, {count}  // cp.async.bulk.wait_group {count}'))
+                        elif 'tensor' in types_set:
+                            # cp.async.bulk.tensor.Nd.shared::cluster.global.tile...
+                            # Determine dimension from types
+                            dim = 1
+                            if '2d' in types_set:
+                                dim = 2
+                            elif '3d' in types_set:
+                                dim = 3
+                            # Check direction
+                            is_store = False
+                            for t in instr.types:
+                                # "global" before "shared" = store direction
+                                if 'global' in t and 'shared' not in t:
+                                    # Check ordering: global.shared::cta = store
+                                    idx_g = None
+                                    idx_s = None
+                                    for i, q in enumerate(instr.types):
+                                        if 'global' in q and idx_g is None:
+                                            idx_g = i
+                                        if 'shared' in q and idx_s is None:
+                                            idx_s = i
+                                    if idx_g is not None and idx_s is not None and idx_g < idx_s:
+                                        is_store = True
+                                    break
+                            if is_store:
+                                # TMA tensor store: uses UTMASTG
+                                # Allocate UR pairs for smem addr and descriptor
+                                ur_smem = ctx._next_ur; ctx._next_ur += 1
+                                ur_desc = ctx._next_ur; ctx._next_ur += 1
+                                output.append(SassInstr(encode_utmastg_1d(ur_smem, ur_desc),
+                                    f'UTMASTG.{dim}D [UR{ur_smem}], [UR{ur_desc}]  // cp.async.bulk.tensor.{dim}d store'))
+                                output.append(SassInstr(encode_utmacmdflush(),
+                                    'UTMACMDFLUSH  // TMA store flush'))
+                            else:
+                                # TMA tensor load: uses UTMALDG
+                                ur_smem = ctx._next_ur; ctx._next_ur += 1
+                                ur_desc = ctx._next_ur; ctx._next_ur += 1
+                                if dim == 1:
+                                    output.append(SassInstr(encode_utmaldg_1d(ur_smem, ur_desc),
+                                        f'UTMALDG.1D [UR{ur_smem}], [UR{ur_desc}]  // cp.async.bulk.tensor.1d load'))
+                                elif dim == 2:
+                                    output.append(SassInstr(encode_utmaldg_2d(ur_smem, ur_desc),
+                                        f'UTMALDG.2D [UR{ur_smem}], [UR{ur_desc}]  // cp.async.bulk.tensor.2d load'))
+                                else:
+                                    # 3D+ not yet supported; emit 1D as fallback
+                                    output.append(SassInstr(encode_utmaldg_1d(ur_smem, ur_desc),
+                                        f'UTMALDG.1D [UR{ur_smem}], [UR{ur_desc}]  // cp.async.bulk.tensor.{dim}d (fallback 1D)'))
+                        elif any('shared' in t for t in instr.types) and any('global' in t for t in instr.types):
+                            # cp.async.bulk.shared::cluster.global — non-tensor bulk copy
+                            # or cp.async.bulk.global.shared::cta — reverse direction
+                            is_store = False
+                            for i, t in enumerate(instr.types):
+                                if 'global' in t:
+                                    # If global appears before shared in type list, it's a store
+                                    for j, t2 in enumerate(instr.types):
+                                        if 'shared' in t2 and j > i:
+                                            is_store = True
+                                    break
+                            ur_dst  = ctx._next_ur; ctx._next_ur += 1
+                            ur_src  = ctx._next_ur; ctx._next_ur += 1
+                            ur_size = ctx._next_ur; ctx._next_ur += 1
+                            if is_store:
+                                output.append(SassInstr(encode_ublkcp_g_s(ur_dst, ur_src, ur_size),
+                                    f'UBLKCP.G.S [UR{ur_dst}], [UR{ur_src}], UR{ur_size}  // cp.async.bulk global<-shared'))
+                                output.append(SassInstr(encode_utmacmdflush(),
+                                    'UTMACMDFLUSH  // bulk store flush'))
+                            else:
+                                output.append(SassInstr(encode_ublkcp_s_g(ur_dst, ur_src, ur_size),
+                                    f'UBLKCP.S.G [UR{ur_dst}], [UR{ur_src}], UR{ur_size}  // cp.async.bulk shared<-global'))
+
+                elif op == 'mbarrier':
+                    # mbarrier.init / mbarrier.arrive / mbarrier.try_wait
+                    types_set = set(instr.types)
+                    if 'init' in types_set:
+                        # mbarrier.init.shared::cta.b64 [mbar], count
+                        ur_mbar  = ctx._next_ur; ctx._next_ur += 1
+                        ur_count = ctx._next_ur; ctx._next_ur += 1
+                        output.append(SassInstr(encode_syncs_exch_64(ur_mbar, ur_count),
+                            f'SYNCS.EXCH.64 URZ, [UR{ur_mbar}], UR{ur_count}  // mbarrier.init'))
+                    elif 'arrive' in types_set:
+                        # mbarrier.arrive.shared::cta.b64 %rd, [mbar]
+                        ur_mbar = ctx._next_ur; ctx._next_ur += 1
+                        output.append(SassInstr(encode_syncs_arrive(ur_mbar),
+                            f'SYNCS.ARRIVE [UR{ur_mbar}]  // mbarrier.arrive'))
+                    elif 'try_wait' in types_set:
+                        # mbarrier.try_wait.parity.shared::cta.b64 %p, [mbar], phase
+                        ur_mbar = ctx._next_ur; ctx._next_ur += 1
+                        # Phase register (R0 typically holds SHF.L.U32 RZ, 0x1f, RZ)
+                        r_phase = 0  # default R0
+                        output.append(SassInstr(encode_syncs_trywait(ur_mbar, r_phase),
+                            f'SYNCS.TRYWAIT PT, [UR{ur_mbar}], R{r_phase}  // mbarrier.try_wait'))
 
                 elif op == 'dp4a':
                     output.extend(_select_dp4a(instr, ctx.ra, ctx))

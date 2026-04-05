@@ -424,6 +424,188 @@ def test_idp4a_already_correct():
     assert raw[8] == 0xFF
 
 
+# ===========================================================================
+# TMA (Tensor Memory Accelerator) encoder tests — 2026-04-04
+# ===========================================================================
+
+from sass.encoding.sm_120_opcodes import (
+    encode_syncs_exch_64, encode_syncs_arrive, encode_syncs_trywait,
+    encode_ublkcp_s_g, encode_ublkcp_g_s,
+    encode_utmaldg_1d, encode_utmaldg_2d, encode_utmastg_1d,
+    encode_utmacmdflush, encode_elect, encode_cctl_ivall,
+)
+
+
+# --- SYNCS.EXCH.64 (mbarrier.init) ---
+
+def test_syncs_exch_64_opcode():
+    raw = encode_syncs_exch_64(ur_mbar=7, ur_count=4)
+    assert _opcode(raw) == 0x5b2, f"opcode={_opcode(raw):#x}"
+    assert raw[2] == 0xff  # dest = URZ
+    assert raw[3] == 7     # ur_mbar
+    assert raw[4] == 4     # ur_count
+    assert raw[9] == 0x01
+    assert raw[11] == 0x08  # TMA marker
+
+def test_syncs_exch_64_ground_truth():
+    """Low 8 bytes must match ptxas output for SYNCS.EXCH.64 URZ, [UR7], UR4."""
+    raw = encode_syncs_exch_64(ur_mbar=7, ur_count=4)
+    lo = struct.unpack_from('<Q', raw, 0)[0]
+    assert lo == 0x0000000407ff75b2, f"lo={lo:#018x}"
+
+
+# --- SYNCS.ARRIVE (mbarrier.arrive) ---
+
+def test_syncs_arrive_opcode():
+    raw = encode_syncs_arrive(ur_mbar=6)
+    assert _opcode(raw) == 0x9a7, f"opcode={_opcode(raw):#x}"
+    assert raw[2] == 0xff  # dest = RZ
+    assert raw[3] == 0xff  # src0 = RZ
+    assert raw[4] == 0xff  # src1 = RZ
+    assert raw[8] == 6     # ur_mbar
+    assert raw[10] == 0x10  # ARRIVE mode
+    assert raw[11] == 0x08  # TMA marker
+
+
+# --- SYNCS.TRYWAIT (mbarrier.try_wait) ---
+
+def test_syncs_trywait_opcode():
+    raw = encode_syncs_trywait(ur_mbar=4, r_phase=0)
+    assert _opcode(raw) == 0x5a7, f"opcode={_opcode(raw):#x}"
+    assert raw[2] == 0x00  # pred dest
+    assert raw[3] == 0xff  # always ff
+    assert raw[4] == 0     # r_phase = R0
+    assert raw[8] == 4     # ur_mbar
+    assert raw[9] == 0x11
+    assert raw[10] == 0x0e
+    assert raw[11] == 0x08  # TMA marker
+
+def test_syncs_trywait_ground_truth():
+    """Low 8 bytes must match ptxas output for SYNCS.PHASECHK.TRYWAIT PT, [UR4], R0."""
+    raw = encode_syncs_trywait(ur_mbar=4, r_phase=0)
+    lo = struct.unpack_from('<Q', raw, 0)[0]
+    assert lo == 0x00000000ff0075a7, f"lo={lo:#018x}"
+
+
+# --- UBLKCP.S.G (bulk copy shared<-global) ---
+
+def test_ublkcp_s_g_opcode():
+    raw = encode_ublkcp_s_g(ur_dst=8, ur_src=10, ur_size=4)
+    assert _opcode(raw) == 0x3ba, f"opcode={_opcode(raw):#x}"
+    assert raw[3] == 10    # ur_src
+    assert raw[4] == 8     # ur_dst
+    assert raw[8] == 4     # ur_size
+    assert raw[9] == 0x02  # S.G mode
+    assert raw[11] == 0x08
+
+def test_ublkcp_s_g_ground_truth():
+    """Low 8 bytes must match ptxas output for UBLKCP.S.G [UR8], [UR10], UR4."""
+    raw = encode_ublkcp_s_g(ur_dst=8, ur_src=10, ur_size=4)
+    lo = struct.unpack_from('<Q', raw, 0)[0]
+    assert lo == 0x000000080a0073ba, f"lo={lo:#018x}"
+
+
+# --- UBLKCP.G.S (bulk copy global<-shared) ---
+
+def test_ublkcp_g_s_opcode():
+    raw = encode_ublkcp_g_s(ur_dst=8, ur_src=4, ur_size=5)
+    assert _opcode(raw) == 0x3ba, f"opcode={_opcode(raw):#x}"
+    assert raw[3] == 4     # ur_src
+    assert raw[4] == 8     # ur_dst
+    assert raw[8] == 5     # ur_size
+    assert raw[9] == 0x04  # G.S mode
+    assert raw[11] == 0x08
+
+def test_ublkcp_g_s_ground_truth():
+    """Low 8 bytes must match ptxas output for UBLKCP.G.S [UR8], [UR4], UR5."""
+    raw = encode_ublkcp_g_s(ur_dst=8, ur_src=4, ur_size=5)
+    lo = struct.unpack_from('<Q', raw, 0)[0]
+    assert lo == 0x00000008040073ba, f"lo={lo:#018x}"
+
+
+# --- UTMALDG.1D (TMA tensor load 1D) ---
+
+def test_utmaldg_1d_opcode():
+    raw = encode_utmaldg_1d(ur_dst=4, ur_desc=8)
+    assert _opcode(raw) == 0x5b4, f"opcode={_opcode(raw):#x}"
+    assert raw[3] == 8     # ur_desc
+    assert raw[4] == 4     # ur_dst
+    assert raw[9] == 0x00  # 1D mode (bit7=0)
+    assert raw[11] == 0x08
+
+def test_utmaldg_1d_ground_truth():
+    """Low 8 bytes must match ptxas output for UTMALDG.1D [UR4], [UR8]."""
+    raw = encode_utmaldg_1d(ur_dst=4, ur_desc=8)
+    lo = struct.unpack_from('<Q', raw, 0)[0]
+    assert lo == 0x00000004080075b4, f"lo={lo:#018x}"
+
+
+# --- UTMALDG.2D (TMA tensor load 2D) ---
+
+def test_utmaldg_2d_opcode():
+    raw = encode_utmaldg_2d(ur_dst=8, ur_desc=12)
+    assert _opcode(raw) == 0x5b4, f"opcode={_opcode(raw):#x}"
+    assert raw[3] == 12    # ur_desc
+    assert raw[4] == 8     # ur_dst
+    assert raw[9] == 0x80  # 2D mode (bit7=1)
+    assert raw[11] == 0x08
+
+def test_utmaldg_2d_ground_truth():
+    """Low 8 bytes must match ptxas output for UTMALDG.2D [UR8], [UR12]."""
+    raw = encode_utmaldg_2d(ur_dst=8, ur_desc=12)
+    lo = struct.unpack_from('<Q', raw, 0)[0]
+    assert lo == 0x000000080c0075b4, f"lo={lo:#018x}"
+
+
+# --- UTMASTG.1D (TMA tensor store 1D) ---
+
+def test_utmastg_1d_opcode():
+    raw = encode_utmastg_1d(ur_src=4, ur_desc=8)
+    assert _opcode(raw) == 0x3b5, f"opcode={_opcode(raw):#x}"
+    assert raw[3] == 8     # ur_desc
+    assert raw[4] == 4     # ur_src
+    assert raw[11] == 0x08
+
+def test_utmastg_1d_ground_truth():
+    """Low 8 bytes must match ptxas output for UTMASTG.1D [UR4], [UR8]."""
+    raw = encode_utmastg_1d(ur_src=4, ur_desc=8)
+    lo = struct.unpack_from('<Q', raw, 0)[0]
+    assert lo == 0x00000004080073b5, f"lo={lo:#018x}"
+
+
+# --- UTMACMDFLUSH ---
+
+def test_utmacmdflush_opcode():
+    raw = encode_utmacmdflush()
+    assert _opcode(raw) == 0x9b7, f"opcode={_opcode(raw):#x}"
+    # All operand bytes should be zero
+    for i in range(2, 12):
+        assert raw[i] == 0, f"b[{i}]={raw[i]:#x} (expected 0)"
+
+
+# --- ELECT ---
+
+def test_elect_opcode():
+    raw = encode_elect(pred_guard=0, pred_dest=1)
+    assert _opcode(raw) == 0x82f, f"opcode={_opcode(raw):#x}"
+    assert raw[2] == 0xff  # URZ
+    assert raw[11] == 0x03
+
+def test_elect_pred_guard():
+    """Pred guard P0 → pred nibble = 0x0."""
+    raw = encode_elect(pred_guard=0)
+    assert (raw[1] >> 4) == 0x0, f"pred_nibble={raw[1]>>4:#x}"
+
+
+# --- CCTL.IVALL ---
+
+def test_cctl_ivall_opcode():
+    raw = encode_cctl_ivall()
+    assert _opcode(raw) == 0x98f, f"opcode={_opcode(raw):#x}"
+    assert raw[3] == 0xff  # always ff
+    assert raw[11] == 0x02  # IVALL mode
+
+
 if __name__ == '__main__':
     tests = [v for k, v in sorted(globals().items()) if k.startswith('test_')]
     passed = 0

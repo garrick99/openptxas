@@ -165,7 +165,7 @@ _TOKEN_RE = re.compile(r"""
     (?P<INT>            [0-9]+             ) |
     (?P<REGNAME>        %[a-zA-Z_][a-zA-Z0-9_.]* ) |
     (?P<LABEL_DEF>      [a-zA-Z_$][a-zA-Z0-9_$]*\s*:(?!:) ) |
-    (?P<IDENT>          \.?[a-zA-Z_$][a-zA-Z0-9_$.@]* ) |
+    (?P<IDENT>          \.?[a-zA-Z_$][a-zA-Z0-9_$.@]*(?:::[a-zA-Z_][a-zA-Z0-9_$.@]*)* ) |
     (?P<PUNCT>          [(){}\[\],;@!+\-<>] ) |
     (?P<NEWLINE>        \n                 ) |
     (?P<WS>             [ \t\r]+           )
@@ -617,7 +617,7 @@ class _Parser:
 
         # Ops that have no destination (void)
         VOID_OPS = {"ret", "bra", "call", "bar", "membar", "exit", "trap",
-                    "st", "prefetch", "prefetchu", "wgmma", "cp"}
+                    "st", "prefetch", "prefetchu", "wgmma", "cp", "mbarrier"}
         if op in VOID_OPS:
             dest = None
             srcs = operands
@@ -646,7 +646,7 @@ class _Parser:
             self._expect("PUNCT", "]")
             return ConstBankOp(bank=bank, offset=off)
 
-        # Memory operand: [base] or [base+offset]
+        # Memory operand: [base] or [base+offset] or [base, {coords}]
         if tok.kind == "PUNCT" and tok.value == "[":
             self._advance()
             base_tok = self._peek()
@@ -660,7 +660,26 @@ class _Parser:
                 offset = self._parse_int_literal()
             elif self._match("PUNCT", "-"):
                 offset = -self._parse_int_literal()
-            self._expect("PUNCT", "]")
+            # Handle TMA-style [reg, {coords}] — if we see a comma before ],
+            # consume all remaining tokens (commas, vectors, etc.) until ].
+            t = self._peek()
+            if t and t.kind == "PUNCT" and t.value == ",":
+                # TMA coordinate syntax: skip everything until matching ]
+                depth = 1
+                while depth > 0 and not self._at_end():
+                    t = self._peek()
+                    if t and t.kind == "PUNCT" and t.value == "]":
+                        depth -= 1
+                        self._advance()
+                        if depth == 0:
+                            break
+                    elif t and t.kind == "PUNCT" and t.value == "[":
+                        depth += 1
+                        self._advance()
+                    else:
+                        self._advance()
+            else:
+                self._expect("PUNCT", "]")
             return MemOp(base=base, offset=offset)
 
         # Vector operand: {%r0, %r1, ...}  (treat as first register)

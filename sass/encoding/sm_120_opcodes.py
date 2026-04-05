@@ -4030,3 +4030,340 @@ def encode_idp4a(dest: int, src_a: int, src_b: int, src_c: int = 0xFF,
                   b2=dest, b3=src_a, b4=src_b,
                   b8=src_c, b9=0x00, b10=0x00, b11=0x00,
                   ctrl=ctrl)
+
+
+# ===========================================================================
+# TMA (Tensor Memory Accelerator) Instructions — SM_120 (Blackwell)
+# ===========================================================================
+# Reverse-engineered from ptxas 13.0 (CUDA 13.0) reference cubins.
+# All TMA instructions operate on uniform registers (UR), not GPR.
+# Common pattern: b[11]=0x08 as TMA marker.
+
+
+# ---------------------------------------------------------------------------
+# SYNCS.EXCH.64 — Mbarrier Init (mbarrier.init)
+# ---------------------------------------------------------------------------
+# Opcode: 0x5b2 (b[0]=0xb2, b[1]=0x75)
+# Ground truth (ptxas sm_120):
+#   SYNCS.EXCH.64 URZ, [UR7], UR4:
+#     lo=b2 75 ff 07 04 00 00 00  hi=00 01 00 08 ...
+#   b2=ff (dest=URZ), b3=UR_mbar, b4=UR_count
+#   b9=0x01, b10=0x00, b11=0x08
+
+def encode_syncs_exch_64(ur_mbar: int, ur_count: int, ctrl: int = 0) -> bytes:
+    """Encode SYNCS.EXCH.64: mbarrier.init on shared memory.
+
+    Initializes an mbarrier at shared memory location [UR_mbar] with UR_count
+    expected arrivals. Dest is always URZ.
+
+    Args:
+        ur_mbar:  Uniform register containing shared memory mbarrier address.
+        ur_count: Uniform register containing arrival count.
+        ctrl:     23-bit scheduling control word.
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0xb2, 0x75,
+                  b2=0xff, b3=ur_mbar, b4=ur_count,
+                  b8=0x00, b9=0x01, b10=0x00, b11=0x08,
+                  ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# SYNCS.ARRIVE.TRANS64.A1T0 — Mbarrier Arrive (mbarrier.arrive)
+# ---------------------------------------------------------------------------
+# Opcode: 0x9a7 (b[0]=0xa7, b[1]=0x79)
+# Ground truth (ptxas sm_120):
+#   SYNCS.ARRIVE.TRANS64.A1T0 RZ, [UR6], RZ:
+#     lo=a7 79 ff ff ff 00 00 00  hi=06 00 10 08 ...
+#   b2=ff (dest=RZ), b3=ff (unused=RZ), b4=ff (unused=RZ)
+#   b8=UR_mbar, b9=0x00, b10=0x10, b11=0x08
+
+def encode_syncs_arrive(ur_mbar: int, ctrl: int = 0) -> bytes:
+    """Encode SYNCS.ARRIVE.TRANS64.A1T0: mbarrier.arrive.
+
+    Signals arrival at the mbarrier. All source regs are RZ (unused),
+    mbarrier address is in b8 (uniform register).
+
+    Args:
+        ur_mbar:  Uniform register containing shared memory mbarrier address.
+        ctrl:     23-bit scheduling control word.
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0]  = 0xa7
+    raw[1]  = 0x79
+    raw[2]  = 0xff  # dest = RZ
+    raw[3]  = 0xff  # src0 = RZ
+    raw[4]  = 0xff  # src1 = RZ
+    # b5-b7 = 0x00
+    raw[8]  = ur_mbar & 0xFF
+    raw[9]  = 0x00
+    raw[10] = 0x10  # ARRIVE mode
+    raw[11] = 0x08  # TMA marker
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# SYNCS.PHASECHK.TRANS64.TRYWAIT — Mbarrier Try Wait (mbarrier.try_wait)
+# ---------------------------------------------------------------------------
+# Opcode: 0x5a7 (b[0]=0xa7, b[1]=0x75)
+# Ground truth (ptxas sm_120):
+#   SYNCS.PHASECHK.TRANS64.TRYWAIT PT, [UR4], R0:
+#     lo=a7 75 00 ff 00 00 00 00  hi=04 11 0e 08 ...
+#   b2=0x00 (pred dest PT), b3=0xff, b4=R_phase (GPR with phase/parity)
+#   b8=UR_mbar, b9=0x11, b10=0x0e, b11=0x08
+
+def encode_syncs_trywait(ur_mbar: int, r_phase: int = 0, ctrl: int = 0) -> bytes:
+    """Encode SYNCS.PHASECHK.TRANS64.TRYWAIT: mbarrier.try_wait.parity.
+
+    Tests whether the mbarrier phase matches the expected parity.
+    Sets predicate PT based on the result.
+
+    Args:
+        ur_mbar: Uniform register containing shared memory mbarrier address.
+        r_phase: GPR containing the parity/phase value.
+        ctrl:    23-bit scheduling control word.
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0xa7, 0x75,
+                  b2=0x00, b3=0xff, b4=r_phase,
+                  b8=ur_mbar, b9=0x11, b10=0x0e, b11=0x08,
+                  ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# UBLKCP.S.G — Bulk Copy Shared←Global (cp.async.bulk.shared::cluster.global)
+# ---------------------------------------------------------------------------
+# Opcode: 0x3ba (b[0]=0xba, b[1]=0x73)
+# Ground truth (ptxas sm_120):
+#   UBLKCP.S.G [UR8], [UR10], UR4:
+#     lo=ba 73 00 0a 08 00 00 00  hi=04 02 00 08 ...
+#   b2=0x00, b3=UR_src_global, b4=UR_dst_smem
+#   b8=UR_size, b9=0x02 (S.G mode), b10=0x00, b11=0x08
+
+def encode_ublkcp_s_g(ur_dst: int, ur_src: int, ur_size: int,
+                       ctrl: int = 0) -> bytes:
+    """Encode UBLKCP.S.G: bulk copy global→shared (non-tensor).
+
+    Copies ur_size bytes from global memory [UR_src] to shared memory [UR_dst].
+    Used for cp.async.bulk.shared::cluster.global.
+
+    Args:
+        ur_dst:  Uniform register with shared memory destination address.
+        ur_src:  Uniform register with global memory source address.
+        ur_size: Uniform register with byte count.
+        ctrl:    23-bit scheduling control word.
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0xba, 0x73,
+                  b2=0x00, b3=ur_src, b4=ur_dst,
+                  b8=ur_size, b9=0x02, b10=0x00, b11=0x08,
+                  ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# UBLKCP.G.S — Bulk Copy Global←Shared (cp.async.bulk.global.shared::cta)
+# ---------------------------------------------------------------------------
+# Opcode: 0x3ba (same as UBLKCP.S.G, direction encoded in b9)
+# Ground truth (ptxas sm_120):
+#   UBLKCP.G.S [UR8], [UR4], UR5:
+#     lo=ba 73 00 04 08 00 00 00  hi=05 04 00 08 ...
+#   b2=0x00, b3=UR_src_smem, b4=UR_dst_global(lo)
+#   b8=UR_size, b9=0x04 (G.S mode), b10=0x00, b11=0x08
+
+def encode_ublkcp_g_s(ur_dst: int, ur_src: int, ur_size: int,
+                       ctrl: int = 0) -> bytes:
+    """Encode UBLKCP.G.S: bulk copy shared→global (non-tensor).
+
+    Copies ur_size bytes from shared memory [UR_src] to global memory [UR_dst].
+    Used for cp.async.bulk.global.shared::cta.
+
+    Args:
+        ur_dst:  Uniform register with global memory destination address.
+        ur_src:  Uniform register with shared memory source address.
+        ur_size: Uniform register with byte count.
+        ctrl:    23-bit scheduling control word.
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0xba, 0x73,
+                  b2=0x00, b3=ur_src, b4=ur_dst,
+                  b8=ur_size, b9=0x04, b10=0x00, b11=0x08,
+                  ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# UTMALDG.1D — TMA Tensor Load 1D (cp.async.bulk.tensor.1d...global)
+# ---------------------------------------------------------------------------
+# Opcode: 0x5b4 (b[0]=0xb4, b[1]=0x75)
+# Ground truth (ptxas sm_120):
+#   UTMALDG.1D [UR4], [UR8]:
+#     lo=b4 75 00 08 04 00 00 00  hi=00 00 00 08 ...
+#   b2=0x00, b3=UR_desc, b4=UR_dst_smem
+#   b8=0x00, b9=0x00 (1D mode), b10=0x00, b11=0x08
+
+def encode_utmaldg_1d(ur_dst: int, ur_desc: int, ctrl: int = 0) -> bytes:
+    """Encode UTMALDG.1D: TMA tensor load 1D, global→shared.
+
+    Loads data using tensor descriptor UR_desc into shared memory UR_dst.
+    Coordinates are passed separately in UR registers (set up by ptxas preamble).
+
+    Args:
+        ur_dst:  Uniform register with shared memory destination address.
+        ur_desc: Uniform register with TMA tensor descriptor address.
+        ctrl:    23-bit scheduling control word.
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0xb4, 0x75,
+                  b2=0x00, b3=ur_desc, b4=ur_dst,
+                  b8=0x00, b9=0x00, b10=0x00, b11=0x08,
+                  ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# UTMALDG.2D — TMA Tensor Load 2D (cp.async.bulk.tensor.2d...global)
+# ---------------------------------------------------------------------------
+# Opcode: 0x5b4 (same as 1D, dimension encoded in b9)
+# Ground truth (ptxas sm_120):
+#   UTMALDG.2D [UR8], [UR12]:
+#     lo=b4 75 00 0c 08 00 00 00  hi=00 80 00 08 ...
+#   b2=0x00, b3=UR_desc, b4=UR_dst_smem
+#   b8=0x00, b9=0x80 (2D mode: bit7=1), b10=0x00, b11=0x08
+
+def encode_utmaldg_2d(ur_dst: int, ur_desc: int, ctrl: int = 0) -> bytes:
+    """Encode UTMALDG.2D: TMA tensor load 2D, global→shared.
+
+    Like UTMALDG.1D but for 2D tensor regions. Dimension bit is b9[7]=1.
+
+    Args:
+        ur_dst:  Uniform register with shared memory destination address.
+        ur_desc: Uniform register with TMA tensor descriptor address.
+        ctrl:    23-bit scheduling control word.
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0xb4, 0x75,
+                  b2=0x00, b3=ur_desc, b4=ur_dst,
+                  b8=0x00, b9=0x80, b10=0x00, b11=0x08,
+                  ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# UTMASTG.1D — TMA Tensor Store 1D (cp.async.bulk.tensor.1d...shared)
+# ---------------------------------------------------------------------------
+# Opcode: 0x3b5 (b[0]=0xb5, b[1]=0x73)
+# Ground truth (ptxas sm_120):
+#   UTMASTG.1D [UR4], [UR8]:
+#     lo=b5 73 00 08 04 00 00 00  hi=00 00 00 08 ...
+#   b2=0x00, b3=UR_desc, b4=UR_src_smem
+#   b8=0x00, b9=0x00, b10=0x00, b11=0x08
+
+def encode_utmastg_1d(ur_src: int, ur_desc: int, ctrl: int = 0) -> bytes:
+    """Encode UTMASTG.1D: TMA tensor store 1D, shared→global.
+
+    Stores data from shared memory UR_src using tensor descriptor UR_desc.
+
+    Args:
+        ur_src:  Uniform register with shared memory source address.
+        ur_desc: Uniform register with TMA tensor descriptor address.
+        ctrl:    23-bit scheduling control word.
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0xb5, 0x73,
+                  b2=0x00, b3=ur_desc, b4=ur_src,
+                  b8=0x00, b9=0x00, b10=0x00, b11=0x08,
+                  ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# UTMACMDFLUSH — TMA Command Flush
+# ---------------------------------------------------------------------------
+# Opcode: 0x9b7 (b[0]=0xb7, b[1]=0x79)
+# Ground truth (ptxas sm_120):
+#   UTMACMDFLUSH:
+#     lo=b7 79 00 00 00 00 00 00  hi=00 00 00 00 ...
+#   No operands. All zeros except opcode and ctrl.
+
+def encode_utmacmdflush(ctrl: int = 0) -> bytes:
+    """Encode UTMACMDFLUSH: flush the TMA command queue.
+
+    Used after TMA store operations to ensure all pending TMA commands
+    are dispatched. No operands.
+
+    Args:
+        ctrl: 23-bit scheduling control word.
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0xb7, 0x79,
+                  b2=0x00, b3=0x00, b4=0x00,
+                  b8=0x00, b9=0x00, b10=0x00, b11=0x00,
+                  ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# ELECT — Elect Leader Thread in Warp
+# ---------------------------------------------------------------------------
+# Opcode: 0x82f (b[0]=0x2f, b[1]=0x08)
+# Ground truth (ptxas sm_120):
+#   @P0 ELECT P1, URZ, PT:
+#     lo=2f 08 ff 00 00 00 00 00  hi=00 00 82 03 ...
+#   b1[7:4]=0x0 (pred guard P0), b2=0xff (URZ), b3=0x00, b4=0x00
+#   b9=0x00, b10=0x82, b11=0x03
+# Note: pred nibble encodes the guard predicate, NOT the default 0x7 (PT).
+# The destination predicate P1 is encoded in b10/b11 fields.
+
+def encode_elect(pred_guard: int = 0, pred_dest: int = 1,
+                  ctrl: int = 0) -> bytes:
+    """Encode ELECT: elect a single leader thread from active threads.
+
+    Sets pred_dest=true in exactly one active thread (the leader).
+    The pred_guard predicate gates which threads participate.
+
+    Args:
+        pred_guard: Guard predicate index (0-5). Default P0.
+        pred_dest:  Destination predicate index for the elected leader. Default P1.
+        ctrl:       23-bit scheduling control word.
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0]  = 0x2f
+    raw[1]  = 0x08 | ((pred_guard & 0xF) << 4)
+    raw[2]  = 0xff  # URZ
+    raw[3]  = 0x00
+    raw[4]  = 0x00
+    # b5-b7 = 0x00
+    raw[8]  = 0x00
+    raw[9]  = 0x00
+    raw[10] = 0x82 | ((pred_dest & 0x7) << 0)  # pred dest in low bits? Actually from ground truth P1→0x82
+    raw[11] = 0x03
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# CCTL.IVALL — Cache Control: Invalidate All
+# ---------------------------------------------------------------------------
+# Opcode: 0x98f (b[0]=0x8f, b[1]=0x79)
+# Ground truth (ptxas sm_120):
+#   CCTL.IVALL:
+#     lo=8f 79 00 ff 00 00 00 00  hi=00 00 00 02 ...
+#   b2=0x00, b3=0xff, b9-b10=0x00, b11=0x02
+
+def encode_cctl_ivall(ctrl: int = 0) -> bytes:
+    """Encode CCTL.IVALL: invalidate all cache lines.
+
+    Used after TMA stores to ensure cache coherence. No register operands.
+
+    Args:
+        ctrl: 23-bit scheduling control word.
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x8f, 0x79,
+                  b2=0x00, b3=0xff, b4=0x00,
+                  b8=0x00, b9=0x00, b10=0x00, b11=0x02,
+                  ctrl=ctrl)

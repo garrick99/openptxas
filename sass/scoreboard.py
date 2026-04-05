@@ -103,6 +103,16 @@ _OPCODE_META: dict[int, _OpMeta] = {
     0x21e: _OpMeta('PLOP3',    0, 0x3f, 0),  # PLOP3 predicate LOP3 (pred dest only)
     0x239: _OpMeta('I2IP',     1, 0x3e, 1),  # I2IP integer pack
     0x822: _OpMeta('FSWZADD',  1, 0x3e, 1),  # FSWZADD float swizzle-add
+    # TMA (Tensor Memory Accelerator) — SM_120 Blackwell
+    0x5b2: _OpMeta('SYNCS.EXCH',   0, 0x03, 2),  # mbarrier.init (wdep varies per context; 0x03/0x15 observed)
+    0x9a7: _OpMeta('SYNCS.ARRIVE', 0, 0x3f, 1),  # mbarrier.arrive (no GPR dest)
+    0x5a7: _OpMeta('SYNCS.TRYWAIT',0, 0x3f, 1),  # mbarrier.try_wait (pred dest only)
+    0x3ba: _OpMeta('UBLKCP',       0, 0x0e, 12), # bulk copy S↔G (wdep=0x0e for load, 0x1f for store)
+    0x5b4: _OpMeta('UTMALDG',      0, 0x0e, 12), # TMA tensor load (wdep=0x0e, misc=12)
+    0x3b5: _OpMeta('UTMASTG',      0, 0x1f, 1),  # TMA tensor store (wdep=0x1f, misc=1)
+    0x9b7: _OpMeta('UTMACMDFLUSH', 0, 0x0f, 1),  # TMA command flush (wdep=0x0f)
+    0x82f: _OpMeta('ELECT',        0, 0x3f, 1),  # elect leader thread (no GPR dest)
+    0x98f: _OpMeta('CCTL',         0, 0x3f, 1),  # cache control invalidate all
 }
 
 
@@ -124,6 +134,9 @@ _OPCODES_CTRL = {0x94d, 0x947, 0x918, 0x91a, 0x992}  # EXIT, BRA, NOP, DEPBAR.LE
 _OPCODES_LDGSTS = {0xfae}  # LDGSTS.E (cp.async global→shared)
 _OPCODES_LDGDEPBAR = {0x9af}  # LDGDEPBAR (cp.async commit)
 _OPCODES_REDUX = {0x3c4}  # REDUX.SUM (warp reduction → UR)
+_OPCODES_TMA = {0x5b2, 0x9a7, 0x5a7,  # SYNCS (mbarrier init/arrive/trywait)
+                0x3ba, 0x5b4, 0x3b5,  # UBLKCP, UTMALDG, UTMASTG
+                0x9b7, 0x82f, 0x98f}  # UTMACMDFLUSH, ELECT, CCTL
 _OPCODES_ALU = {
     # Integer arithmetic (SM_120 + SM_89)
     0x210,        # IADD3 (SM_120 R-R / SM_89 R-R)
@@ -231,8 +244,8 @@ def _get_dest_reg(raw: bytes) -> int:
     """Get the destination register index, or -1 if none."""
     opcode = _get_opcode(raw)
     # LDCU/S2UR write UR registers, not GPR
-    if opcode in (_OPCODES_CTRL | _OPCODES_STG | _OPCODES_STS | _OPCODES_BAR | {0x7ac, 0x9c3}):
-        return -1  # no GPR dest
+    if opcode in (_OPCODES_CTRL | _OPCODES_STG | _OPCODES_STS | _OPCODES_BAR | _OPCODES_TMA | {0x7ac, 0x9c3}):
+        return -1  # no GPR dest (TMA instructions operate on UR, not GPR)
     return raw[2]
 
 

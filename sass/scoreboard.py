@@ -66,6 +66,10 @@ _OPCODE_META: dict[int, _OpMeta] = {
     0x219: _OpMeta('SHF.R.S32.HI.VAR', 1, 0x3e, 1),  # SHF.R.S32.HI variable-shift (shr.s32)
     0x221: _OpMeta('FADD',       1, 0x3e, 1),
     0x223: _OpMeta('FFMA',       1, 0x3e, 1),
+    0x308: _OpMeta('MUFU',       1, 0x3e, 1),  # MUFU (SFU: RCP, SQRT, SIN, COS, EX2, LG2)
+    0x309: _OpMeta('POPC',       1, 0x3e, 1),  # POPC (population count)
+    0x301: _OpMeta('BREV',       1, 0x3e, 1),  # BREV (bit reverse)
+    0x300: _OpMeta('FLO',        1, 0x3e, 1),  # FLO (find leading one)
     0x820: _OpMeta('FMUL.IMM',   1, 0x3e, 1),  # FMUL with 32-bit float immediate
     0x823: _OpMeta('FFMA.IMM',   1, 0x3e, 1),  # FFMA with 32-bit float immediate
     0x80a: _OpMeta('FSEL.STEP',  1, 0x3e, 5),  # Combined float compare+select (misc=5, ptxas-verified)
@@ -339,19 +343,26 @@ def _get_src_regs(raw: bytes) -> set[int]:
         if raw[3] < 255: regs |= {raw[3], raw[3]+1}
     elif opcode in _OPCODES_ALU:
         # ALU: src0 at b3, src1 at b4, src2 at b8 (varies by opcode)
-        if raw[3] < 255: regs.add(raw[3])
-        if opcode in (0x210, 0x212, 0x810):  # IADD3/LOP3/IADD3.IMM: src0=b3, src1=b4, src2=b8
+        # Unary ops (MUFU, POPC, BREV, FLO, IABS): src at b4, b3=0x00 (not a real source)
+        if opcode in (0x308, 0x309, 0x301, 0x300, 0x213):
+            # MUFU/POPC/BREV/FLO/IABS: single src at b4 only
+            if raw[4] < 255: regs.add(raw[4])
+        elif opcode in (0x210, 0x212, 0x810):  # IADD3/LOP3/IADD3.IMM: src0=b3, src1=b4, src2=b8
+            if raw[3] < 255: regs.add(raw[3])
             if raw[4] < 255: regs.add(raw[4])
             if raw[8] < 255: regs.add(raw[8])
         elif opcode in (0x207, 0x20b, 0x416, 0x216):  # SEL/FSETP/PRMT/PRMT.REG: src0=b3, src1=b4
+            if raw[3] < 255: regs.add(raw[3])
             if raw[4] < 255: regs.add(raw[4])
             if opcode == 0x216 and raw[8] < 255: regs.add(raw[8])  # PRMT.REG also reads b8
         elif opcode == 0x235:  # IADD.64: src0=b3 pair, src1=b4 pair
-            if raw[3] < 255: regs.add(raw[3]+1)
+            if raw[3] < 255: regs |= {raw[3], raw[3]+1}
             if raw[4] < 255: regs |= {raw[4], raw[4]+1}
         elif opcode in (0x819,):  # SHF (const): src0=b3, K=b4(imm), src1=b8
+            if raw[3] < 255: regs.add(raw[3])
             if raw[8] < 255: regs.add(raw[8])
         elif opcode in (0x299,):  # SHF.VAR: src0=b3, k_reg=b4(reg), src1=b8
+            if raw[3] < 255: regs.add(raw[3])
             if raw[4] < 255: regs.add(raw[4])   # shift-amount register
             if raw[8] < 255: regs.add(raw[8])
         elif opcode in (0x23c, 0x237, 0x27a):  # HMMA/IMMA/QMMA: a=b3(4 regs), b=b4(2), c=b8(4)
@@ -363,22 +374,30 @@ def _get_src_regs(raw: bytes) -> set[int]:
             if raw[3] < 255: regs.add(raw[3])
             if opcode == 0x823 and raw[8] < 255: regs.add(raw[8])  # FFMA addend
         elif opcode in (0x221, 0x223):  # FADD/FFMA: src0=b3, src1=b4, src2=b8
+            if raw[3] < 255: regs.add(raw[3])
             if raw[4] < 255: regs.add(raw[4])
             if raw[8] < 255 and opcode == 0x223: regs.add(raw[8])
         elif opcode in (0x825, 0x225):  # IMAD.WIDE (R-imm 0x825, R-R 0x225): src2 is 64-bit pair
+            if raw[3] < 255: regs.add(raw[3])
             if raw[4] < 255: regs.add(raw[4])
             if raw[8] < 255: regs |= {raw[8], raw[8]+1}
         elif opcode in (0x824, 0x224, 0x2a4):  # IMAD non-wide variants: src0=b3, src1=b4, src2=b8
+            if raw[3] < 255: regs.add(raw[3])
             if raw[4] < 255: regs.add(raw[4])
             if raw[8] < 255: regs.add(raw[8])
         elif opcode == 0xc24:  # IMAD R-UR: src0=b3 (GPR), src1=b4 (UR, not GPR), src2=b8 (GPR)
+            if raw[3] < 255: regs.add(raw[3])
             if raw[8] < 255: regs.add(raw[8])
         elif opcode == 0x20c:  # ISETP R-R: src0=b3, src1=b4
             if raw[3] < 255: regs.add(raw[3])
             if raw[4] < 255: regs.add(raw[4])
         elif opcode == 0x226:  # IDP.4A: src_a=b3, src_b=b4, src_c=b8
+            if raw[3] < 255: regs.add(raw[3])
             if raw[4] < 255: regs.add(raw[4])
             if raw[8] < 255: regs.add(raw[8])
+        else:
+            # Default: src0 at b3 (generic ALU)
+            if raw[3] < 255: regs.add(raw[3])
     elif opcode in _OPCODES_F2F:
         # F2F: src at b4. F2F.F32.F64 (b9=0x10, narrowing) reads f64 pair;
         # F2F.F64.F32 (b9=0x18, widening) reads single f32.

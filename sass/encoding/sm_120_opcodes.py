@@ -2964,6 +2964,32 @@ def encode_iadd3_imm32(dest: int, src0: int, imm32: int, src2: int,
     return bytes(raw)
 
 
+def encode_iadd3_imm32_neg_src0(dest: int, neg_src0: int, imm32: int, src2: int,
+                                ctrl: int = 0) -> bytes:
+    """Encode IADD3 dest, -neg_src0, imm32, src2 with 32-bit immediate and negated src0.
+
+    Used for CLZ lowering: CLZ = 31 - FLO → IADD3 dest, -FLO_result, 31, RZ.
+    b9=0xe1 (bit[0]=1) encodes the negation of b3.
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0], raw[1] = 0x10, 0x78
+    raw[2] = dest & 0xFF
+    raw[3] = neg_src0 & 0xFF
+    imm32 = imm32 & 0xFFFFFFFF
+    raw[4] = imm32 & 0xFF
+    raw[5] = (imm32 >> 8) & 0xFF
+    raw[6] = (imm32 >> 16) & 0xFF
+    raw[7] = (imm32 >> 24) & 0xFF
+    raw[8]  = src2 & 0xFF
+    raw[9]  = 0xe1  # negate b3 (src0)
+    raw[10] = 0xff
+    raw[11] = 0x07
+    raw[13], raw[14], raw[15] = b13, b14, b15
+    return bytes(raw)
+
+
 def encode_iadd3_neg_b4(dest: int, src0: int, neg_src1: int, src2: int,
                         ctrl: int = 0) -> bytes:
     """Encode IADD3 dest, src0, -neg_src1, src2 (negate second operand).

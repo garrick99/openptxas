@@ -821,23 +821,23 @@ _PTX_FLO = """
 class TestFlo:
     @gpu
     def test_flo(self, cuda_ctx):
-        """clz.b32 (FLO.U32): returns bit position of highest set bit.
+        """clz.b32: returns the count of leading zero bits.
 
-        Note: OpenPTXas maps clz.b32 -> FLO.U32 which returns the MSB
-        position (0-31), not the CLZ value. This is a known semantic gap.
-        Test verifies the FLO encoder produces correct results.
+        clz.b32 is lowered to FLO.U32 + IADD3(-FLO, 31) to compute
+        31 - MSB_position. Zero input gives CLZ=32 (FLO returns 0xFFFFFFFF,
+        31 - 0xFFFFFFFF wraps to 32 in unsigned arithmetic).
         """
         cubins = _compile(_PTX_FLO)
         assert 'flo_test' in cubins
 
-        # FLO.U32 returns MSB position (0-31)
+        # CLZ = 31 - FLO(MSB position)
         test_cases = [
-            (0x80000000, 31),
-            (0x40000000, 30),
-            (0x00000001,  0),
-            (0x0000FFFF, 15),
-            (0x00010000, 16),
-            (0x7FFFFFFF, 30),
+            (0x80000000,  0),
+            (0x40000000,  1),
+            (0x00000001, 31),
+            (0x0000FFFF, 16),
+            (0x00010000, 15),
+            (0x7FFFFFFF,  1),
         ]
         d_in = cuda_ctx.alloc(4)
         d_out = cuda_ctx.alloc(4)

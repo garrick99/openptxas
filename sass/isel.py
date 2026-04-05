@@ -85,7 +85,8 @@ from sass.encoding.sm_120_opcodes import (
     encode_utmaldg_1d, encode_utmaldg_2d, encode_utmastg_1d,
     encode_utmacmdflush, encode_elect, encode_cctl_ivall,
     encode_mov_gpr_from_ur,
-    encode_iadd3_imm32, encode_iadd3_neg_b4, encode_iadd3_neg_b3,
+    encode_iadd3_imm32, encode_iadd3_imm32_neg_src0,
+    encode_iadd3_neg_b4, encode_iadd3_neg_b3,
     encode_iadd3_pred_neg_b4, encode_iadd3_pred_small_imm,
     encode_iadd3_pred_neg_b3, encode_lop3_pred,
     encode_lop3, LOP3_AND, LOP3_OR, LOP3_XOR,
@@ -2030,6 +2031,10 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                 elif op == 'atom' and 'add' in instr.types and 'u32' in instr.types:
                     output.extend(_select_atom_add_u32(instr, ctx.ra, ctx))
 
+                elif op == 'atom' and 'add' in instr.types and 's32' in instr.types:
+                    # s32 add is bitwise-identical to u32 add — same ATOMG encoding
+                    output.extend(_select_atom_add_u32(instr, ctx.ra, ctx))
+
                 elif op == 'atom' and 'exch' in instr.types and 'b32' in instr.types:
                     output.extend(_select_atom_generic_u32(instr, ctx.ra, ctx, ATOMG_EXCH, 'EXCH'))
 
@@ -2365,19 +2370,15 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             # MOV  d_lo, s_r                → lo word
                             s_r = ctx.ra.r32(s.name)
                             d_lo = ctx.ra.lo(d.name)
-                            # Force d_lo = s_r ONLY if s_r is even-aligned.
-                            # 64-bit pairs MUST start on an even register (SM_120 hw req).
-                            # Odd-aligned source → must MOV to d_lo first.
+                            # Always use the regalloc's assignment for d_lo.
+                            # Previous code aliased d_lo=s_r when s_r was even,
+                            # but this mutated int_regs after allocation, causing
+                            # later register conflicts (e.g., %f regs overlapping
+                            # the aliased %rd pair). Emit a MOV when needed.
                             if d_lo != s_r:
-                                if s_r % 2 == 0:
-                                    # Source is even — safe to alias
-                                    ctx.ra.int_regs[d.name] = s_r
-                                    d_lo = s_r
-                                else:
-                                    # Source is odd — copy to allocator's even-aligned dest
-                                    output.append(SassInstr(encode_iadd3(d_lo, s_r, RZ, RZ),
-                                                            f'MOV R{d_lo}, R{s_r}  // cvt.s64.s32 align'))
-                                    s_r = d_lo  # sign-extend from the copy
+                                output.append(SassInstr(encode_iadd3(d_lo, s_r, RZ, RZ),
+                                                        f'MOV R{d_lo}, R{s_r}  // cvt.s64.s32 lo'))
+                                s_r = d_lo  # sign-extend from the copy
                             d_hi = d_lo + 1
                             output.append(SassInstr(
                                 encode_shf_r_s32_hi(d_hi, s_r, 31),
@@ -3091,9 +3092,12 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                 elif op == 'clz' and typ in ('b32',):
                     d = ctx.ra.r32(instr.dest.name)
                     a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
-                    # CLZ = 31 - FLO for non-zero (ptxas compiles CLZ to FLO)
+                    # CLZ = 31 - FLO(x).  FLO returns MSB position (0..31) or
+                    # 0xFFFFFFFF for zero input.  31 - 0xFFFFFFFF = 32 (mod 2^32).
                     output.append(SassInstr(encode_flo(d, a),
-                                            f'FLO.U32 R{d}, R{a}  // clz.b32'))
+                                            f'FLO.U32 R{d}, R{a}  // clz step 1'))
+                    output.append(SassInstr(encode_iadd3_imm32_neg_src0(d, d, 31, RZ),
+                                            f'IADD3 R{d}, -R{d}, 0x1f, RZ  // clz = 31 - FLO'))
 
                 elif op == 'brev' and typ in ('b32',):
                     d = ctx.ra.r32(instr.dest.name)
@@ -3503,16 +3507,24 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             f'MUFU.SQRT R{d}, R{a}'))
 
                 elif op == 'sin' and 'approx' in instr.types and typ == 'f32':
+                    # MUFU.SIN expects input in revolutions (cycles), not radians.
+                    # Scale: FMUL dst, src, 1/(2*pi) then MUFU.SIN dst, dst.
+                    # 1/(2*pi) = 0x3e22f983 in IEEE754 float.
                     d = ctx.ra.r32(instr.dest.name)
                     a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
-                    output.append(SassInstr(encode_mufu(d, a, MUFU_SIN),
-                                            f'MUFU.SIN R{d}, R{a}'))
+                    output.append(SassInstr(encode_fmul_imm(d, a, 0x3e22f983),
+                                            f'FMUL R{d}, R{a}, 0x3e22f983  // radians * 1/(2*pi)'))
+                    output.append(SassInstr(encode_mufu(d, d, MUFU_SIN),
+                                            f'MUFU.SIN R{d}, R{d}'))
 
                 elif op == 'cos' and 'approx' in instr.types and typ == 'f32':
+                    # MUFU.COS expects input in revolutions, not radians.
                     d = ctx.ra.r32(instr.dest.name)
                     a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
-                    output.append(SassInstr(encode_mufu(d, a, MUFU_COS),
-                                            f'MUFU.COS R{d}, R{a}'))
+                    output.append(SassInstr(encode_fmul_imm(d, a, 0x3e22f983),
+                                            f'FMUL R{d}, R{a}, 0x3e22f983  // radians * 1/(2*pi)'))
+                    output.append(SassInstr(encode_mufu(d, d, MUFU_COS),
+                                            f'MUFU.COS R{d}, R{d}'))
 
                 elif op == 'ex2' and 'approx' in instr.types and typ == 'f32':
                     d = ctx.ra.r32(instr.dest.name)

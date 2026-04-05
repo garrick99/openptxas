@@ -643,13 +643,11 @@ class TestClz:
         assert ok, "cuModuleLoadData failed for clz_test"
         func = cuda_ctx.get_func('clz_test')
 
-        # clz.b32 via FLO: FLO returns bit position of highest set bit
-        # The isel maps clz -> FLO, so the result is the FLO value
-        # (PTX clz spec = 32 - 1 - bfind, but on hardware FLO is used directly)
-        # Let's verify what our encoder actually produces
+        # clz.b32 = 31 - FLO(MSB_position).  FLO returns the bit index of
+        # the highest set bit; the IADD3 step computes the complement.
+        # Zero input: FLO returns 0xFFFFFFFF, 31 - 0xFFFFFFFF wraps to 32.
         inputs = [0x80000000, 0x00000001, 0x00000100, 0x0000FFFF]
-        # FLO.U32 returns the bit position of the highest set bit
-        expected = [31, 0, 8, 15]
+        expected = [0, 31, 23, 16]
         N = len(inputs)
 
         d_out = cuda_ctx.alloc(4 * N)

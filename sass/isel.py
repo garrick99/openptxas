@@ -3265,9 +3265,38 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             f'SHFL R{d}, R{a}, 0x{lane:x}, 0x{clamp:x}  // shfl.sync'))
 
                 elif op == 'vote':
+                    # PTX: vote.sync.ballot.b32 %rD, <pred>, <mask>
+                    # <pred> can be a predicate register (%p0..%p7) or immediate 0/1
                     d = ctx.ra.r32(instr.dest.name)
-                    output.append(SassInstr(encode_vote_ballot(d),
-                                            f'VOTE.ANY R{d}, PT, PT  // vote.sync.ballot'))
+                    pred_num = 7   # default PT (always true)
+                    pred_neg = False
+                    if len(instr.srcs) >= 1:
+                        s0 = instr.srcs[0]
+                        if isinstance(s0, RegOp):
+                            if s0.name in ctx.ra.pred_regs:
+                                pred_num = ctx.ra.pred(s0.name) & 0x07
+                                # If the producing setp was inverted (e.g.
+                                # setp.lt → ISETP.GE with negated semantics),
+                                # the predicate value is logically inverted.
+                                if (hasattr(ctx, '_negated_preds')
+                                        and pred_num in ctx._negated_preds):
+                                    pred_neg = True
+                            else:
+                                pred_num = 7
+                        elif isinstance(s0, ImmOp):
+                            # imm 1 → PT (always true); imm 0 → !PT (always false)
+                            if s0.value == 0:
+                                pred_num = 7
+                                pred_neg = True
+                            else:
+                                pred_num = 7
+                                pred_neg = False
+                    pred_label = 'PT' if pred_num == 7 else f'P{pred_num}'
+                    if pred_neg:
+                        pred_label = '!' + pred_label
+                    output.append(SassInstr(
+                        encode_vote_ballot(d, pred_src=pred_num, neg=pred_neg),
+                        f'VOTE.ANY R{d}, PT, {pred_label}  // vote.sync.ballot'))
 
                 elif op == 'div' and typ == 'u32':
                     # Full Newton-Raphson unsigned 32-bit division.

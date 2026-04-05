@@ -507,6 +507,12 @@ def _wdep_for_opcode(opcode: int, raw: bytes = None) -> int:
         return 0x35
     if opcode == 0x3c4:  # REDUX: writes to UR, posts to slot 0x31 like LDCU (ptxas-verified)
         return 0x31
+    if opcode in (0x589, 0xf89, 0x989):  # SHFL (warp shuffle)
+        # ptxas-verified (sm_120): SHFL posts to slot 0x31 (same as LDC/LDCU).
+        # SHFL has variable latency; consumers wait via rbar=0x03 for this slot.
+        # Treating SHFL as wdep=0x3e (ALU in-order) was incorrect — consumers
+        # read stale data because SHFL actually takes many cycles.
+        return 0x31
     if opcode in _OPCODES_LDGSTS:
         return 0x3f  # LDGSTS: async copy writes to shared mem, not GPR — no scoreboard slot
     if opcode in _OPCODES_LDGDEPBAR:
@@ -581,6 +587,10 @@ _OPCODE_MISC: dict[int, int] = {
     0x23f: 2,   # DMMA (FP64)
     0x27a: 2,   # QMMA (FP8 E4M3/E5M2)
     # LDC (0xb82) and S2UR (0x9c3) intentionally omitted — use counter for correct values
+    # SHFL: ptxas uses misc=2 (ground truth SM_120)
+    0x589: 2,   # SHFL R-R
+    0xf89: 2,   # SHFL R-imm
+    0x989: 2,   # SHFL imm-imm
 }
 
 # All opcodes recognised by assign_ctrl.  Unknown opcodes raise ValueError.

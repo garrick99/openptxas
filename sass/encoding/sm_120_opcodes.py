@@ -2644,6 +2644,10 @@ def encode_shfl(dest: int, src: int, lane_or_delta: int, clamp: int,
     packed = ((lane_or_delta & 0x1F) << 5) | ((mode & 0x0F) << 8)
     raw[6] = packed & 0xFF
     raw[7] = (packed >> 8) & 0xFF
+    # Predicate destination = PT (P7). SM_120 requires b10=0x0e; the hardware
+    # rejects SHFL as an illegal instruction when b10=0.
+    # Ground truth (ptxas sm_120): SHFL.BFLY PT, ... → b10=0x0e, b11=0x00.
+    raw[10] = 0x0e
     raw[13], raw[14], raw[15] = b13, b14, b15
     return bytes(raw)
 
@@ -2657,11 +2661,29 @@ def encode_shfl(dest: int, src: int, lane_or_delta: int, clamp: int,
 #   b9=0x01: ballot flag (return bitmask of voting threads)
 #   b10=0x8e: predicate source (PT=7 → 0x8e encodes always-true input predicate)
 #   b11=0x03: AND combiner mode
-def encode_vote_ballot(dest: int, ctrl: int = 0) -> bytes:
+def encode_vote_ballot(dest: int, pred_src: int = 7, neg: bool = False,
+                       ctrl: int = 0) -> bytes:
+    """Encode VOTE.ANY R<dest>, PT, [!]P<pred_src> — warp ballot vote.
+
+    Ground truth (ptxas sm_120):
+      VOTE.ANY R5, PT, P0  → b10=0x0e, b11=0x00
+      VOTE.ANY R7, PT, P1  → b10=0x8e, b11=0x00
+      VOTE.ANY R9, PT, P2  → b10=0x0e, b11=0x01
+      VOTE.ANY R11, PT, P3 → b10=0x8e, b11=0x01
+      VOTE.ANY R5, PT, PT  → b10=0x8e, b11=0x03    (PT=P7)
+      VOTE.ANY R5, PT, !P0 → b10=0x0e, b11=0x04    (neg bit = 0x04 in b11)
+
+    Encoding: pred bit0 → b10[7] (0x80), pred[2:1] → b11[1:0],
+              negation → b11[2] (0x04). b10 low nibble is always 0x0e, b9=0x01
+              selects the ballot mode.
+    """
     if ctrl == 0: ctrl = _CTRL_DEFAULT
+    p = pred_src & 0x07
+    b10 = 0x0e | ((p & 0x01) << 7)
+    b11 = ((p >> 1) & 0x03) | (0x04 if neg else 0x00)
     return _build(0x06, 0x78,
                   b2=dest, b3=0x00, b4=0x00,
-                  b8=0x00, b9=0x01, b10=0x8e, b11=0x03,
+                  b8=0x00, b9=0x01, b10=b10, b11=b11,
                   ctrl=ctrl)
 
 

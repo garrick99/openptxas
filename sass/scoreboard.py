@@ -65,7 +65,7 @@ _OPCODE_META: dict[int, _OpMeta] = {
     0x299: _OpMeta('SHF.VAR',   1, 0x3e, 1),   # variable-shift SHF (opcode 0x7299)
     0x219: _OpMeta('SHF.R.S32.HI.VAR', 1, 0x3e, 1),  # SHF.R.S32.HI variable-shift (shr.s32)
     0x221: _OpMeta('FADD',       1, 0x3e, 1),
-    0x223: _OpMeta('FFMA',       1, 0x3e, 1),
+    0x223: _OpMeta('FFMA',       0, 0x3e, 1),  # FFMA→FFMA bypass: no NOP gap needed on SM_120
     0x308: _OpMeta('MUFU',       1, 0x3e, 1),  # MUFU (SFU: RCP, SQRT, SIN, COS, EX2, LG2)
     0x309: _OpMeta('POPC',       1, 0x3e, 1),  # POPC (population count)
     0x301: _OpMeta('BREV',       1, 0x3e, 1),  # BREV (bit reverse)
@@ -565,6 +565,7 @@ _OPCODE_MISC: dict[int, int] = {
                 #   encode_isetp_ur docstring. Counter value 6 at position 22 → wrong pred.)
     0x20c: 0,   # ISETP R-R: misc=0 (same SM_120 predicate correctness requirement)
     0x80a: 5,   # FSEL.step: misc=5 (ptxas-verified)
+    0x223: 4,   # FFMA R-R-R: misc=4 (ptxas-verified for FMA chains on SM_120)
     0x986: 1,   # STG.E: misc=1 (from ptxas ground truth)
     0x988: 4,   # STS.E: misc=4
     0x225: 1,   # IMAD.WIDE R-R: misc=1

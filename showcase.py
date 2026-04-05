@@ -35,7 +35,7 @@ OPENCUDA_ROOT = REPO_ROOT.parent / "opencuda"
 def print_boot_line(status, message, detail=""):
     """Print a boot-style log line with optional detail."""
     if detail:
-        print(f"{status} {message:<55} {DIM}{detail}{RESET}")
+        print(f"{status} {message:<44} {DIM}{detail}{RESET}")
     else:
         print(f"{status} {message}")
 
@@ -140,9 +140,9 @@ def section_openptxas():
 
     # Subsystems
     subsystems = [
-        ("Integer ALU", "IADD3 IMAD IMAD.WIDE SHF LOP3 POPC BREV FLO IABS PRMT IDP"),
-        ("Float FP32", "FADD FMUL FFMA FSEL.step FMNMX MUFU FSETP FSWZADD"),
-        ("Float FP64", "DADD DMUL DFMA DSETP (b1=0x72 encoding verified)"),
+        ("Integer ALU", "IADD3 IMAD SHF LOP3 POPC BREV FLO IABS IDP"),
+        ("Float FP32", "FADD FMUL FFMA FSEL FMNMX MUFU FSETP"),
+        ("Float FP64", "DADD DMUL DFMA DSETP (b1=0x72 verified)"),
         ("Half FP16", "HADD2 HFMA2 HMUL2 HSETP2 F2FP"),
         ("Memory", "LDG STG LDS STS LDC LDCU LDSM"),
         ("Atomics", "ADD MIN MAX EXCH CAS.32 CAS.64 ADD.F32"),
@@ -212,7 +212,7 @@ def section_toolchain():
     print("-" * 72)
 
     print_boot_line(OK, "FORGE compiler",
-                    "formally-verified .fg → C99/CUDA C (1042 demos)")
+                    "verified .fg -> C99/CUDA C (1042 demos)")
     print_boot_line(OK, "OpenCUDA compiler",
                     "CUDA C → PTX (31,631 tests)")
     print_boot_line(OK, "OpenPTXas assembler",
@@ -229,9 +229,9 @@ def section_unique():
     print("-" * 72)
 
     items = [
-        ("SM_120 opcode coverage", "108 unique opcodes (NVK: ~80 with SM100 padding)"),
-        ("Hardware bug list", "IMAD R-R broken, ISETP↔FSETP, DSETP ordered, MUFU scaling"),
-        ("FP64 encoding details", "DADD b1=0x72, src1 at b8 (NVK uses wrong bits)"),
+        ("SM_120 opcode coverage", "108 unique opcodes (vs NVK's ~80)"),
+        ("Hardware bug list", "IMAD R-R, ISETP/FSETP, DSETP ordered, MUFU"),
+        ("FP64 encoding details", "DADD b1=0x72, src1 at b8 (NVK differs)"),
         ("LDG slot handling", "always 0x35, not slot rotation"),
         ("Capmerc DRM bypass", "full record format + 0x5a signature"),
         ("BAR.SYNC scoreboard rule", "must clear pending_writes/pred_writes"),

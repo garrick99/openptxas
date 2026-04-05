@@ -159,11 +159,11 @@ def test_runtime_k_no_match():
 # Pass-level test
 # ---------------------------------------------------------------------------
 
-def test_pass_finds_valid_and_reports_buggy(capsys):
+def test_pass_finds_valid_and_rejects_buggy():
     """
     The find_rotate_groups pass should:
     - Find one valid rotate group (add + shr.u64)
-    - Report two buggy patterns (sub + shr.u64, add + shr.s64)
+    - Reject buggy patterns (sub + shr.u64, add + shr.s64)
     - Not include buggy patterns in returned groups
     """
     insts = [
@@ -188,7 +188,3 @@ def test_pass_finds_valid_and_reports_buggy(capsys):
     assert len(groups) == 1, f"Expected 1 valid group, got {len(groups)}"
     assert groups[0].k == 8
     assert groups[0].src == "%a"
-
-    captured = capsys.readouterr()
-    assert "Bug 1" in captured.out
-    assert "Bug 2" in captured.out

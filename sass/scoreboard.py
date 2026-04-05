@@ -113,7 +113,7 @@ _OPCODES_ATOMG = {0x3a9,   # ATOMG.E.CAS.b32 / CAS.b64
                  0x9a3}   # ATOMG.E.ADD.F32
 _OPCODES_LDC = {0xb82, 0x7ac, 0x919, 0x9c3,  # SM_120: LDC, LDCU, S2R, S2UR
                 0x624, 0xab9, 0xa02}           # SM_89: IMAD.MOV.U32(cbuf), ULDC.64, MOV(cbuf)
-_OPCODES_LDS = {0x984}
+_OPCODES_LDS = {0x984, 0x83b}  # LDS, LDSM (load shared to matrix)
 _OPCODES_STG = {0x986}
 _OPCODES_STS = {0x988}
 _OPCODES_BAR = {0xb1d}
@@ -173,6 +173,24 @@ _OPCODES_ALU = {
     0x806,        # VOTE.ANY
     # Matrix multiply (HMMA, IMMA, DMMA, QMMA)
     0x23c, 0x237, 0x23f, 0x27a,
+    # Predicate ↔ register moves
+    0x203,        # P2R (predicate-to-register move)
+    0x204,        # R2P (register-to-predicate move)
+    # Address calculation
+    0x211,        # LEA (address calculation)
+    0x811,        # LEA.IMM (address calc with immediate)
+    # Integer min/max & sign-extend & bitmask
+    0x217,        # IMNMX (integer min/max)
+    0x21a,        # SGXT (sign extend)
+    0x21b,        # BMSK (bitmask generation)
+    # Predicate logic
+    0x21e,        # PLOP3 (predicate logic op)
+    # Integer pack
+    0x239,        # I2IP (integer pack)
+    # Float swizzle-add
+    0x822,        # FSWZADD (float swizzle-add)
+    # 64-bit add with UR
+    0xc35,        # IADD.64-UR (64-bit add with UR)
     # Miscellaneous / div.u32 helpers
     0x431,        # HFMA2 (zero-init trick)
     0x810,        # IADD3 immediate form

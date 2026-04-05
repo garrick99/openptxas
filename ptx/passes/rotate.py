@@ -187,10 +187,8 @@ def match_rotate(
 def find_rotate_groups(fn: Function) -> list[RotateGroup]:
     """
     Walk every basic block and return all valid rotate-left groups.
-    Also logs any patterns that would be miscompiled by ptxas.
     """
     groups: list[RotateGroup] = []
-    buggy:  list[str]         = []
 
     for bb in fn.blocks:
         insts = bb.instructions
@@ -223,38 +221,10 @@ def find_rotate_groups(fn: Function) -> list[RotateGroup]:
 
             # Try (shl=prod0, shr=prod1) and (shl=prod1, shr=prod0)
             for shl_cand, shr_cand in [(prod0, prod1), (prod1, prod0)]:
-                # First check: would ptxas miscompile this? (Bug 1 or Bug 2)
-                if _is_shl_b64(shl_cand) and (_is_shr_u64(shr_cand) or _is_shr_s64(shr_cand)):
-                    shl_src  = _reg_name(shl_cand.srcs[0]) if shl_cand.srcs else None
-                    shr_src  = _reg_name(shr_cand.srcs[0]) if shr_cand.srcs else None
-                    shl_k    = _imm_val(shl_cand.srcs[1]) if len(shl_cand.srcs) > 1 else None
-                    shr_k    = _imm_val(shr_cand.srcs[1]) if len(shr_cand.srcs) > 1 else None
-
-                    if (shl_src and shr_src and shl_src == shr_src
-                            and shl_k is not None and shr_k is not None
-                            and shl_k + shr_k == 64):
-
-                        if inst.op in _BUGGY_OPS:
-                            buggy.append(
-                                f"  PTXAS BUG (Bug 1): {inst} — "
-                                f"sub.s64 would be miscompiled as rotate by ptxas"
-                            )
-                        if _is_shr_s64(shr_cand):
-                            buggy.append(
-                                f"  PTXAS BUG (Bug 2): {inst} — "
-                                f"shr.s64 (arithmetic) would be miscompiled as rotate by ptxas"
-                            )
-
-                # Now check if it's a VALID rotate
                 grp = match_rotate(shl_cand, shr_cand, inst)
                 if grp:
                     groups.append(grp)
                     break  # don't double-count
-
-    if buggy:
-        print(f"[rotate pass] Found {len(buggy)} pattern(s) that ptxas would miscompile:")
-        for b in buggy:
-            print(b)
 
     return groups
 
@@ -273,6 +243,4 @@ def run(module: Module) -> tuple[Module, list[RotateGroup]]:
     for fn in module.functions:
         groups = find_rotate_groups(fn)
         all_groups.extend(groups)
-        if groups:
-            print(f"[rotate pass] {fn.name}: {len(groups)} valid rotate-left group(s)")
     return module, all_groups

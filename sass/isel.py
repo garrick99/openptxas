@@ -873,9 +873,16 @@ def _select_atom_add_u32(instr: Instruction, ra: RegAlloc,
     if not isinstance(addr_op, MemOp):
         raise ISelError("atom.add addr must be MemOp")
     d    = ra.r32(dest_op.name)
-    data = ra.r32(data_op.name)
 
     prefix = []
+    # Materialize data operand: may be register or immediate (e.g., atomicAdd(p, 1))
+    if isinstance(data_op, ImmOp):
+        data = _alloc_gpr(ctx)
+        prefix.append(SassInstr(encode_iadd3_imm32(data, RZ, data_op.value & 0xFFFFFFFF, RZ),
+                                f'MOV R{data}, {data_op.value:#x}  // atom data imm'))
+    else:
+        data = ra.r32(data_op.name)
+
     base_name = addr_op.base if addr_op.base.startswith('%') else f'%{addr_op.base}'
     ur_params = getattr(ctx, '_ur_params', {}) if ctx else {}
     gpr_written = getattr(ctx, '_gpr_written', set()) if ctx else set()

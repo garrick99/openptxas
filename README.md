@@ -59,7 +59,7 @@ Verified over 500,000 iterations. Same kernel, same GPU, same input.
 git clone https://github.com/garrick99/openptxas
 cd openptxas
 python demo.py                      # compile + run vector_add on GPU
-pytest tests/ -x -q                 # 281 tests
+pytest tests/ -x -q                 # 356 tests
 ```
 
 ## What's Inside
@@ -68,7 +68,7 @@ pytest tests/ -x -q                 # 281 tests
 |-------|-------------|
 | **Parser** | Recursive descent PTX parser to IR |
 | **RegAlloc** | Linear scan with liveness, safe eviction |
-| **ISel** | PTX to SASS instruction selection (60+ encoders) |
+| **ISel** | PTX to SASS instruction selection (183 encoders, 108 unique opcodes) |
 | **Scheduler** | LDG latency hiding, LDCU.64 hoisting |
 | **Scoreboard** | Automated rbar/wdep/misc generation (bitmask-based) |
 | **Emitter** | Full ELF cubin with .nv.info, .nv.capmerc, .nv.merc |
@@ -95,24 +95,32 @@ Reverse-engineered during development. Not documented publicly elsewhere:
 | **LOP3 reads 3 source registers** | b3, b4, b8 all tracked for dependency; missing b4/b8 causes stale-data hazards |
 | **DADD src1 at b8, not b4** | Unlike DMUL/DFMA, DADD places second operand at byte 8 |
 
-## Instruction Coverage (60+)
+## Instruction Coverage (108 unique opcodes, 183 encoders)
 
-All encoders byte-verified against ptxas 13.0 on SM_120.
+All encoders byte-verified against ptxas 13.0 on SM_120. 70 GPU-verified on RTX 5090.
 
 | Category | Instructions |
 |----------|-------------|
-| Integer | IADD3, IMAD, IMAD.WIDE, IMAD.SHL, IADD.64, IABS |
-| Float | FADD, FMUL, FFMA, FMUL.IMM, FFMA.IMM, FSEL.step, DADD, DMUL, DFMA |
+| Integer | IADD3, IMAD, IMAD.WIDE, IMAD.SHL, IADD.64, IABS, LEA, IMNMX, IDP (dp4a) |
+| Float | FADD, FMUL, FFMA, FSEL.step, FMNMX, FSWZADD, DADD, DMUL, DFMA, DSETP |
 | Transcendentals | MUFU (RCP, SQRT, RSQ, SIN, COS, EX2, LG2) |
-| Shifts | SHF (L/R, U32/U64/S32, HI/LO, const/var) |
-| Bitwise | LOP3.LUT (AND/OR/XOR/NOT), POPC, BREV, FLO |
-| Comparison | ISETP (6 modes), FSETP (8 modes) |
-| Memory | LDG/STG (u8-u128), LDS/STS, LDC/LDCU |
-| Atomics | ATOMG.E (ADD, MIN, MAX, AND, OR, XOR, EXCH, CAS) |
-| Warp | SHFL (IDX/UP/DOWN/BFLY), VOTE.BALLOT |
-| Type convert | I2F, F2I, F2F, CVT (u32/u64/s32/s64) |
-| Control | MOV, NOP, EXIT, BRA, S2R, S2UR, BAR.SYNC |
-| Tensor | HMMA, IMMA, LDSM |
+| Shifts/Bits | SHF (L/R, U32/U64/S32, HI/LO, const/var), LOP3, POPC, BREV, FLO, BMSK, SGXT, PRMT |
+| Comparison | ISETP (6 modes), FSETP (8 modes), DSETP (unordered), VIMNMX |
+| Memory | LDG/STG (32/64-bit), LDS/STS, LDC/LDCU, LDSM |
+| Atomics | ATOMG (ADD, MIN, MAX, EXCH, CAS.32, CAS.64, ADD.F32) |
+| Async copy | LDGSTS (cp.async), LDGDEPBAR, DEPBAR.LE |
+| TMA | UBLKCP (bulk copy), UTMALDG (tensor 1D/2D), UTMASTG, UTMACMDFLUSH |
+| Mbarrier | SYNCS.EXCH (init), SYNCS.ARRIVE, SYNCS.TRYWAIT |
+| Warp | SHFL (4 modes), VOTE (BALLOT/ALL/ANY), REDUX (SUM/MIN/MAX), MATCH (ANY/ALL), NANOSLEEP |
+| Texture | TEX, TLD.LZ, TLD4, TXQ, SULD, SUST |
+| Type convert | I2F (u32/s32), F2I (u32/s32), F2F (f32↔f64), F2FP (f16↔f32), I2IP |
+| Predicates | P2R, R2P, PLOP3 |
+| Uniform | UMOV, UIADD3, UISETP, USEL, UFSETP, UFMUL, ULEA |
+| Cluster | UCGABAR (arrive/wait), MEMBAR.ALL.GPU |
+| Control | MOV, NOP, EXIT, BRA, BRA.U, CALL.REL, RET.REL, S2R, S2UR, ELECT |
+| Barriers | BAR.SYNC, BAR.RED.OR, ERRBAR, CGAERRBAR, B2R, CCTL |
+| Tensor cores | HMMA (BF16/TF32), IMMA (INT8), DMMA (FP64), QMMA (FP8 E4M3/E5M2) |
+| Capmerc/DRM | Fully automatic from SASS, 0x5a universal signature confirmed |
 
 ## Requirements
 

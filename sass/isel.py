@@ -68,7 +68,8 @@ from sass.encoding.sm_120_opcodes import (
     encode_dadd, encode_dmul, encode_dfma, encode_dfma_ur_ur,
     encode_dsetp, DSETP_LT, DSETP_EQ, DSETP_LE, DSETP_GT, DSETP_NE, DSETP_GE,
     DSETP_LTU, DSETP_EQU, DSETP_LEU, DSETP_GTU, DSETP_NEU, DSETP_GEU,
-    encode_i2fp_u32, encode_f2i_u32,
+    encode_i2fp_u32, encode_f2i_u32, encode_i2f_f32_s32, encode_f2i_s32_f32,
+    encode_f2fp_f16_f32,
     encode_f2f_f32_f64, encode_f2f_f64_f32,
     encode_f2i_s32_f64, encode_f2i_u32_f64, encode_i2f_f64_s32, encode_i2f_f64_u32,
     encode_i2f_u32_rp, encode_i2f_s32_rp, encode_f2i_ftz_u32_trunc, encode_hfma2_zero,
@@ -1252,7 +1253,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             output.append(SassInstr(encode_shf_r_u32_hi_var(d, a, k_reg),
                                                     f'SHF.R.U32.HI R{d}, RZ, R{k_reg}, R{a}  // shr.{typ} (var)'))
 
-                elif op == 'shr' and typ in ('u64',):
+                elif op == 'shr' and typ in ('u64', 'b64'):
                     output.extend(_select_shr_u64(instr, ctx.ra))
 
                 elif op == 'shr' and typ in ('s64',):
@@ -1772,7 +1773,11 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     elif 'xor' in _types_set:
                         output.append(SassInstr(encode_redux_xor_b32(ur_tmp, a),
                                                 f'REDUX.XOR.B32 UR{ur_tmp}, R{a}'))
+                    elif 'add' in _types_set and 'u32' in _types_set:
+                        output.append(SassInstr(encode_redux_sum(ur_tmp, a),
+                                                f'REDUX.SUM UR{ur_tmp}, R{a}'))
                     else:
+                        # Default: signed sum (redux.sync.add.s32 or untyped)
                         output.append(SassInstr(encode_redux_sum_s32(ur_tmp, a),
                                                 f'REDUX.SUM.S32 UR{ur_tmp}, R{a}'))
                     # Copy UR result to GPR dest (matches ptxas MOV R, UR pattern)
@@ -2036,18 +2041,34 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 a_r  = ctx.ra.r32(s.name)
                                 output.append(SassInstr(encode_i2f_f64_u32(d_lo, a_r),
                                                         f'I2F.F64.U32 R{d_lo}, R{a_r}'))
+                            elif _dst_t == 'f16' and _src_t == 'f32':
+                                # cvt.rn.f16.f32: FP32 → FP16 (packed into low 16 bits)
+                                d_r = ctx.ra.r32(d.name)
+                                a_r = ctx.ra.r32(s.name)
+                                output.append(SassInstr(encode_f2fp_f16_f32(d_r, a_r),
+                                                        f'F2FP.F16.F32 R{d_r}, RZ, R{a_r}  // cvt.f16.f32'))
                             elif 'f32' in _types_set and ('u32' in _types_set or 's32' in _types_set):
                                 d_r = ctx.ra.r32(d.name)
                                 a_r = ctx.ra.r32(s.name)
                                 _fi = instr.types.index('f32')
                                 _ii = (instr.types.index('u32') if 'u32' in instr.types
                                        else instr.types.index('s32'))
+                                _is_signed = 's32' in _types_set
                                 if _fi < _ii:
+                                    # int → float
+                                    # NOTE: I2FP.F32.S32 (b9=0x10) not GPU-verified for negative values;
+                                    # use GPU-verified unsigned encoder for both signed/unsigned.
+                                    # Signed negative inputs will produce incorrect results (known limitation).
                                     output.append(SassInstr(encode_i2fp_u32(d_r, a_r),
                                                             f'I2FP.F32 R{d_r}, R{a_r}  // cvt.f32.{_src_t}'))
                                 else:
-                                    output.append(SassInstr(encode_f2i_u32(d_r, a_r),
-                                                            f'F2I.U32 R{d_r}, R{a_r}  // cvt.{_dst_t}.f32'))
+                                    # float → int
+                                    if _is_signed:
+                                        output.append(SassInstr(encode_f2i_s32_f32(d_r, a_r),
+                                                                f'F2I.S32 R{d_r}, R{a_r}  // cvt.s32.f32'))
+                                    else:
+                                        output.append(SassInstr(encode_f2i_u32(d_r, a_r),
+                                                                f'F2I.U32 R{d_r}, R{a_r}  // cvt.u32.f32'))
                             elif _dst_t in ('u8', 's8', 'b8') and _src_t in _32B:
                                 # Truncate to 8 bits: AND with 0xFF
                                 d_r = ctx.ra.r32(d.name)
@@ -2119,7 +2140,13 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                     output.append(SassInstr(encode_iadd3(d_lo+1, RZ, RZ, RZ),
                                                             f'MOV R{d_lo+1}, RZ  // cvt.{_dst_t}.{_src_t} zero-ext'))
                             else:
-                                output.append(_nop(f'TODO: cvt {".".join(instr.types)}'))
+                                # Unsupported cvt type combo — no encoder available.
+                                # Known gaps: f64↔s64, f64↔u64 (no SASS encoder),
+                                # f16↔f32 (use F2FP path), narrow↔narrow (unusual).
+                                import sys as _sys
+                                print(f'WARNING: unimplemented cvt type combination: cvt.{".".join(instr.types)}',
+                                      file=_sys.stderr)
+                                output.append(_nop(f'WARNING: unimplemented cvt {".".join(instr.types)}'))
 
                 elif op == 'setp':
                     pred = instr.dest
@@ -2321,9 +2348,20 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                         encode_isetp(emit_pd, ar, r_tmp, cmp=isetp_cmp),
                                         f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, R{r_tmp}, PT'))
                             else:
-                                output.append(_nop(f'TODO: setp with non-register src1'))
+                                # Non-register src1 (e.g. memory operand) — materialize into GPR first
+                                br = _materialize_imm(b, ctx, ctx.ra, output)
+                                emit_pd = pd
+                                if pd > 0 and ctx:
+                                    emit_pd = 0
+                                    ctx.ra.pred_regs[pred.name] = 0
+                                output.append(SassInstr(
+                                    encode_isetp(emit_pd, ar, br, cmp=isetp_cmp),
+                                    f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, R{br}, PT  // setp non-reg src1'))
                     else:
-                        output.append(_nop(f'TODO: setp {instr}'))
+                        # Non-register pred dest or src0 — invalid PTX or unusual operand form
+                        import sys as _sys
+                        print(f'WARNING: setp with non-register pred/src0: {instr}', file=_sys.stderr)
+                        output.append(_nop(f'WARNING: setp non-register pred/src0: {instr}'))
 
                 elif op == 'testp' and 'finite' in instr.types and 'f32' in instr.types:
                     # testp.finite.f32 p, f:
@@ -3143,7 +3181,11 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         output.append(SassInstr(encode_prmt_reg(d, a, b, sel_r),
                                                 f'PRMT.REG R{d}, R{a}, R{b}, R{sel_r}'))
                     else:
-                        output.append(_nop(f'TODO: prmt with unsupported operands'))
+                        # prmt with < 2 source args — invalid PTX
+                        import sys as _sys
+                        print(f'WARNING: prmt requires at least 2 source operands, got {len(instr.srcs)}',
+                              file=_sys.stderr)
+                        output.append(_nop(f'WARNING: prmt invalid operand count: {len(instr.srcs)}'))
 
                 elif op == 'bfe' and typ == 'u32':
                     # Bit field extract: dest = (src >> start) & ((1<<length)-1)
@@ -3242,8 +3284,12 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         f'LOP3.LUT R{d}, R{t1}, R{t2}, RZ, 0xFC  // bfi insert'))
 
                 else:
-                    # Unsupported instruction: emit NOP with comment
-                    output.append(_nop(f'TODO: {instr.op} {".".join(instr.types)} {instr.mods}'))
+                    # Unrecognized PTX instruction — emit NOP placeholder
+                    import sys as _sys
+                    print(f'WARNING: unimplemented PTX instruction: {instr.op} '
+                          f'{".".join(instr.types)} {instr.mods}', file=_sys.stderr)
+                    output.append(_nop(f'WARNING: unimplemented PTX instruction: {instr.op} '
+                                       f'{".".join(instr.types)} {instr.mods}'))
 
             except ISelError as e:
                 # Emit NOP with error comment rather than crashing

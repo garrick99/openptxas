@@ -68,12 +68,16 @@ def run_check(cmd):
 
 
 def banner():
+    W = 68  # inner width between the pipes
+    def row(text):
+        padding = W - 2 - len(text)
+        return f"{BOLD}{CYAN}  |{RESET}  {BOLD}{text}{RESET}{' ' * padding}{BOLD}{CYAN}|{RESET}"
     lines = [
         "",
-        f"{BOLD}{CYAN}  ┌──────────────────────────────────────────────────────────────────┐{RESET}",
-        f"{BOLD}{CYAN}  │{RESET}  {BOLD}OpenPTXas Capability Showcase{RESET}                                   {BOLD}{CYAN}│{RESET}",
-        f"{BOLD}{CYAN}  │{RESET}  Open-source SM_120 toolchain — what we unlocked vs NVIDIA's        {BOLD}{CYAN}│{RESET}",
-        f"{BOLD}{CYAN}  └──────────────────────────────────────────────────────────────────┘{RESET}",
+        f"{BOLD}{CYAN}  +{'-' * W}+{RESET}",
+        row("OpenPTXas Capability Showcase"),
+        row("Open-source SM_120 toolchain vs NVIDIA's closed stack"),
+        f"{BOLD}{CYAN}  +{'-' * W}+{RESET}",
         "",
     ]
     slow_print(lines, delay=0.02)
@@ -190,11 +194,11 @@ def section_benchmarks():
         ("fma_chain",  "13195 GFLOPS","14627 GFLOPS","0.90x", "compute-bound"),
     ]
 
-    print(f"  {BOLD}{'Benchmark':<12} {'OpenPTXas':<15} {'NVIDIA':<15} {'Ratio':<8} Notes{RESET}")
-    print("  " + "─" * 68)
+    print(f"  {BOLD}{'Benchmark':<11} {'OpenPTXas':<14} {'NVIDIA':<14} {'Ratio':<7} Notes{RESET}")
+    print("  " + "-" * 68)
     for bench, ours, nvid, ratio, note in results:
-        print(f"  {bench:<12} {ours:<15} {nvid:<15} {GREEN}{ratio:<8}{RESET} {note}")
-    print("  " + "─" * 68)
+        print(f"  {bench:<11} {ours:<14} {nvid:<14} {GREEN}{ratio:<7}{RESET} {note}")
+    print("  " + "-" * 68)
     print(f"  {BOLD}Geomean parity: {GREEN}99.3%{RESET} {BOLD}of NVIDIA ptxas{RESET}")
     print_boot_line(OK, "Compile time",       "~93% of ptxas (15.7ms vs 14.6ms)")
     print_boot_line(OK, "Cubin size",         "15% smaller than ptxas output")
@@ -256,11 +260,11 @@ def section_comparison():
         ("Performance parity",   "99.3%",         "100% (baseline)"),
         ("Bit-identical output", "yes",           "(baseline)"),
     ]
-    print(f"  {BOLD}{'Capability':<24} {'OpenPTXas':<18} NVIDIA{RESET}")
-    print("  " + "─" * 68)
+    print(f"  {BOLD}{'Capability':<22} {'OpenPTXas':<17} NVIDIA{RESET}")
+    print("  " + "-" * 68)
     for cap, ours, theirs in comparison:
         ours_color = GREEN if ours in ("yes", "0 binaries", "open source", "2532 lines") else CYAN
-        print(f"  {cap:<24} {ours_color}{ours:<18}{RESET} {theirs}")
+        print(f"  {cap:<22} {ours_color}{ours:<17}{RESET} {theirs}")
     print()
 
 
@@ -284,12 +288,12 @@ def section_stats():
 
 
 def finale():
-    print(f"{BOLD}{CYAN}" + "═" * 72 + f"{RESET}")
-    print(f"  {BOLD}SM_120 FULLY UNLOCKED — every subsystem reverse-engineered{RESET}")
+    print(f"{BOLD}{CYAN}" + "=" * 72 + f"{RESET}")
+    print(f"  {BOLD}SM_120 FULLY UNLOCKED - every subsystem reverse-engineered{RESET}")
     print(f"  Open-source toolchain at {GREEN}{BOLD}99.3% parity{RESET} with NVIDIA's closed stack")
     print(f"  Repo: {CYAN}github.com/garrick99/openptxas{RESET}")
     print(f"  Reference: {CYAN}docs/SM_120_REFERENCE.md{RESET} (2532 lines)")
-    print(f"{BOLD}{CYAN}" + "═" * 72 + f"{RESET}")
+    print(f"{BOLD}{CYAN}" + "=" * 72 + f"{RESET}")
     print()
 
 

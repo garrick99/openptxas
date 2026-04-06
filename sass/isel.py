@@ -1562,15 +1562,17 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     lut = {'and': LOP3_AND, 'or': LOP3_OR, 'xor': LOP3_XOR}[op]
                     if isinstance(instr.srcs[1], ImmOp):
-                        # Immediate src1: materialize to dest via IADD3.IMM (R = RZ + imm + RZ),
-                        # then LOP3.LUT R-R. Previously used LDC → LOP3.LUT but LDC→LOP3 scoreboard
-                        # wait didn't take effect empirically — LOP3 consistently read 0 for the
-                        # freshly-loaded LDC result, corrupting the xor/and/or mask. IADD3.IMM
-                        # writes an ALU result that's properly ordered by the ALU GPR-gap pass.
+                        # Immediate src1: materialize via IADD3.IMM, then LOP3.LUT R-R.
+                        # When dest aliases src0 (d == a), materializing into d would
+                        # clobber the source before LOP3 reads it — use a scratch register.
                         imm = instr.srcs[1].value & 0xFFFFFFFF
-                        output.append(SassInstr(encode_iadd3_imm32(d, RZ, imm, RZ),
-                                                f'IADD3 R{d}, RZ, 0x{imm:x}, RZ  // {op} imm materialize'))
-                        _emit_lop3(output, ctx, d, a, d, RZ, lut, f'LOP3.LUT R{d}, R{a}, R{d}, RZ, 0x{lut:02x}  // {op}.{typ} imm')
+                        if d == a:
+                            imm_reg = _alloc_gpr(ctx)
+                        else:
+                            imm_reg = d
+                        output.append(SassInstr(encode_iadd3_imm32(imm_reg, RZ, imm, RZ),
+                                                f'IADD3 R{imm_reg}, RZ, 0x{imm:x}, RZ  // {op} imm materialize'))
+                        _emit_lop3(output, ctx, d, a, imm_reg, RZ, lut, f'LOP3.LUT R{d}, R{a}, R{imm_reg}, RZ, 0x{lut:02x}  // {op}.{typ} imm')
                     else:
                         b = ctx.ra.r32(instr.srcs[1].name)
                         _emit_lop3(output, ctx, d, a, b, RZ, lut, f'LOP3.LUT R{d}, R{a}, R{b}, RZ, 0x{lut:02x}  // {op}.{typ}')
@@ -2672,6 +2674,11 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 if not hasattr(ctx, '_negated_preds'):
                                     ctx._negated_preds = set()
                                 ctx._negated_preds.add(pd)
+                            else:
+                                # Non-inverted comparison: clear any stale negation
+                                # from a previous setp that wrote the same predicate.
+                                if hasattr(ctx, '_negated_preds'):
+                                    ctx._negated_preds.discard(pd)
                             cmp_map = {'lt': ISETP_LT, 'le': ISETP_LE, 'gt': ISETP_GT,
                                        'ge': ISETP_GE, 'eq': ISETP_EQ, 'ne': ISETP_NE}
                             isetp_cmp = cmp_map.get(cmp_name, ISETP_GE)
@@ -2689,9 +2696,11 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             elif isinstance(b, RegOp):
                                 b_param_off = ctx._reg_param_off.get(b.name) if ctx else None
                                 b_ur_idx = (ctx._ur_params.get(b.name) if ctx else None)
-                                if b_ur_idx is not None:
+                                if b_ur_idx is not None and isetp_cmp == ISETP_GE:
                                     # src1 is a u64 param loaded via LDCU.64 into UR pair.
                                     # Use lo UR for comparison (valid when values fit in 32 bits).
+                                    # SM_120 R-UR ISETP only works correctly with GE comparison
+                                    # code; other codes (EQ, NE, LE, GT, LT) give wrong results.
                                     emit_pd = pd
                                     if pd > 0 and ctx:
                                         emit_pd = 0
@@ -2699,14 +2708,18 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                     output.append(SassInstr(
                                         encode_isetp_ur(emit_pd, ar, b_ur_idx, cmp=isetp_cmp),
                                         f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, UR{b_ur_idx}, PT'))
-                                elif b_param_off is not None:
+                                elif b_param_off is not None and isetp_cmp == ISETP_GE:
                                     # src1 came from ld.param.u32 — load via LDCU.32 into UR,
                                     # then compare R vs UR. This is the ptxas-verified path.
                                     #
-                                    # SM_120 hardware: ISETP R-UR (0xc0c) silently produces
-                                    # P=FALSE when pred_dest > 0. Force pred_dest=0 (P0) and
-                                    # remap the PTX predicate so consumers use P0 with their
-                                    # original sign — no comparison inversion needed.
+                                    # SM_120 hardware: ISETP R-UR (0xc0c) only works correctly
+                                    # with GE comparison code. Other codes (EQ, NE, LE, GT, LT)
+                                    # silently produce wrong results. For non-GE comparisons,
+                                    # fall through to the R-R path using the GPR value already
+                                    # loaded by LDC.
+                                    #
+                                    # Additionally, ISETP R-UR silently produces P=FALSE when
+                                    # pred_dest > 0. Force pred_dest=0 (P0) and remap.
                                     emit_pd = pd
                                     if pd > 0 and ctx:
                                         emit_pd = 0
@@ -2884,8 +2897,10 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                 elif op == 'selp':
                     d = ctx.ra.r32(instr.dest.name)
                     pd = 0
+                    neg = False
                     if len(instr.srcs) > 2 and isinstance(instr.srcs[2], RegOp):
                         pd = ctx.ra.pred(instr.srcs[2].name) if instr.srcs[2].name in ctx.ra.pred_regs else 0
+                        neg = hasattr(ctx, '_negated_preds') and pd in ctx._negated_preds
                     def _sel_src(src_op, out):
                         if isinstance(src_op, RegOp):
                             return ctx.ra.r32(src_op.name)
@@ -2897,6 +2912,12 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         return RZ
                     a = _sel_src(instr.srcs[0], output)
                     b = _sel_src(instr.srcs[1], output)
+                    # If the predicate is logically negated (from setp inversion),
+                    # swap src0/src1 to preserve correct selection semantics.
+                    # SEL picks src0 when pred=TRUE, src1 when pred=FALSE.
+                    # Swapping compensates for the inverted predicate sense.
+                    if neg:
+                        a, b = b, a
                     output.append(SassInstr(encode_sel(d, a, b, pd),
                                             f'SEL R{d}, R{a}, R{b}, P{pd}  // selp'))
 

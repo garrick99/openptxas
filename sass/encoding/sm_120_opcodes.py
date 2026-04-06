@@ -5971,8 +5971,16 @@ def encode_sust(data: int, coord: int, ur_desc: int,
 #   b3=GPR src0, b4=UR index, b9=cmp<<4, b10=0xf0|(pred<<1), b11=0x0b
 def encode_fsetp_ur(pred_dest: int, gpr_src: int, ur_src: int, cmp: int = FSETP_GT,
                     ctrl: int = 0) -> bytes:
-    """Encode FSETP R-UR: compare GPR float against UR float → predicate."""
-    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    """Encode FSETP R-UR: compare GPR float against UR float → predicate.
+
+    Uses ptxas-verified ctrl word: rbar=0x0b, wdep=0x3c, misc=10.
+    The scoreboard's assign_ctrl WILL overwrite this, but the hardcoded
+    default ensures correct behavior if the scoreboard doesn't know this opcode.
+    """
+    # ptxas ground truth ctrl: b13=0xca, b14=0x2f, b15=0x00
+    # rbar=0x0b (wait LDC+LDG), wdep=0x3c, misc=10
+    if ctrl == 0:
+        ctrl = (0x0b << 10) | (0x3c << 4) | 10  # ptxas-verified ctrl
     b13, b14, b15 = _ctrl_to_bytes(ctrl)
     raw = bytearray(16)
     raw[0] = 0x0b

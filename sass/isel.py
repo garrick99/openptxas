@@ -2689,9 +2689,6 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                         output.append(SassInstr(
                                             encode_ldcu_32(ur_tmp, 0, param_offset),
                                             f'LDCU.32 UR{ur_tmp}, c[0][0x{param_offset:x}]  // reload for FSETP R-UR'))
-                                        # LDCU.32 needs ≥4 instruction gap before UR consumer
-                                        for _nop_i in range(4):
-                                            output.append(SassInstr(encode_nop(), 'NOP  // LDCU.32 latency'))
                                         cmp_map_ur = {'lt': FSETP_LT, 'le': FSETP_LE, 'gt': FSETP_GT,
                                                       'ge': FSETP_GE, 'eq': FSETP_EQ, 'ne': FSETP_NE}
                                         output.append(SassInstr(

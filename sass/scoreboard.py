@@ -130,6 +130,7 @@ _OPCODE_META: dict[int, _OpMeta] = {
     0x887: _OpMeta('USEL',         0, 0x3f, 1),  # uniform select (writes UR)
     0x31c: _OpMeta('B2R',          1, 0x3e, 1),  # barrier result to register/predicate
     0x853: _OpMeta('UFSETP',       0, 0x3f, 0),  # uniform FP set predicate (writes UP)
+    0xc0b: _OpMeta('FSETP_UR',     0, 0x3c, 10), # FSETP R-UR (ptxas-verified ctrl)
     0x856: _OpMeta('UFMUL',        0, 0x3f, 1),  # uniform FP multiply (writes UR)
     0xc26: _OpMeta('IDP.4A.UR',    1, 0x3e, 1),  # IDP.4A with UR source
     # Cluster operations (2026-04-04)
@@ -216,6 +217,7 @@ _OPCODES_ALU = {
     0x208,        # FSEL
     0x20b,        # FSETP
     0xc0b,        # FSETP R-UR
+
     0x20c,        # ISETP R-R
     0xc0c,        # ISETP R-UR
     # Permute / misc
@@ -514,6 +516,8 @@ def _wdep_for_opcode(opcode: int, raw: bytes = None) -> int:
         # Treating SHFL as wdep=0x3e (ALU in-order) was incorrect — consumers
         # read stale data because SHFL actually takes many cycles.
         return 0x31
+    if opcode == 0xc0b:  # FSETP R-UR: ptxas-verified wdep=0x3c on SM_120
+        return 0x3c
     if opcode in _OPCODES_LDGSTS:
         return 0x3f  # LDGSTS: async copy writes to shared mem, not GPR — no scoreboard slot
     if opcode in _OPCODES_LDGDEPBAR:
@@ -571,6 +575,7 @@ _OPCODE_MISC: dict[int, int] = {
     0xc0c: 0,   # ISETP R-UR: misc=0 (SM_120: misc 1-12 → wrong predicate; see
                 #   encode_isetp_ur docstring. Counter value 6 at position 22 → wrong pred.)
     0x20c: 0,   # ISETP R-R: misc=0 (same SM_120 predicate correctness requirement)
+    0xc0b: 10,  # FSETP R-UR: misc=10 (ptxas-verified SM_120)
     0x80a: 5,   # FSEL.step: misc=5 (ptxas-verified)
     0x223: 4,   # FFMA R-R-R: misc=4 (ptxas-verified for FMA chains on SM_120)
     0x986: 1,   # STG.E: misc=1 (from ptxas ground truth)
@@ -824,7 +829,7 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
         elif opcode == 0x20c:  # ISETP R-R: pred_dest at (raw[10]>>1) & 0x7
             pred_dest = (si.raw[10] >> 1) & 0x7
             pending_pred_writes[pred_dest] = (i, wdep)
-        elif opcode == 0x20b:  # FSETP: pred_dest at raw[9] & 0x7
+        elif opcode in (0x20b, 0xc0b):  # FSETP/FSETP-UR: pred_dest at raw[9] & 0x7
             pred_dest = si.raw[9] & 0x7
             pending_pred_writes[pred_dest] = (i, wdep)
         # DSETP: predicate write is long-latency (wdep=0x33, same slot as LDS).

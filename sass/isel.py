@@ -2670,7 +2670,6 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                     # Reg-reg float comparison WITHOUT FSETP:
                                     # Compute diff = src0 - src1, then FSEL.step(diff > 0)
                                     # This avoids the ISETP→FSETP corruption bug entirely.
-                                    from sass.encoding.sm_120_opcodes import encode_fadd
                                     diff_r = _alloc_gpr(ctx)
                                     # FADD with swapped+negated src0 = FSUB: -br + ar = ar - br
                                     output.append(SassInstr(

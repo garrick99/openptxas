@@ -843,6 +843,17 @@ def compile_function(fn: Function, verbose: bool = False,
                 bytes(old_raw),
                 f'{pred_prefix}BRA {target_label} (offset={rel_offset})')
 
+    # Ensure every code path ends with EXIT before the trap loop.
+    # Blocks that fall through without a terminator (BRA/EXIT/RET) need
+    # an explicit EXIT appended.  This handles cases where block
+    # reordering places a non-terminating block at the end of the stream.
+    if sass_instrs:
+        last = sass_instrs[-1]
+        last_opc = (last.raw[0] | (last.raw[1] << 8)) & 0xFFF
+        _TERMINATORS = {0x947, 0x94d}  # BRA, EXIT
+        if last_opc not in _TERMINATORS:
+            sass_instrs.append(SassInstr(encode_exit(), '// fall-through EXIT'))
+
     # Append BRA trap loop after the final EXIT (required by NVIDIA hardware).
     # This catches warps that somehow continue past EXIT and prevents
     # execution of uninitialized memory.

@@ -272,6 +272,23 @@ def _if_convert(fn: Function) -> None:
                     return True
         return False
 
+    def _pred_from_float_setp(block_instrs, pred_name):
+        """Check if the guard predicate is set by a float setp in the same block.
+
+        Float setps on SM_120 use FSEL.step (not ISETP inversion), so the
+        _negated_preds convention doesn't apply correctly.  If-conversion
+        of diamonds guarded by float predicates produces wrong guard sense.
+        Block if-conversion in this case and let it fall through to branches.
+        """
+        for inst in block_instrs:
+            if (inst.op == 'setp'
+                    and isinstance(inst.dest, RegOp)
+                    and inst.dest.name == pred_name
+                    and inst.types
+                    and any(t in ('f32', 'f64') for t in inst.types)):
+                return True
+        return False
+
     changed = True
     while changed:
         changed = False
@@ -318,7 +335,8 @@ def _if_convert(fn: Function) -> None:
                             # Skip if body already has inner predicates (nested if-conversion)
                             if (_has_inner_predicates(then_instrs) or _has_inner_predicates(else_instrs)
                                     or _overwrites_pred(then_instrs, pred_name)
-                                    or _overwrites_pred(else_instrs, pred_name)):
+                                    or _overwrites_pred(else_instrs, pred_name)
+                                    or _pred_from_float_setp(instrs, pred_name)):
                                 continue
                             guarded_then = _guard(then_instrs, pred_name, not neg_bra)
                             guarded_else = _guard(else_instrs, pred_name, neg_bra)
@@ -485,7 +503,8 @@ def _if_convert(fn: Function) -> None:
                                 if (_has_inner_predicates(true_body)
                                         or _has_inner_predicates(false_body)
                                         or _overwrites_pred(true_body, pred_name)
-                                        or _overwrites_pred(false_body, pred_name)):
+                                        or _overwrites_pred(false_body, pred_name)
+                                        or _pred_from_float_setp(bb.instructions, pred_name)):
                                     continue
                                 guarded_true = _guard(true_body, pred_name, neg_bra)
                                 guarded_false = _guard(false_body, pred_name, not neg_bra)

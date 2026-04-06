@@ -2676,29 +2676,28 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                     output.append(SassInstr(
                                         encode_fadd(diff_r, br, ar, negate_src0=True),
                                         f'FADD R{diff_r}, -R{br}, R{ar}  // fsub for cmp'))
-                                    # Map comparison to FSEL.step on the difference:
-                                    # GT: diff > 0  →  FSEL_GT with threshold=0
-                                    # LT: diff < 0  →  FSEL_LT with threshold=0
-                                    # GE: diff >= 0 →  FSEL_GE with threshold=0
-                                    # LE: diff <= 0 →  FSEL_LE with threshold=0
-                                    # EQ: diff == 0 →  FSEL_EQ with threshold=0
-                                    # NE: diff != 0 →  FSEL_NE with threshold=0
+                                    # Use NATURAL comparison direction. Clear _negated_preds.
+                                    # Float setp diamonds are blocked from if-conversion by
+                                    # _pred_from_float_setp() so the _negated_preds convention
+                                    # mismatch doesn't matter — branches handle the pred directly.
                                     output.append(SassInstr(
                                         encode_fsel_step(tmp_r, diff_r, 0, fsel_c),
                                         f'FSEL.step R{tmp_r}, R{diff_r}, 0x0, {cmp_name.upper()}'))
                                     output.append(SassInstr(
                                         encode_isetp(pd, tmp_r, RZ, ISETP_NE),
                                         f'ISETP.NE P{pd}, R{tmp_r}, RZ  // float reg cmp -> pred'))
+                                    if hasattr(ctx, '_negated_preds'):
+                                        ctx._negated_preds.discard(pd)
                                 else:
                                     # FSEL.step → ISETP.NE (avoids FSETP entirely)
+                                    # Same: clear _negated_preds for natural sense.
                                     output.append(SassInstr(
                                         encode_fsel_step(tmp_r, ar, threshold, fsel_c),
                                         f'FSEL.step R{tmp_r}, R{ar}, 0x{threshold:08x}, {cmp_name.upper()}'))
-                                    # Convert float 1.0/0.0 to predicate via ISETP.NE
                                     output.append(SassInstr(
                                         encode_isetp(pd, tmp_r, RZ, ISETP_NE),
                                         f'ISETP.NE P{pd}, R{tmp_r}, RZ  // float cmp -> pred'))
-                                    if hasattr(ctx, '_negated_preds') and pd in ctx._negated_preds:
+                                    if hasattr(ctx, '_negated_preds'):
                                         ctx._negated_preds.discard(pd)
                         else:
                             # Integer comparison

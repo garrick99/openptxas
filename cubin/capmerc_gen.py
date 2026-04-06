@@ -152,9 +152,12 @@ def compute_capability_mask(
 
     # Higher bits scale with code size / complexity
     # text_size_pages = number of 256-byte pages
-    text_pages = max(text_size // 256, 1)
-    if text_pages > 1:
-        mask |= (text_pages << 16)
+    # NOTE: DO NOT add text_pages to mask. Our generated capmerc only
+    # supports the base structure. Adding text_pages bits changes the
+    # expected record count/layout and causes ERR715 when they don't match.
+    # text_pages = max(text_size // 256, 1)
+    # if text_pages > 1:
+    #     mask |= (text_pages << 16)
 
     # Barrier region count contributes to upper bits
     if num_barrier_regions > 2:
@@ -608,12 +611,13 @@ def build_capmerc(
         )
     )
 
-    # 4. Additional type-01 records for complex kernels (multi-page text only)
-    # NOTE: do NOT gate on num_gprs > 14 — the extra record changes the
-    # capmerc structure in a way that causes ERR715 on some kernels.
-    # The hardware doesn't enforce reg_count from capmerc byte[8].
-    if text_size_pages > 1:
-        body_records.append(_build_type01_alu_basic(region_idx=1))
+    # 4. Additional type-01 records for complex kernels
+    # DISABLED: the extra type-01 record for multi-page text changes the
+    # capmerc structure and causes ERR715. Our generated capmerc only
+    # works with the single-page structure. Multi-page support needs
+    # proper reverse engineering of the record semantics.
+    # if text_size_pages > 1:
+    #     body_records.append(_build_type01_alu_basic(region_idx=1))
 
     # 5. Middle barrier regions (for multi-region kernels)
     if num_barrier_regions > 2:

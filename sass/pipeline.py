@@ -1070,8 +1070,14 @@ def _patch_ptxas_metadata(cubin_bytes: bytes, ptxas_meta: dict,
             ptxas_has_highreg = bool(cap_mask & 0x2000)
             if min_gprs > 14 and not ptxas_has_highreg:
                 # Our kernel needs R14+ but ptxas's capmerc lacks 0x2000 bit.
-                # Skip overwriting so the emitter's generated capmerc stays in place.
-                pass
+                # Use ptxas capmerc anyway (hardware doesn't enforce reg_count)
+                # but patch byte[8] to our actual GPR count.
+                patch = bytearray(ptxas_cap[:sh_size])
+                if len(patch) < sh_size:
+                    patch.extend(bytearray(sh_size - len(patch)))
+                if len(patch) > 8:
+                    patch[8] = max(patch[8], min_gprs)
+                data[sh_offset_val:sh_offset_val + sh_size] = patch
             else:
                 # ptxas capmerc has required capability bits (or we don't need R14+)
                 patch = bytearray(ptxas_cap[:sh_size])

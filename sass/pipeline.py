@@ -871,7 +871,9 @@ def compile_function(fn: Function, verbose: bool = False,
         last_opc = (last.raw[0] | (last.raw[1] << 8)) & 0xFFF
         _TERMINATORS = {0x947, 0x94d}  # BRA, EXIT
         if last_opc not in _TERMINATORS:
-            sass_instrs.append(SassInstr(encode_exit(), '// fall-through EXIT'))
+            # Use EXIT ctrl matching ptxas convention (wdep=0x3f, misc=5)
+            exit_ctrl = (0x01 << 10) | (0x3f << 4) | 5  # rbar=1, wdep=0x3f, misc=5
+            sass_instrs.append(SassInstr(encode_exit(ctrl=exit_ctrl), '// fall-through EXIT'))
 
     # Append BRA trap loop after the final EXIT (required by NVIDIA hardware).
     # This catches warps that somehow continue past EXIT and prevents

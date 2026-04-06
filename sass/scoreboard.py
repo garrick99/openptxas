@@ -215,6 +215,7 @@ _OPCODES_ALU = {
     0xa0c,        # ISETP (SM_89 cbuf form)
     0x208,        # FSEL
     0x20b,        # FSETP
+    0xc0b,        # FSETP R-UR
     0x20c,        # ISETP R-R
     0xc0c,        # ISETP R-UR
     # Permute / misc
@@ -357,7 +358,7 @@ def _get_src_regs(raw: bytes) -> set[int]:
             if raw[3] < 255: regs.add(raw[3])
             if raw[4] < 255: regs.add(raw[4])
             if raw[8] < 255: regs.add(raw[8])
-        elif opcode in (0x207, 0x20b, 0x416, 0x216):  # SEL/FSETP/PRMT/PRMT.REG: src0=b3, src1=b4
+        elif opcode in (0x207, 0x20b, 0xc0b, 0x416, 0x216):  # SEL/FSETP/FSETP-UR/PRMT/PRMT.REG: src0=b3, src1=b4
             if raw[3] < 255: regs.add(raw[3])
             if raw[4] < 255: regs.add(raw[4])
             if opcode == 0x216 and raw[8] < 255: regs.add(raw[8])  # PRMT.REG also reads b8

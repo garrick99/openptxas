@@ -2666,27 +2666,53 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 fsel_c = _fsel_cmp2.get(cmp_name, FSEL_GT)
 
                                 tmp_r = _alloc_gpr(ctx)
+                                # Prevent these temp GPRs from being reclaimed by
+                                # _release_scratch. If they're recycled, subsequent
+                                # selp/mov instructions reuse the same registers,
+                                # causing the IADD3 materializations to collide with
+                                # the FSEL.step/FADD results.
+                                ctx._scratch_mark = ctx._next_gpr
                                 if isinstance(b, RegOp) and threshold is None:
-                                    # Reg-reg float comparison WITHOUT FSETP:
-                                    # Compute diff = src0 - src1, then FSEL.step(diff > 0)
-                                    # This avoids the ISETP→FSETP corruption bug entirely.
-                                    diff_r = _alloc_gpr(ctx)
-                                    # FADD with swapped+negated src0 = FSUB: -br + ar = ar - br
-                                    output.append(SassInstr(
-                                        encode_fadd(diff_r, br, ar, negate_src0=True),
-                                        f'FADD R{diff_r}, -R{br}, R{ar}  // fsub for cmp'))
-                                    # Use NATURAL comparison direction. Clear _negated_preds.
-                                    # Float setp diamonds are blocked from if-conversion by
-                                    # _pred_from_float_setp() so the _negated_preds convention
-                                    # mismatch doesn't matter — branches handle the pred directly.
-                                    output.append(SassInstr(
-                                        encode_fsel_step(tmp_r, diff_r, 0, fsel_c),
-                                        f'FSEL.step R{tmp_r}, R{diff_r}, 0x0, {cmp_name.upper()}'))
-                                    output.append(SassInstr(
-                                        encode_isetp(pd, tmp_r, RZ, ISETP_NE),
-                                        f'ISETP.NE P{pd}, R{tmp_r}, RZ  // float reg cmp -> pred'))
-                                    if hasattr(ctx, '_negated_preds'):
-                                        ctx._negated_preds.discard(pd)
+                                    # Reg-reg float comparison: use FSETP R-UR (0xc0b).
+                                    # The R-UR form is NOT corrupted by preceding ISETP.
+                                    # Load the GPR comparand into a UR via LDCU.32,
+                                    # then emit FSETP R-UR.
+                                    from sass.encoding.sm_120_opcodes import (
+                                        encode_fsetp_ur, encode_ldcu_32)
+                                    # Find the param cbank offset for this register.
+                                    # ctx._reg_param_off maps PTX register name → param byte offset.
+                                    b_ptx = b.name if b.name.startswith('%') else f'%{b.name}'
+                                    param_offset = ctx._reg_param_off.get(b_ptx) or ctx._reg_param_off.get(b.name)
+                                    if param_offset is not None:
+                                        ur_tmp = ctx._next_ur
+                                        ctx._next_ur += 1
+                                        output.append(SassInstr(
+                                            encode_ldcu_32(ur_tmp, 0, param_offset),
+                                            f'LDCU.32 UR{ur_tmp}, c[0][0x{param_offset:x}]  // reload for FSETP R-UR'))
+                                        # LDCU.32 needs ≥4 instruction gap before UR consumer
+                                        for _nop_i in range(4):
+                                            output.append(SassInstr(encode_nop(), 'NOP  // LDCU.32 latency'))
+                                        cmp_map_ur = {'lt': FSETP_LT, 'le': FSETP_LE, 'gt': FSETP_GT,
+                                                      'ge': FSETP_GE, 'eq': FSETP_EQ, 'ne': FSETP_NE}
+                                        output.append(SassInstr(
+                                            encode_fsetp_ur(pd, ar, ur_tmp, cmp_map_ur.get(cmp_name, FSETP_GT)),
+                                            f'FSETP.{cmp_name.upper()} P{pd}, R{ar}, UR{ur_tmp}  // R-UR (safe)'))
+                                        if hasattr(ctx, '_negated_preds'):
+                                            ctx._negated_preds.discard(pd)
+                                    else:
+                                        # Can't find param — fallback to FSUB+FSEL.step+ISETP.NE
+                                        diff_r = _alloc_gpr(ctx)
+                                        output.append(SassInstr(
+                                            encode_fadd(diff_r, br, ar, negate_src0=True),
+                                            f'FADD R{diff_r}, -R{br}, R{ar}  // fsub for cmp'))
+                                        output.append(SassInstr(
+                                            encode_fsel_step(tmp_r, diff_r, 0, fsel_c),
+                                            f'FSEL.step R{tmp_r}, R{diff_r}, 0x0, {cmp_name.upper()}'))
+                                        output.append(SassInstr(
+                                            encode_isetp(pd, tmp_r, RZ, ISETP_NE),
+                                            f'ISETP.NE P{pd}, R{tmp_r}, RZ  // float reg cmp -> pred'))
+                                        if hasattr(ctx, '_negated_preds'):
+                                            ctx._negated_preds.discard(pd)
                                 else:
                                     # FSEL.step → ISETP.NE (avoids FSETP entirely)
                                     # Same: clear _negated_preds for natural sense.

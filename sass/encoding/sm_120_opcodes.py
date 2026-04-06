@@ -5959,3 +5959,29 @@ def encode_sust(data: int, coord: int, ur_desc: int,
                       b8=0x00,
                       b9=mode, b10=0x10, b11=0x08,
                       ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# FSETP R-UR — Float Set Predicate with Uniform Register source
+# ---------------------------------------------------------------------------
+# Opcode 0xc0b. Unlike FSETP R-R (0x20b) which is corrupted by preceding
+# ISETP, the R-UR form works correctly on SM_120.
+# Ground truth (ptxas sm_120):
+#   FSETP.GT.AND P0, PT, R2, UR6, PT → 0b 7c 00 02 06 00 00 00 00 40 f0 0b 00 da 1f 00
+#   b3=GPR src0, b4=UR index, b9=cmp<<4, b10=0xf0|(pred<<1), b11=0x0b
+def encode_fsetp_ur(pred_dest: int, gpr_src: int, ur_src: int, cmp: int = FSETP_GT,
+                    ctrl: int = 0) -> bytes:
+    """Encode FSETP R-UR: compare GPR float against UR float → predicate."""
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0x0b
+    raw[1] = 0x7c
+    raw[2] = 0x00
+    raw[3] = gpr_src & 0xFF
+    raw[4] = ur_src & 0xFF
+    raw[9] = (cmp & 0x0F) << 4
+    raw[10] = 0xf0 | ((pred_dest & 0x07) << 1)
+    raw[11] = 0x0b  # R-UR flag
+    raw[13], raw[14], raw[15] = b13, b14, b15
+    return bytes(raw)

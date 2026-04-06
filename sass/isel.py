@@ -2667,19 +2667,28 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
 
                                 tmp_r = _alloc_gpr(ctx)
                                 if isinstance(b, RegOp) and threshold is None:
-                                    # Register comparison: need FSETP for reg-reg.
-                                    # Fall back to FSETP only for reg-reg (rare in practice).
-                                    cmp_map_fb = {'lt': FSETP_LT, 'le': FSETP_LE, 'gt': FSETP_GT,
-                                                  'ge': FSETP_GE, 'eq': FSETP_EQ, 'ne': FSETP_NE}
-                                    # Use FSEL.step with reg: encode the src1 reg value
-                                    # as an "immediate" by reading its bits. This is a
-                                    # workaround — FSEL.step only takes immediate threshold.
-                                    # For now, use FSETP for reg-reg (works if no ISETP before).
-                                    if hasattr(ctx, '_negated_preds') and pd in ctx._negated_preds:
-                                        ctx._negated_preds.discard(pd)
+                                    # Reg-reg float comparison WITHOUT FSETP:
+                                    # Compute diff = src0 - src1, then FSEL.step(diff > 0)
+                                    # This avoids the ISETP→FSETP corruption bug entirely.
+                                    from sass.encoding.sm_120_opcodes import encode_fadd
+                                    diff_r = _alloc_gpr(ctx)
+                                    # FADD with swapped+negated src0 = FSUB: -br + ar = ar - br
                                     output.append(SassInstr(
-                                        encode_fsetp(pd, ar, br, cmp_map_fb.get(cmp_name, FSETP_GE)),
-                                        f'FSETP.{cmp_name.upper()} P{pd}, R{ar}, R{br}'))
+                                        encode_fadd(diff_r, br, ar, negate_src0=True),
+                                        f'FADD R{diff_r}, -R{br}, R{ar}  // fsub for cmp'))
+                                    # Map comparison to FSEL.step on the difference:
+                                    # GT: diff > 0  →  FSEL_GT with threshold=0
+                                    # LT: diff < 0  →  FSEL_LT with threshold=0
+                                    # GE: diff >= 0 →  FSEL_GE with threshold=0
+                                    # LE: diff <= 0 →  FSEL_LE with threshold=0
+                                    # EQ: diff == 0 →  FSEL_EQ with threshold=0
+                                    # NE: diff != 0 →  FSEL_NE with threshold=0
+                                    output.append(SassInstr(
+                                        encode_fsel_step(tmp_r, diff_r, 0, fsel_c),
+                                        f'FSEL.step R{tmp_r}, R{diff_r}, 0x0, {cmp_name.upper()}'))
+                                    output.append(SassInstr(
+                                        encode_isetp(pd, tmp_r, RZ, ISETP_NE),
+                                        f'ISETP.NE P{pd}, R{tmp_r}, RZ  // float reg cmp -> pred'))
                                 else:
                                     # FSEL.step → ISETP.NE (avoids FSETP entirely)
                                     output.append(SassInstr(

@@ -99,8 +99,11 @@ def _sink_param_loads(fn: Function) -> None:
                 break
 
         if not sunk:
-            # Dest never used in other blocks — keep in entry
-            keep.append(inst)
+            # Dest never used in other blocks — keep in entry.
+            # Insert at the START so it stays above any conditional BRA
+            # that the entry block may contain.  Appending to the END
+            # would place it AFTER the BRA, making it unreachable dead code.
+            keep.insert(0, inst)
 
     entry.instructions = keep
 
@@ -391,6 +394,18 @@ def _if_convert(fn: Function) -> None:
                             bb_merge_d = next((b for b in blocks if b.label == merge_label), None)
                             if bb_merge_d:
                                 bb.instructions += list(bb_merge_d.instructions)
+                                # If the merge block originally fell through (no
+                                # terminator), its successor was the next block in
+                                # the original layout.  When that successor is the
+                                # ret-only false block (already absorbed as early
+                                # exit), append an explicit ret so threads don't
+                                # fall through into whatever block follows.
+                                _merge_last = bb_merge_d.instructions[-1] if bb_merge_d.instructions else None
+                                if _merge_last and _merge_last.op not in ('bra', 'ret'):
+                                    _merge_idx = blocks.index(bb_merge_d)
+                                    _merge_succ = blocks[_merge_idx + 1] if _merge_idx + 1 < len(blocks) else None
+                                    if _merge_succ is bb_false_d or _merge_succ is None:
+                                        bb.instructions.append(Instruction(op='ret', dest=None, srcs=[]))
                                 fn.blocks = [b for b in blocks
                                              if b not in (bb_true_d, bb_false_d, bb_merge_d)]
                             else:
@@ -399,6 +414,14 @@ def _if_convert(fn: Function) -> None:
                         else:
                             fn.blocks = [b for b in blocks
                                          if b not in (bb_true_d, bb_false_d)]
+                        # Replace any remaining BRA <label_false_d> in surviving
+                        # blocks with ret, since the ret-only false block was removed.
+                        for _rb in fn.blocks:
+                            for _ri, _rinst in enumerate(_rb.instructions):
+                                if (_rinst.op == 'bra' and not _rinst.pred
+                                        and _bra_target(_rinst) == label_false_d):
+                                    _rb.instructions[_ri] = Instruction(
+                                        op='ret', dest=None, srcs=[])
                         changed = True
                         break
 
@@ -698,12 +721,20 @@ def compile_function(fn: Function, verbose: bool = False,
             )
 
             if target_is_exit:
-                # Jump to last EXIT
-                actual_target_byte = None
-                for si_idx in range(len(sass_instrs) - 1, -1, -1):
-                    if sass_instrs[si_idx].raw[:2] == bytes([0x4d, 0x79]):
-                        actual_target_byte = si_idx * 16
-                        break
+                # Target is a ret-only block — replace BRA with EXIT directly.
+                # Previous approach jumped to the last EXIT instruction, but
+                # that fails when the only EXIT is predicated (bounds check).
+                exit_raw = encode_exit()
+                # Preserve the predicate from the BRA instruction if present
+                pred_nibble = (si.raw[1] >> 4) & 0xF
+                if pred_nibble != 0x7:  # not PT — has predicate guard
+                    exit_raw = bytearray(exit_raw)
+                    exit_raw[1] = (exit_raw[1] & 0x0F) | (si.raw[1] & 0xF0)
+                    exit_raw = bytes(exit_raw)
+                pred_prefix = si.comment.split('BRA')[0] if 'BRA' in si.comment else ''
+                sass_instrs[i] = SassInstr(exit_raw,
+                    f'{pred_prefix}EXIT  // replaces BRA {target_label} (ret-only)')
+                continue
             elif target_label in label_abs_byte:
                 actual_target_byte = label_abs_byte[target_label]
             else:

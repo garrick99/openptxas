@@ -258,6 +258,20 @@ def _if_convert(fn: Function) -> None:
         """Check if any instruction already has a predicate (from inner if-conversion)."""
         return any(inst.pred for inst in inst_list)
 
+    def _overwrites_pred(inst_list, pred_name):
+        """Check if any instruction overwrites the guard predicate register.
+
+        If a setp inside the guarded block writes to the same predicate
+        that the guard uses, if-conversion is unsafe: the predicated
+        instructions after the setp would use the NEW predicate value
+        (from the comparison result) instead of the ORIGINAL guard value.
+        """
+        for inst in inst_list:
+            if inst.op == 'setp' and isinstance(inst.dest, RegOp):
+                if inst.dest.name == pred_name:
+                    return True
+        return False
+
     changed = True
     while changed:
         changed = False
@@ -302,7 +316,9 @@ def _if_convert(fn: Function) -> None:
                             then_instrs = instrs[bra_idx + 1 : -1]
                             else_instrs = list(bb_else.instructions)
                             # Skip if body already has inner predicates (nested if-conversion)
-                            if _has_inner_predicates(then_instrs) or _has_inner_predicates(else_instrs):
+                            if (_has_inner_predicates(then_instrs) or _has_inner_predicates(else_instrs)
+                                    or _overwrites_pred(then_instrs, pred_name)
+                                    or _overwrites_pred(else_instrs, pred_name)):
                                 continue
                             guarded_then = _guard(then_instrs, pred_name, not neg_bra)
                             guarded_else = _guard(else_instrs, pred_name, neg_bra)
@@ -344,7 +360,9 @@ def _if_convert(fn: Function) -> None:
                 then_instrs = bb_then.instructions[:-1]
                 else_instrs = list(bb_else.instructions)
                 # Skip if body already has inner predicates (nested if-conversion)
-                if _has_inner_predicates(then_instrs) or _has_inner_predicates(else_instrs):
+                if (_has_inner_predicates(then_instrs) or _has_inner_predicates(else_instrs)
+                                    or _overwrites_pred(then_instrs, pred_name)
+                                    or _overwrites_pred(else_instrs, pred_name)):
                     continue
                 guarded_then = _guard(then_instrs, pred_name, not neg_bra)
                 guarded_else = _guard(else_instrs, pred_name, neg_bra)
@@ -465,7 +483,9 @@ def _if_convert(fn: Function) -> None:
                                 true_body = bb_true.instructions[:-1]
                                 # Skip if body already has inner predicates
                                 if (_has_inner_predicates(true_body)
-                                        or _has_inner_predicates(false_body)):
+                                        or _has_inner_predicates(false_body)
+                                        or _overwrites_pred(true_body, pred_name)
+                                        or _overwrites_pred(false_body, pred_name)):
                                     continue
                                 guarded_true = _guard(true_body, pred_name, neg_bra)
                                 guarded_false = _guard(false_body, pred_name, not neg_bra)

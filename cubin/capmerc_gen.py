@@ -578,6 +578,60 @@ def build_capmerc(
     """
     num_gprs = max(num_gprs, 8)
 
+    # ---------------------------------------------------------------
+    # PTXAS-VERIFIED UNIVERSAL CAPMERC (146 bytes)
+    # ---------------------------------------------------------------
+    # ptxas uses the SAME 146-byte structure for ALL non-FP64 kernels
+    # regardless of text size (1-page, 2-page, etc.). The only fields
+    # that change are: header byte[8] (regs), header bytes[12:16] (mask),
+    # terminal byte[20] (text_size dependent), and trailer (2 bytes).
+    #
+    # Body records are ALWAYS:
+    #   type-01 prologue (16B) — universal
+    #   type-01 STG      (16B) — 010b0e0afa0005000000030139040000
+    #   type-02 barrier  (32B) — 02220e06f80052000000830040000200 + 16B zeros
+    #   type-02 barrier  (32B) — 02220e06f80052000000030140000200 + 16B zeros
+    #   terminal         (32B) — 02380e32f80040110000000002010a00 + continuation
+    #   trailer          (2B)
+    #
+    # Total: 16 + 16 + 16 + 32 + 32 + 32 + 2 = 146 bytes
+    if not has_dfma:
+        text_size_pages = max(text_size // 256, 1)
+        # Terminal byte[20]: (text_size >> 7) - 2, clamped to 0 minimum
+        term_b20 = max((text_size >> 7) - 2, 0)
+        # Trailer: encodes reg pressure + barrier info
+        # ptxas pattern: 0x5008 for ≤14 GPRs, 0xd007 for >14 GPRs (approximate)
+        trailer = b'\xd0\x07' if num_gprs > 14 else b'\x50\x08'
+
+        buf = bytearray(146)
+        # Header (16B)
+        buf[0:8] = CAPMERC_MAGIC
+        buf[8] = num_gprs
+        cap_mask = compute_capability_mask(
+            has_stg=has_stg, has_ldg=has_ldg, has_branch=has_branch,
+            has_shift=has_shift, has_ur_ops=has_ur_ops, has_imad=has_imad,
+            has_isetp=has_isetp, has_fadd=has_fadd, num_gprs=num_gprs,
+            num_barrier_regions=num_barrier_regions, text_size=text_size)
+        struct.pack_into('<I', buf, 12, cap_mask)
+        # Type-01 prologue (16B)
+        buf[16:32] = bytes.fromhex('010b040af80004000000410000040000')
+        # Type-01 STG (16B)
+        buf[32:48] = bytes.fromhex('010b0e0afa0005000000030139040000')
+        # Type-02 barrier #1 (32B)
+        buf[48:64] = bytes.fromhex('02220e06f80052000000830040000200')
+        buf[64:80] = bytes.fromhex('00000000000000000000000008000000')
+        # Type-02 barrier #2 (32B)
+        buf[80:96] = bytes.fromhex('02220e06f80052000000030140000200')
+        buf[96:112] = bytes.fromhex('00000000000000000000000000000000')
+        # Terminal (32B)
+        buf[112:128] = bytes.fromhex('02380e32f80040110000000002010a00')
+        buf[128] = 0x00; buf[129] = 0x02; buf[130] = 0x01; buf[131] = 0xc0
+        buf[132] = term_b20  # text_size dependent
+        # Rest of terminal: zeros (already zeroed)
+        # Trailer (2B)
+        buf[144:146] = trailer
+        return bytes(buf)
+
     # FP64 kernels require a fundamentally different capmerc structure:
     # the type-02 sub=0x0c FP64 class descriptor must be present for the
     # driver to populate c[0][0x358] (flat global memory descriptor for

@@ -144,8 +144,11 @@ def compute_capability_mask(
     if has_fadd:
         mask |= 0x20
 
-    if num_gprs > 14:
-        mask |= 0x2000
+    # NOTE: 0x2000 was previously set for num_gprs > 14 but this changes
+    # the capmerc structure and causes ERR715 on some kernels. The hardware
+    # doesn't enforce capmerc reg_count — R14+ works without this bit.
+    # if num_gprs > 14:
+    #     mask |= 0x2000
 
     # Higher bits scale with code size / complexity
     # text_size_pages = number of 256-byte pages
@@ -605,8 +608,11 @@ def build_capmerc(
         )
     )
 
-    # 4. Additional type-01 records for complex kernels
-    if num_gprs > 14 or text_size_pages > 1:
+    # 4. Additional type-01 records for complex kernels (multi-page text only)
+    # NOTE: do NOT gate on num_gprs > 14 — the extra record changes the
+    # capmerc structure in a way that causes ERR715 on some kernels.
+    # The hardware doesn't enforce reg_count from capmerc byte[8].
+    if text_size_pages > 1:
         body_records.append(_build_type01_alu_basic(region_idx=1))
 
     # 5. Middle barrier regions (for multi-region kernels)
@@ -694,7 +700,7 @@ _SHIFT_OPCODES = {0x819}                     # SHF
 _IMAD_OPCODES = {0x824, 0x825, 0xc24, 0xc11, 0x224, 0x225}  # IMAD variants (incl R-UR 0xc24)
 _ISETP_OPCODES = {0x86c, 0xc0c, 0x20c}      # ISETP variants (R-R 0x20c, R-UR 0xc0c)
 _UR_OPCODES = {0x9c3, 0x7ac, 0xb82}         # S2UR (0x9c3), ULDC.64, LDCU
-_FADD_OPCODES = {0x221, 0x220, 0x223}       # FADD, FMUL, FFMA
+_FADD_OPCODES = {0x221, 0x220, 0x223, 0x80a, 0x208, 0x207}  # FADD, FMUL, FFMA, FSEL.step, FSEL, SEL
 _CONST_LOAD_OPCODES = {0x182, 0x189, 0x431, 0x7ac, 0xb82}  # LDCU variants
 
 
@@ -819,7 +825,11 @@ def analyze_sass_for_capmerc(sass_bytes: bytes) -> dict:
     num_barrier_regions = max(barrier_count + 1, 2)
 
     # GPR count: round up to nearest even, minimum 8
-    num_gprs = max(max_reg + 1, 8)
+    # Cap at 14 for capmerc — the hardware doesn't enforce reg_count,
+    # but num_gprs > 14 triggers a different capmerc structure (extra records,
+    # fillers, 0x2000 capability bit) that causes ERR715 on some kernels.
+    # R14+ access works fine with reg_count <= 14 in capmerc.
+    num_gprs = min(max(max_reg + 1, 8), 14)
     if num_gprs % 2 == 1:
         num_gprs += 1
 

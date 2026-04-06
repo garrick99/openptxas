@@ -742,7 +742,13 @@ def analyze_sass_for_capmerc(sass_bytes: bytes) -> dict:
         #   ISETP src2: comparison mode/predicate field (e.g. 0x70), not GPR
         #   R-UR form src1: UR register index, not GPR
         _ISETP_OPCODES_SET = {0x20c, 0x86c, 0xc0c, 0x28c}
-        if opcode == 0x7ac:
+        if opcode == 0xc0b:
+            # FSETP R-UR: dest=pred (not GPR), src1=UR — only count src0 (GPR)
+            # Do NOT set has_isetp — capmerc treats FSETP R-UR as an ALU variant,
+            # not a separate instruction class.
+            if src0 != 255 and src0 < 128 and src0 > max_reg:
+                max_reg = src0
+        elif opcode == 0x7ac:
             # ULDC: dest is UR — skip entirely
             pass
         elif opcode in _CONST_LOAD_OPCODES:

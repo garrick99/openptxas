@@ -5977,10 +5977,7 @@ def encode_fsetp_ur(pred_dest: int, gpr_src: int, ur_src: int, cmp: int = FSETP_
     The scoreboard's assign_ctrl WILL overwrite this, but the hardcoded
     default ensures correct behavior if the scoreboard doesn't know this opcode.
     """
-    # ptxas ground truth ctrl: b13=0xca, b14=0x2f, b15=0x00
-    # rbar=0x0b (wait LDC+LDG), wdep=0x3c, misc=10
-    if ctrl == 0:
-        ctrl = (0x0b << 10) | (0x3c << 4) | 10  # ptxas-verified ctrl
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
     b13, b14, b15 = _ctrl_to_bytes(ctrl)
     raw = bytearray(16)
     raw[0] = 0x0b

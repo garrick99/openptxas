@@ -516,8 +516,6 @@ def _wdep_for_opcode(opcode: int, raw: bytes = None) -> int:
         # Treating SHFL as wdep=0x3e (ALU in-order) was incorrect — consumers
         # read stale data because SHFL actually takes many cycles.
         return 0x31
-    if opcode == 0xc0b:  # FSETP R-UR: ptxas-verified wdep=0x3c on SM_120
-        return 0x3c
     if opcode in _OPCODES_LDGSTS:
         return 0x3f  # LDGSTS: async copy writes to shared mem, not GPR — no scoreboard slot
     if opcode in _OPCODES_LDGDEPBAR:
@@ -575,7 +573,7 @@ _OPCODE_MISC: dict[int, int] = {
     0xc0c: 0,   # ISETP R-UR: misc=0 (SM_120: misc 1-12 → wrong predicate; see
                 #   encode_isetp_ur docstring. Counter value 6 at position 22 → wrong pred.)
     0x20c: 0,   # ISETP R-R: misc=0 (same SM_120 predicate correctness requirement)
-    0xc0b: 10,  # FSETP R-UR: misc=10 (ptxas-verified SM_120)
+    0xc0b: 5,   # FSETP R-UR: misc=5 (ptxas-verified, decoded with <<1 shift)
     0x80a: 5,   # FSEL.step: misc=5 (ptxas-verified)
     0x223: 4,   # FFMA R-R-R: misc=4 (ptxas-verified for FMA chains on SM_120)
     0x986: 1,   # STG.E: misc=1 (from ptxas ground truth)
@@ -725,7 +723,7 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
                     rbar = rbar | _WDEP_TO_RBAR[pw]
         # LDCU consumers: any instruction using UR operands needs rbar for LDCU
         # Check byte 4 for UR source in R-UR instructions
-        if opcode in (0xc35, 0xc0c, 0xc24):  # IADD.64-UR, ISETP R-UR, IMAD R-UR
+        if opcode in (0xc35, 0xc0c, 0xc24, 0xc0b):  # IADD.64-UR, ISETP R-UR, IMAD R-UR, FSETP R-UR
             ur_src = si.raw[4]
             if ur_src in pending_ur_writes:
                 _, pw = pending_ur_writes[ur_src]
@@ -774,6 +772,7 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
             # ptxas uses identical ctrl for both predicated and unconditional EXIT
             rbar = 0x01
             wdep = 0x3f
+
 
         # Build ctrl — bits[22:17] = OPEX (instruction extension / hardware modifier).
         # These are NOT stall counters on SM_120. Each opcode has a fixed OPEX value

@@ -1654,6 +1654,10 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     if isinstance(instr.srcs[0], ImmOp) and typ in ('u32', 's32', 'b32', 'f32'):
                         d = ctx.ra.r32(instr.dest.name)
                         imm = instr.srcs[0].value & 0xFFFFFFFF
+                        if imm == 0:
+                            if not hasattr(ctx, '_zero_regs'):
+                                ctx._zero_regs = set()
+                            ctx._zero_regs.add(d)
                         # Use IADD3_IMM32 to load immediate directly (works for any 32-bit pattern)
                         output.append(SassInstr(encode_iadd3_imm32(d, RZ, imm, RZ),
                                                 f'IADD3 R{d}, RZ, 0x{imm:x}, RZ  // mov.{typ} imm'))
@@ -2171,6 +2175,12 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     b = _materialize_imm(instr.srcs[1], ctx, ctx.ra, output)
                     c = _materialize_imm(instr.srcs[2], ctx, ctx.ra, output)
+                    # Use RZ for known-zero addend and remove the dead zeroing instruction
+                    if hasattr(ctx, '_zero_regs') and c in ctx._zero_regs:
+                        # Remove the preceding IADD3 that zeroed this register
+                        if output and f'R{c}, RZ, 0x0, RZ' in output[-1].comment:
+                            output.pop()
+                        c = RZ
                     output.append(SassInstr(encode_ffma(d, a, b, c),
                                             f'FFMA R{d}, R{a}, R{b}, R{c}  // fma.f32'))
 

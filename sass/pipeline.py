@@ -697,6 +697,11 @@ def compile_function(fn: Function, verbose: bool = False,
             break
         elif opcode in (0x919, 0x9c3):  # S2R/S2UR fallback (no predicated EXIT)
             insert_idx = idx + 1
+    # Skip past any post-EXIT deferred LDCU.64 instructions (from isel)
+    # so the mem desc loads AFTER deferred param loads (ptxas pattern).
+    while (insert_idx < len(body_instrs) and
+           'post-EXIT' in body_instrs[insert_idx].comment):
+        insert_idx += 1
     body_instrs.insert(insert_idx, ur4_desc_instr)
 
     # Update ctx.label_map and _bra_fixups to reflect the UR4 insertion.
@@ -1013,8 +1018,16 @@ def compile_function(fn: Function, verbose: bool = False,
 
     _final_gprs = max(alloc.num_gprs, ctx._next_gpr,
                       getattr(ctx, '_scratch_highwater', 0))
-    # Update uniform register count: use max of regalloc and isel
-    alloc.num_uniform = max(alloc.num_uniform, ctx._next_ur)
+    # For deferred-param kernels, the actual UR usage is lower than regalloc's
+    # estimate (deferred params use post-EXIT URs, not pre-allocated ones).
+    # Cap num_uniform to ctx._next_ur to avoid LAUNCH_OUT_OF_RESOURCES (716).
+    # Only reduce num_uniform for kernels that actually used deferred params.
+    # _deferred_ur_params is cleared after flush, so check if it WAS populated.
+    _had_deferred = getattr(ctx, '_had_deferred_params', False)
+    if _had_deferred:
+        alloc.num_uniform = -1  # signal emitter to use ptxas UR count (14)
+    else:
+        alloc.num_uniform = max(alloc.num_uniform, ctx._next_ur)
     if verbose:
         print(f"[pipeline] final num_gprs: alloc={alloc.num_gprs} ctx._next_gpr={ctx._next_gpr} "
               f"highwater={getattr(ctx, '_scratch_highwater', 0)} -> {_final_gprs}")

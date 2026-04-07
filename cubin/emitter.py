@@ -120,13 +120,17 @@ def _build_nv_info_global(num_gprs: int = 16, num_uniform: int = 14):
     # EIATTR_REGCOUNT (0x2f): GPR count at offset 4, UR count at offset 8.
     # Both must be at least the actual usage to avoid ILLEGAL_INSTRUCTION.
     rc = max(num_gprs, 16)  # minimum 16 per SM_120 hardware requirement
-    ur = max(num_uniform, 16)  # minimum 8 URs
     buf = bytearray(bytes.fromhex(
         '042f08000800000010000000'
         '041108000800000000000000'
         '041208000800000000000000'
     ))
     buf[8] = rc & 0xFF
+    # For deferred-param kernels (num_uniform explicitly set < 0),
+    # reduce UR count from default 16 to ptxas-matching value (14).
+    # Non-deferred kernels keep default 16 (=0x10 in hex string).
+    if num_uniform < 0:
+        buf[12] = 14  # ptxas ground truth for 5-param kernels
     return bytes(buf)
 
 
@@ -170,11 +174,11 @@ def _build_nv_info_kernel(num_gprs: int = 8, num_params: int = 2,
     buf.extend(bytes([0x03, 0x50, 0x00, 0x00]))
 
     # EIATTR_CBANK_PARAM_SIZE (0x1b): param area size in constant bank.
-    # ptxas always uses 0xFF (255) for SM_120 — declares the maximum size.
-    # Using actual param bytes (36 for 5-param kernels) was causing 715
-    # because the driver allocates insufficient constant bank space.
+    # Must be the ACTUAL param size — the driver uses this to know how many
+    # bytes to copy from launch args. Setting to 0xFF causes the driver to
+    # zero the param area after copying, destroying the argument values.
     total_param_bytes = sum(param_sizes) if param_sizes else 0
-    buf.extend(bytes([0x03, 0x1b, 0xFF, 0x00]))
+    buf.extend(bytes([0x03, 0x1b, total_param_bytes & 0xFF, 0x00]))
 
     # EIATTR_0x5f: Mercury compiler version flag — required for SM_120.
     # ptxas always emits 0x0101 here for SM_120 cubins.

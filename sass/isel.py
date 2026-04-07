@@ -826,6 +826,7 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
             if not hasattr(ctx, '_deferred_ur_params'):
                 ctx._deferred_ur_params = {}
             ctx._deferred_ur_params[dest.name] = byte_off
+            ctx._had_deferred_params = True
             return []  # no preamble emission — loaded inline at use
         if ctx:
             if ur_idx % 2 != 0:  # LDCU.64 requires even-aligned UR
@@ -1558,7 +1559,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 # exhausted (5+ params), reuse UR4 for S2UR. The
                                 # IMAD that reads this UR executes before the mem
                                 # desc LDCU.64 overwrites UR4 (ptxas does this too).
-                                _has_deferred = hasattr(ctx, '_deferred_ur_params') and ctx._deferred_ur_params
+                                _has_deferred = getattr(ctx, '_had_deferred_params', False)
                                 if ctx._next_ur >= 14 or _has_deferred:
                                     ur_ctaid = 4  # reuse UR4 (consumed before mem desc)
                                 else:
@@ -1566,6 +1567,12 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 ctx._ur_for_param[instr.dest.name] = ur_ctaid
                                 output.append(SassInstr(encode_s2ur(ur_ctaid, sr_code),
                                                         f'S2UR UR{ur_ctaid}, SR_{sr_label}  // {instr.dest.name} = {instr.srcs[0].name.lstrip("%")}'))
+                                # S2UR latency: insert NOPs to ensure UR is ready
+                                # before IMAD reads it. Needed when UR4 is reused
+                                # (fewer pipeline slots than normal allocation).
+                                if ur_ctaid == 4:
+                                    output.append(SassInstr(encode_nop(), 'NOP  // S2UR UR4 latency'))
+                                    output.append(SassInstr(encode_nop(), 'NOP  // S2UR UR4 latency'))
                                 continue
                     output.extend(_select_mov(instr, ctx.ra, ctx))
 
@@ -3047,7 +3054,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                         # SM_120: keep UR < 14. Reuse low UR when exhausted.
                                         # UR5 conflicts with mem desc (LDCU.64 UR4 writes UR4+UR5).
                                         # Use UR3 instead (below the mem desc pair).
-                                        _has_deferred = hasattr(ctx, '_deferred_ur_params') and ctx._deferred_ur_params
+                                        _has_deferred = getattr(ctx, '_had_deferred_params', False)
                                         if ctx._next_ur >= 14 or _has_deferred:
                                             ur_tmp = 5  # consumed by ISETP before mem desc loads
                                         else:
@@ -3056,6 +3063,10 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                         output.append(SassInstr(
                                             encode_ldcu_32(ur_tmp, 0, b_param_off),
                                             f'LDCU.32 UR{ur_tmp}, c[0][0x{b_param_off:x}]  // setp src'))
+                                        # LDCU.32 latency: insert NOP before consumer (ISETP).
+                                        # ptxas has 3+ instructions between LDCU.32 and ISETP.
+                                        for _nop_i in range(6):
+                                            output.append(SassInstr(encode_nop(), 'NOP  // LDCU.32 latency'))
                                         output.append(SassInstr(
                                             encode_isetp_ur(emit_pd, ar, ur_tmp, cmp=isetp_cmp),
                                             f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, UR{ur_tmp}, PT'))

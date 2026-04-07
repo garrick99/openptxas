@@ -819,15 +819,17 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
         # 4+ pointer params cause 715 due to UR liveness pressure.
         # Fall back to LDC pair (GPR) for the 4th+ param.
         ur_idx = ctx._next_ur if ctx else 6
-        if ctx and ur_idx >= 12 and ctx.sm_version == 120:
-            # UR exhausted — defer load to first use point.
-            # Store param info for inline LDCU.64 + IADD.64-UR at use site.
-            # This matches ptxas: interleaved load→consume→reuse.
-            if not hasattr(ctx, '_deferred_ur_params'):
-                ctx._deferred_ur_params = {}
-            ctx._deferred_ur_params[dest.name] = byte_off
-            ctx._had_deferred_params = True
-            return []  # no preamble emission — loaded inline at use
+        if ctx and ur_idx >= 10 and ctx.sm_version == 120:
+            # SM_120 rule #30: max 2 LDCU.64 params in preamble (ptxas pattern).
+            # 3rd+ param loaded via LDC pair into GPR.
+            dr = ctx.ra.lo(dest.name)
+            ctx._gpr_written.add(dest.name)
+            return [
+                SassInstr(encode_ldc(dr, 0, byte_off),
+                          f'LDC R{dr}, c[0][0x{byte_off:x}]  // {param_name} lo (LDC fallback)'),
+                SassInstr(encode_ldc(dr + 1, 0, byte_off + 4),
+                          f'LDC R{dr+1}, c[0][0x{byte_off + 4:x}]  // {param_name} hi (LDC fallback)'),
+            ]
         if ctx:
             if ur_idx % 2 != 0:  # LDCU.64 requires even-aligned UR
                 ur_idx += 1

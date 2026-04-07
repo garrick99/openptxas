@@ -276,6 +276,29 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
                     if i + j < len(rd.names):
                         quad_follow_regs.add(rd.names[i + j])
 
+    # Co-location preferences: cvt.u64.u32 dest should overlap with 32-bit source.
+    # If the source is dead after the cvt, the 64-bit dest can start at the
+    # source's GPR (eliminating the MOV copy in isel).
+    _ENABLE_CVT_COLOCATE = True
+    cvt_colocate: dict[str, str] = {}
+    if _ENABLE_CVT_COLOCATE:
+        for inst in all_instrs:
+            if (inst.op == 'cvt' and isinstance(inst.dest, RegOp) and inst.srcs
+                    and isinstance(inst.srcs[0], RegOp)):
+                types = inst.types
+                is_u64_dst = any(t in ('u64', 'b64') for t in types[:1])
+                is_u32_src = any(t in ('u32', 'b32') for t in types[1:])
+                if is_u64_dst and is_u32_src:
+                    src_name = inst.srcs[0].name
+                    dst_name = inst.dest.name
+                    src_last = reg_last_use.get(src_name, 0)
+                    cvt_def = reg_first_def.get(dst_name, len(all_instrs))
+                    if src_last <= cvt_def:
+                        cvt_colocate[dst_name] = src_name
+
+    # Identify 32-bit registers that are cvt.u64.u32 sources — prefer even alignment
+    cvt_sources = set(cvt_colocate.values()) if cvt_colocate else set()
+
     # Linear scan register allocation for GPRs
     # Sort registers by first definition order
     reg_info = []  # (name, is_64, first_def, last_use)
@@ -326,9 +349,44 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
         # register range is available. Verified 2026-04-01 (commit 8d516ca).
         _MAX_GPR = 255
         if is_64:
-            if free_regs_64:
+            # Co-location: if this is a cvt.u64.u32 dest, try to place it
+            # at the source register's GPR (so the MOV copy becomes a no-op).
+            colocated = False
+            if name in cvt_colocate:
+                src_name = cvt_colocate[name]
+                if src_name in int_regs:
+                    src_phys = int_regs[src_name]
+                    if src_phys % 2 == 0:
+                        # Source is even-aligned — can form a pair at src_phys.
+                        # Check no OTHER register occupies src_phys or src_phys+1.
+                        # The source itself is allowed (that's the co-location).
+                        pair_ok = True
+                        for aname, areg, alast, a64 in active:
+                            if aname == src_name:
+                                continue  # allow overlap with co-location source
+                            if a64 and areg == src_phys:
+                                pair_ok = False; break
+                            if not a64 and areg in (src_phys, src_phys + 1) and alast >= first_def:
+                                pair_ok = False; break
+                        if pair_ok:
+                            phys = src_phys
+                            # Remove from free lists if present
+                            if phys in free_regs_64:
+                                free_regs_64.remove(phys)
+                            if phys in free_regs_32:
+                                free_regs_32.remove(phys)
+                            if phys + 1 in free_regs_32:
+                                free_regs_32.remove(phys + 1)
+                            # Remove source from active — its GPR slot is now
+                            # owned by the 64-bit dest. Without this, the
+                            # source's expiry would free the GPR while the
+                            # 64-bit register is still alive.
+                            active = [(n, r, l, w) for n, r, l, w in active
+                                      if n != src_name]
+                            colocated = True
+            if not colocated and free_regs_64:
                 phys = free_regs_64.pop(0)
-            else:
+            elif not colocated:
                 # Try to form a 64-bit pair from freed 32-bit slots.
                 # When u32 regs free up even-aligned slots, we can pair them with
                 # their odd neighbour (either also freed or the next fresh register),
@@ -390,6 +448,11 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
                 # directly so all 4 accumulator registers are contiguous in GPR space.
                 phys = next_gpr
                 next_gpr += 1
+            elif name in cvt_sources and any(r % 2 == 0 for r in free_regs_32):
+                # cvt.u64.u32 source: prefer even-aligned for co-location
+                even = next(r for r in sorted(free_regs_32) if r % 2 == 0)
+                free_regs_32.remove(even)
+                phys = even
             elif free_regs_32:
                 phys = free_regs_32.pop(0)
             elif free_regs_64:
@@ -410,6 +473,10 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
                     phys = next_gpr
                     next_gpr += 1
             else:
+                if name in cvt_sources and next_gpr % 2 != 0:
+                    # cvt source: bump to even for co-location
+                    free_regs_32.append(next_gpr)
+                    next_gpr += 1
                 phys = next_gpr
                 next_gpr += 1
             int_regs[name] = phys

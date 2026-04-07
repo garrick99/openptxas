@@ -1570,9 +1570,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 # S2UR latency: insert NOPs to ensure UR is ready
                                 # before IMAD reads it. Needed when UR4 is reused
                                 # (fewer pipeline slots than normal allocation).
-                                if ur_ctaid == 4:
-                                    output.append(SassInstr(encode_nop(), 'NOP  // S2UR UR4 latency'))
-                                    output.append(SassInstr(encode_nop(), 'NOP  // S2UR UR4 latency'))
+                                pass  # no S2UR NOPs
                                 continue
                     output.extend(_select_mov(instr, ctx.ra, ctx))
 
@@ -3063,10 +3061,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                         output.append(SassInstr(
                                             encode_ldcu_32(ur_tmp, 0, b_param_off),
                                             f'LDCU.32 UR{ur_tmp}, c[0][0x{b_param_off:x}]  // setp src'))
-                                        # LDCU.32 latency: insert NOP before consumer (ISETP).
-                                        # ptxas has 3+ instructions between LDCU.32 and ISETP.
-                                        for _nop_i in range(6):
-                                            output.append(SassInstr(encode_nop(), 'NOP  // LDCU.32 latency'))
+                                        pass  # NOPs removed
                                         output.append(SassInstr(
                                             encode_isetp_ur(emit_pd, ar, ur_tmp, cmp=isetp_cmp),
                                             f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, UR{ur_tmp}, PT'))

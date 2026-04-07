@@ -444,9 +444,9 @@ def encode_iadd3(dest: int, src0: int, src1: int, src2: int,
 # The .X suffix enables carry-in from the previous IADD3's predicate output.
 
 def encode_iadd3x(dest: int, src0: int, src1: int, src2: int,
-                  ctrl: int = 0) -> bytes:
+                  negate_src1: bool = False, ctrl: int = 0) -> bytes:
     """
-    Encode IADD3.X dest, PT, PT, src0, src1, src2, P0, !PT to 16 bytes.
+    Encode IADD3.X dest, PT, PT, src0, [+-]src1, src2, P0, !PT to 16 bytes.
 
     IADD3.X is the carry-extended version of IADD3, used for the high word of
     a 64-bit add or subtract (carries the overflow from the low word).
@@ -456,6 +456,7 @@ def encode_iadd3x(dest: int, src0: int, src1: int, src2: int,
         src0:  First source register index (0..255, 255=RZ).
         src1:  Second source register index (0..255, 255=RZ).
         src2:  Third source register index (0..255, 255=RZ).
+        negate_src1: If True, negate src1 (subtraction high word).
         ctrl:  23-bit scheduling control word (0 = default 0x7e0).
 
     Returns:
@@ -467,11 +468,15 @@ def encode_iadd3x(dest: int, src0: int, src1: int, src2: int,
     """
     if ctrl == 0:
         ctrl = _CTRL_DEFAULT
-    return _build(0x10, 0x72,
+    b10 = 0xff if negate_src1 else 0x7f
+    raw = bytearray(_build(0x10, 0x72,
                   b2=dest, b3=src0, b4=src1,
                   b8=src2,
-                  b9=0xe4, b10=0x7f, b11=0x00,
-                  ctrl=ctrl)
+                  b9=0xe4, b10=b10, b11=0x00,
+                  ctrl=ctrl))
+    if negate_src1:
+        raw[7] = 0x80  # negate flag
+    return bytes(raw)
 
 
 # ---------------------------------------------------------------------------

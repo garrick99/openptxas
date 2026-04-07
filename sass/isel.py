@@ -531,13 +531,17 @@ def _select_sub_u64(instr: Instruction, ra: RegAlloc) -> list[SassInstr]:
     if not isinstance(dest, RegOp) or not isinstance(a, RegOp) or not isinstance(b, RegOp):
         raise ISelError(f"sub.u64: all operands must be registers")
 
-    a_lo = ra.lo(a.name)
-    b_lo = ra.lo(b.name)
-    d_lo = ra.lo(dest.name)  # use allocator's assignment
+    a_lo = ra.lo(a.name); a_hi = a_lo + 1
+    b_lo = ra.lo(b.name); b_hi = b_lo + 1
+    d_lo = ra.lo(dest.name); d_hi = d_lo + 1
 
+    # SM_120 rule: IADD.64 R-R (0x235) is broken. Use IADD3+IADD3.X.
+    # sub.u64: d = a + (-b). IADD3 with negate on src1.
     return [
-        SassInstr(encode_iadd64(d_lo, a_lo, b_lo, negate_src1=True),
-                  f'IADD.64 R{d_lo}, R{a_lo}, -R{b_lo}  // sub.u64'),
+        SassInstr(encode_iadd3(d_lo, a_lo, b_lo, RZ, negate_src1=True),
+                  f'IADD3 R{d_lo}, R{a_lo}, -R{b_lo}, RZ  // sub.u64 lo'),
+        SassInstr(encode_iadd3x(d_hi, a_hi, b_hi, RZ, negate_src1=True),
+                  f'IADD3.X R{d_hi}, R{a_hi}, -R{b_hi}, RZ  // sub.u64 hi'),
     ]
 
 
@@ -679,15 +683,19 @@ def _select_add_u64(instr: Instruction, ra: RegAlloc,
                       f'IADD.64 R{d_lo}, R{r_lo}, UR{ur_idx}  // add.u64 (UR base)'),
         ]
     else:
-        # Both operands in R bank: use IADD.64 single instruction
-        a_lo = ra.lo(a.name)
-        b_lo = ra.lo(b.name)
-        d_lo = ra.lo(dest.name)  # use allocator's assignment
+        # Both operands in R bank.
+        # SM_120 rule: IADD.64 R-R (0x235) is broken (causes 715).
+        # Use IADD3 + IADD3.X pair instead (same as SM_89 path).
+        a_lo = ra.lo(a.name); a_hi = a_lo + 1
+        b_lo = ra.lo(b.name); b_hi = b_lo + 1
+        d_lo = ra.lo(dest.name); d_hi = d_lo + 1
         if ctx:
             ctx._gpr_written.add(dest.name)
         return [
-            SassInstr(encode_iadd64(d_lo, a_lo, b_lo),
-                      f'IADD.64 R{d_lo}, R{a_lo}, R{b_lo}  // add.u64'),
+            SassInstr(encode_iadd3(d_lo, a_lo, b_lo, RZ),
+                      f'IADD3 R{d_lo}, R{a_lo}, R{b_lo}, RZ  // add.u64 lo (R-R safe)'),
+            SassInstr(encode_iadd3x(d_hi, a_hi, b_hi, RZ),
+                      f'IADD3.X R{d_hi}, R{a_hi}, R{b_hi}, RZ  // add.u64 hi (R-R safe)'),
         ]
 
 
@@ -3010,11 +3018,14 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             f'IADD3 R{d}, RZ, -R{a}, RZ  // neg.{typ}'))
 
                 elif op == 'neg' and typ in ('s64', 'u64', 'b64'):
-                    # neg.s64: IADD.64 d, RZ, -a  (two's complement of 64-bit value)
-                    d_lo = ctx.ra.lo(instr.dest.name)
-                    a_lo = ctx.ra.lo(instr.srcs[0].name)
-                    output.append(SassInstr(encode_iadd64(d_lo, RZ, a_lo, negate_src1=True),
-                                            f'IADD.64 R{d_lo}, RZ, -R{a_lo}  // neg.{typ}'))
+                    # neg.s64: d = 0 - a (two's complement of 64-bit value)
+                    # SM_120: IADD.64 R-R broken. Use IADD3+IADD3.X.
+                    d_lo = ctx.ra.lo(instr.dest.name); d_hi = d_lo + 1
+                    a_lo = ctx.ra.lo(instr.srcs[0].name); a_hi = a_lo + 1
+                    output.append(SassInstr(encode_iadd3(d_lo, RZ, a_lo, RZ, negate_src1=True),
+                                            f'IADD3 R{d_lo}, RZ, -R{a_lo}, RZ  // neg.{typ} lo'))
+                    output.append(SassInstr(encode_iadd3x(d_hi, RZ, a_hi, RZ, negate_src1=True),
+                                            f'IADD3.X R{d_hi}, RZ, -R{a_hi}, RZ  // neg.{typ} hi'))
 
                 elif op == 'neg' and typ == 'f32':
                     # neg.f32: FADD with negated src and zero
@@ -3354,8 +3365,10 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         f'MOV R{t_hi}, RZ  // abs.s64 addend hi=0'))
                     output.append(SassInstr(encode_iadd3(t_lo, RZ, sign, RZ, negate_src1=True),
                         f'IADD3 R{t_lo}, RZ, -R{sign}, RZ  // abs.s64 addend=-sign'))
-                    output.append(SassInstr(encode_iadd64(d_lo, d_lo, t_lo),
-                        f'IADD.64 R{d_lo}, R{d_lo}, R{t_lo}  // abs.s64 add'))
+                    output.append(SassInstr(encode_iadd3(d_lo, d_lo, t_lo, RZ),
+                        f'IADD3 R{d_lo}, R{d_lo}, R{t_lo}, RZ  // abs.s64 add lo'))
+                    output.append(SassInstr(encode_iadd3x(d_lo+1, d_lo+1, t_hi, RZ),
+                        f'IADD3.X R{d_lo+1}, R{d_lo+1}, R{t_hi}, RZ  // abs.s64 add hi'))
 
                 elif op == 'min' and typ in ('u64', 's64'):
                     # min.u64 branchless: min(a,b) = b + ((a-b) & sign_mask(a-b))
@@ -3367,14 +3380,18 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     b_lo  = ctx.ra.lo(instr.srcs[1].name)
                     t_lo  = ctx._next_gpr; ctx._next_gpr += 2   # diff pair (t_lo, t_lo+1)
                     mask  = _alloc_gpr(ctx)
-                    output.append(SassInstr(encode_iadd64(t_lo, a_lo, b_lo, negate_src1=True),
-                        f'IADD.64 R{t_lo}, R{a_lo}, -R{b_lo}  // min.{typ} diff'))
+                    output.append(SassInstr(encode_iadd3(t_lo, a_lo, b_lo, RZ, negate_src1=True),
+                        f'IADD3 R{t_lo}, R{a_lo}, -R{b_lo}, RZ  // min.{typ} diff lo'))
+                    output.append(SassInstr(encode_iadd3x(t_lo+1, a_lo+1, b_lo+1, RZ, negate_src1=True),
+                        f'IADD3.X R{t_lo+1}, R{a_lo+1}, -R{b_lo+1}, RZ  // min.{typ} diff hi'))
                     output.append(SassInstr(encode_shf_r_s32_hi(mask, t_lo+1, 31),
                         f'SHF.R.S32.HI R{mask}, RZ, 0x1f, R{t_lo+1}  // min.{typ} mask'))
                     _emit_lop3(output, ctx, t_lo,   t_lo,   mask, RZ, LOP3_AND, f'LOP3.AND R{t_lo}, R{t_lo}, R{mask}, RZ  // min.{typ} lo')
                     _emit_lop3(output, ctx, t_lo+1, t_lo+1, mask, RZ, LOP3_AND, f'LOP3.AND R{t_lo+1}, R{t_lo+1}, R{mask}, RZ  // min.{typ} hi')
-                    output.append(SassInstr(encode_iadd64(d_lo, b_lo, t_lo),
-                        f'IADD.64 R{d_lo}, R{b_lo}, R{t_lo}  // min.{typ} result'))
+                    output.append(SassInstr(encode_iadd3(d_lo, b_lo, t_lo, RZ),
+                        f'IADD3 R{d_lo}, R{b_lo}, R{t_lo}, RZ  // min.{typ} result lo'))
+                    output.append(SassInstr(encode_iadd3x(d_lo+1, b_lo+1, t_lo+1, RZ),
+                        f'IADD3.X R{d_lo+1}, R{b_lo+1}, R{t_lo+1}, RZ  // min.{typ} result hi'))
 
                 elif op == 'max' and typ in ('u64', 's64'):
                     # max.u64 branchless: max(a,b) = b + ((a-b) & ~sign_mask(a-b))
@@ -3384,15 +3401,19 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     b_lo  = ctx.ra.lo(instr.srcs[1].name)
                     t_lo  = ctx._next_gpr; ctx._next_gpr += 2   # diff pair
                     mask  = _alloc_gpr(ctx)   # inverted sign mask
-                    output.append(SassInstr(encode_iadd64(t_lo, a_lo, b_lo, negate_src1=True),
-                        f'IADD.64 R{t_lo}, R{a_lo}, -R{b_lo}  // max.{typ} diff'))
+                    output.append(SassInstr(encode_iadd3(t_lo, a_lo, b_lo, RZ, negate_src1=True),
+                        f'IADD3 R{t_lo}, R{a_lo}, -R{b_lo}, RZ  // max.{typ} diff lo'))
+                    output.append(SassInstr(encode_iadd3x(t_lo+1, a_lo+1, b_lo+1, RZ, negate_src1=True),
+                        f'IADD3.X R{t_lo+1}, R{a_lo+1}, -R{b_lo+1}, RZ  // max.{typ} diff hi'))
                     output.append(SassInstr(encode_shf_r_s32_hi(mask, t_lo+1, 31),
                         f'SHF.R.S32.HI R{mask}, RZ, 0x1f, R{t_lo+1}  // max.{typ} sign'))
                     _emit_lop3(output, ctx, mask, mask, RZ, RZ, 0x0F, f'LOP3.NOT R{mask}, R{mask}, RZ, RZ  // max.{typ} ~sign')
                     _emit_lop3(output, ctx, t_lo,   t_lo,   mask, RZ, LOP3_AND, f'LOP3.AND R{t_lo}, R{t_lo}, R{mask}, RZ  // max.{typ} lo')
                     _emit_lop3(output, ctx, t_lo+1, t_lo+1, mask, RZ, LOP3_AND, f'LOP3.AND R{t_lo+1}, R{t_lo+1}, R{mask}, RZ  // max.{typ} hi')
-                    output.append(SassInstr(encode_iadd64(d_lo, b_lo, t_lo),
-                        f'IADD.64 R{d_lo}, R{b_lo}, R{t_lo}  // max.{typ} result'))
+                    output.append(SassInstr(encode_iadd3(d_lo, b_lo, t_lo, RZ),
+                        f'IADD3 R{d_lo}, R{b_lo}, R{t_lo}, RZ  // max.{typ} result lo'))
+                    output.append(SassInstr(encode_iadd3x(d_lo+1, b_lo+1, t_lo+1, RZ),
+                        f'IADD3.X R{d_lo+1}, R{b_lo+1}, R{t_lo+1}, RZ  // max.{typ} result hi'))
 
                 elif op == 'min' and typ == 'f32':
                     d = ctx.ra.r32(instr.dest.name)

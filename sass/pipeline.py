@@ -640,11 +640,12 @@ def compile_function(fn: Function, verbose: bool = False,
     # ptxas in ways that cause 700/715 for large text sizes.
     # Use ptxas fallback for LDG kernels with sync (BAR/VOTE/REDUX) or
     # complex control flow (if-else chains producing >512B text).
-    _has_sync = any(
-        inst.op in ('vote', 'redux', 'bar', 'shfl')
+    _has_vote_shfl = any(
+        inst.op in ('vote', 'redux', 'shfl')
         for bb in fn.blocks
         for inst in bb.instructions
     )
+    _has_sync = _has_vote_shfl  # BAR alone works natively now
     _has_ldg = any(
         inst.op == 'ld' and 'global' in inst.types
         for bb in fn.blocks
@@ -662,10 +663,23 @@ def compile_function(fn: Function, verbose: bool = False,
         for bb in fn.blocks
         for inst in bb.instructions
     )
-    # Fallback for: LDG + (sync, complex CF+STG, or atomics)
-    # 5+ param kernels now work natively via LDC fallback for 2nd+ pointer params
+    _has_bar = any(
+        inst.op == 'bar'
+        for bb in fn.blocks
+        for inst in bb.instructions
+    )
+    _has_smem = any(
+        (inst.op == 'st' and 'shared' in inst.types)
+        or (inst.op == 'ld' and 'shared' in inst.types)
+        for bb in fn.blocks
+        for inst in bb.instructions
+    )
+    # Fallback: vote/redux/shfl, BAR+smem (shared_copy pattern), complex CF+STG, atoms
+    # BAR without direct smem load/store (maxreduce, scan, matvec) works natively
+    _bar_smem = _has_bar and _has_smem and not _has_complex_cf
     ctx._has_vote = _has_ldg and (
-        _has_sync or (_has_complex_cf and _has_stg) or _has_atom
+        _has_vote_shfl or _bar_smem
+        or (_has_complex_cf and _has_stg) or _has_atom
     )
 
     body_instrs = select_function(fn, ctx)

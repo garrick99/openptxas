@@ -470,6 +470,91 @@ def _hoist_isetp_past_vote(instrs: list[SassInstr]) -> list[SassInstr]:
     return result
 
 
+def _fill_ldcu_latency(instrs: list[SassInstr]) -> list[SassInstr]:
+    """Hoist deferred LDCU.64 upward to fill latency window with useful work.
+
+    Pattern: find [useful, useful, ..., LDCU.64(deferred), NOP, NOP, NOP, IADD.64]
+    and move LDCU.64 earlier so preceding instructions fill the latency slots,
+    reducing or eliminating NOPs.
+
+    Only moves deferred LDCU.64 (identified by 'deferred' in comment).
+    Safe if: no UR6 write/read conflict in the instructions we move past.
+    """
+    _UR_CONSUMER_OPCODES = {0xc35, 0xc0c, 0xc24, 0x981}
+    result = list(instrs)
+    changed = True
+    while changed:
+        changed = False
+        for i in range(len(result)):
+            si = result[i]
+            opc = (si.raw[0] | (si.raw[1] << 8)) & 0xFFF
+            if opc != 0x7ac or si.raw[9] != 0x0a or 'deferred' not in si.comment:
+                continue
+            ur_dest = si.raw[2]  # UR6 typically
+            if i == 0:
+                continue
+
+            # Find how far back we can hoist: skip NOPs, stop at barriers
+            hoist_to = i
+            for j in range(i - 1, -1, -1):
+                sj = result[j]
+                opc_j = (sj.raw[0] | (sj.raw[1] << 8)) & 0xFFF
+                # Skip NOPs (we'll clean up excess NOPs after)
+                if opc_j == 0x918:
+                    hoist_to = j
+                    continue
+                # Stop at another LDCU.64 (avoid reordering loads)
+                if opc_j == 0x7ac:
+                    break
+                # Stop at UR consumer (previous IADD.64 reading UR6)
+                if opc_j in _UR_CONSUMER_OPCODES and sj.raw[4] == ur_dest:
+                    break
+                # Stop at branch/exit
+                if opc_j in (0x947, 0x94d):
+                    break
+                # This instruction is safe to move past
+                hoist_to = j
+            if hoist_to < i:
+                ldcu = result.pop(i)
+                result.insert(hoist_to, ldcu)
+                changed = True
+                break
+
+    # Clean up: remove excess LDCU.64 latency NOPs after hoisting.
+    # Only remove NOPs explicitly tagged "LDCU.64 latency" when the total
+    # instruction gap (including all instructions) between the LDCU.64 and
+    # its UR consumer is already ≥3.
+    cleaned = []
+    for i, si in enumerate(result):
+        opc = (si.raw[0] | (si.raw[1] << 8)) & 0xFFF
+        if opc == 0x918 and 'LDCU.64 latency' in si.comment:
+            # Find the preceding LDCU.64
+            ldcu_pos = -1
+            for j in range(i - 1, -1, -1):
+                oj = (result[j].raw[0] | (result[j].raw[1] << 8)) & 0xFFF
+                if oj == 0x7ac and result[j].raw[9] == 0x0a:
+                    ldcu_pos = j
+                    break
+                if oj in _UR_CONSUMER_OPCODES:
+                    break
+            if ldcu_pos >= 0:
+                # Find the consumer IADD.64 after this NOP
+                consumer_pos = -1
+                ur_dest = result[ldcu_pos].raw[2]
+                for k in range(i + 1, min(i + 6, len(result))):
+                    ok = (result[k].raw[0] | (result[k].raw[1] << 8)) & 0xFFF
+                    if ok in _UR_CONSUMER_OPCODES and result[k].raw[4] == ur_dest:
+                        consumer_pos = k
+                        break
+                if consumer_pos >= 0:
+                    # Gap = instructions between LDCU and consumer (exclusive)
+                    current_gap = consumer_pos - ldcu_pos - 1
+                    if current_gap > 3:
+                        continue  # Excess NOP — skip it
+        cleaned.append(si)
+    return cleaned
+
+
 def schedule(instrs: list[SassInstr]) -> list[SassInstr]:
     """
     Reorder and pad instructions for correct SM_120 execution.
@@ -477,13 +562,15 @@ def schedule(instrs: list[SassInstr]) -> list[SassInstr]:
     Passes (in order):
       1. _hoist_ldcu64        — move LDCU.64 early (≥3-cycle gap before UR consumers)
       2. _enforce_gpr_latency — insert NOPs for ALU GPR RAW hazards
-      3. _reorder_after_ldg  — hide LDG latency by filling the slot with LDC/NOP
-      4. _hoist_isetp_past_vote — SM_120 rule #23: avoid ISETP+VOTE+ISETP pattern
+      3. _fill_ldcu_latency   — hoist deferred LDCU.64 to fill latency with useful work
+      4. _reorder_after_ldg  — hide LDG latency by filling the slot with LDC/NOP
+      5. _hoist_isetp_past_vote — SM_120 rule #23: avoid ISETP+VOTE+ISETP pattern
 
     Ctrl assignment is handled separately by sass.scoreboard.assign_ctrl().
     """
     instrs = _hoist_ldcu64(instrs)
     instrs = _enforce_gpr_latency(instrs)
+    instrs = _fill_ldcu_latency(instrs)
     # Skip LDG latency NOPs — rely on ctrl wdep for LDG (ptxas pattern)
     # instrs = _reorder_after_ldg(instrs)
 

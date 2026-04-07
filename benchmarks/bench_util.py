@@ -138,23 +138,84 @@ def print_header(title):
     print()
 
 
+def analyze_cubin(cubin, kernel_name=None):
+    """Extract instruction count, register count, and text size from a cubin."""
+    import struct as s
+    e_shoff = s.unpack_from('<Q', cubin, 40)[0]
+    e_shnum = s.unpack_from('<H', cubin, 60)[0]
+    e_shstrndx = s.unpack_from('<H', cubin, 62)[0]
+    shstrtab_off = s.unpack_from('<Q', cubin, e_shoff + e_shstrndx*64 + 24)[0]
+    shstrtab_sz = s.unpack_from('<Q', cubin, e_shoff + e_shstrndx*64 + 32)[0]
+    shstrtab = cubin[shstrtab_off:shstrtab_off+shstrtab_sz]
+    text_size = 0
+    for i in range(e_shnum):
+        sh = e_shoff + i*64
+        n_off = s.unpack_from('<I', cubin, sh)[0]
+        nm = shstrtab[n_off:shstrtab.index(0, n_off)].decode()
+        sec_off = s.unpack_from('<Q', cubin, sh+24)[0]
+        sec_sz = s.unpack_from('<Q', cubin, sh+32)[0]
+        if '.text.' in nm and 'capmerc' not in nm:
+            text_data = cubin[sec_off:sec_off+sec_sz]
+            text_size = sec_sz
+            # Count real instructions (non-NOP, non-padding)
+            n_instrs = sec_sz // 16
+            n_nops = sum(1 for off in range(0, sec_sz, 16)
+                         if (s.unpack_from('<Q', text_data, off)[0] & 0xFFF) == 0x918)
+            break
+    # Extract register count from nv.info EIATTR
+    num_gprs = 0
+    for i in range(e_shnum):
+        sh = e_shoff + i*64
+        n_off = s.unpack_from('<I', cubin, sh)[0]
+        nm = shstrtab[n_off:shstrtab.index(0, n_off)].decode()
+        sec_off = s.unpack_from('<Q', cubin, sh+24)[0]
+        sec_sz = s.unpack_from('<Q', cubin, sh+32)[0]
+        if 'capmerc' in nm:
+            cm = cubin[sec_off:sec_off+sec_sz]
+            if len(cm) > 8:
+                num_gprs = cm[8]
+            break
+    return {
+        'text_size': text_size,
+        'n_instrs': n_instrs,
+        'n_nops': n_nops,
+        'n_real': n_instrs - n_nops,
+        'num_gprs': num_gprs,
+    }
+
+
 def print_results(t_ours_ms, t_nvid_ms, c_ours, c_nvid,
                   med_ours_us, med_nvid_us, perf_label, perf_ours, perf_nvid,
                   correct, perf_fmt="{:.1f} GB/s"):
+    a_ours = analyze_cubin(c_ours)
+    a_nvid = analyze_cubin(c_nvid)
+
     print("=" * 64)
     print("  RESULTS")
     print("=" * 64)
     fmt = "  {:<22} {:>14}  {:>14}  {:>10}"
-    print(fmt.format("Metric", "OpenPTXas", "NVIDIA ptxas", "Ratio"))
+    print(fmt.format("Metric", "OpenPTXas", "NVIDIA ptxas", "Delta"))
     print("-" * 64)
+    print(fmt.format("Instructions (real)",
+                     str(a_ours['n_real']),
+                     str(a_nvid['n_real']),
+                     f"{a_ours['n_real'] - a_nvid['n_real']:+d}"))
+    print(fmt.format("Instructions (NOPs)",
+                     str(a_ours['n_nops']),
+                     str(a_nvid['n_nops']),
+                     f"{a_ours['n_nops'] - a_nvid['n_nops']:+d}"))
+    print(fmt.format("Text size",
+                     f"{a_ours['text_size']} B",
+                     f"{a_nvid['text_size']} B",
+                     f"{a_ours['text_size'] - a_nvid['text_size']:+d}"))
+    print(fmt.format("Registers (GPR)",
+                     str(a_ours['num_gprs']),
+                     str(a_nvid['num_gprs']),
+                     f"{a_ours['num_gprs'] - a_nvid['num_gprs']:+d}"))
     print(fmt.format("Compile time",
                      f"{t_ours_ms:.1f} ms",
                      f"{t_nvid_ms:.1f} ms",
                      f"{t_nvid_ms/max(t_ours_ms,0.001):.1f}x"))
-    print(fmt.format("Cubin size",
-                     f"{len(c_ours)} B",
-                     f"{len(c_nvid)} B",
-                     f"{(len(c_nvid)-len(c_ours))/max(len(c_nvid),1)*100:+.0f}%"))
     print(fmt.format("GPU exec (median)",
                      f"{med_ours_us:.1f} us",
                      f"{med_nvid_us:.1f} us",

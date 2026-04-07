@@ -1165,6 +1165,15 @@ def _extract_ptxas_metadata(ptx_src: str) -> dict[str, dict]:
         # ptxas requires ASCII-only input — strip non-ASCII characters
         # (e.g. em-dash U+2014 in Forge-generated comments) before passing to ptxas.
         ptx_ascii = ptx_src.encode('ascii', errors='replace').decode('ascii')
+        # Fix Forge-generated PTX: mov.f32 %fN, 0 → mov.f32 %fN, 0f00000000
+        # (ptxas rejects bare '0' as a float immediate)
+        import re as _ptx_re
+        ptx_ascii = _ptx_re.sub(
+            r'mov\.f32\s+(%f\d+),\s*0\b',
+            r'mov.f32 \1, 0f00000000', ptx_ascii)
+        ptx_ascii = _ptx_re.sub(
+            r'mov\.f64\s+(%fd?\d+),\s*0\b',
+            r'mov.f64 \1, 0d0000000000000000', ptx_ascii)
         with tempfile.NamedTemporaryFile(suffix='.ptx', delete=False, mode='w',
                                          encoding='ascii') as f:
             f.write(ptx_ascii)

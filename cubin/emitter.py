@@ -296,6 +296,37 @@ def _build_callgraph():
     )
 
 
+def _patch_capmerc_text_size(capmerc: bytes, text_size: int) -> bytes:
+    """Patch text_size-dependent fields in a ptxas-generated capmerc.
+
+    When using ptxas's capmerc with our native SASS, the text sizes may differ.
+    This patches the terminal record's page count and barrier region window
+    sizes to match the actual .text section size.
+    """
+    cm = bytearray(capmerc)
+    ptxas_pages = (text_size + 127) // 128  # 128 bytes per page
+
+    # Patch terminal record (type 02 sub 0x38): byte[20] = pages - 2
+    for i in range(len(cm) - 1):
+        if cm[i] == 0x02 and cm[i + 1] == 0x38:
+            if i + 20 < len(cm):
+                cm[i + 20] = max(ptxas_pages - 2, 0)
+            break
+
+    # Patch barrier region records (type 02 sub 0x22): byte[28] = window size
+    # First barrier: pages * 8; subsequent: 0x10 (multi-page) or 0x08
+    barrier_idx = 0
+    for i in range(len(cm) - 1):
+        if cm[i] == 0x02 and cm[i + 1] == 0x22:
+            if i + 28 < len(cm):
+                if barrier_idx == 0:
+                    cm[i + 28] = ptxas_pages * 8
+                # Others keep their relative values
+            barrier_idx += 1
+
+    return bytes(cm)
+
+
 def _build_capmerc(num_gprs: int = 10):
     """
     .nv.capmerc.text.<kernel> — Mercury compiler metadata encoding PRF allocation.
@@ -575,7 +606,7 @@ def emit_cubin(kernel: KernelDesc) -> bytes:
     # Use ptxas metadata when available. Otherwise, use the capmerc generator
     # which produces text-size-aware capmerc from SASS analysis.
     if kernel.ptxas_capmerc:
-        capmerc_data = kernel.ptxas_capmerc
+        capmerc_data = _patch_capmerc_text_size(kernel.ptxas_capmerc, len(text_data))
     else:
         from cubin.capmerc_gen import build_capmerc_from_sass
         capmerc_data = build_capmerc_from_sass(text_data, num_gprs=kernel.num_gprs)

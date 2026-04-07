@@ -1055,6 +1055,9 @@ def compile_function(fn: Function, verbose: bool = False,
         # SM_120 rule #25: complex kernels with LDG + sync require
         # ptxas fallback. Our native backend's instruction stream differs
         # from ptxas in ways that cause 700/715 for these patterns.
+        # Group A (LDG + sync/shfl): full ptxas cubin fallback required
+        # Group B (LDG + complex CF/params/atoms, no sync): try native
+        #   SASS + ptxas capmerc (capmerc was the missing piece, not SASS)
         if ctx._has_vote and ptxas_meta:
             ptxas_cubin = ptxas_meta.get('cubin_bytes')
             if ptxas_cubin:
@@ -1077,10 +1080,16 @@ def _select_capmerc(ptxas_meta: dict | None, kernel_gprs: int) -> bytes | None:
     byte[8] for GPR count. Hardware does not enforce the 0x2000 capability
     bit for register access (verified: ptxas kernels with 28 GPRs lack 0x2000).
     """
-    # Always use our generated capmerc — ptxas's capmerc encodes PTXAS's
-    # instruction class mix, which differs from ours. Our generated capmerc
-    # with correct cap_mask/trailer (from ptxas ground truth class mapping)
-    # works for arbitrary instruction streams.
+    # Use ptxas's capmerc when available — it has the correct instruction
+    # class encoding and multi-page structure. Our SASS uses the same
+    # opcodes as ptxas (just different scheduling/NOP count), so ptxas's
+    # capmerc class descriptors are a valid superset of ours.
+    # Patch byte[8] (GPR count) to match our actual register usage.
+    if ptxas_meta and 'capmerc' in ptxas_meta:
+        cm = bytearray(ptxas_meta['capmerc'])
+        if len(cm) >= 9:
+            cm[8] = max(cm[8], kernel_gprs)
+        return bytes(cm)
     return None
 
 

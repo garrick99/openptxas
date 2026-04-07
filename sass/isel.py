@@ -439,7 +439,8 @@ def _select_mov(instr: Instruction, ra: RegAlloc,
         return [SassInstr(encode_iadd3(d, s, RZ, RZ), f'MOV R{d}, R{s}  // {dest.name} = {src.name}')]
 
 
-def _select_shl_b64(instr: Instruction, ra: RegAlloc) -> list[SassInstr]:
+def _select_shl_b64(instr: Instruction, ra: RegAlloc,
+                    ctx: 'ISelContext' = None) -> list[SassInstr]:
     """
     shl.b64 dest, src, K → SHF.L.U32 (lo) + SHF.L.U64.HI (hi).
 
@@ -2676,8 +2677,9 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             if not hasattr(ctx, '_zero_regs'):
                                 ctx._zero_regs = set()
                             ctx._zero_regs.add(d_lo+1)
-                            output.append(SassInstr(encode_iadd3(d_lo, s_r, RZ, RZ),
-                                                    f'MOV R{d_lo}, R{s_r}  // cvt.64.32 lo'))
+                            if d_lo != s_r:
+                                output.append(SassInstr(encode_iadd3(d_lo, s_r, RZ, RZ),
+                                                        f'MOV R{d_lo}, R{s_r}  // cvt.64.32 lo'))
                             output.append(SassInstr(encode_iadd3(d_lo+1, RZ, RZ, RZ),
                                                     f'MOV R{d_lo+1}, RZ  // cvt.64.32 hi=0'))
                         elif _is_64_dst and any(t == 's32' for t in instr.types[1:]):

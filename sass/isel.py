@@ -1658,6 +1658,10 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             if not hasattr(ctx, '_zero_regs'):
                                 ctx._zero_regs = set()
                             ctx._zero_regs.add(d)
+                        # Track known-immediate registers for FFMA.IMM fusion
+                        if not hasattr(ctx, '_imm_regs'):
+                            ctx._imm_regs = {}
+                        ctx._imm_regs[d] = imm
                         # Use IADD3_IMM32 to load immediate directly (works for any 32-bit pattern)
                         output.append(SassInstr(encode_iadd3_imm32(d, RZ, imm, RZ),
                                                 f'IADD3 R{d}, RZ, 0x{imm:x}, RZ  // mov.{typ} imm'))
@@ -2177,12 +2181,23 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     c = _materialize_imm(instr.srcs[2], ctx, ctx.ra, output)
                     # Use RZ for known-zero addend and remove the dead zeroing instruction
                     if hasattr(ctx, '_zero_regs') and c in ctx._zero_regs:
-                        # Remove the preceding IADD3 that zeroed this register
                         if output and f'R{c}, RZ, 0x0, RZ' in output[-1].comment:
                             output.pop()
                         c = RZ
-                    output.append(SassInstr(encode_ffma(d, a, b, c),
-                                            f'FFMA R{d}, R{a}, R{b}, R{c}  // fma.f32'))
+                    # FFMA.IMM: if the multiplier is a known immediate, bake it in
+                    _imm_regs = getattr(ctx, '_imm_regs', {})
+                    if b in _imm_regs:
+                        imm_val = _imm_regs[b]
+                        # Remove the IADD3 that loaded this immediate
+                        for j in range(len(output) - 1, max(len(output) - 5, -1), -1):
+                            if j >= 0 and f'R{b}, RZ, 0x{imm_val:x}, RZ' in output[j].comment:
+                                output.pop(j)
+                                break
+                        output.append(SassInstr(encode_ffma_imm(d, a, imm_val, c),
+                                                f'FFMA.IMM R{d}, R{a}, 0x{imm_val:x}, R{c}  // fma.f32 (imm)'))
+                    else:
+                        output.append(SassInstr(encode_ffma(d, a, b, c),
+                                                f'FFMA R{d}, R{a}, R{b}, R{c}  // fma.f32'))
 
                 elif op == 'add' and typ == 'f64':
                     d = ctx.ra.lo(instr.dest.name)

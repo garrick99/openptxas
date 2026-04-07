@@ -170,22 +170,16 @@ def _build_nv_info_kernel(num_gprs: int = 8, num_params: int = 2,
     # EIATTR_PARAM_CBANK (0x50)
     buf.extend(bytes([0x03, 0x50, 0x00, 0x00]))
 
-    # EIATTR_CBANK_PARAM_SIZE (0x1b): actual total parameter bytes.
-    # Must NOT exceed the real param area — driver zeros this many bytes at
-    # param_base, clobbering any literal pool values placed after params.
+    # EIATTR_CBANK_PARAM_SIZE (0x1b): param area size in constant bank.
+    # ptxas always uses 0xFF (255) for SM_120 — declares the maximum size.
+    # Using actual param bytes (36 for 5-param kernels) was causing 715
+    # because the driver allocates insufficient constant bank space.
     total_param_bytes = sum(param_sizes) if param_sizes else 0
-    buf.extend(bytes([0x03, 0x1b, total_param_bytes & 0xFF, 0x00]))
+    buf.extend(bytes([0x03, 0x1b, 0xFF, 0x00]))
 
     # EIATTR_0x5f: Mercury compiler version flag — required for SM_120.
     # ptxas always emits 0x0101 here for SM_120 cubins.
     buf.extend(bytes([0x03, 0x5f, 0x01, 0x01]))
-
-    # EIATTR 0x29: thread mask (0xFFFFFFFF = all threads active)
-    # ptxas emits this for all kernels with 3+ params.
-    buf.extend(bytes([0x04, 0x29, 0x04, 0x00, 0xFF, 0xFF, 0xFF, 0xFF]))
-
-    # EIATTR 0x28: reg allocation hint (ptxas uses 0xA0 = 160)
-    buf.extend(bytes([0x04, 0x28, 0x04, 0x00, 0xA0, 0x00, 0x00, 0x00]))
 
     # EIATTR_EXIT_INSTR_OFFSETS (0x1c): list of EXIT byte offsets in .text
     # Format 0x04: 4-byte header (fmt, tag, size_lo, size_hi) + N*4 bytes payload
@@ -267,10 +261,6 @@ def _build_merc_nv_info_kernel(num_gprs: int = 8, num_params: int = 2,
     buf.extend(bytes([0x03, 0x1b, total_param_bytes & 0xFF, 0x00]))
     # EIATTR_0x5f: version/flag (always 0x0101 in ptxas cubins)
     buf.extend(bytes([0x03, 0x5f, 0x01, 0x01]))
-    # EIATTR 0x29: thread mask (0xFFFFFFFF = all threads active)
-    buf.extend(bytes([0x04, 0x29, 0x04, 0x00, 0xFF, 0xFF, 0xFF, 0xFF]))
-    # EIATTR 0x28: reg allocation hint
-    buf.extend(bytes([0x04, 0x28, 0x04, 0x00, 0xA0, 0x00, 0x00, 0x00]))
     # EIATTR_CTAID_DIMS (0x4a)
     buf.extend(bytes([0x02, 0x4a, 0x00, 0x00]))
     # EIATTR_EXIT_INSTR_OFFSETS (0x1c)

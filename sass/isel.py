@@ -156,6 +156,23 @@ def _nop(comment: str = '') -> SassInstr:
     return SassInstr(encode_nop(), comment or 'NOP')
 
 
+def _emit_ur_to_gpr(dest: int, ur_idx: int, comment: str = '') -> list[SassInstr]:
+    """Materialize a UR pair into a GPR pair.
+
+    SM_120 rule #27: IADD.64 R-UR with RZ as src_r is broken (causes 715/719).
+    Workaround: zero the dest pair first (IADD3 + IADD3.X), then add UR
+    via IADD.64 R-UR with the zeroed dest as src_r (not RZ).
+    """
+    return [
+        SassInstr(encode_iadd3(dest, RZ, RZ, RZ),
+                  f'IADD3 R{dest}, RZ, RZ, RZ  // zero lo for UR->GPR'),
+        SassInstr(encode_iadd3(dest + 1, RZ, RZ, RZ),
+                  f'IADD3 R{dest+1}, RZ, RZ, RZ  // zero hi for UR->GPR'),
+        SassInstr(encode_iadd64_ur(dest, dest, ur_idx),
+                  f'IADD.64 R{dest}, R{dest}, UR{ur_idx}  // {comment or "UR->GPR"}'),
+    ]
+
+
 def _f64_to_gpr(name: str, ctx, output: list) -> int:
     """Return the lo GPR index for an f64 register.
     If the register is GPR-backed, return it directly.
@@ -175,8 +192,7 @@ def _f64_to_gpr(name: str, ctx, output: list) -> int:
     if t % 2 != 0:
         t = _alloc_gpr(ctx)
     _alloc_gpr(ctx)  # reserve t+1
-    output.append(SassInstr(encode_iadd64_ur(t, RZ, ur),
-                             f'IADD.64 R{t}, RZ, UR{ur}  // materialize f64 {name}'))
+    output.extend(_emit_ur_to_gpr(t, ur, "materialize f64 {name}"))
     ctx._f64_gpr_cache[name] = t
     return t
 
@@ -571,16 +587,11 @@ def _select_add_u64(instr: Instruction, ra: RegAlloc,
                 ctx._gpr_written.add(dest.name)
             if b.value == 0:
                 # add.u64 dest, ur_param, 0 → just materialize UR to GPR
-                return [
-                    SassInstr(encode_iadd64_ur(d_lo, RZ, ur_idx),
-                              f'IADD.64 R{d_lo}, RZ, UR{ur_idx}  // add.u64 imm0 (UR->GPR)'),
-                ]
+                return _emit_ur_to_gpr(d_lo, ur_idx, 'add.u64 imm0 (UR->GPR)')
             else:
                 # Materialize UR→GPR, then add immediate
                 imm_lo = b.value & 0xFFFFFFFF
-                return [
-                    SassInstr(encode_iadd64_ur(d_lo, RZ, ur_idx),
-                              f'IADD.64 R{d_lo}, RZ, UR{ur_idx}  // materialize UR->GPR'),
+                return _emit_ur_to_gpr(d_lo, ur_idx, 'materialize UR->GPR') + [
                     SassInstr(encode_iadd3_imm32(d_lo, d_lo, imm_lo, RZ),
                               f'IADD3.IMM R{d_lo}, R{d_lo}, {imm_lo:#x}, RZ  // add.u64 lo imm'),
                     SassInstr(encode_iadd3x(d_lo + 1, d_lo + 1, RZ, RZ),
@@ -841,8 +852,7 @@ def _select_ld_global(instr: Instruction, ra: RegAlloc,
         addr = getattr(ctx, '_addr_scratch_lo', None)
         if addr is None:
             addr = _alloc_gpr_pair(ctx)
-        result.append(SassInstr(encode_iadd64_ur(addr, RZ, ur_idx),
-                                f'IADD.64 R{addr}, RZ, UR{ur_idx}  // UR->GPR addr'))
+        result.extend(_emit_ur_to_gpr(addr, ur_idx, "UR->GPR addr"))
     else:
         addr = RZ
 
@@ -883,8 +893,7 @@ def _select_atom_cas(instr: Instruction, ra: RegAlloc,
         addr = getattr(ctx, '_addr_scratch_lo', None)
         if addr is None:
             addr = _alloc_gpr_pair(ctx)
-        prefix.append(SassInstr(encode_iadd64_ur(addr, RZ, ur_idx),
-                                f'IADD.64 R{addr}, RZ, UR{ur_idx}  // UR->GPR addr'))
+        prefix.extend(_emit_ur_to_gpr(addr, ur_idx, "UR->GPR addr"))
     else:
         addr = RZ
 
@@ -927,8 +936,7 @@ def _select_atom_add_u32(instr: Instruction, ra: RegAlloc,
         addr = getattr(ctx, '_addr_scratch_lo', None)
         if addr is None:
             addr = _alloc_gpr_pair(ctx)
-        prefix.append(SassInstr(encode_iadd64_ur(addr, RZ, ur_idx),
-                                f'IADD.64 R{addr}, RZ, UR{ur_idx}  // UR->GPR addr'))
+        prefix.extend(_emit_ur_to_gpr(addr, ur_idx, "UR->GPR addr"))
     else:
         addr = RZ
 
@@ -961,8 +969,7 @@ def _select_atom_generic_u32(instr: Instruction, ra: RegAlloc,
         addr = getattr(ctx, '_addr_scratch_lo', None)
         if addr is None:
             addr = _alloc_gpr_pair(ctx)
-        prefix.append(SassInstr(encode_iadd64_ur(addr, RZ, ur_idx),
-                                f'IADD.64 R{addr}, RZ, UR{ur_idx}  // UR->GPR addr'))
+        prefix.extend(_emit_ur_to_gpr(addr, ur_idx, "UR->GPR addr"))
     else:
         addr = RZ
 
@@ -994,8 +1001,7 @@ def _select_atom_add_f32(instr: Instruction, ra: RegAlloc,
         addr = getattr(ctx, '_addr_scratch_lo', None)
         if addr is None:
             addr = _alloc_gpr_pair(ctx)
-        prefix.append(SassInstr(encode_iadd64_ur(addr, RZ, ur_idx),
-                                f'IADD.64 R{addr}, RZ, UR{ur_idx}  // UR->GPR addr'))
+        prefix.extend(_emit_ur_to_gpr(addr, ur_idx, "UR->GPR addr"))
     else:
         addr = RZ
 
@@ -1033,8 +1039,7 @@ def _select_atom_cas_b64(instr: Instruction, ra: RegAlloc,
         elif base_name in ur_params:
             ur_idx = ur_params[base_name]
             gpr = _alloc_gpr_pair(ctx)
-            prefix.append(SassInstr(encode_iadd64_ur(gpr, RZ, ur_idx),
-                                    f'IADD.64 R{gpr}, RZ, UR{ur_idx}  // UR->GPR {label}'))
+            prefix.extend(_emit_ur_to_gpr(gpr, ur_idx, "UR->GPR {label}"))
             return gpr
         else:
             return ra.lo(name)
@@ -1046,8 +1051,7 @@ def _select_atom_cas_b64(instr: Instruction, ra: RegAlloc,
     elif addr_base in ur_params:
         ur_idx = ur_params[addr_base]
         addr = _alloc_gpr_pair(ctx)
-        prefix.append(SassInstr(encode_iadd64_ur(addr, RZ, ur_idx),
-                                f'IADD.64 R{addr}, RZ, UR{ur_idx}  // UR->GPR addr'))
+        prefix.extend(_emit_ur_to_gpr(addr, ur_idx, "UR->GPR addr"))
     else:
         addr = RZ
 
@@ -1105,8 +1109,7 @@ def _select_st_global(instr: Instruction, ra: RegAlloc,
         addr = getattr(ctx, '_addr_scratch_lo', None)
         if addr is None:
             addr = _alloc_gpr_pair(ctx)
-        prefix.append(SassInstr(encode_iadd64_ur(addr, RZ, ur_idx),
-                                f'IADD.64 R{addr}, RZ, UR{ur_idx}  // UR->GPR addr'))
+        prefix.extend(_emit_ur_to_gpr(addr, ur_idx, "UR->GPR addr"))
     else:
         addr = RZ
 
@@ -2198,8 +2201,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 addr = getattr(ctx, '_addr_scratch_lo', None)
                                 if addr is None:
                                     addr = _alloc_gpr_pair(ctx)
-                                output.append(SassInstr(encode_iadd64_ur(addr, RZ, ur_idx),
-                                    f'IADD.64 R{addr}, RZ, UR{ur_idx}  // cp.async UR->GPR addr'))
+                                output.extend(_emit_ur_to_gpr(addr, ur_idx, "cp.async UR->GPR addr"))
                                 glob_r = addr
                             elif gbase in ctx.ra.int_regs:
                                 glob_r = ctx.ra.lo(gbase)

@@ -400,6 +400,51 @@ def verify_schedule(instrs: list[SassInstr]) -> list[str]:
     return violations
 
 
+def _hoist_isetp_past_vote(instrs: list[SassInstr]) -> list[SassInstr]:
+    """Hoist ISETP past VOTE when operands are independent.
+
+    SM_120 rule #23: ISETP+VOTE+ISETP (same pred, misc=0) in sequence causes
+    ERR715. ptxas avoids this by putting all ISETPs before the VOTE.
+    This pass detects VOTE followed by ISETP and hoists the ISETP above
+    the VOTE when the ISETP doesn't read the VOTE's output register.
+    """
+    result = list(instrs)
+    _isetp_opcodes = {0x20c, 0xc0c}
+    _vote_opcodes = {0x806}
+    changed = True
+    while changed:
+        changed = False
+        for i in range(len(result) - 1):
+            op_i = (result[i].raw[0] | (result[i].raw[1] << 8)) & 0xFFF
+            op_next = (result[i+1].raw[0] | (result[i+1].raw[1] << 8)) & 0xFFF
+            if op_i in _vote_opcodes and op_next in _isetp_opcodes:
+                # VOTE at i, ISETP at i+1
+                # Check: does ISETP read VOTE's dest register?
+                vote_dest = result[i].raw[2]  # VOTE dest at byte[2]
+                isetp_src0 = result[i+1].raw[3]
+                isetp_src1 = result[i+1].raw[4]
+                if vote_dest not in (isetp_src0, isetp_src1):
+                    # Safe to swap: ISETP doesn't depend on VOTE result
+                    result[i], result[i+1] = result[i+1], result[i]
+                    changed = True
+                    break
+            # Also handle VOTE...NOP...ISETP pattern
+            if (op_i in _vote_opcodes and i + 2 < len(result)
+                    and ((result[i+1].raw[0] | (result[i+1].raw[1] << 8)) & 0xFFF) == 0x918):
+                op_next2 = (result[i+2].raw[0] | (result[i+2].raw[1] << 8)) & 0xFFF
+                if op_next2 in _isetp_opcodes:
+                    vote_dest = result[i].raw[2]
+                    isetp_src0 = result[i+2].raw[3]
+                    isetp_src1 = result[i+2].raw[4]
+                    if vote_dest not in (isetp_src0, isetp_src1):
+                        # Move ISETP before VOTE: [VOTE, NOP, ISETP] → [ISETP, VOTE, NOP]
+                        isetp = result.pop(i+2)
+                        result.insert(i, isetp)
+                        changed = True
+                        break
+    return result
+
+
 def schedule(instrs: list[SassInstr]) -> list[SassInstr]:
     """
     Reorder and pad instructions for correct SM_120 execution.
@@ -408,10 +453,12 @@ def schedule(instrs: list[SassInstr]) -> list[SassInstr]:
       1. _hoist_ldcu64        — move LDCU.64 early (≥3-cycle gap before UR consumers)
       2. _enforce_gpr_latency — insert NOPs for ALU GPR RAW hazards
       3. _reorder_after_ldg  — hide LDG latency by filling the slot with LDC/NOP
+      4. _hoist_isetp_past_vote — SM_120 rule #23: avoid ISETP+VOTE+ISETP pattern
 
     Ctrl assignment is handled separately by sass.scoreboard.assign_ctrl().
     """
     instrs = _hoist_ldcu64(instrs)
     instrs = _enforce_gpr_latency(instrs)
     instrs = _reorder_after_ldg(instrs)
+
     return instrs

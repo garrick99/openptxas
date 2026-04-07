@@ -122,46 +122,43 @@ def compute_capability_mask(
 ) -> int:
     """Compute the capability bitmask for the capmerc header.
 
-    This is an approximation — the exact bit semantics are not fully decoded,
-    but matches ptxas output for the kernel classes we support.
+    Ground truth from ptxas SM_120 kernel variants (2026-04-06):
+      base (ALU+LDG+STG):     0x00000aa8  bits: 3,5,7,9,11
+      +FMUL (float ALU):      0x000004a8  bits: 3,5,7,10 (9,11 OFF)
+      +VOTE/SETP:             0x000016a8  bits: 3,5,7,9,10,12
+      +SHFL:                  0x00000aa8  (same as base)
+      +BAR:                   0x00002928  bits: 3,5,8,11,13
+      +MUFU:                  0x0000bea8  bits: 3,5,7,9,10,11,12,13,15
+
+    The mask encodes pipeline configuration for the instruction class mix.
+    Bits interact (some turn OFF when others turn ON), so this uses
+    pattern matching rather than additive flags.
     """
-    mask = 0x08  # base ALU always set
+    # Start with base configuration (ALU + memory)
+    mask = 0x00000aa8  # base: S2R, MOV, LDCU, IADD3, LDG, STG, IMAD, IADD64
 
-    if has_stg:
-        mask |= 0x40
-    if has_ldg:
-        mask |= 0x1000
-    if has_branch:
-        mask |= 0x80 | 0x100 | 0x400
-    if has_shift:
-        mask |= 0x100
-    if has_ur_ops:
-        mask |= 0x200
-    if has_imad:
-        mask |= 0x800
-    if has_isetp:
-        mask |= 0x400
-    if has_fadd:
-        mask |= 0x20
-
-    # NOTE: 0x2000 was previously set for num_gprs > 14 but this changes
-    # the capmerc structure and causes ERR715 on some kernels. The hardware
-    # doesn't enforce capmerc reg_count — R14+ works without this bit.
-    # if num_gprs > 14:
-    #     mask |= 0x2000
-
-    # Higher bits scale with code size / complexity
-    # text_size_pages = number of 256-byte pages
-    # NOTE: DO NOT add text_pages to mask. Our generated capmerc only
-    # supports the base structure. Adding text_pages bits changes the
-    # expected record count/layout and causes ERR715 when they don't match.
-    # text_pages = max(text_size // 256, 1)
-    # if text_pages > 1:
-    #     mask |= (text_pages << 16)
-
-    # Barrier region count contributes to upper bits
-    if num_barrier_regions > 2:
-        mask |= (num_barrier_regions << 8)
+    # Cap_mask depends on the COMBINATION of instruction classes.
+    # ptxas ground truth (2026-04-06):
+    #   base only:           0x00000aa8
+    #   +SETP/VOTE (no LDG): 0x000016a8  (bits 10,12 ON, bit 11 OFF)
+    #   +LDG+SETP/VOTE:      0x00004fa8  (bits 8,11,14 ON, different pattern)
+    #   +FMUL (no SETP):     0x000004a8  (bits 9,11 OFF, bit 10 ON)
+    if has_ldg and (has_isetp or has_branch):
+        mask = 0x00004fa8  # LDG+VOTE/SETP combined class (base for <=384B)
+        # Upper mask bits scale with text size (ptxas ground truth):
+        # 384B: 0x00004fa8, 512B: 0x00027fa8, 640B+: higher bits
+        text_pages = max(text_size // 256, 1)
+        if text_pages > 1:
+            mask |= 0x00020000  # bit 17 for 2+ pages
+            mask |= 0x00003000  # bits 12-13 for multi-page
+    elif has_isetp or has_branch:
+        mask |= 0x1400   # bits 10, 12
+        mask &= ~0x0800  # remove bit 11
+    elif has_fadd:
+        mask &= ~0x0A00  # remove bits 9, 11
+        mask |= 0x0400   # add bit 10
+    if has_ldg and not (has_isetp or has_branch):
+        mask |= 0x4000   # LDG without SETP: just add bit 14
 
     return mask
 
@@ -601,35 +598,72 @@ def build_capmerc(
         term_b20 = max((text_size >> 7) - 2, 0)
         # Trailer: encodes reg pressure + barrier info
         # ptxas pattern: 0x5008 for ≤14 GPRs, 0xd007 for >14 GPRs (approximate)
-        trailer = b'\xd0\x07' if num_gprs > 14 else b'\x50\x08'
+        # Trailer encodes instruction class presence (ptxas ground truth):
+        #   0x5006: base ALU only
+        #   0xd006: float ALU present (high bit set)
+        #   0xd005: SETP/VOTE present
+        #   0x5005: BAR present
+        #   0x5008: MUFU present
+        text_pages_tr = max(text_size // 256, 1)
+        if has_ldg and (has_isetp or has_branch) and text_pages_tr > 1:
+            trailer = b'\x50\x07'  # LDG+VOTE multi-page (ptxas 512B ground truth)
+        elif has_ldg and (has_isetp or has_branch):
+            trailer = b'\xd0\x04'  # LDG+VOTE single-page (ptxas 384B ground truth)
+        elif has_isetp or has_branch:
+            trailer = b'\xd0\x05'  # SETP/VOTE class
+        elif has_fadd:
+            trailer = b'\xd0\x06'  # float ALU class
+        else:
+            trailer = b'\x50\x06'  # base ALU class
 
-        buf = bytearray(146)
-        # Header (16B)
-        buf[0:8] = CAPMERC_MAGIC
-        buf[8] = num_gprs
         cap_mask = compute_capability_mask(
             has_stg=has_stg, has_ldg=has_ldg, has_branch=has_branch,
             has_shift=has_shift, has_ur_ops=has_ur_ops, has_imad=has_imad,
             has_isetp=has_isetp, has_fadd=has_fadd, num_gprs=num_gprs,
             num_barrier_regions=num_barrier_regions, text_size=text_size)
+
+        if has_ldg and (has_isetp or has_branch):
+            # PTXAS-VERIFIED 166-BYTE STRUCTURE for LDG+VOTE/SETP kernels:
+            # LDG requires an additional barrier record + marker.
+            buf = bytearray(166)
+            buf[0:8] = CAPMERC_MAGIC
+            buf[8] = num_gprs
+            struct.pack_into('<I', buf, 12, cap_mask)
+            buf[16:32]  = bytes.fromhex('010b040af80004000000410000040000')  # type-01 prologue
+            # Type-01 ALU: bytes 37-38 change with text size
+            # 384B: 0x01,0x00  512B+: 0x41,0x01
+            text_pages_alu = max(text_size // 256, 1)
+            if text_pages_alu > 1:
+                buf[32:48] = bytes.fromhex('010b040af80004000000410101020000')
+            else:
+                buf[32:48] = bytes.fromhex('010b040af80004000000010001020000')
+            buf[48:64]  = bytes.fromhex('02220806fa0052000000830140000200')  # type-02 barrier
+            buf[64:80]  = bytes.fromhex('00000000000000000000000008000000')
+            buf[80:96]  = bytes.fromhex('010b0e0afa0005000000030139040000')  # type-01 STG
+            buf[96:100] = bytes.fromhex('410c5404')                          # page marker
+            buf[100:116] = bytes.fromhex('02220e06f80052000000830040000200')  # type-02 barrier (LDG page)
+            buf[116:132] = bytes.fromhex('00000000000000000000000000000000')
+            buf[132:148] = bytes.fromhex('02380e32f80040110000000082000a00')  # terminal
+            buf[148:164] = bytes.fromhex('000201400100000000000000000000')
+            buf[148] = 0x00; buf[149] = 0x02; buf[150] = 0x01; buf[151] = 0x40
+            buf[152] = 0x01  # text_size hint
+            buf[164:166] = trailer
+            return bytes(buf)
+
+        # PTXAS-VERIFIED 138-BYTE STRUCTURE for non-LDG kernels:
+        buf = bytearray(138)
+        buf[0:8] = CAPMERC_MAGIC
+        buf[8] = num_gprs
         struct.pack_into('<I', buf, 12, cap_mask)
-        # Type-01 prologue (16B)
-        buf[16:32] = bytes.fromhex('010b040af80004000000410000040000')
-        # Type-01 STG (16B)
-        buf[32:48] = bytes.fromhex('010b0e0afa0005000000030139040000')
-        # Type-02 barrier #1 (32B)
-        buf[48:64] = bytes.fromhex('02220e06f80052000000830040000200')
-        buf[64:80] = bytes.fromhex('00000000000000000000000008000000')
-        # Type-02 barrier #2 (32B)
-        buf[80:96] = bytes.fromhex('02220e06f80052000000030140000200')
-        buf[96:112] = bytes.fromhex('00000000000000000000000000000000')
-        # Terminal (32B)
-        buf[112:128] = bytes.fromhex('02380e32f80040110000000002010a00')
-        buf[128] = 0x00; buf[129] = 0x02; buf[130] = 0x01; buf[131] = 0xc0
-        buf[132] = term_b20  # text_size dependent
-        # Rest of terminal: zeros (already zeroed)
-        # Trailer (2B)
-        buf[144:146] = trailer
+        buf[16:32] = bytes.fromhex('010b040af80004000000410000040000')  # type-01 prologue
+        buf[32:48] = bytes.fromhex('010b040af80004000000810001020000')  # type-01 ALU
+        buf[48:64] = bytes.fromhex('02220806fa0062000000070240000200')  # type-02 barrier
+        buf[64:80] = bytes.fromhex('00000000000000000000000000000000')
+        buf[80:96] = bytes.fromhex('010b0e0afa0005000000030139040000')  # type-01 STG
+        buf[96:112] = bytes.fromhex('410c5404410c540402380e32f8004011')  # markers+terminal
+        buf[112:128] = bytes.fromhex('0000000082000a00000201c001000000')
+        buf[128:136] = bytes.fromhex('0000000000000000')
+        buf[136:138] = trailer
         return bytes(buf)
 
     # FP64 kernels require a fundamentally different capmerc structure:
@@ -758,7 +792,7 @@ _SHIFT_OPCODES = {0x819}                     # SHF
 _IMAD_OPCODES = {0x824, 0x825, 0xc24, 0xc11, 0x224, 0x225}  # IMAD variants (incl R-UR 0xc24)
 _ISETP_OPCODES = {0x86c, 0xc0c, 0x20c}      # ISETP variants (R-R 0x20c, R-UR 0xc0c)
 _UR_OPCODES = {0x9c3, 0x7ac, 0xb82}         # S2UR (0x9c3), ULDC.64, LDCU
-_FADD_OPCODES = {0x221, 0x220, 0x223, 0x80a, 0x208, 0x207}  # FADD, FMUL, FFMA, FSEL.step, FSEL, SEL
+_FADD_OPCODES = {0x221, 0x220, 0x223, 0x80a, 0x208, 0x808, 0x207, 0x20b}  # FADD, FMUL, FFMA, FSEL.step, FSEL, FSEL.imm, SEL, FSETP
 _CONST_LOAD_OPCODES = {0x182, 0x189, 0x431, 0x7ac, 0xb82}  # LDCU variants
 
 

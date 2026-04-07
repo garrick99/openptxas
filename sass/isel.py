@@ -379,6 +379,20 @@ def _select_mov(instr: Instruction, ra: RegAlloc,
         raise ISelError("MOV from immediate not yet supported in isel (use LDC for params)")
 
     if not isinstance(src, RegOp):
+        # Handle mov.u64 %rd, smem_name — shared memory base address
+        from ptx.ir import LabelOp
+        if isinstance(src, LabelOp) and ctx and hasattr(ctx, '_smem_offsets'):
+            smem_off = ctx._smem_offsets.get(src.name, None)
+            if smem_off is not None:
+                # Shared memory base = offset within shared space (always 0 for first decl)
+                d_lo = ra.lo(dest.name)
+                d_hi = d_lo + 1
+                return [
+                    SassInstr(encode_iadd3_imm32(d_lo, RZ, smem_off, RZ),
+                              f'IADD3 R{d_lo}, RZ, 0x{smem_off:x}, RZ  // smem base lo'),
+                    SassInstr(encode_iadd3_imm32(d_hi, RZ, 0, RZ),
+                              f'IADD3 R{d_hi}, RZ, 0, RZ  // smem base hi'),
+                ]
         raise ISelError(f"MOV src must be register: {src!r}")
 
     if typ in ('u64', 's64', 'b64', 'f64'):
@@ -762,18 +776,28 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
                       f'LDCU.64 UR{ur_idx}, c[0][0x{byte_off:x}]  // {param_name}'),
         ]
     else:
-        # u32 param: load directly into a GPR via LDC.
-        # Using LDCU.32 would consume an LDCU counter slot before the descriptor,
-        # forcing the descriptor to a higher counter than 2 (wdep≠0x35), which
-        # breaks LDG's rbar=0x09 requirement on SM_120.
-        if dest.name not in ra.int_regs:
-            # Dead u32 parameter — skip
-            return []
-        d = ra.r32(dest.name)
         if ctx:
             ctx._reg_param_off[dest.name] = byte_off
-        return [SassInstr(encode_ldc(d, 0, byte_off, ctrl=0x7f1),
-                          f'LDC R{d}, c[0][0x{byte_off:x}]  // {param_name}')]
+        if dest.name not in ra.int_regs:
+            return []
+        d = ra.r32(dest.name)
+
+        # SM_120 rule #25: body LDC (0xb82) causes ERR715 in kernels
+        # with VOTE+LDG. ptxas loads scalar params via LDCU.64 instead.
+        _has_vote_fn = getattr(ctx, '_has_vote', False) if ctx else False
+
+        if _has_vote_fn:
+            # VOTE present: skip body LDC. Record param for preamble load.
+            # SM_120 rule #25: body LDC with scoreboard ctrl causes ERR715.
+            # The pipeline will add a preamble LDC for this param.
+            if ctx:
+                if not hasattr(ctx, '_vote_param_loads'):
+                    ctx._vote_param_loads = []
+                ctx._vote_param_loads.append((d, byte_off, param_name))
+            return []
+        else:
+            return [SassInstr(encode_ldc(d, 0, byte_off, ctrl=0x7f1),
+                              f'LDC R{d}, c[0][0x{byte_off:x}]  // {param_name}')]
 
 
 def _select_ld_global(instr: Instruction, ra: RegAlloc,
@@ -1140,6 +1164,8 @@ class ISelContext:
     _next_pred: int = 0
     # Target SM version (89 = Ada Lovelace / RTX 4090, 120 = Blackwell / RTX 5090)
     sm_version: int = 120
+    # Whether the kernel contains VOTE instructions (for SM_120 rule #25)
+    _has_vote: bool = False
 
     def _alloc_literal(self, value: int) -> int:
         """Return the c[0] byte offset for a 32-bit literal constant.
@@ -1412,6 +1438,10 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
             # Track output length before this instruction so we can apply
             # predicates to all newly-generated SASS after the handler runs.
             _pre_len = len(output)
+            # Snapshot _negated_preds BEFORE processing: a predicated setp that
+            # writes to the same predicate as its guard must use the OUTER guard
+            # sense (from before the setp), not the NEW sense (after inversion).
+            _neg_preds_snapshot = set(ctx._negated_preds) if hasattr(ctx, '_negated_preds') else set()
 
             try:
                 if op == 'mov' and typ in ('u32', 's32', 'b32', 'f32', 'u64', 's64', 'b64', 'f64'):
@@ -1674,10 +1704,32 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     d = ctx.ra.r32(instr.dest.name)
                     a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     if isinstance(instr.srcs[1], ImmOp):
+                        # PEEPHOLE: mul.lo.s32 + cvt.u64.u32 → IMAD.WIDE
+                        # If the next instruction is cvt to 64-bit using our result,
+                        # emit IMAD.WIDE directly (1 instruction instead of 3).
+                        imm = instr.srcs[1].value & 0xFFFFFFFF
+                        _next_cvt = None
+                        if _instr_idx + 1 < len(bb.instructions):
+                            _ni = bb.instructions[_instr_idx + 1]
+                            if (_ni.op == 'cvt'
+                                    and any(t in ('u64', 's64') for t in _ni.types)
+                                    and isinstance(_ni.srcs[0], RegOp)
+                                    and _ni.srcs[0].name == instr.dest.name):
+                                _next_cvt = _ni
+                        if _next_cvt is not None and imm > 0 and imm <= 0xFFFF:
+                            # Fuse: emit IMAD.WIDE Rd_lo, src, imm, RZ
+                            d_lo = ctx.ra.lo(_next_cvt.dest.name)
+                            output.append(SassInstr(
+                                encode_imad_wide(d_lo, a, imm, RZ),
+                                f'IMAD.WIDE R{d_lo}, R{a}, 0x{imm:x}, RZ  // fused mul+cvt64'))
+                            if not hasattr(ctx, '_skip_instrs'):
+                                ctx._skip_instrs = set()
+                            ctx._skip_instrs.add(id(_next_cvt))
+                            continue
+
                         # Immediate multiplier: use IMAD.SHL.U32 if power-of-2 and ≤15,
                         # else try IMAD R-imm (16-bit immediate, opcode 0x824),
                         # else load into UR via literal pool and use IMAD R-UR.
-                        imm = instr.srcs[1].value & 0xFFFFFFFF
                         if imm > 0 and (imm & (imm - 1)) == 0:
                             # Power of two: IMAD.SHL.U32 dest, src, imm, RZ
                             shift = imm.bit_length() - 1
@@ -1817,11 +1869,17 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     if isinstance(addr_op, MemOp):
                         offset = addr_op.offset
                         base = addr_op.base
-                        # Check if base is a register (starts with %) → GPR-addressed
+                        # Check if base is a register (starts with %)
                         if base.startswith('%') and base in ctx.ra.int_regs:
+                            # 32-bit register → use directly
                             addr_r = ctx.ra.r32(base)
                             output.append(SassInstr(encode_sts_r(4, addr_r, data_r, offset),
                                 f'STS [UR4+R{addr_r}+{offset:#x}], R{data_r}  // st.shared'))
+                        elif base.startswith('%') and hasattr(ctx.ra, 'lo') and base in getattr(ctx.ra, 'int64_regs', {}):
+                            # 64-bit register → use low 32 bits for smem addressing
+                            addr_r = ctx.ra.lo(base)
+                            output.append(SassInstr(encode_sts_r(4, addr_r, data_r, offset),
+                                f'STS [UR4+R{addr_r}+{offset:#x}], R{data_r}  // st.shared (64->32)'))
                         else:
                             # Shared variable name or fixed offset → immediate-only
                             smem_off = ctx._smem_offsets.get(base, 0) + offset if hasattr(ctx, '_smem_offsets') else offset
@@ -1842,6 +1900,10 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             addr_r = ctx.ra.r32(base)
                             output.append(SassInstr(encode_lds_r(dest_r, 4, addr_r, offset),
                                 f'LDS R{dest_r}, [UR4+R{addr_r}+{offset:#x}]  // ld.shared'))
+                        elif base.startswith('%') and hasattr(ctx.ra, 'lo') and base in getattr(ctx.ra, 'int64_regs', {}):
+                            addr_r = ctx.ra.lo(base)
+                            output.append(SassInstr(encode_lds_r(dest_r, 4, addr_r, offset),
+                                f'LDS R{dest_r}, [UR4+R{addr_r}+{offset:#x}]  // ld.shared (64->32)'))
                         else:
                             smem_off = ctx._smem_offsets.get(base, 0) + offset if hasattr(ctx, '_smem_offsets') else offset
                             output.append(SassInstr(encode_lds(dest_r, 4, smem_off),
@@ -2646,18 +2708,76 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                     ctx._skip_instrs = set()
                                 ctx._skip_instrs.add(id(remaining[0]))
                                 ctx._skip_instrs.add(id(remaining[1]))
+                            # PEEPHOLE 2: setp.gt.f32 + selp.f32 → FSETP + FSEL.imm
+                            # When the ONLY consumer of the predicate is selp.f32
+                            # (no branch), we can use FSETP directly because FSETP
+                            # predicates work for data-path consumers (SEL/FSEL).
+                            # This matches ptxas's pattern: FSETP + FSEL.imm = 2 instrs
+                            # vs FSEL.step + ISETP.NE + MOV + MOV + SEL = 5 instrs.
+                            elif (not can_fsel and len(remaining) >= 1
+                                  and remaining[0].op == 'selp'
+                                  and remaining[0].srcs[2].name == pred.name
+                                  and isinstance(remaining[0].srcs[0], ImmOp)
+                                  and isinstance(remaining[0].srcs[1], ImmOp)):
+                                from sass.encoding.sm_120_opcodes import encode_fsel_imm
+                                _fsetp_cmp = {'lt': FSETP_LT, 'le': FSETP_LE,
+                                              'gt': FSETP_GT, 'ge': FSETP_GE,
+                                              'eq': FSETP_EQ, 'ne': FSETP_NE}
+                                fsetp_c = _fsetp_cmp.get(cmp_name, FSETP_GT)
+
+                                # Materialize threshold (if immediate)
+                                if isinstance(b, ImmOp):
+                                    br = _alloc_gpr(ctx)
+                                    imm_val = b.value & 0xFFFFFFFF
+                                    output.append(SassInstr(
+                                        encode_iadd3_imm32(br, RZ, imm_val, RZ),
+                                        f'IADD3 R{br}, RZ, 0x{imm_val:08x}, RZ  // fsetp threshold'))
+                                elif isinstance(b, RegOp):
+                                    br = ctx.ra.r32(b.name)
+                                else:
+                                    br = RZ
+
+                                # FSETP: write predicate (data-path only, safe for FSEL)
+                                output.append(SassInstr(
+                                    encode_fsetp(pd, ar, br, cmp=fsetp_c),
+                                    f'FSETP.{cmp_name.upper()} P{pd}, R{ar}, R{br}'))
+
+                                # Fuse selp.f32 into IADD3(true_val) + FSEL.imm(false_val)
+                                selp_instr = remaining[0]
+                                true_val = selp_instr.srcs[0].value & 0xFFFFFFFF
+                                false_val = selp_instr.srcs[1].value & 0xFFFFFFFF
+                                d = ctx.ra.r32(selp_instr.dest.name)
+
+                                # Load true_val into dest, then FSEL.imm selects
+                                # between dest (when pred TRUE) and false_val (when FALSE)
+                                output.append(SassInstr(
+                                    encode_iadd3_imm32(d, RZ, true_val, RZ),
+                                    f'IADD3 R{d}, RZ, 0x{true_val:08x}, RZ  // selp true'))
+                                output.append(SassInstr(
+                                    encode_fsel_imm(d, d, false_val, pred=pd),
+                                    f'FSEL.imm R{d}, R{d}, 0x{false_val:08x}, P{pd}'))
+
+                                # Skip the selp instruction (already fused)
+                                if not hasattr(ctx, '_skip_instrs'):
+                                    ctx._skip_instrs = set()
+                                ctx._skip_instrs.add(id(selp_instr))
+                                # Clear negated_preds (FSETP uses natural sense)
+                                if hasattr(ctx, '_negated_preds'):
+                                    ctx._negated_preds.discard(pd)
                             else:
-                                # SM_120 ISETP→FSETP CORRUPTION WORKAROUND:
-                                # ISETP permanently corrupts FSETP predicate state.
-                                # Use FSEL.step (compare+select to 1.0/0.0) then
-                                # ISETP.NE to convert the float result to a predicate.
-                                # This avoids FSETP entirely on SM_120.
+                                # SM_120 FSETP GUARD PREDICATE LIMITATION:
+                                # FSETP writes predicates that work for SEL/FSEL
+                                # (data-path predicate reads) but NOT for BRA/EXIT
+                                # guards (control-flow predicate reads). ptxas knows
+                                # this and never uses FSETP predicates as branch guards.
+                                #
+                                # Workaround: FSEL.step (compare+select → 1.0/0.0)
+                                # then ISETP.NE to convert to a branch-compatible pred.
                                 if isinstance(b, ImmOp):
                                     threshold = b.value & 0xFFFFFFFF
                                 elif isinstance(b, RegOp):
                                     br = ctx.ra.r32(b.name)
-                                    # Materialize reg to use as FSEL threshold
-                                    threshold = None  # will use register form
+                                    threshold = None  # register form
                                 else:
                                     threshold = 0
 
@@ -2667,12 +2787,8 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
 
                                 tmp_r = _alloc_gpr(ctx)
                                 if isinstance(b, RegOp) and threshold is None:
-                                    # Reg-reg float comparison WITHOUT FSETP:
-                                    # FSETP (both R-R 0x20b and R-UR 0xc0b) is BROKEN
-                                    # in high-register mode (GPRs > 14) on SM_120.
-                                    # Use FSUB + FSEL.step + ISETP.NE instead.
+                                    # Reg-reg: FSUB + FSEL.step + ISETP.NE
                                     diff_r = _alloc_gpr(ctx)
-                                    # FADD with swapped+negated src0 = FSUB
                                     output.append(SassInstr(
                                         encode_fadd(diff_r, br, ar, negate_src0=True),
                                         f'FADD R{diff_r}, -R{br}, R{ar}  // fsub for cmp'))
@@ -2684,12 +2800,9 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                         f'ISETP.NE P{pd}, R{tmp_r}, RZ  // float reg cmp -> pred'))
                                     if hasattr(ctx, '_negated_preds'):
                                         ctx._negated_preds.discard(pd)
-                                    # Bump scratch mark so these temps aren't recycled
-                                    # (prevents collision with subsequent selp materialization)
                                     ctx._scratch_mark = ctx._next_gpr
                                 else:
-                                    # FSEL.step → ISETP.NE (avoids FSETP entirely)
-                                    # Same: clear _negated_preds for natural sense.
+                                    # Reg-imm: FSEL.step + ISETP.NE
                                     output.append(SassInstr(
                                         encode_fsel_step(tmp_r, ar, threshold, fsel_c),
                                         f'FSEL.step R{tmp_r}, R{ar}, 0x{threshold:08x}, {cmp_name.upper()}'))
@@ -2702,8 +2815,21 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             # Integer comparison
                             # SM_120: ISETP.LT encoding (b8=0x10) doesn't work on hardware.
                             # Invert LT→GE and GT→LE, negate the predicate on branches.
+                            # EXCEPTION: if src1 is from a param (has UR), use ISETP.UR
+                            # with direct GT/LT instead of inverting. ISETP.UR works with
+                            # GT on SM_120 (ptxas-verified). This avoids the negated-pred
+                            # path that creates ISETP+VOTE+ISETP hazards (rule #23).
                             _INVERT = {'lt': 'ge', 'gt': 'le'}
-                            if cmp_name in _INVERT and ctx.sm_version != 89:
+                            # GT/LT always invert to GE/LE for ISETP.UR (ptxas-verified).
+                            # ptxas uses GE (not GT) even for vote-feeding compares.
+                            _can_use_ur_direct = False
+                            _can_use_imm_direct = False
+                            # ISETP.IMM (0x80c) supports all comparison codes directly.
+                            # No inversion needed for immediate operands on SM_120.
+                            if (cmp_name in _INVERT and ctx.sm_version != 89
+                                    and isinstance(b, ImmOp)):
+                                _can_use_imm_direct = True
+                            if cmp_name in _INVERT and ctx.sm_version != 89 and not _can_use_ur_direct and not _can_use_imm_direct:
                                 cmp_name = _INVERT[cmp_name]
                                 if not hasattr(ctx, '_negated_preds'):
                                     ctx._negated_preds = set()
@@ -2730,47 +2856,70 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             elif isinstance(b, RegOp):
                                 b_param_off = ctx._reg_param_off.get(b.name) if ctx else None
                                 b_ur_idx = (ctx._ur_params.get(b.name) if ctx else None)
-                                if b_ur_idx is not None and isetp_cmp == ISETP_GE:
-                                    # src1 is a u64 param loaded via LDCU.64 into UR pair.
-                                    # Use lo UR for comparison (valid when values fit in 32 bits).
-                                    # SM_120 R-UR ISETP only works correctly with GE comparison
-                                    # code; other codes (EQ, NE, LE, GT, LT) give wrong results.
-                                    emit_pd = pd
-                                    if pd > 0 and ctx:
-                                        emit_pd = 0
-                                        ctx.ra.pred_regs[pred.name] = 0
-                                    output.append(SassInstr(
-                                        encode_isetp_ur(emit_pd, ar, b_ur_idx, cmp=isetp_cmp),
-                                        f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, UR{b_ur_idx}, PT'))
-                                elif b_param_off is not None and isetp_cmp == ISETP_GE:
-                                    # src1 came from ld.param.u32 — load via LDCU.32 into UR,
-                                    # then compare R vs UR. This is the ptxas-verified path.
-                                    #
-                                    # SM_120 hardware: ISETP R-UR (0xc0c) only works correctly
-                                    # with GE comparison code. Other codes (EQ, NE, LE, GT, LT)
-                                    # silently produce wrong results. For non-GE comparisons,
-                                    # fall through to the R-R path using the GPR value already
-                                    # loaded by LDC.
-                                    #
-                                    # Additionally, ISETP R-UR silently produces P=FALSE when
-                                    # pred_dest > 0. Force pred_dest=0 (P0) and remap.
-                                    emit_pd = pd
-                                    if pd > 0 and ctx:
-                                        emit_pd = 0
-                                        ctx.ra.pred_regs[pred.name] = 0
-                                    ur_tmp = ctx._next_ur
-                                    ctx._next_ur += 1
-                                    output.append(SassInstr(
-                                        encode_ldcu_32(ur_tmp, 0, b_param_off),
-                                        f'LDCU.32 UR{ur_tmp}, c[0][0x{b_param_off:x}]  // setp src'))
-                                    output.append(SassInstr(
-                                        encode_isetp_ur(emit_pd, ar, ur_tmp, cmp=isetp_cmp),
-                                        f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, UR{ur_tmp}, PT'))
+                                if b_ur_idx is not None and isetp_cmp in (ISETP_GE, ISETP_GT, ISETP_LE, ISETP_LT):
+                                    # SM_120 rule #25: ISETP.UR + VOTE causes ERR715 when
+                                    # LDG is present. Use GPR path for vote kernels.
+                                    _vote_safe = getattr(ctx, '_has_vote', False)
+                                    if _vote_safe:
+                                        # Value already in GPR (from LDCU.64 + MOV).
+                                        br = ctx.ra.r32(b.name)
+                                        emit_pd = pd
+                                        if ctx.sm_version != 89 and pd > 0 and ctx:
+                                            emit_pd = 0
+                                            ctx.ra.pred_regs[pred.name] = 0
+                                        output.append(SassInstr(
+                                            encode_isetp(emit_pd, ar, br, cmp=isetp_cmp),
+                                            f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, R{br}, PT  // vote-safe GPR'))
+                                    else:
+                                        emit_pd = pd
+                                        if pd > 0 and ctx:
+                                            emit_pd = 0
+                                            ctx.ra.pred_regs[pred.name] = 0
+                                        output.append(SassInstr(
+                                            encode_isetp_ur(emit_pd, ar, b_ur_idx, cmp=isetp_cmp),
+                                            f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, UR{b_ur_idx}, PT'))
+                                elif b_param_off is not None and isetp_cmp in (ISETP_GE, ISETP_GT, ISETP_LE, ISETP_LT):
+                                    # SM_120 rule #25: LDCU.32 + VOTE coexistence causes
+                                    # ERR715 when LDG is present. Check if VOTE exists in
+                                    # this kernel — if so, skip the LDCU.32+ISETP.UR path
+                                    # and use GPR-to-GPR comparison instead.
+                                    _has_vote = any(
+                                        inst2.op == 'vote'
+                                        for bb2 in fn.blocks
+                                        for inst2 in bb2.instructions
+                                    )
+                                    if _has_vote:
+                                        # VOTE present: use GPR R-R path (value already
+                                        # loaded into GPR by ld.param → LDC).
+                                        br = ctx.ra.r32(b.name)
+                                        emit_pd = pd
+                                        if ctx.sm_version != 89 and pd > 0 and ctx:
+                                            emit_pd = 0
+                                            ctx.ra.pred_regs[pred.name] = 0
+                                        output.append(SassInstr(
+                                            encode_isetp(emit_pd, ar, br, cmp=isetp_cmp),
+                                            f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, R{br}, PT  // vote-safe GPR path'))
+                                    else:
+                                        # No VOTE: safe to use LDCU.32 + ISETP.UR path.
+                                        emit_pd = pd
+                                        if pd > 0 and ctx:
+                                            emit_pd = 0
+                                            ctx.ra.pred_regs[pred.name] = 0
+                                        ur_tmp = ctx._next_ur
+                                        ctx._next_ur += 1
+                                        output.append(SassInstr(
+                                            encode_ldcu_32(ur_tmp, 0, b_param_off),
+                                            f'LDCU.32 UR{ur_tmp}, c[0][0x{b_param_off:x}]  // setp src'))
+                                        output.append(SassInstr(
+                                            encode_isetp_ur(emit_pd, ar, ur_tmp, cmp=isetp_cmp),
+                                            f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, UR{ur_tmp}, PT'))
                                 else:
+                                    # No UR/param available for ISETP.UR. Use ISETP R-R
+                                    # as last resort. NOTE: ISETP R-R (0x20c) has toxic
+                                    # interaction with VOTE on SM_120. For vote-feeding
+                                    # compares, prefer ISETP.UR by materializing src1
+                                    # via LDCU.32 from a scratch literal pool slot.
                                     br = ctx.ra.r32(b.name)
-                                    # SM_120: ISETP R-R (0x20c) silently produces P=FALSE when
-                                    # pred_dest > 0 (same hw bug as R-UR). Force emit_pd=0 and
-                                    # remap so consumers find the result in P0.
                                     emit_pd = pd
                                     if ctx.sm_version != 89 and pd > 0 and ctx:
                                         emit_pd = 0
@@ -2790,20 +2939,18 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 if pd > 0 and ctx:
                                     emit_pd = 0
                                     ctx.ra.pred_regs[pred.name] = 0
-                                if imm_val == 0:
-                                    # Use R-R ISETP with RZ (matches ptxas; no literal pool needed)
-                                    output.append(SassInstr(
-                                        encode_isetp(emit_pd, ar, RZ, cmp=isetp_cmp),
-                                        f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, RZ, PT'))
-                                else:
-                                    # Materialize imm in a GPR, then R-R ISETP
-                                    r_tmp = _alloc_gpr(ctx)
-                                    output.append(SassInstr(
-                                        encode_iadd3_imm32(r_tmp, RZ, imm_val, RZ),
-                                        f'IADD3 R{r_tmp}, RZ, {imm_val:#x}, RZ  // setp imm'))
-                                    output.append(SassInstr(
-                                        encode_isetp(emit_pd, ar, r_tmp, cmp=isetp_cmp),
-                                        f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, R{r_tmp}, PT'))
+                                    # Clear stale negation for the new physical pred (0).
+                                    # The discard above ran with the old pd; the remap
+                                    # to physical 0 must also clear physical 0's state.
+                                    if hasattr(ctx, '_negated_preds'):
+                                        ctx._negated_preds.discard(0)
+                                # SM_120 rule: use ISETP.IMM (0x80c) for ALL immediate
+                                # comparisons, including imm=0. ISETP R-R (0x20c) causes
+                                # toxic interaction with VOTE on SM_120 (rule #23).
+                                from sass.encoding.sm_120_opcodes import encode_isetp_imm
+                                output.append(SassInstr(
+                                    encode_isetp_imm(emit_pd, ar, imm_val, cmp=isetp_cmp),
+                                    f'ISETP.{cmp_name.upper()}.IMM P{emit_pd}, R{ar}, {imm_val:#x}'))
                             else:
                                 # Non-register src1 (e.g. memory operand) — materialize into GPR first
                                 br = _materialize_imm(b, ctx, ctx.ra, output)
@@ -3846,7 +3993,10 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                 if instr.pred and op not in ('bra',):  # ret needs predication for early-exit pattern
                     pd = ctx.ra.pred(instr.pred) if instr.pred in ctx.ra.pred_regs else 0
                     neg = instr.neg
-                    if hasattr(ctx, '_negated_preds') and pd in ctx._negated_preds:
+                    # Use the pre-instruction snapshot to determine guard sense.
+                    # A predicated setp that writes to its own guard predicate
+                    # must not flip the guard with its own inversion.
+                    if pd in _neg_preds_snapshot:
                         neg = not neg
                     pred_str = f'@{"!" if neg else ""}P{pd} '
                     for si_idx in range(_pre_len, len(output)):

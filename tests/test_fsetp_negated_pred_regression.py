@@ -103,7 +103,7 @@ def _get_cuda():
 
 
 @pytest.mark.skipif(_get_cuda() is None, reason="No CUDA GPU")
-@pytest.mark.xfail(reason="FSETP stale _negated_preds: P0 negation from ISETP.GE persists through FSETP.GT rewrite — wrong branch taken")
+@pytest.mark.gpu
 def test_fsetp_pred_reuse_gpu_correctness():
     """
     Thread 0: a[0] = 15.0, threshold = 10.0

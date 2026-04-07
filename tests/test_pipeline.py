@@ -309,8 +309,9 @@ def test_setp_immediate_compiles():
     text = elf.section_data('.text.imm_kernel')
     opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
                for off in range(0, len(text), 16)]
-    # ISETP R-R (0x20c) must appear — immediate is materialized via IADD3_IMM32
-    assert 0x20c in opcodes, "ISETP R-R (0x20c) not found — setp with immediate failed"
+    # ISETP.IMM (0x80c) or ISETP R-R (0x20c) must appear for the comparison
+    assert 0x80c in opcodes or 0x20c in opcodes, \
+        "Neither ISETP.IMM (0x80c) nor ISETP R-R (0x20c) found — setp with immediate failed"
 
 
 # ---------------------------------------------------------------------------

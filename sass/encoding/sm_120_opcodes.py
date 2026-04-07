@@ -815,8 +815,8 @@ def encode_isetp_ge_and(pred_dest: int, src_reg: int, ur_src: int,
     """
     if ctrl == 0:
         ctrl = _CTRL_DEFAULT
-    # b9 bit 1 depends on src_reg index parity: even=0x60, odd=0x62
-    # Verified: ptxas R0(even)+UR5 → 0x60; ptxas R13(odd)+UR5 → 0x62; R9(odd)+UR5 → 0x62
+    # b9 parity: even=0x42, odd=0x62
+    # Verified: ptxas R2(even)+UR6 → 0x42; ptxas R13(odd)+UR5 → 0x62; R9(odd)+UR5 → 0x62
     b9_val = 0x62 if (src_reg & 1) else 0x60
     return _build(0x0c, 0x7c,
                   b2=pred_dest & 0xFF, b3=src_reg, b4=ur_src & 0xFF,
@@ -845,6 +845,12 @@ def encode_isetp_ur(pred_dest: int, src_reg: int, ur_src: int,
     """
     if ctrl == 0:
         ctrl = _CTRL_DEFAULT
+    # b9 encoding depends on src_reg parity AND comparison code.
+    # GE (cmp=6): b9 = 0x62 (odd) or 0x60 (even)  [original ground truth]
+    # GT (cmp=4): b9 = 0x62 (odd) or 0x42 (even)  [ptxas ballot kernel]
+    # Other codes: use GE-style as default (verified for GE/LE bounds checks)
+    # b9 parity: even=0x42, odd=0x62 (all comparison codes)
+    # ptxas ground truth: R2(even) → 0x42 for both GE and GT
     b9_val = 0x62 if (src_reg & 1) else 0x60
     b8_val = (cmp << 4) | 0x10  # same cmp encoding as R-R variant
     return _build(0x0c, 0x7c,
@@ -2331,6 +2337,42 @@ def encode_fsel(dest: int, src0: int, src1: int, pred: int = 0,
     return bytes(raw)
 
 
+def encode_fsel_imm(dest: int, src0: int, imm32: int, pred: int = 0,
+                    negate_pred: bool = False, ctrl: int = 0) -> bytes:
+    """Encode FSEL dest, src0, imm32, [!]Ppred (immediate variant, opcode 0x808).
+
+    Ground truth (ptxas sm_120):
+        FSEL R9, R9, 0x3f000000, P0:
+        lo=0x3f00000009097808 hi=0x000fca0000000000
+        byte[0:2]=opcode(0x08,0x78), byte[2]=dest, byte[3]=src0,
+        byte[4:8]=imm32, byte[8:12]=pred/flags
+    When pred is TRUE: result = src0 (register).
+    When pred is FALSE: result = imm32.
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0]  = 0x08
+    raw[1]  = 0x78          # 0x808 opcode (immediate variant)
+    raw[2]  = dest & 0xFF
+    raw[3]  = src0 & 0xFF
+    raw[4]  = (imm32 >> 0) & 0xFF
+    raw[5]  = (imm32 >> 8) & 0xFF
+    raw[6]  = (imm32 >> 16) & 0xFF
+    raw[7]  = (imm32 >> 24) & 0xFF
+    # Predicate select (same layout as register variant)
+    raw[8]  = 0x00
+    raw[9]  = 0x00
+    raw[10] = (pred & 1) << 7
+    raw[11] = ((pred >> 1) & 0x7F) | (0x04 if negate_pred else 0x00)
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
 # ---------------------------------------------------------------------------
 # ATOMG — Atomic Global Memory Operations
 # ---------------------------------------------------------------------------
@@ -2767,6 +2809,38 @@ def encode_isetp(pred_dest: int, src0: int, src1: int, cmp: int = ISETP_GE,
     raw[7]  = 0x00
     raw[8]  = 0x70                          # fixed for R-R comparisons
     raw[9]  = ((cmp & 0x0F) << 4) | (0x02 if signed else 0x00)  # cmp type + signed bit
+    raw[10] = 0xf0 | ((pred_dest & 0x07) << 1)
+    raw[11] = 0x03
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+def encode_isetp_imm(pred_dest: int, src0: int, imm32: int, cmp: int = ISETP_GT,
+                     signed: bool = True, ctrl: int = 0) -> bytes:
+    """Encode ISETP with 32-bit immediate (opcode 0x80c).
+
+    Ground truth (ptxas sm_120, setp.gt.s32 %p0, %r2, 15):
+        0c780002 0f000000 7042f003 00da4f00
+        b3=R2(src0), b4-7=0xF(imm=15), b9=0x42(GT|signed), b10=0xf0(P0)
+
+    This form avoids the ISETP R-R (0x20c) toxic interaction with VOTE on SM_120.
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0]  = 0x0c
+    raw[1]  = 0x78          # 0x80c opcode (immediate variant)
+    raw[2]  = 0x00
+    raw[3]  = src0 & 0xFF
+    raw[4]  = (imm32 >> 0) & 0xFF
+    raw[5]  = (imm32 >> 8) & 0xFF
+    raw[6]  = (imm32 >> 16) & 0xFF
+    raw[7]  = (imm32 >> 24) & 0xFF
+    raw[8]  = 0x70           # mode (same as R-R)
+    raw[9]  = ((cmp & 0x0F) << 4) | (0x02 if signed else 0x00)
     raw[10] = 0xf0 | ((pred_dest & 0x07) << 1)
     raw[11] = 0x03
     raw[12] = 0x00

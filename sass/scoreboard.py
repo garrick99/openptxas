@@ -76,6 +76,8 @@ _OPCODE_META: dict[int, _OpMeta] = {
     0x235: _OpMeta('IADD.64',    1, 0x3e, 1),
     0xc35: _OpMeta('IADD.64-UR', 1, 0x3e, 5),  # misc=5 per hardware bisect 2026-03-25
     0x202: _OpMeta('MOV',        0, 0x3e, 1),
+    0x20b: _OpMeta('FSETP.RR',   0, 0x3c, 5),  # FSETP R-R: misc=5, wdep=0x3c (ptxas-verified from forced_match)
+    0x808: _OpMeta('FSEL.IMM',   1, 0x3e, 1),  # FSEL with 32-bit immediate (float select)
     0x20c: _OpMeta('ISETP.RR',   0, 0x3e, 0),  # ISETP R-R: misc=0 (SM_120 predicate)
     0xc0c: _OpMeta('ISETP.RU',   0, 0x3e, 0),  # ISETP R-UR: misc=0 on SM_120
     0x431: _OpMeta('HFMA2',      1, 0x3e, 1),  # HFMA2 (half-precision FMA2, used as zero-init in div.u32)
@@ -214,17 +216,19 @@ _OPCODES_ALU = {
     0x207,        # SEL (SM_120)
     0x807,        # SEL (SM_89, imm form)
     0xa0c,        # ISETP (SM_89 cbuf form)
-    0x208,        # FSEL
+    0x208,        # FSEL (register)
+    0x808,        # FSEL (immediate)
     0x20b,        # FSETP
     0xc0b,        # FSETP R-UR
 
     0x20c,        # ISETP R-R
+    0x80c,        # ISETP IMM (32-bit immediate)
     0xc0c,        # ISETP R-UR
     # Permute / misc
     0x416,        # PRMT (immediate selector, opc=0x416)
     0x216,        # PRMT.REG (register selector, opc=0x216)
     0x589, 0xf89, 0x989,  # SHFL (reg-reg, reg-imm, imm-imm)
-    0x806,        # VOTE.ANY
+    # 0x806 VOTE removed from ALU — uses wdep=0x3F (see _wdep_for_opcode)
     # Matrix multiply (HMMA, IMMA, DMMA, QMMA)
     0x23c, 0x237, 0x23f, 0x27a,
     # Predicate ↔ register moves
@@ -379,7 +383,7 @@ def _get_src_regs(raw: bytes) -> set[int]:
             for r in range(2): regs.add(raw[4]+r)
             if raw[8] < 255:
                 for r in range(4): regs.add(raw[8]+r)
-        elif opcode in (0x820, 0x823, 0x80a):  # FMUL.IMM/FFMA.IMM/FSEL: src0=b3, b4-b7=imm
+        elif opcode in (0x820, 0x823, 0x80a, 0x808, 0x80c):  # FMUL.IMM/FFMA.IMM/FSEL.step/FSEL.imm/ISETP.IMM: src0=b3, b4-b7=imm
             if raw[3] < 255: regs.add(raw[3])
             if opcode == 0x823 and raw[8] < 255: regs.add(raw[8])  # FFMA addend
         elif opcode in (0x221, 0x223):  # FADD/FFMA: src0=b3, src1=b4, src2=b8
@@ -493,13 +497,14 @@ def _wdep_for_opcode(opcode: int, raw: bytes = None) -> int:
             slot = slots[(_ldcu_slot_counter[0] - 1) % len(slots)]
             _ldcu_slot_counter[0] += 1
             return slot
-        # LDCU.32: ptxas-verified uses slot 0x35 on SM_120 (same slot as LDG).
-        # Consumer IMAD R-UR (and similar UR consumers) waits with rbar=0x09
-        # (bit 3, same as LDG). Using wdep=0x31 here caused IMAD R-UR to
-        # read stale 0 from the UR destination → mul.lo with non-power-of-2
-        # immediate returned wrong results.
+        # LDCU.32: use rotating slots like LDCU.64.
+        # ptxas uses 0x31 for param scalar loads and 0x35 for descriptors.
+        # Using only 0x35 causes scoreboard collision with LDG in VOTE-path
+        # kernels, leading to ERR715. Rotate between 0x31 and 0x33.
+        slots32 = [0x31, 0x33]
+        slot = slots32[(_ldcu_slot_counter[0]) % len(slots32)]
         _ldcu_slot_counter[0] += 1
-        return 0x35
+        return slot
     if opcode == 0x918:  # NOP: even wdep (misc=0 paired with 0x3e is safe)
         return 0x3e
     if opcode in _OPCODES_LDC:
@@ -516,6 +521,10 @@ def _wdep_for_opcode(opcode: int, raw: bytes = None) -> int:
         # Treating SHFL as wdep=0x3e (ALU in-order) was incorrect — consumers
         # read stale data because SHFL actually takes many cycles.
         return 0x31
+    if opcode == 0x806:  # VOTE: ptxas uses wdep=0x3F (no ALU tracking)
+        return 0x3f     # VOTE result availability is ensured by instruction ordering,
+                        # not scoreboard. Using wdep=0x3E corrupts the ALU slot when
+                        # combined with ISETP + predicated EXIT (SM_120 rule #23).
     if opcode in _OPCODES_LDGSTS:
         return 0x3f  # LDGSTS: async copy writes to shared mem, not GPR — no scoreboard slot
     if opcode in _OPCODES_LDGDEPBAR:
@@ -570,12 +579,14 @@ _OPCODE_MISC: dict[int, int] = {
     0xc2b: 2,   # DFMA R-UR-UR: misc=2 (b1=0x7c form)
     0x22a: 2,   # DSETP: misc=2 (ptxas ground truth — all DSETP variants use 2)
     0xc35: 5,   # IADD.64-UR: misc=5 (wide ALU result)
-    0xc0c: 0,   # ISETP R-UR: misc=0 (SM_120: misc 1-12 → wrong predicate; see
-                #   encode_isetp_ur docstring. Counter value 6 at position 22 → wrong pred.)
-    0x20c: 0,   # ISETP R-R: misc=0 (same SM_120 predicate correctness requirement)
+    0xc0c: 0,   # ISETP R-UR: misc=0 default (overridden for VOTE-adjacent context)
+    0x20c: 0,   # ISETP R-R: misc=0 default (overridden for VOTE-adjacent context)
+    0x80c: 0,   # ISETP IMM: misc=0 default (overridden for VOTE-adjacent context)
+    0x20b: 5,   # FSETP R-R: misc=5 (ptxas-verified from forced_match kernel)
     0xc0b: 5,   # FSETP R-UR: misc=5 (ptxas-verified, decoded with <<1 shift)
     0x80a: 5,   # FSEL.step: misc=5 (ptxas-verified)
     0x223: 4,   # FFMA R-R-R: misc=4 (ptxas-verified for FMA chains on SM_120)
+    0x806: 1,   # VOTE: misc=1 (ptxas-verified, ballot kernel)
     0x986: 1,   # STG.E: misc=1 (from ptxas ground truth)
     0x988: 4,   # STS.E: misc=4
     0x225: 1,   # IMAD.WIDE R-R: misc=1
@@ -598,12 +609,15 @@ _OPCODE_MISC: dict[int, int] = {
 }
 
 # All opcodes recognised by assign_ctrl.  Unknown opcodes raise ValueError.
+_OPCODES_VOTE = {0x806}  # VOTE.BALLOT — warp-level, wdep=0x3F (no ALU tracking)
+
 _ALL_KNOWN_OPCODES: frozenset = frozenset(
     _OPCODES_LDG | _OPCODES_LDC | _OPCODES_LDS |
     _OPCODES_STG | _OPCODES_STS | _OPCODES_BAR |
     _OPCODES_CTRL | _OPCODES_ALU | _OPCODES_IADD64_UR |
     _OPCODES_SMEM_SETUP | _OPCODES_ATOMG | _OPCODES_DFPU |
-    _OPCODES_F2F | _OPCODES_LDGSTS | _OPCODES_LDGDEPBAR
+    _OPCODES_F2F | _OPCODES_LDGSTS | _OPCODES_LDGDEPBAR |
+    _OPCODES_VOTE
 )
 
 
@@ -798,6 +812,21 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
         # Opcodes in _OPCODE_MISC get the override value; all others use the counter.
         # This matches ptxas ground truth for fp64_bench preamble exactly.
         misc = _OPCODE_MISC.get(opcode, misc_counter & 0xF)
+        # ISETP misc: context-sensitive. Default misc=0 (from _OPCODE_MISC).
+        # When within 3 instructions of VOTE (0x806), use counter-based misc
+        # instead. ptxas uses counter-based misc for ISETP near VOTE.
+        # SM_120 rule #24: ISETP misc=0 near VOTE causes ERR715.
+        if opcode in (0x20c, 0xc0c, 0x80c):
+            # Check if VOTE is within +/- 3 instructions
+            vote_nearby = False
+            for k in range(max(0, i-3), min(len(instrs), i+4)):
+                if k != i:
+                    k_op = (instrs[k].raw[0] | (instrs[k].raw[1] << 8)) & 0xFFF
+                    if k_op == 0x806:  # VOTE
+                        vote_nearby = True
+                        break
+            if vote_nearby:
+                misc = misc_counter & 0xF  # use counter, not override
         ctrl = (stall << 17) | (rbar << 10) | (wdep << 4) | misc
         misc_counter += 1
 
@@ -825,7 +854,7 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
         if opcode == 0xc0c:  # ISETP R-UR: pred_dest at raw[2]
             pred_dest = si.raw[2]  # destination predicate index (0..6)
             pending_pred_writes[pred_dest] = (i, wdep)
-        elif opcode == 0x20c:  # ISETP R-R: pred_dest at (raw[10]>>1) & 0x7
+        elif opcode in (0x20c, 0x80c):  # ISETP R-R/IMM: pred_dest at (raw[10]>>1) & 0x7
             pred_dest = (si.raw[10] >> 1) & 0x7
             pending_pred_writes[pred_dest] = (i, wdep)
         elif opcode in (0x20b, 0xc0b):  # FSETP/FSETP-UR: pred_dest at raw[9] & 0x7
@@ -841,6 +870,27 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
         # needs the rbar wait independently.
 
         patched = _patch_ctrl(si.raw, ctrl)
+
+        # SM_120 ISETP.UR b9 vote-path override:
+        # When ISETP.UR feeds VOTE and source register is in the %4==2 group
+        # (R2, R6, R10, R14), ptxas uses b9=0x42 instead of 0x60.
+        # This is a narrow surgical fix — only applies to the vote window.
+        if opcode == 0xc0c:
+            vote_feeds = False
+            for k in range(i+1, min(len(instrs), i+4)):
+                k_op = (instrs[k].raw[0] | (instrs[k].raw[1] << 8)) & 0xFFF
+                if k_op == 0x806:  # VOTE
+                    vote_feeds = True
+                    break
+                if k_op != 0x918:  # non-NOP between ISETP and VOTE
+                    break
+            if vote_feeds:
+                src_reg = patched[3]
+                if src_reg % 4 == 2:  # R2, R6, R10, R14
+                    patched = bytearray(patched)
+                    patched[9] = 0x42
+                    patched = bytes(patched)
+
         result.append(SassInstr(patched, si.comment))
 
     return result

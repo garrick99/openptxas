@@ -535,8 +535,6 @@ def _fill_ldcu_latency(instrs: list[SassInstr]) -> list[SassInstr]:
                 if oj == 0x7ac and result[j].raw[9] == 0x0a:
                     ldcu_pos = j
                     break
-                if oj in _UR_CONSUMER_OPCODES:
-                    break
             if ldcu_pos >= 0:
                 # Find the consumer IADD.64 after this NOP
                 consumer_pos = -1

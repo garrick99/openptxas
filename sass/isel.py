@@ -1558,7 +1558,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 # exhausted (5+ params), reuse UR4 for S2UR. The
                                 # IMAD that reads this UR executes before the mem
                                 # desc LDCU.64 overwrites UR4 (ptxas does this too).
-                                if ctx._next_ur >= 14:
+                                if ctx._next_ur >= 12:
                                     ur_ctaid = 4  # reuse UR4 (consumed before mem desc)
                                 else:
                                     ur_ctaid = ctx._next_ur; ctx._next_ur += 1
@@ -2401,6 +2401,23 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
 
                 elif op == 'ret':
                     output.append(SassInstr(encode_exit(ctrl=0x7f5), 'EXIT'))
+                    # Flush deferred params right after predicated EXIT
+                    if instr.pred:
+                        deferred = getattr(ctx, '_deferred_ur_params', {})
+                        if deferred:
+                            first_d = True
+                            for dpname, dpoff in list(deferred.items()):
+                                dur = ctx._next_ur
+                                if dur % 2 != 0: dur += 1
+                                ctx._next_ur = dur + 2
+                                draw = bytearray(encode_ldcu_64(dur, 0, dpoff))
+                                if first_d:
+                                    draw[9] = 0x0c  # Rule #29
+                                    first_d = False
+                                output.append(SassInstr(bytes(draw),
+                                    f'LDCU.64 UR{dur}, c[0][0x{dpoff:x}]  // post-EXIT deferred'))
+                                ctx._ur_params[dpname] = dur
+                            deferred.clear()
 
                 elif op == 'bra':
                     from ptx.ir import LabelOp
@@ -2430,6 +2447,25 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             pred_str = f'@{"!" if neg else ""}P{pd} '
                             output.append(SassInstr(exit_raw,
                                                     f'{pred_str}EXIT  // early exit (idle threads)'))
+                            # Flush deferred params: emit LDCU.64 right after EXIT.
+                            # Use UR indices starting at ctx._next_ur (post-EXIT,
+                            # UR pressure is lower because exited threads freed slots).
+                            deferred = getattr(ctx, '_deferred_ur_params', {})
+                            if deferred:
+                                first = True
+                                for pname, poff in list(deferred.items()):
+                                    ur_tmp = ctx._next_ur
+                                    if ur_tmp % 2 != 0:
+                                        ur_tmp += 1
+                                    ctx._next_ur = ur_tmp + 2
+                                    raw = bytearray(encode_ldcu_64(ur_tmp, 0, poff))
+                                    if first:
+                                        raw[9] = 0x0c  # Rule #29: first post-EXIT
+                                        first = False
+                                    output.append(SassInstr(bytes(raw),
+                                        f'LDCU.64 UR{ur_tmp}, c[0][0x{poff:x}]  // post-EXIT deferred'))
+                                    ctx._ur_params[pname] = ur_tmp
+                                deferred.clear()
                             continue
 
                     # Unconditional BRA to ret-only block → EXIT
@@ -2459,6 +2495,22 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                     exit_raw = patch_pred(encode_exit(), pred=prev_pred, neg=False)
                                     output.append(SassInstr(exit_raw,
                                                             f'@P{prev_pred} EXIT  // bounds check'))
+                                    # Flush deferred params right after EXIT
+                                    deferred = getattr(ctx, '_deferred_ur_params', {})
+                                    if deferred:
+                                        first_d = True
+                                        for dpname, dpoff in list(deferred.items()):
+                                            dur = ctx._next_ur
+                                            if dur % 2 != 0: dur += 1
+                                            ctx._next_ur = dur + 2
+                                            draw = bytearray(encode_ldcu_64(dur, 0, dpoff))
+                                            if first_d:
+                                                draw[9] = 0x0c  # Rule #29
+                                                first_d = False
+                                            output.append(SassInstr(bytes(draw),
+                                                f'LDCU.64 UR{dur}, c[0][0x{dpoff:x}]  // post-EXIT'))
+                                            ctx._ur_params[dpname] = dur
+                                        deferred.clear()
                                     continue
                             # No peephole match — emit plain EXIT
                             output.append(SassInstr(encode_exit(),
@@ -2992,7 +3044,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             emit_pd = 0
                                             ctx.ra.pred_regs[pred.name] = 0
                                         # SM_120: keep UR < 14. Reuse UR5 when exhausted.
-                                        if ctx._next_ur >= 14:
+                                        if ctx._next_ur >= 12:
                                             ur_tmp = 5  # reuse UR5 (consumed by ISETP immediately)
                                         else:
                                             ur_tmp = ctx._next_ur

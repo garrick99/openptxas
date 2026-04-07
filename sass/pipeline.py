@@ -1013,6 +1013,9 @@ def compile_function(fn: Function, verbose: bool = False,
 
     _final_gprs = max(alloc.num_gprs, ctx._next_gpr,
                       getattr(ctx, '_scratch_highwater', 0))
+    # Use actual UR count from isel (may be less than regalloc's estimate
+    # because deferred params use fewer URs than pre-allocated).
+    alloc.num_uniform = ctx._next_ur
     if verbose:
         print(f"[pipeline] final num_gprs: alloc={alloc.num_gprs} ctx._next_gpr={ctx._next_gpr} "
               f"highwater={getattr(ctx, '_scratch_highwater', 0)} -> {_final_gprs}")
@@ -1038,6 +1041,7 @@ def compile_function(fn: Function, verbose: bool = False,
         exit_offset=exit_offset,
         s2r_offset=s2r_offset,
         smem_size=smem_size,
+        num_uniform=alloc.num_uniform,
         # Pass ptxas capmerc to emitter for ELF section sizing — UNLESS our kernel
         # needs more GPRs than ptxas's (high-register kernel). In that case use
         # None so the emitter calls build_capmerc_from_sass with 0x2000 capability

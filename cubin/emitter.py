@@ -116,18 +116,18 @@ def _patch_cuinfo_sm(sm_version: int) -> bytes:
     return bytes(buf)
 
 
-def _build_nv_info_global(num_gprs: int = 16):
-    # EIATTR_REGCOUNT (0x2f): must be at least the actual register count so that
-    # R16+ instructions are not rejected as out-of-range by the driver.
-    # Previously hard-coded to 0x10 (16), which caused ERR_ILLEGAL_INSTRUCTION
-    # for kernels that use addr-scratch registers R16..R17.
+def _build_nv_info_global(num_gprs: int = 16, num_uniform: int = 14):
+    # EIATTR_REGCOUNT (0x2f): GPR count at offset 4, UR count at offset 8.
+    # Both must be at least the actual usage to avoid ILLEGAL_INSTRUCTION.
     rc = max(num_gprs, 16)  # minimum 16 per SM_120 hardware requirement
+    ur = max(num_uniform, 8)  # minimum 8 URs
     buf = bytearray(bytes.fromhex(
         '042f08000800000010000000'
         '041108000800000000000000'
         '041208000800000000000000'
     ))
     buf[8] = rc & 0xFF
+    buf[12] = ur & 0xFF
     return bytes(buf)
 
 
@@ -384,6 +384,7 @@ class KernelDesc:
     exit_offset: int = 0x10  # byte offset of EXIT instruction in .text
     s2r_offset: int = 0x10  # byte offset of first S2R instruction in .text
     smem_size: int = 0           # static shared memory size in bytes (0 = none)
+    num_uniform: int = 14        # uniform register count for EIATTR 0x2f
     sm_version: int = 120        # 89 (Ada) or 120 (Blackwell)
     ptxas_capmerc: bytes | None = None    # capmerc from ptxas (overrides generated)
     ptxas_merc_info: bytes | None = None  # merc.nv.info from ptxas (overrides generated)
@@ -558,7 +559,7 @@ def emit_cubin(kernel: KernelDesc) -> bytes:
         symtab_data,                 # 3
         _NOTE_TKINFO,                # 4
         _patch_cuinfo_sm(kernel.sm_version),  # 5
-        _build_nv_info_global(num_gprs=kernel.num_gprs),  # 6
+        _build_nv_info_global(num_gprs=kernel.num_gprs, num_uniform=kernel.num_uniform),  # 6
         _build_nv_compat(),          # 7
         _build_nv_info_kernel(num_gprs=kernel.num_gprs, num_params=kernel.num_params,
                               param_sizes=kernel.param_sizes, exit_offsets=exit_offsets,
@@ -607,7 +608,7 @@ def emit_cubin(kernel: KernelDesc) -> bytes:
     section_datas.extend([
         const0_data,
         capmerc_data,
-        _build_nv_info_global(num_gprs=kernel.num_gprs),
+        _build_nv_info_global(num_gprs=kernel.num_gprs, num_uniform=kernel.num_uniform),
         merc_info_data,
         merc_symtab_data,
     ])

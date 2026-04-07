@@ -156,13 +156,20 @@ def _nop(comment: str = '') -> SassInstr:
     return SassInstr(encode_nop(), comment or 'NOP')
 
 
-def _emit_ur_to_gpr(dest: int, ur_idx: int, comment: str = '') -> list[SassInstr]:
+def _emit_ur_to_gpr(dest: int, ur_idx: int, comment: str = '',
+                    ctx: 'ISelContext' = None) -> list[SassInstr]:
     """Materialize a UR pair into a GPR pair.
 
     SM_120 rule #27: IADD.64 R-UR with RZ as src_r is broken (causes 715/719).
     Workaround: zero the dest pair first (IADD3 + IADD3.X), then add UR
     via IADD.64 R-UR with the zeroed dest as src_r (not RZ).
+
+    Frees the UR pair for reuse (SM_120 rule: keep max UR < 14).
     """
+    # Don't free UR here — the IADD.64-UR reads the UR value, and a
+    # subsequent LDCU.64 reusing the same UR would overwrite it before
+    # the hardware pipeline reads it. URs are freed at _select_add_u64
+    # where the value has been fully consumed into GPRs.
     return [
         SassInstr(encode_iadd3(dest, RZ, RZ, RZ),
                   f'IADD3 R{dest}, RZ, RZ, RZ  // zero lo for UR->GPR'),
@@ -689,6 +696,7 @@ def _select_add_u64(instr: Instruction, ra: RegAlloc,
             ra.int_regs[dest.name] = d_lo
         if ctx:
             ctx._gpr_written.add(dest.name)
+            pass  # UR free disabled (causes hazard)
         return [
             SassInstr(encode_iadd64_ur(d_lo, r_lo, ur_idx),
                       f'IADD.64 R{d_lo}, R{r_lo}, UR{ur_idx}  // add.u64 (UR base)'),
@@ -778,13 +786,25 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
 
     if typ in ('u64', 's64', 'b64'):
         # Load 64-bit param into UR via LDCU.64, materialize to GPR via IADD.64-UR.
-        # Avoids LDC.64 single-slot scoreboard collision for 3+ pointer params.
+        # SM_120 rule: max 3 simultaneous LDCU.64 params (UR6-UR11).
+        # 4+ pointer params cause 715 due to UR liveness pressure.
+        # Fall back to LDC pair (GPR) for the 4th+ param.
         ur_idx = ctx._next_ur if ctx else 6
+        if ctx and ur_idx >= 12 and ctx.sm_version == 120:
+            # UR exhausted — use LDC pair into GPRs instead
+            dr = ctx.ra.lo(dest.name)
+            ctx._gpr_written.add(dest.name)  # mark as GPR-backed
+            return [
+                SassInstr(encode_ldc(dr, 0, byte_off),
+                          f'LDC R{dr}, c[0][0x{byte_off:x}]  // {param_name} (lo, GPR fallback)'),
+                SassInstr(encode_ldc(dr + 1, 0, byte_off + 4),
+                          f'LDC R{dr+1}, c[0][0x{byte_off + 4:x}]  // {param_name} (hi, GPR fallback)'),
+            ]
         if ctx:
             if ur_idx % 2 != 0:  # LDCU.64 requires even-aligned UR
                 ur_idx += 1
                 ctx._next_ur = ur_idx
-            ctx._next_ur += 2
+            ctx._next_ur = ur_idx + 2
             ctx._ur_params[dest.name] = ur_idx
         # Just load into UR — address computation (IADD.64 Roffset + UR)
         # is done at the point of use (ld.global / st.global), matching ptxas.
@@ -1146,6 +1166,7 @@ class ISelContext:
     label_map:     dict[str, int] = field(default_factory=dict)
     # Next available uniform register for LDCU param loading (UR6+)
     _next_ur:      int = 6  # UR4 = mem desc, UR6+ for params
+    _ur_free:      list = field(default_factory=list)  # freed UR pairs for reuse
     # Map PTX register name → UR index (for params loaded via LDCU)
     _ur_params:    dict[str, int] = field(default_factory=dict)
     # Map PTX register name → param byte offset (for setp LDCU fallback)
@@ -1485,7 +1506,14 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 # descriptor LDCU overwrites UR4 before IMAD finishes reading it.
                                 sr_code = _SPECIAL_REGS[instr.srcs[0].name]
                                 sr_label = instr.srcs[0].name.lstrip('%').replace('.', '_').upper()
-                                ur_ctaid = ctx._next_ur; ctx._next_ur += 1
+                                # SM_120 rule: keep UR max < 14. When UR space is
+                                # exhausted (5+ params), reuse UR4 for S2UR. The
+                                # IMAD that reads this UR executes before the mem
+                                # desc LDCU.64 overwrites UR4 (ptxas does this too).
+                                if ctx._next_ur >= 12:
+                                    ur_ctaid = 4  # reuse UR4 (consumed before mem desc)
+                                else:
+                                    ur_ctaid = ctx._next_ur; ctx._next_ur += 1
                                 ctx._ur_for_param[instr.dest.name] = ur_ctaid
                                 output.append(SassInstr(encode_s2ur(ur_ctaid, sr_code),
                                                         f'S2UR UR{ur_ctaid}, SR_{sr_label}  // {instr.dest.name} = {instr.srcs[0].name.lstrip("%")}'))
@@ -2915,8 +2943,12 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                         if pd > 0 and ctx:
                                             emit_pd = 0
                                             ctx.ra.pred_regs[pred.name] = 0
-                                        ur_tmp = ctx._next_ur
-                                        ctx._next_ur += 1
+                                        # SM_120: keep UR < 14. Reuse UR5 when exhausted.
+                                        if ctx._next_ur >= 12:
+                                            ur_tmp = 5  # reuse UR5 (consumed by ISETP immediately)
+                                        else:
+                                            ur_tmp = ctx._next_ur
+                                            ctx._next_ur += 1
                                         output.append(SassInstr(
                                             encode_ldcu_32(ur_tmp, 0, b_param_off),
                                             f'LDCU.32 UR{ur_tmp}, c[0][0x{b_param_off:x}]  // setp src'))

@@ -1558,7 +1558,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 # exhausted (5+ params), reuse UR4 for S2UR. The
                                 # IMAD that reads this UR executes before the mem
                                 # desc LDCU.64 overwrites UR4 (ptxas does this too).
-                                if ctx._next_ur >= 12:
+                                if ctx._next_ur >= 14:
                                     ur_ctaid = 4  # reuse UR4 (consumed before mem desc)
                                 else:
                                     ur_ctaid = ctx._next_ur; ctx._next_ur += 1
@@ -3044,7 +3044,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             emit_pd = 0
                                             ctx.ra.pred_regs[pred.name] = 0
                                         # SM_120: keep UR < 14. Reuse UR5 when exhausted.
-                                        if ctx._next_ur >= 12:
+                                        if ctx._next_ur >= 14:
                                             ur_tmp = 5  # reuse UR5 (consumed by ISETP immediately)
                                         else:
                                             ur_tmp = ctx._next_ur

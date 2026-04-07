@@ -1013,9 +1013,8 @@ def compile_function(fn: Function, verbose: bool = False,
 
     _final_gprs = max(alloc.num_gprs, ctx._next_gpr,
                       getattr(ctx, '_scratch_highwater', 0))
-    # Use actual UR count from isel (may be less than regalloc's estimate
-    # because deferred params use fewer URs than pre-allocated).
-    alloc.num_uniform = ctx._next_ur
+    # Update uniform register count: use max of regalloc and isel
+    alloc.num_uniform = max(alloc.num_uniform, ctx._next_ur)
     if verbose:
         print(f"[pipeline] final num_gprs: alloc={alloc.num_gprs} ctx._next_gpr={ctx._next_gpr} "
               f"highwater={getattr(ctx, '_scratch_highwater', 0)} -> {_final_gprs}")

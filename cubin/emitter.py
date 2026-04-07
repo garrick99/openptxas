@@ -120,14 +120,13 @@ def _build_nv_info_global(num_gprs: int = 16, num_uniform: int = 14):
     # EIATTR_REGCOUNT (0x2f): GPR count at offset 4, UR count at offset 8.
     # Both must be at least the actual usage to avoid ILLEGAL_INSTRUCTION.
     rc = max(num_gprs, 16)  # minimum 16 per SM_120 hardware requirement
-    ur = max(num_uniform, 8)  # minimum 8 URs
+    ur = max(num_uniform, 16)  # minimum 8 URs
     buf = bytearray(bytes.fromhex(
         '042f08000800000010000000'
         '041108000800000000000000'
         '041208000800000000000000'
     ))
     buf[8] = rc & 0xFF
-    buf[12] = ur & 0xFF
     return bytes(buf)
 
 

@@ -158,25 +158,15 @@ def _nop(comment: str = '') -> SassInstr:
 
 def _emit_ur_to_gpr(dest: int, ur_idx: int, comment: str = '',
                     ctx: 'ISelContext' = None) -> list[SassInstr]:
-    """Materialize a UR pair into a GPR pair.
+    """Materialize a UR pair into a GPR pair via IADD.64 R, RZ, UR.
 
-    SM_120 rule #27: IADD.64 R-UR with RZ as src_r is broken (causes 715/719).
-    Workaround: zero the dest pair first (IADD3 + IADD3.X), then add UR
-    via IADD.64 R-UR with the zeroed dest as src_r (not RZ).
-
-    Frees the UR pair for reuse (SM_120 rule: keep max UR < 14).
+    SM_120 rule #27 (OBSOLETE): IADD.64 R-UR with RZ as src_r was
+    reported broken, but hardware testing (v1.8, driver 595.79) confirms
+    IADD.64 R, RZ, UR works correctly. ptxas uses this form.
     """
-    # Don't free UR here — the IADD.64-UR reads the UR value, and a
-    # subsequent LDCU.64 reusing the same UR would overwrite it before
-    # the hardware pipeline reads it. URs are freed at _select_add_u64
-    # where the value has been fully consumed into GPRs.
     return [
-        SassInstr(encode_iadd3(dest, RZ, RZ, RZ),
-                  f'IADD3 R{dest}, RZ, RZ, RZ  // zero lo for UR->GPR'),
-        SassInstr(encode_iadd3(dest + 1, RZ, RZ, RZ),
-                  f'IADD3 R{dest+1}, RZ, RZ, RZ  // zero hi for UR->GPR'),
-        SassInstr(encode_iadd64_ur(dest, dest, ur_idx),
-                  f'IADD.64 R{dest}, R{dest}, UR{ur_idx}  // {comment or "UR->GPR"}'),
+        SassInstr(encode_iadd64_ur(dest, RZ, ur_idx),
+                  f'IADD.64 R{dest}, RZ, UR{ur_idx}  // {comment or "UR->GPR"}'),
     ]
 
 

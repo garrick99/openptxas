@@ -819,7 +819,7 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
         # 4+ pointer params cause 715 due to UR liveness pressure.
         # Fall back to LDC pair (GPR) for the 4th+ param.
         ur_idx = ctx._next_ur if ctx else 6
-        if ctx and ur_idx >= 10 and ctx.sm_version == 120:
+        if ctx and ur_idx >= 8 and ctx.sm_version == 120:
             # SM_120 rule #30: max 2 LDCU.64 params in preamble (ptxas pattern).
             # 3rd+ param loaded via LDC pair into GPR.
             dr = ctx.ra.lo(dest.name)

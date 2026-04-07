@@ -288,8 +288,10 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
                 continue
             if name in cbuf_only_regs:
                 continue  # SM_89: skip GPR for cbuf-inline params
-            if name in ur_only_f64_regs:
-                continue  # SM_120: skip GPR for UR-loaded f64 params
+            # Don't skip GPR for UR-loaded params — the isel's LDC fallback
+            # for 3rd+ params needs GPRs even for UR-declared params.
+            # if name in ur_only_f64_regs:
+            #     continue
             first = reg_first_def.get(name, 0)
             last = reg_last_use.get(name, len(all_instrs))
             reg_info.append((name, is_64, first, last))

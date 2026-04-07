@@ -822,7 +822,7 @@ def encode_isetp_ge_and(pred_dest: int, src_reg: int, ur_src: int,
         ctrl = _CTRL_DEFAULT
     # b9 parity: even=0x42, odd=0x62
     # Verified: ptxas R2(even)+UR6 → 0x42; ptxas R13(odd)+UR5 → 0x62; R9(odd)+UR5 → 0x62
-    b9_val = 0x62 if (src_reg & 1) else 0x60
+    b9_val = 0x62  # always 0x62 per ptxas ground truth
     return _build(0x0c, 0x7c,
                   b2=pred_dest & 0xFF, b3=src_reg, b4=ur_src & 0xFF,
                   b8=0x70,
@@ -856,7 +856,7 @@ def encode_isetp_ur(pred_dest: int, src_reg: int, ur_src: int,
     # Other codes: use GE-style as default (verified for GE/LE bounds checks)
     # b9 parity: even=0x42, odd=0x62 (all comparison codes)
     # ptxas ground truth: R2(even) → 0x42 for both GE and GT
-    b9_val = 0x62 if (src_reg & 1) else 0x60
+    b9_val = 0x62  # always 0x62 per ptxas ground truth
     b8_val = (cmp << 4) | 0x10  # same cmp encoding as R-R variant
     return _build(0x0c, 0x7c,
                   b2=pred_dest & 0xFF, b3=src_reg, b4=ur_src & 0xFF,

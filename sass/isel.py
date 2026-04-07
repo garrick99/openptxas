@@ -3694,6 +3694,15 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     d = ctx.ra.r32(instr.dest.name)
                     a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     b = _materialize_imm(instr.srcs[1], ctx, ctx.ra, output)
+                    # Use RZ for known-zero operand (e.g., relu: max(x, 0))
+                    if hasattr(ctx, '_zero_regs') and b in ctx._zero_regs:
+                        if output and f'R{b}, RZ, 0x0, RZ' in output[-1].comment:
+                            output.pop()
+                        b = RZ
+                    elif hasattr(ctx, '_zero_regs') and a in ctx._zero_regs:
+                        if output and f'R{a}, RZ, 0x0, RZ' in output[-1].comment:
+                            output.pop()
+                        a = RZ
                     output.append(SassInstr(encode_fmnmx(d, a, b, is_max=True),
                                             f'FMNMX R{d}, R{a}, R{b}, !PT  // max.f32'))
 

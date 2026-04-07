@@ -942,6 +942,23 @@ def compile_function(fn: Function, verbose: bool = False,
         for i, si in enumerate(sass_instrs):
             print(f"  +{i*16:4d}: {si.hex()}  // {si.comment}")
 
+    # SM_120 rule #29: the first LDCU.64 param load after @P0 EXIT must use
+    # b9=0x0c (not 0x0a). ptxas uses this encoding. Without it, post-EXIT
+    # param loads cause 715.
+    if sm_version >= 120:
+        found_exit = False
+        for i, si in enumerate(sass_instrs):
+            opc = (si.raw[0] | (si.raw[1] << 8)) & 0xFFF
+            guard = (si.raw[1] >> 4) & 0xF
+            if opc == 0x94d and guard != 7:  # predicated EXIT
+                found_exit = True
+            if found_exit and opc == 0x7ac and si.raw[9] == 0x0a:
+                if si.raw[5] >= 0x70:  # param load (not descriptor)
+                    patched = bytearray(si.raw)
+                    patched[9] = 0x0c
+                    sass_instrs[i] = SassInstr(bytes(patched), si.comment + ' [b9=0x0c]')
+                    break
+
     # 3. Concatenate SASS bytes
     sass_bytes = b''.join(si.raw for si in sass_instrs)
 

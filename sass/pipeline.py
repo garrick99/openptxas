@@ -679,6 +679,35 @@ def compile_function(fn: Function, verbose: bool = False,
     # if-conversion + deferred params handle this correctly.
     ctx._has_vote = False
 
+    # Pre-scan: identify u32 params consumed ONLY by setp.
+    # These don't need a GPR LDC — setp handler emits LDCU.32 directly.
+    # Only safe for non-divergent kernels (no if-converted branches).
+    _setp_only_params = set()
+    _has_if_converted = any(
+        inst.pred and inst.op in ('ld', 'st')
+        for bb in fn.blocks for inst in bb.instructions
+    )
+    if sm_version >= 120 and not _has_if_converted:
+        _ld_param_dests = {}
+        for bb in fn.blocks:
+            for inst in bb.instructions:
+                if inst.op == 'ld' and 'param' in inst.types and inst.dest:
+                    typ = inst.types[-1] if inst.types else ''
+                    if typ in ('u32', 's32', 'b32'):
+                        _ld_param_dests[inst.dest.name] = True
+        for pname in list(_ld_param_dests):
+            uses = []
+            for bb in fn.blocks:
+                for inst in bb.instructions:
+                    if inst.op == 'ld' and inst.dest and inst.dest.name == pname:
+                        continue
+                    if any(getattr(s, 'name', None) == pname for s in (inst.srcs or [])):
+                        uses.append(inst.op)
+            if uses and all(op == 'setp' for op in uses):
+                _setp_only_params.add(pname)
+        if _setp_only_params:
+            ctx._setp_only_params = _setp_only_params
+
     body_instrs = select_function(fn, ctx)
 
     # SM_120 requires at least one S2R before LDCU param loads.

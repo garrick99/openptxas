@@ -571,6 +571,7 @@ def schedule(instrs: list[SassInstr]) -> list[SassInstr]:
     instrs = _hoist_ldcu64(instrs)
     instrs = _enforce_gpr_latency(instrs)
     instrs = _fill_ldcu_latency(instrs)
+    instrs = _enforce_gpr_latency(instrs)  # re-check after fill reordering
     # Skip LDG latency NOPs — rely on ctrl wdep for LDG (ptxas pattern)
     # instrs = _reorder_after_ldg(instrs)
 

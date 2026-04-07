@@ -884,6 +884,13 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
             return []
         d = ra.r32(dest.name)
 
+        # Skip LDC for u32 params consumed only by setp —
+        # the setp handler emits LDCU.32 directly into a UR.
+        # Still record _reg_param_off so the setp handler can find the offset.
+        if ctx and dest.name in getattr(ctx, '_setp_only_params', set()):
+            ctx._reg_param_off[dest.name] = byte_off
+            return []
+
         # SM_120 rule #25: body LDC (0xb82) causes ERR715 in kernels
         # with VOTE+LDG. ptxas loads scalar params via LDCU.64 instead.
         _has_vote_fn = getattr(ctx, '_has_vote', False) if ctx else False

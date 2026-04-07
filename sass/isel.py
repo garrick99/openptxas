@@ -440,7 +440,8 @@ def _select_mov(instr: Instruction, ra: RegAlloc,
 
 
 def _select_shl_b64(instr: Instruction, ra: RegAlloc,
-                    ctx: 'ISelContext' = None) -> list[SassInstr]:
+                    ctx: 'ISelContext' = None,
+                    output: list = None) -> list[SassInstr]:
     """
     shl.b64 dest, src, K → SHF.L.U32 (lo) + SHF.L.U64.HI (hi).
 
@@ -456,6 +457,27 @@ def _select_shl_b64(instr: Instruction, ra: RegAlloc,
     k = _get_imm(k_op)
     d_lo = ra.lo(dest.name); d_hi = d_lo + 1
     s_lo = ra.lo(src.name);  s_hi = s_lo + 1
+
+    # IMAD.WIDE fusion: if source was cvt.u64.u32, the hi word is zero.
+    # Use IMAD.WIDE to compute both lo and hi in one instruction:
+    #   (dest, dest+1) = src32 * (1<<K) + RZ
+    # This replaces MOV+MOV+IMAD.SHL+SHF with a single wide multiply.
+    if (ctx and k < 32 and k <= 7
+            and hasattr(ctx, '_cvt_src_map') and src.name in ctx._cvt_src_map):
+        src32 = ctx._cvt_src_map[src.name]
+        from sass.encoding.sm_120_opcodes import encode_imad_wide
+        # Remove the dead MOV+MOV from cvt.u64.u32 (they're the last 1-2 instrs)
+        if output is not None:
+            # Remove trailing MOV hi=0
+            if output and 'cvt.64.32 hi=0' in output[-1].comment:
+                output.pop()
+            # Remove trailing MOV lo copy (if present)
+            if output and 'cvt.64.32 lo' in output[-1].comment:
+                output.pop()
+        return [
+            SassInstr(encode_imad_wide(d_lo, src32, 1 << k, RZ),
+                      f'IMAD.WIDE R{d_lo}, R{src32}, {1<<k:#x}, RZ  // LEA: ({dest.name}.lo,hi) = {src.name} * {1<<k}'),
+        ]
 
     if k < 32 and k <= 15:
         # Use IMAD.SHL for lo (avoids SHF.L/SHF.R pipeline conflicts)
@@ -1677,7 +1699,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     output.extend(_select_mov(instr, ctx.ra, ctx))
 
                 elif op == 'shl' and typ in ('b64', 'u64', 's64'):
-                    output.extend(_select_shl_b64(instr, ctx.ra))
+                    output.extend(_select_shl_b64(instr, ctx.ra, ctx, output))
 
                 elif op == 'shl' and typ in ('b32', 'u32', 's32'):
                     # 32-bit shift left: IMAD.SHL or SHF.L.U32 for constants,
@@ -2677,6 +2699,10 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             if not hasattr(ctx, '_zero_regs'):
                                 ctx._zero_regs = set()
                             ctx._zero_regs.add(d_lo+1)
+                            # Record 32-bit source for IMAD.WIDE fusion
+                            if not hasattr(ctx, '_cvt_src_map'):
+                                ctx._cvt_src_map = {}
+                            ctx._cvt_src_map[d.name] = s_r
                             if d_lo != s_r:
                                 output.append(SassInstr(encode_iadd3(d_lo, s_r, RZ, RZ),
                                                         f'MOV R{d_lo}, R{s_r}  // cvt.64.32 lo'))

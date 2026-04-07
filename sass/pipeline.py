@@ -662,10 +662,10 @@ def compile_function(fn: Function, verbose: bool = False,
         for bb in fn.blocks
         for inst in bb.instructions
     )
-    # Fallback for: LDG + (sync, complex CF+STG, 5+ params+STG, or atomics)
+    # Fallback for: LDG + (sync, complex CF+STG, or atomics)
+    # 5+ param kernels now work natively via LDC fallback for 2nd+ pointer params
     ctx._has_vote = _has_ldg and (
-        _has_sync or (_has_complex_cf and _has_stg)
-        or (_has_stg and _n_params >= 5) or _has_atom
+        _has_sync or (_has_complex_cf and _has_stg) or _has_atom
     )
 
     body_instrs = select_function(fn, ctx)

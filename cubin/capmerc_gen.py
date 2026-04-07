@@ -623,31 +623,26 @@ def build_capmerc(
             num_barrier_regions=num_barrier_regions, text_size=text_size)
 
         if has_ldg and (has_isetp or has_branch):
-            # PTXAS-VERIFIED 166-BYTE STRUCTURE for LDG+VOTE/SETP kernels:
-            # LDG requires an additional barrier record + marker.
-            buf = bytearray(166)
+            # PTXAS-VERIFIED 170-BYTE STRUCTURE for LDG+ISETP+branch kernels.
+            # Bounds-check kernels have TWO barrier regions:
+            #   1. Pre-EXIT region (0x42 variant) — covers preamble + bounds check
+            #   2. Body region (0x62 variant) — covers post-EXIT computation
+            # Ground truth: ptxas ldg_isetp_br kernel (384B text, 15 GPRs).
+            buf = bytearray(170)
             buf[0:8] = CAPMERC_MAGIC
             buf[8] = num_gprs
             struct.pack_into('<I', buf, 12, cap_mask)
             buf[16:32]  = bytes.fromhex('010b040af80004000000410000040000')  # type-01 prologue
-            # Type-01 ALU: bytes 37-38 change with text size
-            # 384B: 0x01,0x00  512B+: 0x41,0x01
-            text_pages_alu = max(text_size // 256, 1)
-            if text_pages_alu > 1:
-                buf[32:48] = bytes.fromhex('010b040af80004000000410101020000')
-            else:
-                buf[32:48] = bytes.fromhex('010b040af80004000000010001020000')
-            buf[48:64]  = bytes.fromhex('02220806fa0052000000830140000200')  # type-02 barrier
-            buf[64:80]  = bytes.fromhex('00000000000000000000000008000000')
-            buf[80:96]  = bytes.fromhex('010b0e0afa0005000000030139040000')  # type-01 STG
-            buf[96:100] = bytes.fromhex('410c5404')                          # page marker
-            buf[100:116] = bytes.fromhex('02220e06f80052000000830040000200')  # type-02 barrier (LDG page)
-            buf[116:132] = bytes.fromhex('00000000000000000000000000000000')
-            buf[132:148] = bytes.fromhex('02380e32f80040110000000082000a00')  # terminal
-            buf[148:164] = bytes.fromhex('000201400100000000000000000000')
-            buf[148] = 0x00; buf[149] = 0x02; buf[150] = 0x01; buf[151] = 0x40
-            buf[152] = 0x01  # text_size hint
-            buf[164:166] = trailer
+            buf[32:48]  = bytes.fromhex('010b040af80004000000810001020000')  # type-01 ALU
+            buf[48:64]  = bytes.fromhex('02220806fa0042000000010140000200')  # type-02 barrier (pre-EXIT, 0x42)
+            buf[64:80]  = bytes.fromhex('00000000000000000000000010000000')  # zeros + EXIT boundary marker
+            buf[80:96]  = bytes.fromhex('02220806fa0062000000070240000200')  # type-02 barrier (body, 0x62)
+            buf[96:112] = bytes.fromhex('00000000000000000000000000000000')  # zeros
+            buf[112:128] = bytes.fromhex('010b0e0afa0005000000030139040000')  # type-01 STG
+            buf[128:144] = bytes.fromhex('410c5404410c540402380e32f8004011')  # markers + terminal
+            buf[144:160] = bytes.fromhex('0000000082000a000002014001000000')  # terminal continuation
+            buf[160:168] = bytes.fromhex('0000000000000000')                  # padding
+            buf[168:170] = b'\x50\x05'  # trailer (ISETP+branch class)
             return bytes(buf)
 
         # PTXAS-VERIFIED 138-BYTE STRUCTURE for non-LDG kernels:

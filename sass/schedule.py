@@ -194,10 +194,13 @@ def _hoist_ldcu64(instrs: list[SassInstr]) -> list[SassInstr]:
     post_boundary = instrs[boundary_idx:]
 
     # --- Pre-boundary: hoist LDCU.64s to position 1 ---
+    # Skip deferred-param LDCU.64s — they must stay at their point of use
+    # (inline LDCU.64 UR6 + IADD.64 pairs emitted by deferred param handling).
     ldcu64s: list[SassInstr] = []
     remaining: list[SassInstr] = []
     for si in pre_boundary:
-        if _get_opcode(si.raw) == 0x7ac and si.raw[9] == 0x0a:
+        if (_get_opcode(si.raw) == 0x7ac and si.raw[9] == 0x0a
+                and 'deferred' not in si.comment):
             ldcu64s.append(si)
         else:
             remaining.append(si)
@@ -273,6 +276,28 @@ def _hoist_ldcu64(instrs: list[SassInstr]) -> list[SassInstr]:
                 for _ in range(3):
                     padded_post.append(SassInstr(_encode_nop(), 'NOP  // LDCU.64 latency'))
     post_boundary = padded_post
+
+    # Inline deferred LDCU.64s (in pre_result) also need latency padding.
+    # These were kept in-place (not hoisted) and may be adjacent to their consumer.
+    padded_pre = []
+    for idx, si in enumerate(pre_result):
+        padded_pre.append(si)
+        if (_get_opcode(si.raw) == 0x7ac and si.raw[9] == 0x0a
+                and 'deferred' in si.comment):
+            ur_dest = si.raw[2]
+            needs_gap = False
+            for k in range(1, 4):
+                if idx + k < len(pre_result):
+                    next_si = pre_result[idx + k]
+                    next_opc = _get_opcode(next_si.raw)
+                    if next_opc in _UR_CONSUMER_OPCODES and next_si.raw[4] == ur_dest:
+                        needs_gap = True
+                        break
+            if needs_gap:
+                for _ in range(3):
+                    padded_pre.append(SassInstr(_encode_nop(), 'NOP  // LDCU.64 latency'))
+    pre_result = padded_pre
+
     return pre_result + post_boundary
 
 

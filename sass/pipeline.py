@@ -674,13 +674,10 @@ def compile_function(fn: Function, verbose: bool = False,
         for bb in fn.blocks
         for inst in bb.instructions
     )
-    # Fallback: vote/redux/shfl, BAR+smem (shared_copy pattern), complex CF+STG, atoms
-    # BAR without direct smem load/store (maxreduce, scan, matvec) works natively
-    _bar_smem = _has_bar and _has_smem and not _has_complex_cf
-    ctx._has_vote = _has_ldg and (
-        _has_vote_shfl or _bar_smem
-        or (_has_complex_cf and _has_stg) or _has_atom
-    )
+    # All instruction classes now compile natively.
+    # Complex CF+STG (>4 blocks with stores) was the last gate;
+    # if-conversion + deferred params handle this correctly.
+    ctx._has_vote = False
 
     body_instrs = select_function(fn, ctx)
 
@@ -972,7 +969,9 @@ def compile_function(fn: Function, verbose: bool = False,
             if opc == 0x94d and guard != 7:  # predicated EXIT
                 found_exit = True
             if found_exit and opc == 0x7ac and si.raw[9] == 0x0a:
-                if si.raw[5] >= 0x70:  # param load (not descriptor)
+                if si.raw[5] >= 0x70 and 'deferred' not in si.comment:
+                    # Only patch non-deferred post-EXIT LDCU.64 (preamble loads).
+                    # Deferred LDCU.64 deep in the body use standard b9=0x0a.
                     patched = bytearray(si.raw)
                     patched[9] = 0x0c
                     sass_instrs[i] = SassInstr(bytes(patched), si.comment + ' [b9=0x0c]')
@@ -1073,7 +1072,9 @@ def compile_function(fn: Function, verbose: bool = False,
         # None so the emitter calls build_capmerc_from_sass with 0x2000 capability
         # bit and full-range type-02 barrier records (byte[10]=0x01), which is
         # required to enable R14+ access on SM_120 Mercury.
-        ptxas_capmerc=_select_capmerc(ptxas_meta, _final_gprs),
+        # Deferred params change instruction stream; use our generated capmerc.
+        ptxas_capmerc=None if getattr(ctx, '_has_inline_deferred', False)
+                      else _select_capmerc(ptxas_meta, _final_gprs),
         ptxas_merc_info=None,
     )
     if sm_version == 89:

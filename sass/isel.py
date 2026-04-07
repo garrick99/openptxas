@@ -579,6 +579,31 @@ def _select_add_u64(instr: Instruction, ra: RegAlloc,
 
     # Handle immediate operand: add.u64 dest, a, imm  (e.g. loop counter increment by 1)
     if isinstance(b, ImmOp) and isinstance(dest, RegOp) and isinstance(a, RegOp):
+        # If 'a' is a deferred param, emit inline LDCU.64 UR6 + materialize
+        a_deferred_imm = ctx and a.name in ctx._deferred_ur_params
+        if a_deferred_imm:
+            param_off = ctx._deferred_ur_params.pop(a.name)
+            ur_tmp = 6  # always reuse UR6
+            d_lo = ra.lo(dest.name)
+            limit = getattr(ctx, '_gpr_limit', _GPR_HARD_LIMIT_DEFAULT)
+            if d_lo >= limit:
+                if not hasattr(ctx, '_addr_scratch'):
+                    ctx._addr_scratch = 10
+                d_lo = ctx._addr_scratch
+                ra.int_regs[dest.name] = d_lo
+            ctx._gpr_written.add(dest.name)
+            prefix = [SassInstr(encode_ldcu_64(ur_tmp, 0, param_off),
+                                f'LDCU.64 UR{ur_tmp}, c[0][0x{param_off:x}]  // deferred param')]
+            if b.value == 0:
+                return prefix + _emit_ur_to_gpr(d_lo, ur_tmp, 'add.u64 imm0 (deferred UR->GPR)')
+            else:
+                imm_lo = b.value & 0xFFFFFFFF
+                return prefix + _emit_ur_to_gpr(d_lo, ur_tmp, 'deferred UR->GPR') + [
+                    SassInstr(encode_iadd3_imm32(d_lo, d_lo, imm_lo, RZ),
+                              f'IADD3.IMM R{d_lo}, R{d_lo}, {imm_lo:#x}, RZ  // add.u64 lo imm'),
+                    SassInstr(encode_iadd3x(d_lo + 1, d_lo + 1, RZ, RZ),
+                              f'IADD3.X R{d_lo+1}, R{d_lo+1}, RZ, RZ  // add.u64 hi carry'),
+                ]
         # If 'a' is in UR space (loaded via LDCU.64), must materialize first
         a_in_ur = ctx and a.name in ctx._ur_params
         if a_in_ur:
@@ -814,32 +839,40 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
         ]
 
     if typ in ('u64', 's64', 'b64'):
-        # Load 64-bit param into UR via LDCU.64, materialize to GPR via IADD.64-UR.
-        # SM_120 rule: max 3 simultaneous LDCU.64 params (UR6-UR11).
-        # 4+ pointer params cause 715 due to UR liveness pressure.
-        # Fall back to LDC pair (GPR) for the 4th+ param.
+        # SM_120 preamble interleaving: ALL pointer params are deferred.
+        # Each add.u64 / ld.global / atom emits inline LDCU.64 UR6 + IADD.64,
+        # reusing UR6 each time. No UR pressure, no clobber hazards.
+        # For post-EXIT params (after bounds check), materialize immediately
+        # via LDCU.64 UR6 + _emit_ur_to_gpr so LDCU stays in post-EXIT region.
+        if ctx and ctx.sm_version == 120:
+            # Ensure UR6:UR7 are declared in ELF metadata
+            if ctx._next_ur < 8:
+                ctx._next_ur = 8
+            # Safety: predicated ld.param.u64 is in a divergent path (if-converted).
+            # The deferred LDCU.64 would execute unconditionally (warp-wide) but
+            # the consumer is predicated — UR/GPR conflicts across paths.
+            # Fall back to LDC pair for predicated params.
+            if instr.pred:
+                dr = ctx.ra.lo(dest.name)
+                ctx._gpr_written.add(dest.name)
+                return [
+                    SassInstr(encode_ldc(dr, 0, byte_off),
+                              f'LDC R{dr}, c[0][0x{byte_off:x}]  // {param_name} lo (divergent fallback)'),
+                    SassInstr(encode_ldc(dr + 1, 0, byte_off + 4),
+                              f'LDC R{dr+1}, c[0][0x{byte_off + 4:x}]  // {param_name} hi (divergent fallback)'),
+                ]
+            # Dominating block: defer until add.u64 / ld.global / atom
+            ctx._deferred_ur_params[dest.name] = byte_off
+            ctx._has_inline_deferred = True
+            return []
+        # Non-SM_120 fallback: load into UR pair
         ur_idx = ctx._next_ur if ctx else 6
-        if ctx and ur_idx >= 8 and ctx.sm_version == 120:
-            # SM_120 rule #30: max 2 LDCU.64 params in preamble (ptxas pattern).
-            # 3rd+ param loaded via LDC pair into GPR.
-            dr = ctx.ra.lo(dest.name)
-            ctx._gpr_written.add(dest.name)
-            return [
-                SassInstr(encode_ldc(dr, 0, byte_off),
-                          f'LDC R{dr}, c[0][0x{byte_off:x}]  // {param_name} lo (LDC fallback)'),
-                SassInstr(encode_ldc(dr + 1, 0, byte_off + 4),
-                          f'LDC R{dr+1}, c[0][0x{byte_off + 4:x}]  // {param_name} hi (LDC fallback)'),
-            ]
         if ctx:
-            if ur_idx % 2 != 0:  # LDCU.64 requires even-aligned UR
+            if ur_idx % 2 != 0:
                 ur_idx += 1
                 ctx._next_ur = ur_idx
             ctx._next_ur = ur_idx + 2
             ctx._ur_params[dest.name] = ur_idx
-        # Just load into UR — address computation (IADD.64 Roffset + UR)
-        # is done at the point of use (ld.global / st.global), matching ptxas.
-        # Do NOT materialize into GPR here — that clobbers registers used
-        # by other parameters.
         return [
             SassInstr(encode_ldcu_64(ur_idx, 0, byte_off),
                       f'LDCU.64 UR{ur_idx}, c[0][0x{byte_off:x}]  // {param_name}'),
@@ -946,9 +979,19 @@ def _select_atom_cas(instr: Instruction, ra: RegAlloc,
     prefix = []
     base_name = addr_op.base if addr_op.base.startswith('%') else f'%{addr_op.base}'
     ur_params = getattr(ctx, '_ur_params', {}) if ctx else {}
+    deferred = getattr(ctx, '_deferred_ur_params', {}) if ctx else {}
     gpr_written = getattr(ctx, '_gpr_written', set()) if ctx else set()
     if base_name in gpr_written and addr_op.base in ra.int_regs:
         addr = ra.lo(addr_op.base)
+    elif base_name in deferred:
+        param_off = deferred.pop(base_name)
+        ur_tmp = 6
+        addr = getattr(ctx, '_addr_scratch_lo', None)
+        if addr is None:
+            addr = _alloc_gpr_pair(ctx)
+        prefix.append(SassInstr(encode_ldcu_64(ur_tmp, 0, param_off),
+                                f'LDCU.64 UR{ur_tmp}, c[0][0x{param_off:x}]  // deferred param'))
+        prefix.extend(_emit_ur_to_gpr(addr, ur_tmp, "deferred UR->GPR addr"))
     elif base_name in ur_params:
         ur_idx = ur_params[base_name]
         addr = getattr(ctx, '_addr_scratch_lo', None)
@@ -989,9 +1032,19 @@ def _select_atom_add_u32(instr: Instruction, ra: RegAlloc,
 
     base_name = addr_op.base if addr_op.base.startswith('%') else f'%{addr_op.base}'
     ur_params = getattr(ctx, '_ur_params', {}) if ctx else {}
+    deferred = getattr(ctx, '_deferred_ur_params', {}) if ctx else {}
     gpr_written = getattr(ctx, '_gpr_written', set()) if ctx else set()
     if base_name in gpr_written and addr_op.base in ra.int_regs:
         addr = ra.lo(addr_op.base)
+    elif base_name in deferred:
+        param_off = deferred.pop(base_name)
+        ur_tmp = 6
+        addr = getattr(ctx, '_addr_scratch_lo', None)
+        if addr is None:
+            addr = _alloc_gpr_pair(ctx)
+        prefix.append(SassInstr(encode_ldcu_64(ur_tmp, 0, param_off),
+                                f'LDCU.64 UR{ur_tmp}, c[0][0x{param_off:x}]  // deferred param'))
+        prefix.extend(_emit_ur_to_gpr(addr, ur_tmp, "deferred UR->GPR addr"))
     elif base_name in ur_params:
         ur_idx = ur_params[base_name]
         addr = getattr(ctx, '_addr_scratch_lo', None)
@@ -1022,9 +1075,19 @@ def _select_atom_generic_u32(instr: Instruction, ra: RegAlloc,
     prefix = []
     base_name = addr_op.base if addr_op.base.startswith('%') else f'%{addr_op.base}'
     ur_params = getattr(ctx, '_ur_params', {}) if ctx else {}
+    deferred = getattr(ctx, '_deferred_ur_params', {}) if ctx else {}
     gpr_written = getattr(ctx, '_gpr_written', set()) if ctx else set()
     if base_name in gpr_written and addr_op.base in ra.int_regs:
         addr = ra.lo(addr_op.base)
+    elif base_name in deferred:
+        param_off = deferred.pop(base_name)
+        ur_tmp = 6
+        addr = getattr(ctx, '_addr_scratch_lo', None)
+        if addr is None:
+            addr = _alloc_gpr_pair(ctx)
+        prefix.append(SassInstr(encode_ldcu_64(ur_tmp, 0, param_off),
+                                f'LDCU.64 UR{ur_tmp}, c[0][0x{param_off:x}]  // deferred param'))
+        prefix.extend(_emit_ur_to_gpr(addr, ur_tmp, "deferred UR->GPR addr"))
     elif base_name in ur_params:
         ur_idx = ur_params[base_name]
         addr = getattr(ctx, '_addr_scratch_lo', None)
@@ -1054,9 +1117,19 @@ def _select_atom_add_f32(instr: Instruction, ra: RegAlloc,
     prefix = []
     base_name = addr_op.base if addr_op.base.startswith('%') else f'%{addr_op.base}'
     ur_params = getattr(ctx, '_ur_params', {}) if ctx else {}
+    deferred = getattr(ctx, '_deferred_ur_params', {}) if ctx else {}
     gpr_written = getattr(ctx, '_gpr_written', set()) if ctx else set()
     if base_name in gpr_written and addr_op.base in ra.int_regs:
         addr = ra.lo(addr_op.base)
+    elif base_name in deferred:
+        param_off = deferred.pop(base_name)
+        ur_tmp = 6
+        addr = getattr(ctx, '_addr_scratch_lo', None)
+        if addr is None:
+            addr = _alloc_gpr_pair(ctx)
+        prefix.append(SassInstr(encode_ldcu_64(ur_tmp, 0, param_off),
+                                f'LDCU.64 UR{ur_tmp}, c[0][0x{param_off:x}]  // deferred param'))
+        prefix.extend(_emit_ur_to_gpr(addr, ur_tmp, "deferred UR->GPR addr"))
     elif base_name in ur_params:
         ur_idx = ur_params[base_name]
         addr = getattr(ctx, '_addr_scratch_lo', None)
@@ -1088,6 +1161,7 @@ def _select_atom_cas_b64(instr: Instruction, ra: RegAlloc,
         raise ISelError("atom.cas.b64 addr must be MemOp")
 
     ur_params = getattr(ctx, '_ur_params', {}) if ctx else {}
+    deferred = getattr(ctx, '_deferred_ur_params', {}) if ctx else {}
     gpr_written = getattr(ctx, '_gpr_written', set()) if ctx else set()
     prefix = []
 
@@ -1097,10 +1171,18 @@ def _select_atom_cas_b64(instr: Instruction, ra: RegAlloc,
         base_name = name if name.startswith('%') else f'%{name}'
         if base_name in gpr_written and name in ra.int_regs:
             return ra.lo(name)
+        elif base_name in deferred:
+            param_off = deferred.pop(base_name)
+            ur_tmp = 6
+            gpr = _alloc_gpr_pair(ctx)
+            prefix.append(SassInstr(encode_ldcu_64(ur_tmp, 0, param_off),
+                                    f'LDCU.64 UR{ur_tmp}, c[0][0x{param_off:x}]  // deferred param'))
+            prefix.extend(_emit_ur_to_gpr(gpr, ur_tmp, f"deferred UR->GPR {label}"))
+            return gpr
         elif base_name in ur_params:
             ur_idx = ur_params[base_name]
             gpr = _alloc_gpr_pair(ctx)
-            prefix.extend(_emit_ur_to_gpr(gpr, ur_idx, "UR->GPR {label}"))
+            prefix.extend(_emit_ur_to_gpr(gpr, ur_idx, f"UR->GPR {label}"))
             return gpr
         else:
             return ra.lo(name)
@@ -1109,6 +1191,13 @@ def _select_atom_cas_b64(instr: Instruction, ra: RegAlloc,
     addr_base = addr_op.base if addr_op.base.startswith('%') else f'%{addr_op.base}'
     if addr_base in gpr_written and addr_op.base in ra.int_regs:
         addr = ra.lo(addr_op.base)
+    elif addr_base in deferred:
+        param_off = deferred.pop(addr_base)
+        ur_tmp = 6
+        addr = _alloc_gpr_pair(ctx)
+        prefix.append(SassInstr(encode_ldcu_64(ur_tmp, 0, param_off),
+                                f'LDCU.64 UR{ur_tmp}, c[0][0x{param_off:x}]  // deferred param'))
+        prefix.extend(_emit_ur_to_gpr(addr, ur_tmp, "deferred UR->GPR addr"))
     elif addr_base in ur_params:
         ur_idx = ur_params[addr_base]
         addr = _alloc_gpr_pair(ctx)
@@ -1218,6 +1307,9 @@ class ISelContext:
     # Next available uniform register for LDCU param loading (UR6+)
     _next_ur:      int = 6  # UR4 = mem desc, UR6+ for params
     _ur_free:      list = field(default_factory=list)  # freed UR pairs for reuse
+    # Deferred u64 params: name → cbuf byte offset. Loaded inline via LDCU.64 UR6
+    # at point of use (add.u64 / ld.global / atom), keeping max live URs to UR6-UR7.
+    _deferred_ur_params: dict[str, int] = field(default_factory=dict)
     # Map PTX register name → UR index (for params loaded via LDCU)
     _ur_params:    dict[str, int] = field(default_factory=dict)
     # Map PTX register name → param byte offset (for setp LDCU fallback)
@@ -2409,23 +2501,8 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
 
                 elif op == 'ret':
                     output.append(SassInstr(encode_exit(ctrl=0x7f5), 'EXIT'))
-                    # Flush deferred params right after predicated EXIT
                     if instr.pred:
-                        deferred = getattr(ctx, '_deferred_ur_params', {})
-                        if deferred:
-                            first_d = True
-                            for dpname, dpoff in list(deferred.items()):
-                                dur = ctx._next_ur
-                                if dur % 2 != 0: dur += 1
-                                ctx._next_ur = dur + 2
-                                draw = bytearray(encode_ldcu_64(dur, 0, dpoff))
-                                if first_d:
-                                    draw[9] = 0x0c  # Rule #29
-                                    first_d = False
-                                output.append(SassInstr(bytes(draw),
-                                    f'LDCU.64 UR{dur}, c[0][0x{dpoff:x}]  // post-EXIT deferred'))
-                                ctx._ur_params[dpname] = dur
-                            deferred.clear()
+                        ctx._past_predicated_exit = True
 
                 elif op == 'bra':
                     from ptx.ir import LabelOp

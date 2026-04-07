@@ -671,6 +671,35 @@ def _select_add_u64(instr: Instruction, ra: RegAlloc,
             ]
 
     # SM_120 path
+    # Check for deferred params (4th+ pointer param, not yet loaded)
+    deferred = getattr(ctx, '_deferred_ur_params', {}) if ctx else {}
+    a_deferred = a.name in deferred
+    b_deferred = b.name in deferred
+    if a_deferred or b_deferred:
+        # Inline LDCU.64 UR6 → IADD.64 R-UR for deferred param
+        if a_deferred:
+            param_off = deferred.pop(a.name)
+            r_lo = ra.lo(b.name)
+        else:
+            param_off = deferred.pop(b.name)
+            r_lo = ra.lo(a.name)
+        d_lo = ra.lo(dest.name) if dest.name in ra.int_regs else r_lo
+        limit = getattr(ctx, '_gpr_limit', _GPR_HARD_LIMIT_DEFAULT)
+        if d_lo >= limit:
+            if not hasattr(ctx, '_addr_scratch'):
+                ctx._addr_scratch = 10
+            d_lo = ctx._addr_scratch
+            ra.int_regs[dest.name] = d_lo
+        ur_tmp = 6  # always reuse UR6 for deferred loads
+        if ctx:
+            ctx._gpr_written.add(dest.name)
+        return [
+            SassInstr(encode_ldcu_64(ur_tmp, 0, param_off),
+                      f'LDCU.64 UR{ur_tmp}, c[0][0x{param_off:x}]  // deferred param'),
+            SassInstr(encode_iadd64_ur(d_lo, r_lo, ur_tmp),
+                      f'IADD.64 R{d_lo}, R{r_lo}, UR{ur_tmp}  // add.u64 (deferred UR)'),
+        ]
+
     # Check if either operand is a UR param (loaded via LDCU)
     a_in_ur = ctx and a.name in ctx._ur_params
     b_in_ur = ctx and b.name in ctx._ur_params
@@ -791,15 +820,13 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
         # Fall back to LDC pair (GPR) for the 4th+ param.
         ur_idx = ctx._next_ur if ctx else 6
         if ctx and ur_idx >= 12 and ctx.sm_version == 120:
-            # UR exhausted — use LDC pair into GPRs instead
-            dr = ctx.ra.lo(dest.name)
-            ctx._gpr_written.add(dest.name)  # mark as GPR-backed
-            return [
-                SassInstr(encode_ldc(dr, 0, byte_off),
-                          f'LDC R{dr}, c[0][0x{byte_off:x}]  // {param_name} (lo, GPR fallback)'),
-                SassInstr(encode_ldc(dr + 1, 0, byte_off + 4),
-                          f'LDC R{dr+1}, c[0][0x{byte_off + 4:x}]  // {param_name} (hi, GPR fallback)'),
-            ]
+            # UR exhausted — defer load to first use point.
+            # Store param info for inline LDCU.64 + IADD.64-UR at use site.
+            # This matches ptxas: interleaved load→consume→reuse.
+            if not hasattr(ctx, '_deferred_ur_params'):
+                ctx._deferred_ur_params = {}
+            ctx._deferred_ur_params[dest.name] = byte_off
+            return []  # no preamble emission — loaded inline at use
         if ctx:
             if ur_idx % 2 != 0:  # LDCU.64 requires even-aligned UR
                 ur_idx += 1
@@ -857,12 +884,23 @@ def _select_ld_global(instr: Instruction, ra: RegAlloc,
 
     # Resolve address register: if the register was written to GPR (by add.u64 etc.),
     # use the GPR value. Otherwise, if it's only in a UR (raw pointer from ld.param.u64),
-    # materialize via IADD.64-UR.
+    # materialize via IADD.64-UR. For deferred params (4th+ pointer), emit inline LDCU.64.
     result = []
     ur_params = getattr(ctx, '_ur_params', {}) if ctx else {}
+    deferred = getattr(ctx, '_deferred_ur_params', {}) if ctx else {}
     gpr_written = getattr(ctx, '_gpr_written', set()) if ctx else set()
     if base_name in gpr_written and src.base in ra.int_regs:
         addr = ra.lo(src.base)
+    elif base_name in deferred:
+        # Deferred param: emit inline LDCU.64 UR6 → materialize to GPR
+        param_off = deferred.pop(base_name)
+        ur_tmp = 6
+        addr = getattr(ctx, '_addr_scratch_lo', None)
+        if addr is None:
+            addr = _alloc_gpr_pair(ctx)
+        result.append(SassInstr(encode_ldcu_64(ur_tmp, 0, param_off),
+                                f'LDCU.64 UR{ur_tmp}, c[0][0x{param_off:x}]  // deferred param'))
+        result.extend(_emit_ur_to_gpr(addr, ur_tmp, "deferred UR->GPR"))
     elif base_name in ur_params:
         # Register only exists as a UR (raw pointer from ld.param.u64, no add.u64).
         # Use the dedicated addr-scratch pair from context when available.
@@ -1121,9 +1159,19 @@ def _select_st_global(instr: Instruction, ra: RegAlloc,
     # Resolve address: prefer GPR (if written by add.u64) over stale UR entry
     prefix = []
     ur_params = getattr(ctx, '_ur_params', {}) if ctx else {}
+    deferred = getattr(ctx, '_deferred_ur_params', {}) if ctx else {}
     gpr_written = getattr(ctx, '_gpr_written', set()) if ctx else set()
     if base_name in gpr_written and dest_op.base in ra.int_regs:
         addr = ra.lo(dest_op.base)
+    elif base_name in deferred:
+        param_off = deferred.pop(base_name)
+        ur_tmp = 6
+        addr = getattr(ctx, '_addr_scratch_lo', None)
+        if addr is None:
+            addr = _alloc_gpr_pair(ctx)
+        prefix.append(SassInstr(encode_ldcu_64(ur_tmp, 0, param_off),
+                                f'LDCU.64 UR{ur_tmp}, c[0][0x{param_off:x}]  // deferred param'))
+        prefix.extend(_emit_ur_to_gpr(addr, ur_tmp, "deferred UR->GPR"))
     elif base_name in ur_params:
         ur_idx = ur_params[base_name]
         addr = getattr(ctx, '_addr_scratch_lo', None)
@@ -1510,7 +1558,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 # exhausted (5+ params), reuse UR4 for S2UR. The
                                 # IMAD that reads this UR executes before the mem
                                 # desc LDCU.64 overwrites UR4 (ptxas does this too).
-                                if ctx._next_ur >= 12:
+                                if ctx._next_ur >= 14:
                                     ur_ctaid = 4  # reuse UR4 (consumed before mem desc)
                                 else:
                                     ur_ctaid = ctx._next_ur; ctx._next_ur += 1
@@ -2944,7 +2992,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             emit_pd = 0
                                             ctx.ra.pred_regs[pred.name] = 0
                                         # SM_120: keep UR < 14. Reuse UR5 when exhausted.
-                                        if ctx._next_ur >= 12:
+                                        if ctx._next_ur >= 14:
                                             ur_tmp = 5  # reuse UR5 (consumed by ISETP immediately)
                                         else:
                                             ur_tmp = ctx._next_ur

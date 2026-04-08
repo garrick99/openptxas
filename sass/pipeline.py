@@ -772,33 +772,29 @@ def compile_function(fn: Function, verbose: bool = False,
             for bra_idx, target_label in ctx._bra_fixups
         ]
 
-    # 3b. Hoist deferred LDCU.64 out of divergent regions before BAR.SYNC.
-    # SM_120 rule: LDCU writes to uniform registers (shared across warp).
-    # If LDCU executes in a divergent path (between conditional BRA and
-    # BAR.SYNC), the UR state is inconsistent → ERR715.
-    # Fix: find LDCUs in the [first_bra, bar) window and hoist them
-    # before first_bra. Only targets the specific divergent window.
-    first_bra = None
+    # 3b. Hoist post-BAR LDCUs to before BAR.SYNC.
+    # SM_120 rule: LDCU after BAR.SYNC in shared-memory kernels causes
+    # ERR715. ptxas loads all params before BAR. Fix: find LDCUs that
+    # appear AFTER BAR.SYNC and move them to just before BAR.
     bar_idx = None
     for idx, si in enumerate(body_instrs):
         opc = (si.raw[0] | (si.raw[1] << 8)) & 0xFFF
-        pred = si.raw[1] >> 4
-        if first_bra is None and opc in (0x947, 0x547) and pred != 7:
-            first_bra = idx
         if opc == 0xb1d:  # BAR.SYNC
             bar_idx = idx
             break
-    if first_bra is not None and bar_idx is not None and first_bra < bar_idx:
+    if bar_idx is not None:
         hoisted = []
         remaining = []
         for idx, si in enumerate(body_instrs):
             opc = (si.raw[0] | (si.raw[1] << 8)) & 0xFFF
-            if first_bra < idx < bar_idx and opc == 0x7ac and 'deferred' in (si.comment or ''):
+            if idx > bar_idx and opc == 0x7ac:  # LDCU after BAR
                 hoisted.append(si)
             else:
                 remaining.append(si)
         if hoisted:
-            body_instrs = remaining[:first_bra] + hoisted + remaining[first_bra:]
+            # Insert hoisted LDCUs just before BAR
+            new_bar_idx = remaining.index(body_instrs[bar_idx])
+            body_instrs = remaining[:new_bar_idx] + hoisted + remaining[new_bar_idx:]
 
     # 4. Schedule: reorder for LDG latency, then assign ctrl via scoreboard
     raw_instrs = preamble + body_instrs

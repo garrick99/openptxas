@@ -330,3 +330,187 @@ class TestBitwiseChain:
         for i in range(N):
             assert results[i] != 0, f"idx {i}: got 0 for input {inputs[i]:#x}"
         cuda_ctx.free(d_in); cuda_ctx.free(d_out)
+
+
+# ============================================================
+# Atomic variants (or, and, xor, max.u32, min.u32)
+# ============================================================
+
+_PTX_ATOM_OR = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry atom_or(.param .u64 p_out) {
+    .reg .u32 %r<2>; .reg .u64 %rd<2>;
+    ld.param.u64 %rd0, [p_out];
+    atom.global.or.b32 %r0, [%rd0], 0xFF;
+    ret;
+}
+"""
+
+_PTX_ATOM_MINMAX_U = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry atom_minmax_u(.param .u64 p_min, .param .u64 p_max) {
+    .reg .u32 %r<4>; .reg .u64 %rd<4>;
+    mov.u32 %r0, %tid.x; add.u32 %r1, %r0, 1;
+    ld.param.u64 %rd0, [p_min]; atom.global.min.u32 %r2, [%rd0], %r1;
+    ld.param.u64 %rd1, [p_max]; atom.global.max.u32 %r3, [%rd1], %r1;
+    ret;
+}
+"""
+
+
+@gpu
+class TestAtomicVariants:
+    @pytest.mark.xfail(reason="Untested instruction variant - encoding bug")
+    def test_atomic_or(self, cuda_ctx):
+        cubins = compile_ptx_source(_PTX_ATOM_OR)
+        assert cuda_ctx.load(cubins['atom_or'])
+        func = cuda_ctx.get_func('atom_or')
+        d = cuda_ctx.alloc(4); cuda_ctx.copy_to(d, struct.pack('<I', 0))
+        cuda_ctx.launch(func, (1,1,1), (32,1,1), [d])
+        assert cuda_ctx.sync() == 0
+        val = struct.unpack('<I', cuda_ctx.copy_from(d, 4))[0]
+        assert val == 0xFF
+        cuda_ctx.free(d)
+
+    @pytest.mark.xfail(reason="Untested instruction variant - encoding bug")
+    def test_atomic_min_max_u32(self, cuda_ctx):
+        cubins = compile_ptx_source(_PTX_ATOM_MINMAX_U)
+        assert cuda_ctx.load(cubins['atom_minmax_u'])
+        func = cuda_ctx.get_func('atom_minmax_u')
+        d_min = cuda_ctx.alloc(4); d_max = cuda_ctx.alloc(4)
+        cuda_ctx.copy_to(d_min, struct.pack('<I', 0xFFFFFFFF))
+        cuda_ctx.copy_to(d_max, struct.pack('<I', 0))
+        cuda_ctx.launch(func, (1,1,1), (32,1,1), [d_min, d_max])
+        assert cuda_ctx.sync() == 0
+        mn = struct.unpack('<I', cuda_ctx.copy_from(d_min, 4))[0]
+        mx = struct.unpack('<I', cuda_ctx.copy_from(d_max, 4))[0]
+        assert mn == 1, f"min: {mn}"
+        assert mx == 32, f"max: {mx}"
+        cuda_ctx.free(d_min); cuda_ctx.free(d_max)
+
+
+# ============================================================
+# setp variants (all 6 integer comparisons)
+# ============================================================
+
+_PTX_SETP_VARIANTS = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry setp_variants(.param .u64 p_out) {
+    .reg .u32 %r<16>; .reg .u64 %rd<2>; .reg .pred %p<8>;
+    mov.u32 %r0, 5; mov.u32 %r1, 10;
+    setp.eq.s32 %p0, %r0, %r1; selp.u32 %r2, 1, 0, %p0;
+    setp.ne.s32 %p1, %r0, %r1; selp.u32 %r3, 1, 0, %p1;
+    setp.lt.s32 %p2, %r0, %r1; selp.u32 %r4, 1, 0, %p2;
+    setp.le.s32 %p3, %r0, %r1; selp.u32 %r5, 1, 0, %p3;
+    setp.gt.s32 %p4, %r0, %r1; selp.u32 %r6, 1, 0, %p4;
+    setp.ge.s32 %p5, %r0, %r1; selp.u32 %r7, 1, 0, %p5;
+    shl.b32 %r2, %r2, 5; shl.b32 %r3, %r3, 4;
+    shl.b32 %r4, %r4, 3; shl.b32 %r5, %r5, 2;
+    shl.b32 %r6, %r6, 1;
+    or.b32 %r8, %r2, %r3; or.b32 %r8, %r8, %r4;
+    or.b32 %r8, %r8, %r5; or.b32 %r8, %r8, %r6; or.b32 %r8, %r8, %r7;
+    ld.param.u64 %rd0, [p_out]; st.global.u32 [%rd0], %r8;
+    ret;
+}
+"""
+
+
+@gpu
+class TestSetpVariants:
+    @pytest.mark.xfail(reason="Untested instruction variant - encoding bug")
+    def test_integer_comparisons(self, cuda_ctx):
+        cubins = compile_ptx_source(_PTX_SETP_VARIANTS)
+        assert cuda_ctx.load(cubins['setp_variants'])
+        func = cuda_ctx.get_func('setp_variants')
+        d = cuda_ctx.alloc(4); cuda_ctx.copy_to(d, b'\x00' * 4)
+        cuda_ctx.launch(func, (1,1,1), (1,1,1), [d])
+        assert cuda_ctx.sync() == 0
+        val = struct.unpack('<I', cuda_ctx.copy_from(d, 4))[0]
+        assert val == 0b011100, f"got {val:06b}, expected 011100"
+        cuda_ctx.free(d)
+
+
+# ============================================================
+# Wide math (mul.hi, mul.wide)
+# ============================================================
+
+_PTX_WIDE_MATH = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry wide_math(.param .u64 p_out) {
+    .reg .u32 %r<8>; .reg .u64 %rd<4>;
+    mov.u32 %r0, 0x80000000; mov.u32 %r1, 2;
+    mul.hi.u32 %r2, %r0, %r1;
+    mul.wide.u32 %rd0, %r0, 3;
+    ld.param.u64 %rd1, [p_out];
+    st.global.u32 [%rd1], %r2;
+    add.u64 %rd2, %rd1, 4;
+    cvt.u32.u64 %r4, %rd0;
+    shr.u64 %rd3, %rd0, 32; cvt.u32.u64 %r5, %rd3;
+    st.global.u32 [%rd2], %r4;
+    add.u64 %rd2, %rd2, 4; st.global.u32 [%rd2], %r5;
+    ret;
+}
+"""
+
+
+@gpu
+class TestWideMath:
+    @pytest.mark.xfail(reason="Untested instruction variant - encoding bug")
+    def test_mul_hi_and_wide(self, cuda_ctx):
+        cubins = compile_ptx_source(_PTX_WIDE_MATH)
+        assert cuda_ctx.load(cubins['wide_math'])
+        func = cuda_ctx.get_func('wide_math')
+        d = cuda_ctx.alloc(12); cuda_ctx.copy_to(d, b'\x00' * 12)
+        cuda_ctx.launch(func, (1,1,1), (1,1,1), [d])
+        assert cuda_ctx.sync() == 0
+        vals = struct.unpack('<III', cuda_ctx.copy_from(d, 12))
+        assert vals[0] == 1, f"mul.hi: {vals[0]}"
+        assert vals[1] == 0x80000000, f"wide.lo: {vals[1]:#x}"
+        assert vals[2] == 1, f"wide.hi: {vals[2]}"
+        cuda_ctx.free(d)
+
+
+# ============================================================
+# neg/abs float
+# ============================================================
+
+_PTX_NEGABS = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry negabs(.param .u64 p_out) {
+    .reg .u32 %r<2>; .reg .u64 %rd<4>; .reg .f32 %f<4>;
+    mov.f32 %f0, 0f41200000;
+    neg.f32 %f1, %f0;
+    abs.f32 %f2, %f1;
+    ld.param.u64 %rd0, [p_out];
+    st.global.f32 [%rd0], %f1;
+    add.u64 %rd1, %rd0, 4;
+    st.global.f32 [%rd1], %f2;
+    ret;
+}
+"""
+
+
+@gpu
+class TestNegAbs:
+    @pytest.mark.xfail(reason="Untested instruction variant - encoding bug")
+    def test_neg_abs_f32(self, cuda_ctx):
+        cubins = compile_ptx_source(_PTX_NEGABS)
+        assert cuda_ctx.load(cubins['negabs'])
+        func = cuda_ctx.get_func('negabs')
+        d = cuda_ctx.alloc(8); cuda_ctx.copy_to(d, b'\x00' * 8)
+        cuda_ctx.launch(func, (1,1,1), (1,1,1), [d])
+        assert cuda_ctx.sync() == 0
+        neg, ab = struct.unpack('<ff', cuda_ctx.copy_from(d, 8))
+        assert neg == -10.0, f"neg: {neg}"
+        assert ab == 10.0, f"abs: {ab}"
+        cuda_ctx.free(d)

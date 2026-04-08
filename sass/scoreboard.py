@@ -65,13 +65,13 @@ _OPCODE_META: dict[int, _OpMeta] = {
     0x299: _OpMeta('SHF.VAR',   1, 0x3e, 1),   # variable-shift SHF (opcode 0x7299)
     0x219: _OpMeta('SHF.R.S32.HI.VAR', 1, 0x3e, 1),  # SHF.R.S32.HI variable-shift (shr.s32)
     0x221: _OpMeta('FADD',       1, 0x3e, 1),
-    0x223: _OpMeta('FFMA',       0, 0x3e, 1),  # FFMA→FFMA bypass: no NOP gap needed on SM_120
+    0x223: _OpMeta('FFMA',       0, 0x00, 1),  # FFMA: wdep=0 (ptxas pattern, pipeline handles ordering)
     0x308: _OpMeta('MUFU',       1, 0x3e, 1),  # MUFU (SFU: RCP, SQRT, SIN, COS, EX2, LG2)
     0x309: _OpMeta('POPC',       1, 0x3e, 1),  # POPC (population count)
     0x301: _OpMeta('BREV',       1, 0x3e, 1),  # BREV (bit reverse)
     0x300: _OpMeta('FLO',        1, 0x3e, 1),  # FLO (find leading one)
     0x820: _OpMeta('FMUL.IMM',   1, 0x3e, 1),  # FMUL with 32-bit float immediate
-    0x823: _OpMeta('FFMA.IMM',   1, 0x3e, 1),  # FFMA with 32-bit float immediate
+    0x823: _OpMeta('FFMA.IMM',   1, 0x00, 1),  # FFMA.IMM: wdep=0 (ptxas pattern)
     0x80a: _OpMeta('FSEL.STEP',  1, 0x3e, 5),  # Combined float compare+select (misc=5, ptxas-verified)
     0x235: _OpMeta('IADD.64',    1, 0x3e, 1),
     0xc35: _OpMeta('IADD.64-UR', 1, 0x3e, 5),  # misc=5 per hardware bisect 2026-03-25
@@ -529,6 +529,8 @@ def _wdep_for_opcode(opcode: int, raw: bytes = None) -> int:
         return 0x3f  # LDGSTS: async copy writes to shared mem, not GPR — no scoreboard slot
     if opcode in _OPCODES_LDGDEPBAR:
         return 0x31  # LDGDEPBAR: commit group, posts to LDC slot (ptxas-verified)
+    if opcode in (0x223, 0x823):  # FFMA/FFMA.IMM: dedicated FP wdep slot (ptxas pattern)
+        return 0x3c  # wdep=0x3c = FP pipeline slot (not ALU 0x3e)
     if opcode in _OPCODES_IADD64_UR:
         return 0x3e  # ALU slot — consumer LDG/STG gets rbar via pending_writes
     if opcode in _OPCODES_ALU | _OPCODES_SMEM_SETUP:
@@ -586,6 +588,7 @@ _OPCODE_MISC: dict[int, int] = {
     0xc0b: 5,   # FSETP R-UR: misc=5 (ptxas-verified, decoded with <<1 shift)
     0x80a: 5,   # FSEL.step: misc=5 (ptxas-verified)
     0x223: 4,   # FFMA R-R-R: misc=4 (ptxas-verified for FMA chains on SM_120)
+    0x823: 8,   # FFMA.IMM: misc=8 (ptxas ground truth from FMA chain benchmark)
     0x806: 1,   # VOTE: misc=1 (ptxas-verified, ballot kernel)
     0x986: 1,   # STG.E: misc=1 (from ptxas ground truth)
     0x988: 4,   # STS.E: misc=4

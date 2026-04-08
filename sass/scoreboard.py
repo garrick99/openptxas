@@ -571,6 +571,10 @@ _OPCODE_MISC: dict[int, int] = {
     0x918: 0,   # NOP: misc=0 (ptxas-verified)
     0x947: 1,   # BRA: misc=1 (ptxas-verified: @P0 BRA and loop-back BRA both use 1)
     0x94d: 5,   # EXIT: misc=5 (ptxas-verified: same for predicated and unconditional)
+    0xb1d: 6,   # BAR.SYNC: misc=6 (ptxas-verified 2026-04-08 from bar_probe)
+    0x221: 1,   # FADD: misc=1 (ptxas-verified 2026-04-08 bar_probe; counter-misc causes ERR715)
+    0x388: 1,   # STS (store shared): misc=1 (ptxas-verified 2026-04-08)
+    0x984: 2,   # LDS (load shared): misc=2 (ptxas-verified 2026-04-08)
     0x981: 6,   # LDG.E: misc=6 (hardware-verified SM_120)
     0x7ac: 7,   # LDCU: misc=7 — CRITICAL FIX. SM_120 LDCU requires misc=7 (same as
                 #   SM_89 ULDC.64). All 4 LDCU.64 in fp64 preamble use misc=7 per ptxas.

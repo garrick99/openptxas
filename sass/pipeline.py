@@ -774,25 +774,36 @@ def compile_function(fn: Function, verbose: bool = False,
             if idx >= s2r_pos and (is_ldcu or is_pre_bar_ldc):
                 hoist_indices.add(idx)
 
-    # Build the final instruction list in one pass:
-    # [S2R region] [preamble LDCUs] [hoisted body LDCs] [UR4 desc] [rest of body]
+    # Build the final instruction list:
+    # Preamble (hardcoded ctrl, scheduler-immune):
+    #   [LDC R1] [preamble LDCUs] [hoisted body LDCs] [UR4 desc]
+    # Body (scoreboard ctrl, scheduled):
+    #   [S2R] [rest of body without hoisted loads]
     preamble_ldcus = getattr(ctx, '_preamble_ldcus', [])
     hoisted_loads = [body_instrs[i] for i in sorted(hoist_indices)]
     body_without_hoisted = [si for i, si in enumerate(body_instrs) if i not in hoist_indices]
 
-    # Compute total insertions for label adjustment
-    all_inserted = preamble_ldcus + hoisted_loads + [ur4_desc_instr]
-    _n_inserted = len(all_inserted)
+    if has_bar_in_body:
+        # BAR kernel: add ALL constant loads + UR4 to preamble (scheduler-immune).
+        for item in preamble_ldcus + hoisted_loads + [ur4_desc_instr]:
+            preamble.append(item)
+        body_instrs = body_without_hoisted
+        _n_removed = len(hoist_indices)
+    else:
+        # Non-BAR kernel: insert preamble LDCUs + UR4 into body_instrs
+        # at s2r_pos (the original pattern that works for these kernels).
+        all_inserted = preamble_ldcus + [ur4_desc_instr]
+        for pi, item in enumerate(all_inserted):
+            body_without_hoisted.insert(s2r_pos + pi, item)
+        body_instrs = body_without_hoisted
+        _n_removed = 0
 
-    # Insert all preamble items at s2r_pos in the cleaned body
-    for pi, item in enumerate(all_inserted):
-        body_without_hoisted.insert(s2r_pos + pi, item)
-    body_instrs = body_without_hoisted
-
-    # Update labels and fixups for the net change in instruction count.
-    # Net change = _n_inserted - len(hoist_indices) (hoisted loads removed from
-    # body and re-inserted in preamble, plus new preamble LDCUs and UR4).
-    _net_shift = _n_inserted - len(hoist_indices)
+    if has_bar_in_body:
+        # BAR kernel: loads removed from body, nothing inserted.
+        _net_shift = -_n_removed
+    else:
+        # Non-BAR kernel: preamble LDCUs + UR4 inserted at s2r_pos.
+        _net_shift = len(preamble_ldcus) + 1  # +1 for UR4
     first_body_label = None
     if hasattr(ctx, '_bra_fixups') and ctx._bra_fixups:
         for _, target in ctx._bra_fixups:

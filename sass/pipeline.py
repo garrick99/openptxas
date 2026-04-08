@@ -733,7 +733,16 @@ def compile_function(fn: Function, verbose: bool = False,
     # any body instruction that uses UR values (including bounds-check ISETP).
     # Then insert UR4 descriptor after the predicated EXIT (if any).
     #
-    # Step 1: Find S2R position for preamble LDCU insertion
+    # SM_120 preamble construction:
+    # Phase 1: classify each instruction in original body_instrs BEFORE
+    #          any insertions. Tag body LDC/LDCU that need hoisting.
+    # Phase 2: build the final instruction list in one pass.
+    #
+    # SM_120 rule: ANY constant-bank load (LDC 0xb82, LDCU 0x7ac) in the
+    # body region of a BAR.SYNC kernel poisons IADD.64-UR → ERR715.
+    # All constant loads must be in the preamble window.
+
+    # Find S2R position
     s2r_pos = 0
     for idx, si in enumerate(body_instrs):
         opcode = struct.unpack_from('<Q', si.raw, 0)[0] & 0xFFF
@@ -741,18 +750,49 @@ def compile_function(fn: Function, verbose: bool = False,
             s2r_pos = idx + 1
             break
 
-    # Step 2: Insert ALL preamble LDCUs + UR4 descriptor right after S2R.
-    # SM_120 rule: ALL LDCUs must be in the preamble window.
-    preamble_ldcus = getattr(ctx, '_preamble_ldcus', [])
-    all_preamble = preamble_ldcus + [ur4_desc_instr]
-    for pi, pldcu in enumerate(all_preamble):
-        body_instrs.insert(s2r_pos + pi, pldcu)
-    insert_idx = s2r_pos  # for label adjustment reference
+    # Detect BAR.SYNC in original body_instrs
+    has_bar_in_body = any(
+        (si.raw[0] | (si.raw[1] << 8)) & 0xFFF == 0xb1d
+        for si in body_instrs)
 
-    # Update ctx.label_map and _bra_fixups to reflect ALL insertions:
-    # - preamble LDCUs at s2r_pos (len = len(preamble_ldcus))
-    # - UR4 descriptor at insert_idx (len = 1)
-    _n_inserted = len(all_preamble)  # total insertions (LDCUs + NOPs + UR4)
+    # Tag body constant loads for hoisting (only in BAR kernels).
+    # Hoist LDCU (UR bank, safe) and LDC that appear BEFORE BAR.
+    # Do NOT hoist LDC that appears AFTER BAR (post-BAR LDC is intentional
+    # and its register may be reused between preamble and BAR).
+    hoist_indices = set()
+    if has_bar_in_body:
+        bar_pos_orig = None
+        for idx, si in enumerate(body_instrs):
+            opc = (si.raw[0] | (si.raw[1] << 8)) & 0xFFF
+            if opc == 0xb1d:
+                bar_pos_orig = idx
+                break
+        for idx, si in enumerate(body_instrs):
+            opc = (si.raw[0] | (si.raw[1] << 8)) & 0xFFF
+            is_ldcu = opc == 0x7ac
+            is_pre_bar_ldc = opc == 0xb82 and si.raw[2] != 1 and bar_pos_orig and idx < bar_pos_orig
+            if idx >= s2r_pos and (is_ldcu or is_pre_bar_ldc):
+                hoist_indices.add(idx)
+
+    # Build the final instruction list in one pass:
+    # [S2R region] [preamble LDCUs] [hoisted body LDCs] [UR4 desc] [rest of body]
+    preamble_ldcus = getattr(ctx, '_preamble_ldcus', [])
+    hoisted_loads = [body_instrs[i] for i in sorted(hoist_indices)]
+    body_without_hoisted = [si for i, si in enumerate(body_instrs) if i not in hoist_indices]
+
+    # Compute total insertions for label adjustment
+    all_inserted = preamble_ldcus + hoisted_loads + [ur4_desc_instr]
+    _n_inserted = len(all_inserted)
+
+    # Insert all preamble items at s2r_pos in the cleaned body
+    for pi, item in enumerate(all_inserted):
+        body_without_hoisted.insert(s2r_pos + pi, item)
+    body_instrs = body_without_hoisted
+
+    # Update labels and fixups for the net change in instruction count.
+    # Net change = _n_inserted - len(hoist_indices) (hoisted loads removed from
+    # body and re-inserted in preamble, plus new preamble LDCUs and UR4).
+    _net_shift = _n_inserted - len(hoist_indices)
     first_body_label = None
     if hasattr(ctx, '_bra_fixups') and ctx._bra_fixups:
         for _, target in ctx._bra_fixups:
@@ -767,46 +807,12 @@ def compile_function(fn: Function, verbose: bool = False,
         body_byte = ctx.label_map[label]
         body_idx = body_byte // 16
         if body_idx >= s2r_pos:
-            ctx.label_map[label] = body_byte + _n_inserted * 16
+            ctx.label_map[label] = body_byte + _net_shift * 16
     if hasattr(ctx, '_bra_fixups'):
         ctx._bra_fixups = [
-            (bra_idx + _n_inserted if bra_idx >= s2r_pos else bra_idx, target_label)
+            (bra_idx + _net_shift if bra_idx >= s2r_pos else bra_idx, target_label)
             for bra_idx, target_label in ctx._bra_fixups
         ]
-
-    # 3b. Hoist post-BAR LDCUs to before BAR.SYNC.
-    # SM_120 rule: LDCU after BAR.SYNC in shared-memory kernels causes
-    # ERR715. ptxas loads all params before BAR. Fix: find LDCUs that
-    # appear AFTER BAR.SYNC and move them to just before BAR.
-    bar_idx = None
-    for idx, si in enumerate(body_instrs):
-        opc = (si.raw[0] | (si.raw[1] << 8)) & 0xFFF
-        if opc == 0xb1d:  # BAR.SYNC
-            bar_idx = idx
-            break
-    if bar_idx is not None:
-        # SM_120 rule: ANY constant-bank load (LDC 0xb82 or LDCU 0x7ac) in the
-        # body of a BAR.SYNC kernel poisons IADD.64-UR → ERR715.
-        # Hoist ALL body LDC/LDCU instructions to right after S2R (preamble).
-        # Exception: LDC R1 (frame ptr) at the very start is already in preamble.
-        hoisted = []
-        remaining = []
-        for idx, si in enumerate(body_instrs):
-            opc = (si.raw[0] | (si.raw[1] << 8)) & 0xFFF
-            is_ldc = opc == 0xb82 and si.raw[2] != 1  # LDC but not frame ptr
-            is_ldcu = opc == 0x7ac
-            # Hoist if before BAR and is a constant load (not already in preamble)
-            preamble_end = s2r_pos + len(all_preamble)
-            if idx > preamble_end and idx < bar_idx and (is_ldc or is_ldcu):
-                hoisted.append(si)
-            elif idx > bar_idx and is_ldcu:  # also hoist post-BAR LDCU
-                hoisted.append(si)
-            else:
-                remaining.append(si)
-        if hoisted:
-            # Insert right after the preamble block (S2R + preamble LDCUs + UR4)
-            insert_after = len(all_preamble) + s2r_pos
-            body_instrs = remaining[:insert_after] + hoisted + remaining[insert_after:]
 
     # 4. Schedule: reorder for LDG latency, then assign ctrl via scoreboard
     raw_instrs = preamble + body_instrs

@@ -10,17 +10,23 @@ Compiles PTX into executable cubins for **SM_120 Blackwell** GPUs. Full pipeline
 
 PTX compiled to working SM_120 cubins using only open-source Python tools.
 
-**GPU-verified on RTX 5090:**
+**386 tests. Zero failures. Zero xfails.** GPU-verified on RTX 5090:
 
-| Kernel | What it does | Status |
-|--------|-------------|--------|
-| `vector_add` | Float addition, multi-block indexing | **PASS** |
-| `kernel_a` | Float multiply by constant (`in[i] * 2.0f`) | **PASS** |
-| `increment` | Integer add (`in[i] + 1`) | **PASS** |
-| `divergent_warp` | Predicated early exit, intra-warp divergence | **PASS** |
-| `sel` | Float ternary with bounds check (`v > 0.5f ? 1.0f : 0.0f`) | **PASS** |
-| `imad_chain` | Multi-block multiply-add chain | **PASS** |
-| `predicated_exit` | Idle thread writes nothing | **PASS** |
+| Category | Tests | What it covers |
+|----------|------:|----------------|
+| Transcendentals | 7 | sin, cos, ex2, lg2, rsqrt, rcp, sqrt |
+| Arithmetic | 8 | SAXPY, dot product, mul.hi, mul.wide, div.u32, neg/abs, u64 add |
+| Comparison | 4 | setp 6-way s32, fsetp lt/gt, int min/max, float min/max |
+| Memory | 5 | warp reduce (shfl), atomics (or/min/max), 5-pointer deferred params |
+| Control flow | 3 | divergent branch, vote.ballot, predicated store |
+| Conversion | 3 | cvt u32/f32 roundtrip, f16/f32, div.approx |
+| Bitwise | 2 | brev/popc/clz/bfind chain, XOR |
+| FP64 | 1 | dmul + dadd chain |
+| Hazard rules | 15 | LDCU latency, ALU RAW, ISETP-BRA gap, scoreboard barriers |
+| Integration | 51 | Phase 1-6, CVT encoders, bugfix regressions, TMA, fsetp pred |
+| Non-GPU | 287 | Encoders, parser, pipeline, scoreboard, regalloc, roundtrip |
+
+SAXPY: **1.48x faster** than ptxas. All benchmarks at parity or better.
 
 ### With [OpenCUDA](https://github.com/garrick99/opencuda): full CUDA C pipeline
 
@@ -59,7 +65,8 @@ Verified over 500,000 iterations. Same kernel, same GPU, same input.
 git clone https://github.com/garrick99/openptxas
 cd openptxas
 python demo.py                      # compile + run vector_add on GPU
-pytest tests/ -x -q                 # 356 tests
+python tests/run_all.py             # 386 tests (GPU-isolated)
+pytest tests/ -x -q                 # non-GPU tests only
 ```
 
 ## What's Inside
@@ -94,10 +101,13 @@ Reverse-engineered during development. Not documented publicly elsewhere:
 | **DADD/DMUL/DFMA use b1=0x72** | The b1=0x7e/0x7c forms (from decode_sass.py) silently produce wrong results |
 | **LOP3 reads 3 source registers** | b3, b4, b8 all tracked for dependency; missing b4/b8 causes stale-data hazards |
 | **DADD src1 at b8, not b4** | Unlike DMUL/DFMA, DADD places second operand at byte 8 |
+| **UR cache leaks across launches** | Uniform register bank retains stale values across cuModuleLoad; ~20+ loads corrupt LDCU.64 |
+| **SEL barrier race** | SEL predicate read shares ALU wdep slot; intermediate ALU clears barrier before pred ready |
+| **FMNMX pred encoding** | b10=0x80 (not 0xfe); b11=0x03 for min (PT), 0x07 for max (!PT) |
 
 ## Instruction Coverage (108 unique opcodes, 183 encoders)
 
-All encoders byte-verified against ptxas 13.0 on SM_120. 70 GPU-verified on RTX 5090.
+All encoders byte-verified against ptxas 13.0 on SM_120. 99 GPU-verified on RTX 5090.
 
 | Category | Instructions |
 |----------|-------------|

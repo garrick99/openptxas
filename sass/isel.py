@@ -4133,7 +4133,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
 
                 elif op == 'rsqrt' and 'approx' in instr.types and typ == 'f32':
                     # rsqrt = rcp(sqrt(x)) but MUFU has dedicated RSQ function
-                    MUFU_RSQ = 0x02  # common on NVIDIA
+                    MUFU_RSQ = 0x14  # ptxas SM_120 ground truth
                     d = ctx.ra.r32(instr.dest.name)
                     a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     output.append(SassInstr(encode_mufu(d, a, MUFU_RSQ),

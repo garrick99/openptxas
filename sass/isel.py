@@ -912,19 +912,26 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
             return []
         d = ra.r32(dest.name)
 
-        # u32 params consumed only by setp: preamble LDCU.32
+        # u32 params consumed only by setp: load to GPR via LDC, then
+        # use ISETP R-R (not R-UR). LDCU.32 poisons IADD.64-UR and
+        # LDCU.64 reads past the 4-byte param boundary.
+        # Simply record the param offset; the setp handler will use LDC.
         if ctx and dest.name in getattr(ctx, '_setp_only_params', set()):
             ctx._reg_param_off[dest.name] = byte_off
-            if ctx.sm_version == 120:
-                ur_idx = ctx._next_ur
-                ctx._next_ur = ur_idx + 1
+            d = ra.r32(dest.name)
+            # SM_120 rule: constant-bank loads (LDC/LDCU) in the body poison
+            # IADD.64-UR in BAR.SYNC kernels. For BAR kernels, load in preamble.
+            # For non-BAR kernels, keep in body (avoids register liveness issues).
+            has_bar = getattr(ctx, '_has_bar_sync', False)
+            if ctx.sm_version == 120 and has_bar:
                 if not hasattr(ctx, '_preamble_ldcus'):
                     ctx._preamble_ldcus = []
                 ctx._preamble_ldcus.append(
-                    SassInstr(encode_ldcu_32(ur_idx, 0, byte_off),
-                              f'LDCU.32 UR{ur_idx}, c[0][0x{byte_off:x}]  // preamble setp param'))
-                ctx._ur_params[dest.name] = ur_idx
-            return []
+                    SassInstr(encode_ldc(d, 0, byte_off),
+                              f'LDC R{d}, c[0][0x{byte_off:x}]  // preamble setp param'))
+                return []
+            return [SassInstr(encode_ldc(d, 0, byte_off),
+                              f'LDC R{d}, c[0][0x{byte_off:x}]  // setp param')]
 
         # SM_120 rule #25: body LDC (0xb82) causes ERR715 in kernels
         # with VOTE+LDG. ptxas loads scalar params via LDCU.64 instead.
@@ -3236,48 +3243,23 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             encode_isetp_ur(emit_pd, ar, b_ur_idx, cmp=isetp_cmp),
                                             f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, UR{b_ur_idx}, PT'))
                                 elif b_param_off is not None and isetp_cmp in (ISETP_GE, ISETP_GT, ISETP_LE, ISETP_LT):
-                                    # SM_120 rule #25: LDCU.32 + VOTE coexistence causes
-                                    # ERR715 when LDG is present. Check if VOTE exists in
-                                    # this kernel — if so, skip the LDCU.32+ISETP.UR path
-                                    # and use GPR-to-GPR comparison instead.
-                                    _has_vote = any(
-                                        inst2.op == 'vote'
-                                        for bb2 in fn.blocks
-                                        for inst2 in bb2.instructions
-                                    )
-                                    if _has_vote:
-                                        # VOTE present: use GPR R-R path (value already
-                                        # loaded into GPR by ld.param → LDC).
-                                        br = ctx.ra.r32(b.name)
-                                        emit_pd = pd
-                                        if ctx.sm_version != 89 and pd > 0 and ctx:
-                                            emit_pd = 0
-                                            ctx.ra.pred_regs[pred.name] = 0
-                                        output.append(SassInstr(
-                                            encode_isetp(emit_pd, ar, br, cmp=isetp_cmp),
-                                            f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, R{br}, PT  // vote-safe GPR path'))
-                                    else:
-                                        # No VOTE: safe to use LDCU.32 + ISETP.UR path.
-                                        emit_pd = pd
-                                        if pd > 0 and ctx:
-                                            emit_pd = 0
-                                            ctx.ra.pred_regs[pred.name] = 0
-                                        # SM_120: keep UR < 14. Reuse low UR when exhausted.
-                                        # UR5 conflicts with mem desc (LDCU.64 UR4 writes UR4+UR5).
-                                        # Use UR3 instead (below the mem desc pair).
-                                        _has_deferred = getattr(ctx, '_had_deferred_params', False)
-                                        if ctx._next_ur >= 14 or _has_deferred:
-                                            ur_tmp = 5  # consumed by ISETP before mem desc loads
-                                        else:
-                                            ur_tmp = ctx._next_ur
-                                            ctx._next_ur += 1
-                                        output.append(SassInstr(
-                                            encode_ldcu_32(ur_tmp, 0, b_param_off),
-                                            f'LDCU.32 UR{ur_tmp}, c[0][0x{b_param_off:x}]  // setp src'))
-                                        pass  # NOPs removed
-                                        output.append(SassInstr(
-                                            encode_isetp_ur(emit_pd, ar, ur_tmp, cmp=isetp_cmp),
-                                            f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, UR{ur_tmp}, PT'))
+                                    # SM_120 rule: LDCU.32 in the body poisons IADD.64-UR.
+                                    # Always use GPR R-R path. The param value was loaded
+                                    # into a GPR by ld.param → LDC at the regular u32 path.
+                                    br = ctx.ra.r32(b.name)
+                                    emit_pd = pd
+                                    if ctx.sm_version != 89 and pd > 0 and ctx:
+                                        emit_pd = 0
+                                        ctx.ra.pred_regs[pred.name] = 0
+                                        if hasattr(ctx, '_negated_preds'):
+                                            if pd in ctx._negated_preds:
+                                                ctx._negated_preds.discard(pd)
+                                                ctx._negated_preds.add(0)
+                                            else:
+                                                ctx._negated_preds.discard(0)
+                                    output.append(SassInstr(
+                                        encode_isetp(emit_pd, ar, br, cmp=isetp_cmp),
+                                        f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, R{br}, PT  // GPR path (no body LDCU.32)'))
                                 else:
                                     # No UR/param available for ISETP.UR. Use ISETP R-R
                                     # as last resort. NOTE: ISETP R-R (0x20c) has toxic

@@ -708,6 +708,14 @@ def compile_function(fn: Function, verbose: bool = False,
         if _setp_only_params:
             ctx._setp_only_params = _setp_only_params
 
+    # Pre-scan: detect if kernel uses bar.sync (shared memory synchronization).
+    # Kernels with bar.sync need preamble-only constant loads to avoid
+    # LDC/LDCU poisoning of IADD.64-UR.
+    ctx._has_bar_sync = any(
+        inst.op == 'bar' and 'sync' in inst.types
+        for bb in fn.blocks for inst in bb.instructions
+    )
+
     body_instrs = select_function(fn, ctx)
 
     # SM_120 requires at least one S2R before LDCU param loads.
@@ -744,7 +752,7 @@ def compile_function(fn: Function, verbose: bool = False,
     # Update ctx.label_map and _bra_fixups to reflect ALL insertions:
     # - preamble LDCUs at s2r_pos (len = len(preamble_ldcus))
     # - UR4 descriptor at insert_idx (len = 1)
-    _n_inserted = len(preamble_ldcus) + 1  # total insertions
+    _n_inserted = len(all_preamble)  # total insertions (LDCUs + NOPs + UR4)
     first_body_label = None
     if hasattr(ctx, '_bra_fixups') and ctx._bra_fixups:
         for _, target in ctx._bra_fixups:
@@ -777,18 +785,28 @@ def compile_function(fn: Function, verbose: bool = False,
             bar_idx = idx
             break
     if bar_idx is not None:
+        # SM_120 rule: ANY constant-bank load (LDC 0xb82 or LDCU 0x7ac) in the
+        # body of a BAR.SYNC kernel poisons IADD.64-UR → ERR715.
+        # Hoist ALL body LDC/LDCU instructions to right after S2R (preamble).
+        # Exception: LDC R1 (frame ptr) at the very start is already in preamble.
         hoisted = []
         remaining = []
         for idx, si in enumerate(body_instrs):
             opc = (si.raw[0] | (si.raw[1] << 8)) & 0xFFF
-            if idx > bar_idx and opc == 0x7ac:  # LDCU after BAR
+            is_ldc = opc == 0xb82 and si.raw[2] != 1  # LDC but not frame ptr
+            is_ldcu = opc == 0x7ac
+            # Hoist if before BAR and is a constant load (not already in preamble)
+            preamble_end = s2r_pos + len(all_preamble)
+            if idx > preamble_end and idx < bar_idx and (is_ldc or is_ldcu):
+                hoisted.append(si)
+            elif idx > bar_idx and is_ldcu:  # also hoist post-BAR LDCU
                 hoisted.append(si)
             else:
                 remaining.append(si)
         if hoisted:
-            # Insert hoisted LDCUs just before BAR
-            new_bar_idx = remaining.index(body_instrs[bar_idx])
-            body_instrs = remaining[:new_bar_idx] + hoisted + remaining[new_bar_idx:]
+            # Insert right after the preamble block (S2R + preamble LDCUs + UR4)
+            insert_after = len(all_preamble) + s2r_pos
+            body_instrs = remaining[:insert_after] + hoisted + remaining[insert_after:]
 
     # 4. Schedule: reorder for LDG latency, then assign ctrl via scoreboard
     raw_instrs = preamble + body_instrs

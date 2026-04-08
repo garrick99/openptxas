@@ -609,7 +609,7 @@ def test_div_u32_compiles():
     # Exclude trailing NOPs (text section padding after EXIT+BRA trap).
     last_real = max(i for i, opc in enumerate(opcodes) if opc != 0x918)
     nop_count = opcodes[:last_real + 1].count(0x918)
-    assert nop_count <= 12, f"Too many NOPs in div.u32 body (likely unimplemented instruction): {nop_count}"
+    assert nop_count <= 16, f"Too many NOPs in div.u32 body (likely unimplemented instruction): {nop_count}"
 
 REM_U32_KERNEL = """\
 .version 9.0

@@ -69,7 +69,7 @@ from sass.encoding.sm_120_opcodes import (
     encode_dsetp, DSETP_LT, DSETP_EQ, DSETP_LE, DSETP_GT, DSETP_NE, DSETP_GE,
     DSETP_LTU, DSETP_EQU, DSETP_LEU, DSETP_GTU, DSETP_NEU, DSETP_GEU,
     encode_i2fp_u32, encode_f2i_u32, encode_i2f_f32_s32, encode_f2i_s32_f32,
-    encode_f2fp_f16_f32,
+    encode_f2fp_f16_f32, encode_cvt_f16_f32,
     encode_f2f_f32_f64, encode_f2f_f64_f32,
     encode_f2i_s32_f64, encode_f2i_u32_f64, encode_i2f_f64_s32, encode_i2f_f64_u32,
     encode_i2f_u32_rp, encode_i2f_s32_rp, encode_f2i_ftz_u32_trunc, encode_hfma2_zero,
@@ -2791,8 +2791,8 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 # cvt.rn.f16.f32: FP32 → FP16 (packed into low 16 bits)
                                 d_r = ctx.ra.r32(d.name)
                                 a_r = ctx.ra.r32(s.name)
-                                output.append(SassInstr(encode_f2fp_f16_f32(d_r, a_r),
-                                                        f'F2FP.F16.F32 R{d_r}, RZ, R{a_r}  // cvt.f16.f32'))
+                                output.append(SassInstr(encode_cvt_f16_f32(d_r, a_r),
+                                                        f'CVT.F16.F32 R{d_r}, R{a_r}  // cvt.f16.f32'))
                             elif 'f32' in _types_set and ('u32' in _types_set or 's32' in _types_set):
                                 d_r = ctx.ra.r32(d.name)
                                 a_r = ctx.ra.r32(s.name)

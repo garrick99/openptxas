@@ -4001,11 +4001,23 @@ def encode_depbar_le(sb=0, count=0, ctrl=0):
 
 def encode_f2fp_f16_f32(dest, src, ctrl=0):
     """F2FP.F16.F32.PACK_AB Rdest, RZ, Rsrc — FP32 to packed FP16 pair.
-    NOTE: ptxas uses opcode 0x304 (not F2FP) for cvt.f16.f32. This encoder
-    produces wrong packing order. Needs replacement with 0x304 encoder."""
+    NOTE: ptxas uses encode_cvt_f16_f32 (opcode 0x304) instead."""
     if ctrl == 0: ctrl = _CTRL_DEFAULT
     return _build(0x3e, 0x72, b2=dest, b3=RZ, b4=src, b8=0xFF,
                   b9=0x00, b10=0x00, b11=0x00, ctrl=ctrl)
+
+
+def encode_cvt_f16_f32(dest, src, ctrl=0):
+    """Convert F32 to F16 (rounding to nearest). Result in low 16 bits of dest.
+    Opcode 0x304. ptxas ground truth for cvt.rn.f16.f32.
+
+    Args:
+        dest: Destination GPR (gets f16 value zero-extended to u32).
+        src:  Source GPR (f32 input).
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x04, 0x73, b2=dest, b3=src, b4=src,
+                  b8=0x00, b9=0x08, b10=0x20, b11=0x00, ctrl=ctrl)
 
 
 # ---------------------------------------------------------------------------

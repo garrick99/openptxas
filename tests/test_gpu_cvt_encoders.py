@@ -284,11 +284,10 @@ _PTX_CVT_F16_F32 = """
     // Load float input (single thread)
     ld.global.f32 %f0, [%rd1];
 
-    // Convert float to half
-    cvt.rn.f16.f32 %h0, %f0;
+    // Convert float to half (result in low 16 bits of u32)
+    cvt.rn.f16.f32 %r1, %f0;
 
-    // Store result as u32 (the packed f16 in low bits)
-    mov.b32 %r1, %h0;
+    // Store result
     st.global.u32 [%rd0], %r1;
     ret;
 }

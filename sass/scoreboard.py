@@ -264,6 +264,7 @@ _OPCODES_ALU = {
     0x22a,        # DSETP (FP64 compare → predicate; reads pairs, no GPR dest)
     # FP conversion (decoded 2026-04-01)
     0x23e,        # F2FP.F16.F32 (FP32→packed FP16)
+    0x304,        # CVT.F16.F32 (FP32→FP16, low 16 bits)
     # Warp reduction (decoded 2026-04-01) — writes UR, not GPR
     0x3c4,        # REDUX.SUM (warp sum → UR)
     # MOV R, UR — copy uniform register to GPR (after REDUX)
@@ -383,6 +384,9 @@ def _get_src_regs(raw: bytes) -> set[int]:
             for r in range(2): regs.add(raw[4]+r)
             if raw[8] < 255:
                 for r in range(4): regs.add(raw[8]+r)
+        elif opcode == 0x304:  # F2F.F16.F32: src at both b3 and b4 (same register)
+            if raw[3] < 255: regs.add(raw[3])
+            if raw[4] < 255: regs.add(raw[4])
         elif opcode in (0x820, 0x823, 0x80a, 0x808, 0x80c):  # FMUL.IMM/FFMA.IMM/FSEL.step/FSEL.imm/ISETP.IMM: src0=b3, b4-b7=imm
             if raw[3] < 255: regs.add(raw[3])
             if opcode == 0x823 and raw[8] < 255: regs.add(raw[8])  # FFMA addend

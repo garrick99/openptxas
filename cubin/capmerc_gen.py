@@ -942,11 +942,10 @@ def analyze_sass_for_capmerc(sass_bytes: bytes) -> dict:
     num_barrier_regions = max(barrier_count + 1, 2)
 
     # GPR count: round up to nearest even, minimum 8
-    # Cap at 14 for capmerc — the hardware doesn't enforce reg_count,
-    # but num_gprs > 14 triggers a different capmerc structure (extra records,
-    # fillers, 0x2000 capability bit) that causes ERR715 on some kernels.
-    # R14+ access works fine with reg_count <= 14 in capmerc.
-    num_gprs = min(max(max_reg + 1, 8), 14)
+    # SM_120 BAR+smem kernels need accurate GPR count in capmerc.
+    # Using reg_count <= 14 works for simple kernels but causes ERR715
+    # when the kernel actually uses R15+ in BAR kernels.
+    num_gprs = max(max_reg + 1, 8)
     if num_gprs % 2 == 1:
         num_gprs += 1
 

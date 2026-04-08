@@ -1155,8 +1155,9 @@ def compile_function(fn: Function, verbose: bool = False,
         # bit and full-range type-02 barrier records (byte[10]=0x01), which is
         # required to enable R14+ access on SM_120 Mercury.
         # Deferred params change instruction stream; use our generated capmerc.
-        ptxas_capmerc=None if getattr(ctx, '_has_inline_deferred', False)
-                      else _select_capmerc(ptxas_meta, _final_gprs),
+        # Always use our generated capmerc — ptxas capmerc has region-specific
+        # GPR allocations that don't match our instruction stream.
+        ptxas_capmerc=None,
         ptxas_merc_info=None,
     )
     if sm_version == 89:

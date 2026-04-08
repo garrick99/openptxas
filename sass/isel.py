@@ -716,10 +716,10 @@ def _select_add_u64(instr: Instruction, ra: RegAlloc,
     if a_deferred or b_deferred:
         # Inline LDCU.64 UR6 → IADD.64 R-UR for deferred param
         if a_deferred:
-            param_off = deferred.pop(a.name)
+            param_off = deferred.get(a.name)
             r_lo = ra.lo(b.name)
         else:
-            param_off = deferred.pop(b.name)
+            param_off = deferred.get(b.name)
             r_lo = ra.lo(a.name)
         d_lo = ra.lo(dest.name) if dest.name in ra.int_regs else r_lo
         limit = getattr(ctx, '_gpr_limit', _GPR_HARD_LIMIT_DEFAULT)
@@ -949,7 +949,7 @@ def _select_ld_global(instr: Instruction, ra: RegAlloc,
         addr = ra.lo(src.base)
     elif base_name in deferred:
         # Deferred param: emit inline LDCU.64 UR6 → materialize to GPR
-        param_off = deferred.pop(base_name)
+        param_off = deferred.get(base_name)
         ur_tmp = 6
         addr = getattr(ctx, '_addr_scratch_lo', None)
         if addr is None:
@@ -1004,7 +1004,7 @@ def _select_atom_cas(instr: Instruction, ra: RegAlloc,
     if base_name in gpr_written and addr_op.base in ra.int_regs:
         addr = ra.lo(addr_op.base)
     elif base_name in deferred:
-        param_off = deferred.pop(base_name)
+        param_off = deferred.get(base_name)
         ur_tmp = 6
         addr = getattr(ctx, '_addr_scratch_lo', None)
         if addr is None:
@@ -1057,7 +1057,7 @@ def _select_atom_add_u32(instr: Instruction, ra: RegAlloc,
     if base_name in gpr_written and addr_op.base in ra.int_regs:
         addr = ra.lo(addr_op.base)
     elif base_name in deferred:
-        param_off = deferred.pop(base_name)
+        param_off = deferred.get(base_name)
         ur_tmp = 6
         addr = getattr(ctx, '_addr_scratch_lo', None)
         if addr is None:
@@ -1100,7 +1100,7 @@ def _select_atom_generic_u32(instr: Instruction, ra: RegAlloc,
     if base_name in gpr_written and addr_op.base in ra.int_regs:
         addr = ra.lo(addr_op.base)
     elif base_name in deferred:
-        param_off = deferred.pop(base_name)
+        param_off = deferred.get(base_name)
         ur_tmp = 6
         addr = getattr(ctx, '_addr_scratch_lo', None)
         if addr is None:
@@ -1142,7 +1142,7 @@ def _select_atom_add_f32(instr: Instruction, ra: RegAlloc,
     if base_name in gpr_written and addr_op.base in ra.int_regs:
         addr = ra.lo(addr_op.base)
     elif base_name in deferred:
-        param_off = deferred.pop(base_name)
+        param_off = deferred.get(base_name)
         ur_tmp = 6
         addr = getattr(ctx, '_addr_scratch_lo', None)
         if addr is None:
@@ -1192,7 +1192,7 @@ def _select_atom_cas_b64(instr: Instruction, ra: RegAlloc,
         if base_name in gpr_written and name in ra.int_regs:
             return ra.lo(name)
         elif base_name in deferred:
-            param_off = deferred.pop(base_name)
+            param_off = deferred.get(base_name)
             ur_tmp = 6
             gpr = _alloc_gpr_pair(ctx)
             prefix.append(SassInstr(encode_ldcu_64(ur_tmp, 0, param_off),
@@ -1212,7 +1212,7 @@ def _select_atom_cas_b64(instr: Instruction, ra: RegAlloc,
     if addr_base in gpr_written and addr_op.base in ra.int_regs:
         addr = ra.lo(addr_op.base)
     elif addr_base in deferred:
-        param_off = deferred.pop(addr_base)
+        param_off = deferred.get(addr_base)
         ur_tmp = 6
         addr = _alloc_gpr_pair(ctx)
         prefix.append(SassInstr(encode_ldcu_64(ur_tmp, 0, param_off),
@@ -1276,7 +1276,7 @@ def _select_st_global(instr: Instruction, ra: RegAlloc,
     if base_name in gpr_written and dest_op.base in ra.int_regs:
         addr = ra.lo(dest_op.base)
     elif base_name in deferred:
-        param_off = deferred.pop(base_name)
+        param_off = deferred.get(base_name)
         ur_tmp = 6
         addr = getattr(ctx, '_addr_scratch_lo', None)
         if addr is None:

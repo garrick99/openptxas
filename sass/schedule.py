@@ -535,6 +535,11 @@ def _fill_ldcu_latency(instrs: list[SassInstr]) -> list[SassInstr]:
                 if oj == 0x7ac and result[j].raw[9] == 0x0a:
                     ldcu_pos = j
                     break
+                # Stop at UR consumers EXCEPT LDG.E (which uses UR4 descriptor,
+                # not the deferred param's UR6). LDG blocking the scan caused
+                # excess NOPs to be retained for ReLU/FMA (the v1.6.1 fix).
+                if oj in _UR_CONSUMER_OPCODES and oj != 0x981:
+                    break
             if ldcu_pos >= 0:
                 # Find the consumer IADD.64 after this NOP
                 consumer_pos = -1
@@ -545,10 +550,16 @@ def _fill_ldcu_latency(instrs: list[SassInstr]) -> list[SassInstr]:
                         consumer_pos = k
                         break
                 if consumer_pos >= 0:
-                    # Gap = instructions between LDCU and consumer (exclusive)
-                    current_gap = consumer_pos - ldcu_pos - 1
-                    if current_gap > 3:
-                        continue  # Excess NOP — skip it
+                    # Don't clean up if DFPU instructions are in the window
+                    # (DADD/DMUL/DFMA need extra latency, NOPs may be required)
+                    _DFPU = {0x229, 0x228, 0x22b, 0xc2b, 0x22a}
+                    has_dfpu = any(
+                        (result[k].raw[0] | (result[k].raw[1] << 8)) & 0xFFF in _DFPU
+                        for k in range(ldcu_pos + 1, consumer_pos))
+                    if not has_dfpu:
+                        current_gap = consumer_pos - ldcu_pos - 1
+                        if current_gap > 3:
+                            continue  # Excess NOP — skip it
         cleaned.append(si)
     return cleaned
 

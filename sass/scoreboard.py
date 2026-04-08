@@ -835,10 +835,9 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
             guard = (si.raw[1] >> 4) & 0xF
             if guard != 0x7:
                 _ldcu_slot_counter[0] = 0
-        # Misc nibble: hybrid counter+override model.
-        # misc_counter increments for every instruction regardless of override.
-        # Opcodes in _OPCODE_MISC get the override value; all others use the counter.
-        # This matches ptxas ground truth for fp64_bench preamble exactly.
+        # Misc nibble: counter-based default with per-opcode overrides.
+        # Most ALU instructions use misc = (counter & 0xF). Specific opcodes
+        # have fixed overrides in _OPCODE_MISC (BAR=6, STS=1, LDS=2, etc.).
         misc = _OPCODE_MISC.get(opcode, misc_counter & 0xF)
         # ISETP misc: context-sensitive. Default misc=0 (from _OPCODE_MISC).
         # When within 3 instructions of VOTE (0x806), use counter-based misc

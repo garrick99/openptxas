@@ -618,8 +618,10 @@ def _select_add_u64(instr: Instruction, ra: RegAlloc,
                     SassInstr(encode_iadd3x(d_lo + 1, d_lo + 1, RZ, RZ),
                               f'IADD3.X R{d_lo+1}, R{d_lo+1}, RZ, RZ  // add.u64 hi carry'),
                 ]
-        # If 'a' is in UR space (loaded via LDCU.64), must materialize first
-        a_in_ur = ctx and a.name in ctx._ur_params
+        # If 'a' is in UR space (loaded via LDCU.64), must materialize first.
+        # Skip if 'a' was already written to GPR (e.g., by a previous add.u64).
+        a_in_ur = (ctx and a.name in ctx._ur_params
+                   and a.name not in getattr(ctx, '_gpr_written', set()))
         if a_in_ur:
             ur_idx = ctx._ur_params[a.name]
             d_lo = ra.lo(dest.name)
@@ -739,9 +741,12 @@ def _select_add_u64(instr: Instruction, ra: RegAlloc,
                       f'IADD.64 R{d_lo}, R{r_lo}, UR{ur_tmp}  // add.u64 (deferred UR)'),
         ]
 
-    # Check if either operand is a UR param (loaded via LDCU)
-    a_in_ur = ctx and a.name in ctx._ur_params
-    b_in_ur = ctx and b.name in ctx._ur_params
+    # Check if either operand is a UR param (loaded via LDCU).
+    # Skip if the register was already written to GPR (e.g., by a previous
+    # add.u64 increment) — _gpr_written tracks modified registers.
+    gpr_written = getattr(ctx, '_gpr_written', set()) if ctx else set()
+    a_in_ur = ctx and a.name in ctx._ur_params and a.name not in gpr_written
+    b_in_ur = ctx and b.name in ctx._ur_params and b.name not in gpr_written
 
     if a_in_ur or b_in_ur:
         # Use IADD.64 R-UR variant: dest(R) = src_r(R) + src_ur(UR)
@@ -875,8 +880,17 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
                     SassInstr(encode_ldc(dr + 1, 0, byte_off + 4),
                               f'LDC R{dr+1}, c[0][0x{byte_off + 4:x}]  // {param_name} hi (divergent fallback)'),
                 ]
-            # Dominating block: defer until add.u64 / ld.global / atom
-            ctx._deferred_ur_params[dest.name] = byte_off
+            # Preamble preload: assign UR pair, record for preamble emission.
+            # The LDCU is emitted by compile_function in the preamble window.
+            # Body code uses _ur_params to find the UR index.
+            ur_idx = ctx._next_ur
+            ctx._next_ur = ur_idx + 2
+            if not hasattr(ctx, '_preamble_ldcus'):
+                ctx._preamble_ldcus = []
+            ctx._preamble_ldcus.append(
+                SassInstr(encode_ldcu_64(ur_idx, 0, byte_off),
+                          f'LDCU.64 UR{ur_idx}, c[0][0x{byte_off:x}]  // preamble param {param_name}'))
+            ctx._ur_params[dest.name] = ur_idx
             ctx._has_inline_deferred = True
             return []
         # Non-SM_120 fallback: load into UR pair
@@ -898,11 +912,18 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
             return []
         d = ra.r32(dest.name)
 
-        # Skip LDC for u32 params consumed only by setp —
-        # the setp handler emits LDCU.32 directly into a UR.
-        # Still record _reg_param_off so the setp handler can find the offset.
+        # u32 params consumed only by setp: preamble LDCU.32
         if ctx and dest.name in getattr(ctx, '_setp_only_params', set()):
             ctx._reg_param_off[dest.name] = byte_off
+            if ctx.sm_version == 120:
+                ur_idx = ctx._next_ur
+                ctx._next_ur = ur_idx + 1
+                if not hasattr(ctx, '_preamble_ldcus'):
+                    ctx._preamble_ldcus = []
+                ctx._preamble_ldcus.append(
+                    SassInstr(encode_ldcu_32(ur_idx, 0, byte_off),
+                              f'LDCU.32 UR{ur_idx}, c[0][0x{byte_off:x}]  // preamble setp param'))
+                ctx._ur_params[dest.name] = ur_idx
             return []
 
         # SM_120 rule #25: body LDC (0xb82) causes ERR715 in kernels

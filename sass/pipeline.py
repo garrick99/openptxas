@@ -721,54 +721,61 @@ def compile_function(fn: Function, verbose: bool = False,
         body_instrs.insert(0, SassInstr(encode_s2r(0, SR_TID_X),
                                          'S2R R0, SR_TID.X  // required for LDCU init'))
 
-    # Insert ULDC/LDCU descriptor load after the bounds-check predicated EXIT.
-    # Both SM_89 and SM_120 use UR4 for the memory descriptor; only the
-    # encoding and constant bank offset differ (handled above).
+    # SM_120 preamble window: insert ALL LDCUs right after S2R, before
+    # any body instruction that uses UR values (including bounds-check ISETP).
+    # Then insert UR4 descriptor after the predicated EXIT (if any).
     #
-    # Predicated EXIT: opcode=0x94d with guard nibble ≠ 0x7 (not @PT).
-    insert_idx = 0
+    # Step 1: Find S2R position for preamble LDCU insertion
+    s2r_pos = 0
     for idx, si in enumerate(body_instrs):
+        opcode = struct.unpack_from('<Q', si.raw, 0)[0] & 0xFFF
+        if opcode in (0x919, 0x9c3):
+            s2r_pos = idx + 1
+            break
+
+    # Step 2: Insert preamble LDCUs right after S2R
+    preamble_ldcus = getattr(ctx, '_preamble_ldcus', [])
+    for pi, pldcu in enumerate(preamble_ldcus):
+        body_instrs.insert(s2r_pos + pi, pldcu)
+
+    # Step 3: Find insert_idx for UR4 descriptor (after predicated EXIT)
+    insert_idx = s2r_pos + len(preamble_ldcus)
+    for idx in range(insert_idx, len(body_instrs)):
+        si = body_instrs[idx]
         opcode = struct.unpack_from('<Q', si.raw, 0)[0] & 0xFFF
         guard_nibble = (si.raw[1] >> 4) & 0xF
         is_predicated = guard_nibble != 0x7
-
-        if opcode == 0x94d and is_predicated:  # predicated EXIT (bounds check)
+        if opcode == 0x94d and is_predicated:
             insert_idx = idx + 1
             break
-        elif opcode in (0x919, 0x9c3):  # S2R/S2UR fallback (no predicated EXIT)
-            insert_idx = idx + 1
-    # Skip past any post-EXIT deferred LDCU.64 instructions (from isel)
-    # so the mem desc loads AFTER deferred param loads (ptxas pattern).
+    # Skip past post-EXIT deferred LDCU.64 instructions
     while (insert_idx < len(body_instrs) and
            'post-EXIT' in body_instrs[insert_idx].comment):
         insert_idx += 1
     body_instrs.insert(insert_idx, ur4_desc_instr)
 
-    # Update ctx.label_map and _bra_fixups to reflect the UR4 insertion.
-    # Labels at or after insert_idx shift by 1 instruction (16 bytes).
-    # EXCEPTION: the first body label (BRA target from bounds check) should
-    # NOT be shifted — the BRA should land ON the LDCU.64 so active threads
-    # execute the descriptor load. Without this, BRA jumps past LDCU.64 and
-    # all LDG/STG use an uninitialized descriptor → crash.
+    # Update ctx.label_map and _bra_fixups to reflect ALL insertions:
+    # - preamble LDCUs at s2r_pos (len = len(preamble_ldcus))
+    # - UR4 descriptor at insert_idx (len = 1)
+    _n_inserted = len(preamble_ldcus) + 1  # total insertions
     first_body_label = None
     if hasattr(ctx, '_bra_fixups') and ctx._bra_fixups:
-        # Find the first BRA that goes to a post-boundary label
         for _, target in ctx._bra_fixups:
             tgt_byte = ctx.label_map.get(target, 0)
-            if tgt_byte // 16 >= insert_idx:
+            if tgt_byte // 16 >= s2r_pos:
                 first_body_label = target
                 break
 
     for label in list(ctx.label_map):
         if label == first_body_label:
-            continue  # Don't shift — BRA should land on LDCU.64
+            continue
         body_byte = ctx.label_map[label]
         body_idx = body_byte // 16
-        if body_idx >= insert_idx:
-            ctx.label_map[label] = body_byte + 16
+        if body_idx >= s2r_pos:
+            ctx.label_map[label] = body_byte + _n_inserted * 16
     if hasattr(ctx, '_bra_fixups'):
         ctx._bra_fixups = [
-            (bra_idx + 1 if bra_idx >= insert_idx else bra_idx, target_label)
+            (bra_idx + _n_inserted if bra_idx >= s2r_pos else bra_idx, target_label)
             for bra_idx, target_label in ctx._bra_fixups
         ]
 

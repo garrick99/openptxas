@@ -1365,15 +1365,20 @@ def encode_stg_e_64_direct(addr: int, data: int, ctrl: int = 0) -> bytes:
 # ---------------------------------------------------------------------------
 
 def encode_fadd(dest: int, src0: int, src1: int,
-                negate_src0: bool = False, ctrl: int = 0) -> bytes:
-    """Encode FADD dest, [+-]src0, src1 (FP32 add/subtract)."""
+                negate_src0: bool = False, abs_src0: bool = False,
+                ctrl: int = 0) -> bytes:
+    """Encode FADD dest, [+-|]src0, src1 (FP32 add/subtract).
+    negate_src0: b7 bit 7 = negate src0. abs_src0: b9 bit 1 = absolute src0.
+    ptxas ground truth: neg uses b7=0x80, abs uses b9=0x02."""
     if ctrl == 0:
         ctrl = _CTRL_DEFAULT
-    return _build(0x21, 0x72,
+    b7 = 0x80 if negate_src0 else 0x00
+    b9 = 0x02 if abs_src0 else 0x00
+    raw = bytearray(_build(0x21, 0x72,
                   b2=dest, b3=src0, b4=src1,
-                  b8=0x00,
-                  b9=0x01 if negate_src0 else 0x00, b10=0x00, b11=0x00,
-                  ctrl=ctrl)
+                  b8=0x00, b9=b9, b10=0x00, b11=0x00, ctrl=ctrl))
+    raw[7] = b7
+    return bytes(raw)
 
 
 def encode_fmul(dest: int, src0: int, src1: int, ctrl: int = 0) -> bytes:
@@ -2611,8 +2616,8 @@ def encode_fmnmx(dest: int, src0: int, src1: int, is_max: bool = False,
     raw[3] = src0 & 0xFF
     raw[4] = src1 & 0xFF
     # PT (min) vs !PT (max) encoded in modifier bytes
-    # Empirically verified on SM_120: mode byte is b10=0xfe, selector is b11=0x03(min)/0x07(max)
-    raw[10] = 0xfe
+    # ptxas ground truth (2026-04-07): b10=0x80, b11=0x03(min)/0x07(max)
+    raw[10] = 0x80
     raw[11] = 0x07 if is_max else 0x03
     raw[13], raw[14], raw[15] = b13, b14, b15
     return bytes(raw)

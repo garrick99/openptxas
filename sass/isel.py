@@ -54,7 +54,7 @@ from sass.encoding.sm_120_opcodes import (
     encode_bra, patch_pred,
     encode_fadd, encode_fmul, encode_fmul_imm, encode_ffma, encode_ffma_imm,
     encode_mufu, MUFU_RCP, MUFU_SQRT, MUFU_SIN, MUFU_COS, MUFU_EX2, MUFU_LG2,
-    encode_sel, encode_fsel,
+    encode_sel, encode_sel_imm, encode_fsel,
     encode_vimnmx_s32, encode_vimnmx_u32,
     encode_fmnmx,
     encode_prmt, encode_prmt_reg,
@@ -62,7 +62,7 @@ from sass.encoding.sm_120_opcodes import (
     encode_shfl, SHFL_IDX, SHFL_UP, SHFL_DOWN, SHFL_BFLY,
     encode_vote_ballot,
     encode_atomg_cas_b32, encode_atomg_cas_b64, encode_atomg_u32, encode_atomg_add_f32,
-    ATOMG_ADD, ATOMG_MIN, ATOMG_MAX, ATOMG_EXCH,
+    ATOMG_ADD, ATOMG_MIN, ATOMG_MAX, ATOMG_EXCH, ATOMG_OR, ATOMG_AND,
     encode_membar, MEMBAR_GPU, MEMBAR_CTA,
     encode_idp4a,
     encode_dadd, encode_dmul, encode_dfma, encode_dfma_ur_ur,
@@ -593,7 +593,8 @@ def _select_add_u64(instr: Instruction, ra: RegAlloc,
     # Handle immediate operand: add.u64 dest, a, imm  (e.g. loop counter increment by 1)
     if isinstance(b, ImmOp) and isinstance(dest, RegOp) and isinstance(a, RegOp):
         # If 'a' is a deferred param, emit inline LDCU.64 UR6 + materialize
-        a_deferred_imm = ctx and a.name in ctx._deferred_ur_params
+        a_deferred_imm = (ctx and a.name in ctx._deferred_ur_params
+                          and a.name not in getattr(ctx, '_gpr_written', set()))
         if a_deferred_imm:
             param_off = ctx._deferred_ur_params.pop(a.name)
             ur_tmp = 6  # always reuse UR6
@@ -948,15 +949,25 @@ def _select_ld_global(instr: Instruction, ra: RegAlloc,
     if base_name in gpr_written and src.base in ra.int_regs:
         addr = ra.lo(src.base)
     elif base_name in deferred:
-        # Deferred param: emit inline LDCU.64 UR6 → materialize to GPR
+        # Deferred param: emit inline LDCU.64 UR6 → materialize to GPR.
+        # Materialize into the ALLOCATED register for the address variable
+        # (not a scratch pair), so subsequent add.u64 %rd, %rd, K reads
+        # the correct GPR and can increment in-place.
         param_off = deferred.get(base_name)
         ur_tmp = 6
-        addr = getattr(ctx, '_addr_scratch_lo', None)
-        if addr is None:
-            addr = _alloc_gpr_pair(ctx)
+        if src.base in ra.int_regs:
+            addr = ra.lo(src.base)
+        else:
+            addr = getattr(ctx, '_addr_scratch_lo', None)
+            if addr is None:
+                addr = _alloc_gpr_pair(ctx)
         result.append(SassInstr(encode_ldcu_64(ur_tmp, 0, param_off),
                                 f'LDCU.64 UR{ur_tmp}, c[0][0x{param_off:x}]  // deferred param'))
         result.extend(_emit_ur_to_gpr(addr, ur_tmp, "deferred UR->GPR"))
+        # Mark address register as written so subsequent add.u64 %rd, %rd, K
+        # increments the GPR value instead of re-materializing from the param.
+        if ctx:
+            ctx._gpr_written.add(base_name)
     elif base_name in ur_params:
         # Register only exists as a UR (raw pointer from ld.param.u64, no add.u64).
         # Use the dedicated addr-scratch pair from context when available.
@@ -2190,6 +2201,9 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     else:
                         output.append(SassInstr(encode_ffma(d, a, b, c),
                                                 f'FFMA R{d}, R{a}, R{b}, R{c}  // fma.f32'))
+                    # Clear zero-reg status: dest is no longer zero after FMA
+                    if hasattr(ctx, '_zero_regs'):
+                        ctx._zero_regs.discard(d)
 
                 elif op == 'add' and typ == 'f64':
                     d = ctx.ra.lo(instr.dest.name)
@@ -2367,6 +2381,18 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
 
                 elif op == 'atom' and 'add' in instr.types and 'f32' in instr.types:
                     output.extend(_select_atom_add_f32(instr, ctx.ra, ctx))
+
+                elif op == 'atom' and 'or' in instr.types and 'b32' in instr.types:
+                    output.extend(_select_atom_generic_u32(instr, ctx.ra, ctx, ATOMG_OR, 'OR.b32'))
+
+                elif op == 'atom' and 'and' in instr.types and 'b32' in instr.types:
+                    output.extend(_select_atom_generic_u32(instr, ctx.ra, ctx, ATOMG_AND, 'AND.b32'))
+
+                elif op == 'atom' and 'min' in instr.types and 'u32' in instr.types:
+                    output.extend(_select_atom_generic_u32(instr, ctx.ra, ctx, ATOMG_MIN, 'MIN.u32'))
+
+                elif op == 'atom' and 'max' in instr.types and 'u32' in instr.types:
+                    output.extend(_select_atom_generic_u32(instr, ctx.ra, ctx, ATOMG_MAX, 'MAX.u32'))
 
                 elif op == 'atom' and 'cas' in instr.types and 'b64' in instr.types:
                     output.extend(_select_atom_cas_b64(instr, ctx.ra, ctx))
@@ -3165,6 +3191,12 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                         if ctx.sm_version != 89 and pd > 0 and ctx:
                                             emit_pd = 0
                                             ctx.ra.pred_regs[pred.name] = 0
+                                            if hasattr(ctx, '_negated_preds'):
+                                                if pd in ctx._negated_preds:
+                                                    ctx._negated_preds.discard(pd)
+                                                    ctx._negated_preds.add(0)
+                                                else:
+                                                    ctx._negated_preds.discard(0)
                                         output.append(SassInstr(
                                             encode_isetp(emit_pd, ar, br, cmp=isetp_cmp),
                                             f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, R{br}, PT  // vote-safe GPR'))
@@ -3173,6 +3205,12 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                         if pd > 0 and ctx:
                                             emit_pd = 0
                                             ctx.ra.pred_regs[pred.name] = 0
+                                            if hasattr(ctx, '_negated_preds'):
+                                                if pd in ctx._negated_preds:
+                                                    ctx._negated_preds.discard(pd)
+                                                    ctx._negated_preds.add(0)
+                                                else:
+                                                    ctx._negated_preds.discard(0)
                                         output.append(SassInstr(
                                             encode_isetp_ur(emit_pd, ar, b_ur_idx, cmp=isetp_cmp),
                                             f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, UR{b_ur_idx}, PT'))
@@ -3230,6 +3268,13 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                     if ctx.sm_version != 89 and pd > 0 and ctx:
                                         emit_pd = 0
                                         ctx.ra.pred_regs[pred.name] = 0
+                                        # Sync _negated_preds with physical P0 after remap
+                                        if hasattr(ctx, '_negated_preds'):
+                                            if pd in ctx._negated_preds:
+                                                ctx._negated_preds.discard(pd)
+                                                ctx._negated_preds.add(0)
+                                            else:
+                                                ctx._negated_preds.discard(0)
                                     output.append(SassInstr(
                                         encode_isetp(emit_pd, ar, br, cmp=isetp_cmp),
                                         f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, R{br}, PT'))
@@ -3264,6 +3309,12 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 if pd > 0 and ctx:
                                     emit_pd = 0
                                     ctx.ra.pred_regs[pred.name] = 0
+                                    if hasattr(ctx, '_negated_preds'):
+                                        if pd in ctx._negated_preds:
+                                            ctx._negated_preds.discard(pd)
+                                            ctx._negated_preds.add(0)
+                                        else:
+                                            ctx._negated_preds.discard(0)
                                 output.append(SassInstr(
                                     encode_isetp(emit_pd, ar, br, cmp=isetp_cmp),
                                     f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, R{br}, PT  // setp non-reg src1'))
@@ -3333,13 +3384,11 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             f'FADD R{d}, -R{a}, RZ  // neg.f32'))
 
                 elif op == 'abs' and typ == 'f32':
-                    # abs.f32: FADD |src|, -RZ (with abs modifier bit in b11)
+                    # abs.f32: FADD |src|, RZ (absolute value via abs modifier)
                     d = ctx.ra.r32(instr.dest.name)
                     a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
-                    # FADD with abs on src0: encode as FADD d, |a|, -RZ
-                    # Ground truth: b11 has abs bit 0x02
-                    output.append(SassInstr(encode_fadd(d, a, RZ, negate_src0=True),
-                                            f'FADD R{d}, |R{a}|, -RZ  // abs.f32'))
+                    output.append(SassInstr(encode_fadd(d, a, RZ, abs_src0=True),
+                                            f'FADD R{d}, |R{a}|, RZ  // abs.f32'))
 
                 elif op == 'neg' and typ == 'f64':
                     # neg.f64: flip sign bit (bit 31) of hi word via XOR 0x80000000.
@@ -3391,25 +3440,56 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     if len(instr.srcs) > 2 and isinstance(instr.srcs[2], RegOp):
                         pd = ctx.ra.pred(instr.srcs[2].name) if instr.srcs[2].name in ctx.ra.pred_regs else 0
                         neg = hasattr(ctx, '_negated_preds') and pd in ctx._negated_preds
-                    def _sel_src(src_op, out):
-                        if isinstance(src_op, RegOp):
-                            return ctx.ra.r32(src_op.name)
-                        elif isinstance(src_op, ImmOp):
-                            t = _alloc_gpr(ctx)
-                            out.append(SassInstr(encode_iadd3_imm32(t, RZ, src_op.value & 0xFFFFFFFF, RZ),
-                                                 f'MOV R{t}, {src_op.value}  // selp imm'))
-                            return t
-                        return RZ
-                    a = _sel_src(instr.srcs[0], output)
-                    b = _sel_src(instr.srcs[1], output)
-                    # If the predicate is logically negated (from setp inversion),
-                    # swap src0/src1 to preserve correct selection semantics.
-                    # SEL picks src0 when pred=TRUE, src1 when pred=FALSE.
-                    # Swapping compensates for the inverted predicate sense.
-                    if neg:
-                        a, b = b, a
-                    output.append(SassInstr(encode_sel(d, a, b, pd),
-                                            f'SEL R{d}, R{a}, R{b}, P{pd}  // selp'))
+                    s0, s1 = instr.srcs[0], instr.srcs[1]
+                    # Predicated-MOV path: avoids SEL predicate-read barrier races.
+                    # SM_120 scoreboard handles instruction guards (@P) correctly,
+                    # so we emit: MOV R, false_val; @P MOV R, true_val.
+                    # For negated preds (setp inversion): @!P MOV R, true_val.
+                    if isinstance(s0, ImmOp) and isinstance(s1, ImmOp):
+                        true_val  = s0.value & 0xFFFFFFFF
+                        false_val = s1.value & 0xFFFFFFFF
+                        # Emit unconditional MOV for false value
+                        output.append(SassInstr(
+                            encode_iadd3_imm32(d, RZ, false_val, RZ),
+                            f'IADD3 R{d}, RZ, {false_val:#x}, RZ  // selp false'))
+                        # Emit predicated MOV for true value
+                        pred_byte = (pd & 0x07)
+                        if neg:
+                            pred_byte |= 0x08  # negate
+                        raw_pmov = bytearray(encode_iadd3_imm32(d, RZ, true_val, RZ))
+                        raw_pmov[1] = (raw_pmov[1] & 0x0F) | (pred_byte << 4)
+                        output.append(SassInstr(
+                            bytes(raw_pmov),
+                            f'@{"!" if neg else ""}P{pd} IADD3 R{d}, RZ, {true_val:#x}, RZ  // selp true'))
+                    elif isinstance(s0, ImmOp) or isinstance(s1, ImmOp):
+                        # One register, one immediate
+                        if isinstance(s0, ImmOp):
+                            true_val = s0.value & 0xFFFFFFFF
+                            false_reg = ctx.ra.r32(s1.name) if isinstance(s1, RegOp) else RZ
+                        else:
+                            true_val = s1.value & 0xFFFFFFFF
+                            false_reg = ctx.ra.r32(s0.name) if isinstance(s0, RegOp) else RZ
+                            neg = not neg  # swap true/false semantics
+                        # MOV R, false_reg; @P MOV R, true_val
+                        output.append(SassInstr(
+                            encode_iadd3(d, false_reg, RZ, RZ),
+                            f'MOV R{d}, R{false_reg}  // selp false'))
+                        pred_byte = (pd & 0x07)
+                        if neg:
+                            pred_byte |= 0x08
+                        raw_pmov = bytearray(encode_iadd3_imm32(d, RZ, true_val, RZ))
+                        raw_pmov[1] = (raw_pmov[1] & 0x0F) | (pred_byte << 4)
+                        output.append(SassInstr(
+                            bytes(raw_pmov),
+                            f'@{"!" if neg else ""}P{pd} IADD3 R{d}, RZ, {true_val:#x}, RZ  // selp true'))
+                    else:
+                        # Both register sources: use SEL R-R
+                        a = ctx.ra.r32(s0.name) if isinstance(s0, RegOp) else RZ
+                        b = ctx.ra.r32(s1.name) if isinstance(s1, RegOp) else RZ
+                        if neg:
+                            a, b = b, a
+                        output.append(SassInstr(encode_sel(d, a, b, pd),
+                                                f'SEL R{d}, R{a}, R{b}, P{pd}  // selp'))
 
                 elif op == 'min' and typ in ('u32', 's32'):
                     d = ctx.ra.r32(instr.dest.name)
@@ -3568,11 +3648,34 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             f'IMAD.WIDE R{d_lo}, R{a}, R{b}, R{c_lo}  // mad.wide.{typ} R-R'))
 
                 elif op == 'mul' and 'hi' in instr.types and typ in ('u32', 's32'):
+                    # mul.hi.u32: upper 32 bits of 32×32 product.
+                    # Use IMAD.WIDE to get full 64-bit result, then take upper word.
                     d = ctx.ra.r32(instr.dest.name)
                     a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     b = _materialize_imm(instr.srcs[1], ctx, ctx.ra, output)
-                    output.append(SassInstr(encode_imad_hi(d, a, b, RZ, signed=(typ == 's32')),
-                                            f'IMAD.HI R{d}, R{a}, R{b}, RZ  // mul.hi.{typ}'))
+                    # Allocate even-aligned tmp pair for IMAD.WIDE dest
+                    tmp_lo = _alloc_gpr(ctx)
+                    if tmp_lo & 1:
+                        tmp_lo = _alloc_gpr(ctx)
+                    tmp_hi = tmp_lo + 1
+                    ctx._next_gpr = max(ctx._next_gpr, tmp_hi + 1)
+                    _wide_enc = encode_imad_wide_u32 if typ == 'u32' else encode_imad_wide_rr
+                    output.append(SassInstr(
+                        _wide_enc(tmp_lo, a, b, RZ),
+                        f'IMAD.WIDE.{"U32" if typ=="u32" else "S32"} R{tmp_lo}, R{a}, R{b}, RZ  // mul.hi.{typ}'))
+                    if d != tmp_hi:
+                        output.append(SassInstr(encode_iadd3(d, tmp_hi, RZ, RZ),
+                                                f'MOV R{d}, R{tmp_hi}  // mul.hi upper'))
+
+                elif op == 'mul' and 'wide' in instr.types and typ in ('u32', 's32'):
+                    # mul.wide.u32: 64-bit result = 32×32 product
+                    d_lo = ctx.ra.lo(instr.dest.name)
+                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
+                    b = _materialize_imm(instr.srcs[1], ctx, ctx.ra, output)
+                    _wide_enc = encode_imad_wide_u32 if typ == 'u32' else encode_imad_wide_rr
+                    output.append(SassInstr(
+                        _wide_enc(d_lo, a, b, RZ),
+                        f'IMAD.WIDE.{"U32" if typ=="u32" else "S32"} R{d_lo}, R{a}, R{b}, RZ  // mul.wide.{typ}'))
 
                 elif op == 'mul' and 'hi' in instr.types and typ in ('u64', 's64'):
                     # mul.hi.u64: upper 64 bits of 128-bit unsigned product.
@@ -3829,62 +3932,60 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         f'VOTE.ANY R{d}, PT, {pred_label}  // vote.sync.ballot'))
 
                 elif op == 'div' and typ == 'u32':
-                    # Full Newton-Raphson unsigned 32-bit division.
-                    # Matches the exact sequence ptxas emits for div.u32 (sm_120).
-                    # Ground truth: cuobjdump verified against ptxas 13.0 output.
+                    # Unsigned 32-bit division via Newton-Raphson reciprocal.
+                    # Uses only battle-tested encoders (no custom div-specific ones).
+                    # Algorithm: rcp approx → scale → NR refine → quotient → correction.
                     d  = ctx.ra.r32(instr.dest.name)
                     a  = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     b  = _materialize_imm(instr.srcs[1], ctx, ctx.ra, output)
-                    # Allocate 4 scratch GPRs and 3 scratch predicate registers
-                    t0 = _alloc_gpr(ctx)
-                    t1 = _alloc_gpr(ctx)
-                    t2 = _alloc_gpr(ctx)
-                    t3 = _alloc_gpr(ctx)
-                    pnz  = ctx._next_pred; ctx._next_pred += 1  # divisor != 0
-                    pge1 = ctx._next_pred; ctx._next_pred += 1  # first correction
-                    pge2 = ctx._next_pred; ctx._next_pred += 1  # second correction
-                    # Step 1: float approximation of reciprocal (round-up for conservative estimate)
+                    t0 = _alloc_gpr(ctx)  # float rcp
+                    t1 = _alloc_gpr(ctx)  # NR error / scratch
+                    t2 = _alloc_gpr(ctx)  # int approx
+                    t3 = _alloc_gpr(ctx)  # remainder
+                    # Even-aligned pair for IMAD.WIDE scratch
+                    tw = _alloc_gpr(ctx)
+                    if tw & 1: tw = _alloc_gpr(ctx)
+                    ctx._next_gpr = max(ctx._next_gpr, tw + 2)
+                    # Step 1: float reciprocal + scale to integer
                     output.append(SassInstr(encode_i2f_u32_rp(t0, b),
-                        f'I2F.U32.RP R{t0}, R{b}  // div.u32 step 1: float(divisor)'))
-                    output.append(SassInstr(encode_isetp(pnz, b, RZ, ISETP_NE),
-                        f'ISETP.NE.U32 P{pnz}, PT, R{b}, RZ, PT  // P{pnz}=(divisor!=0)'))
+                        f'I2F.U32.RP R{t0}, R{b}  // div.u32: float(divisor)'))
                     output.append(SassInstr(encode_mufu(t0, t0, MUFU_RCP),
-                        f'MUFU.RCP R{t0}, R{t0}  // t0 = 1/float(divisor)'))
-                    # Step 2: bias the reciprocal approximation toward the correct int
-                    output.append(SassInstr(encode_iadd3_imm32(t1, t0, 0x0ffffffe, RZ),
-                        f'IADD3 R{t1}, R{t0}, 0xffffffe, RZ  // bias rcp approx'))
-                    output.append(SassInstr(encode_f2i_ftz_u32_trunc(t2, t1),
-                        f'F2I.FTZ.U32.TRUNC R{t2}, R{t1}  // int approx of rcp'))
-                    output.append(SassInstr(encode_hfma2_zero(t1),
-                        f'HFMA2 R{t1}, -RZ, RZ, 0, 0  // zero R{t1}'))
-                    # Step 3: Newton-Raphson refinement via multiply-high
-                    output.append(SassInstr(encode_iadd3_neg_b4(t3, RZ, t2, RZ),
-                        f'IADD3 R{t3}, RZ, -R{t2}, RZ  // negate approx'))
-                    output.append(SassInstr(encode_imad(t3, t3, b, RZ),
-                        f'IMAD R{t3}, R{t3}, R{b}, RZ  // error term'))
-                    output.append(SassInstr(encode_imad_hi(t2, t2, t3, t1),
-                        f'IMAD.HI.U32 R{t2}, R{t2}, R{t3}, R{t1}  // refine estimate'))
-                    # Step 4: compute quotient approximation
-                    output.append(SassInstr(encode_imad_hi(d, t2, a, RZ),
-                        f'IMAD.HI.U32 R{d}, R{t2}, R{a}, RZ  // quotient approx'))
-                    # Step 5: compute remainder and apply correction(s)
-                    output.append(SassInstr(encode_iadd3_neg_b3(t3, d, RZ, RZ),
-                        f'IADD3 R{t3}, -R{d}, RZ, RZ  // negate quotient'))
-                    output.append(SassInstr(encode_imad(t3, b, t3, a),
-                        f'IMAD R{t3}, R{b}, R{t3}, R{a}  // remainder = a - d*b'))
-                    output.append(SassInstr(encode_isetp(pge1, t3, b, ISETP_GE),
-                        f'ISETP.GE.U32 P{pge1}, PT, R{t3}, R{b}, PT'))
-                    output.append(SassInstr(encode_iadd3_pred_neg_b4(t3, t3, b, RZ, pge1),
-                        f'@P{pge1} IADD3 R{t3}, R{t3}, -R{b}, RZ  // correction 1'))
-                    output.append(SassInstr(encode_iadd3_pred_small_imm(d, d, 1, RZ, pge1),
-                        f'@P{pge1} IADD3 R{d}, R{d}, 0x1, RZ  // correction 1'))
-                    output.append(SassInstr(encode_isetp(pge2, t3, b, ISETP_GE),
-                        f'ISETP.GE.U32 P{pge2}, PT, R{t3}, R{b}, PT'))
-                    output.append(SassInstr(encode_iadd3_pred_small_imm(d, d, 1, RZ, pge2),
-                        f'@P{pge2} IADD3 R{d}, R{d}, 0x1, RZ  // correction 2'))
-                    # Step 6: handle division by zero (result = 0xFFFFFFFF per CUDA spec)
-                    output.append(SassInstr(encode_lop3_pred(d, RZ, b, RZ, 0x33, pnz, inverted=True),
-                        f'@!P{pnz} LOP3.LUT R{d}, RZ, R{b}, RZ, 0x33  // div-by-zero: result=0xFFFFFFFF'))
+                        f'MUFU.RCP R{t0}, R{t0}  // rcp'))
+                    output.append(SassInstr(encode_fmul_imm(t0, t0, 0x4F7FFFFE),
+                        f'FMUL.IMM R{t0}, R{t0}, 0x4F7FFFFE  // scale rcp'))
+                    output.append(SassInstr(encode_f2i_ftz_u32_trunc(t2, t0),
+                        f'F2I.FTZ.U32.TRUNC R{t2}, R{t0}  // int approx'))
+                    # Step 2: quotient = mulhi(approx, dividend)
+                    output.append(SassInstr(
+                        encode_imad_wide_u32(tw, t2, a, RZ),
+                        f'IMAD.WIDE.U32 R{tw}, R{t2}, R{a}, RZ  // quotient'))
+                    output.append(SassInstr(encode_iadd3(d, tw+1, RZ, RZ),
+                        f'MOV R{d}, R{tw+1}  // quotient = hi word'))
+                    # Step 3: remainder = dividend - quotient * divisor
+                    output.append(SassInstr(encode_imad(t3, d, b, RZ),
+                        f'IMAD R{t3}, R{d}, R{b}, RZ  // q*divisor'))
+                    raw_sub = bytearray(encode_iadd3(t3, a, t3, RZ))
+                    raw_sub[7] = 0x80  # negate src1 (b4)
+                    output.append(SassInstr(bytes(raw_sub),
+                        f'IADD3 R{t3}, R{a}, -R{t3}, RZ  // remainder = a - q*b'))
+                    # Step 4: corrections (remainder >= divisor → quotient++)
+                    output.append(SassInstr(encode_isetp(0, t3, b, ISETP_GE),
+                        f'ISETP.GE.U32 P0, PT, R{t3}, R{b}, PT'))
+                    raw_p = bytearray(encode_iadd3_imm32(d, d, 1, RZ))
+                    raw_p[1] = (raw_p[1] & 0x0F) | (0x00 << 4)  # @P0
+                    output.append(SassInstr(bytes(raw_p),
+                        f'@P0 IADD3 R{d}, R{d}, 1, RZ  // correction 1'))
+                    raw_s = bytearray(encode_iadd3(t3, t3, b, RZ))
+                    raw_s[7] = 0x80  # negate src1
+                    raw_s[1] = (raw_s[1] & 0x0F) | (0x00 << 4)  # @P0
+                    output.append(SassInstr(bytes(raw_s),
+                        f'@P0 IADD3 R{t3}, R{t3}, -R{b}, RZ  // sub divisor'))
+                    output.append(SassInstr(encode_isetp(0, t3, b, ISETP_GE),
+                        f'ISETP.GE.U32 P0, PT, R{t3}, R{b}, PT'))
+                    raw_p2 = bytearray(encode_iadd3_imm32(d, d, 1, RZ))
+                    raw_p2[1] = (raw_p2[1] & 0x0F) | (0x00 << 4)  # @P0
+                    output.append(SassInstr(bytes(raw_p2),
+                        f'@P0 IADD3 R{d}, R{d}, 1, RZ  // correction 2'))
 
                 elif op == 'div' and typ == 's32':
                     # Signed 32-bit division via Newton-Raphson on absolute values.

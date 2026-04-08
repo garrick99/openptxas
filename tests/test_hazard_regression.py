@@ -92,97 +92,12 @@ def _get_misc(ctrl: int) -> int:
 # GPU driver bootstrap (shared with test_gpu_correctness.py)
 # ---------------------------------------------------------------------------
 
-def _get_cuda():
-    try:
-        cuda = ctypes.cdll.LoadLibrary('nvcuda.dll')
-        if cuda.cuInit(0) != 0:
-            return None
-        return cuda
-    except Exception:
-        return None
 
-
-_CUDA = _get_cuda()
-gpu = pytest.mark.skipif(_CUDA is None, reason="No CUDA GPU available")
-
-
-class CUDAContext:
-    def __init__(self):
-        self.cuda = _CUDA
-        self.ctx  = ctypes.c_void_p()
-        self.mod  = ctypes.c_void_p()
-        dev = ctypes.c_int()
-        assert self.cuda.cuDeviceGet(ctypes.byref(dev), 0) == 0
-        err = self.cuda.cuCtxCreate_v2(ctypes.byref(self.ctx), 0, dev)
-        assert err == 0, f"cuCtxCreate_v2 failed: {err}"
-
-    def load(self, cubin: bytes) -> bool:
-        if self.mod and self.mod.value:
-            self.cuda.cuModuleUnload(self.mod)
-            self.mod = ctypes.c_void_p()
-        return self.cuda.cuModuleLoadData(ctypes.byref(self.mod), cubin) == 0
-
-    def get_func(self, name: str):
-        func = ctypes.c_void_p()
-        assert self.cuda.cuModuleGetFunction(ctypes.byref(func), self.mod, name.encode()) == 0
-        return func
-
-    def alloc(self, nbytes: int) -> int:
-        ptr = ctypes.c_uint64()
-        assert self.cuda.cuMemAlloc_v2(ctypes.byref(ptr), nbytes) == 0
-        return ptr.value
-
-    def fill32(self, ptr: int, val: int, count: int):
-        data = struct.pack(f'<{count}I', *([val] * count))
-        self.cuda.cuMemcpyHtoD_v2(ctypes.c_uint64(ptr), data, len(data))
-
-    def copy_to(self, ptr: int, data: bytes):
-        self.cuda.cuMemcpyHtoD_v2(ctypes.c_uint64(ptr), data, len(data))
-
-    def copy_from(self, ptr: int, nbytes: int) -> bytes:
-        buf = (ctypes.c_uint8 * nbytes)()
-        assert self.cuda.cuMemcpyDtoH_v2(buf, ctypes.c_uint64(ptr), nbytes) == 0
-        return bytes(buf)
-
-    def launch(self, func, grid, block, args):
-        holders, ptrs = [], []
-        for a in args:
-            h = ctypes.c_uint64(a) if isinstance(a, int) and a > 0xFFFFFFFF else ctypes.c_int32(a)
-            holders.append(h)
-            ptrs.append(ctypes.cast(ctypes.byref(h), ctypes.c_void_p))
-        arr = (ctypes.c_void_p * len(ptrs))(*ptrs)
-        gx, gy, gz = grid
-        bx, by, bz = block
-        return self.cuda.cuLaunchKernel(func, gx, gy, gz, bx, by, bz, 0, None, arr, None)
-
-    def sync(self) -> int:
-        return self.cuda.cuCtxSynchronize()
-
-    def free(self, ptr: int):
-        self.cuda.cuMemFree_v2(ctypes.c_uint64(ptr))
-
-    def close(self):
-        if self.mod and self.mod.value:
-            self.cuda.cuModuleUnload(self.mod)
-            self.mod = ctypes.c_void_p()
-        if self.ctx and self.ctx.value:
-            self.cuda.cuCtxDestroy_v2(self.ctx)
-            self.ctx = ctypes.c_void_p()
-
-
-@pytest.fixture(scope="module")
-def cuda_ctx():
-    if _CUDA is None:
-        pytest.skip("No CUDA GPU available")
-    try:
-        cctx = CUDAContext()
-    except AssertionError as e:
-        # CUDA context creation failed — most likely a sticky device error (error 700)
-        # left by a kernel crash in a previous test module.  Skip gracefully instead of
-        # erroring; run this module in isolation to exercise GPU tests cleanly.
-        pytest.skip(f"Could not create CUDA context: {e}")
-    yield cctx
-    cctx.close()
+try:
+    import ctypes; _c = ctypes.cdll.LoadLibrary("nvcuda.dll"); _CUDA = _c.cuInit(0) == 0
+except Exception:
+    _CUDA = False
+gpu = pytest.mark.skipif(not _CUDA, reason="No CUDA GPU")
 
 
 # ---------------------------------------------------------------------------

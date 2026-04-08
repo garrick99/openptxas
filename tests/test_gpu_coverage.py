@@ -13,73 +13,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from sass.pipeline import compile_ptx_source
 
 
-def _get_cuda():
-    try:
-        cuda = ctypes.cdll.LoadLibrary('nvcuda.dll')
-        if cuda.cuInit(0) != 0: return None
-        return cuda
-    except: return None
-
-_CUDA = _get_cuda()
-gpu = pytest.mark.skipif(_CUDA is None, reason="No CUDA GPU")
-
-
-class CUDAContext:
-    def __init__(self):
-        self.cuda = _CUDA
-        self.ctx = ctypes.c_void_p()
-        self.mod = ctypes.c_void_p()
-        dev = ctypes.c_int()
-        self.cuda.cuDeviceGet(ctypes.byref(dev), 0)
-        assert self.cuda.cuCtxCreate_v2(ctypes.byref(self.ctx), 0, dev) == 0
-
-    def load(self, cubin):
-        if self.mod.value: self.cuda.cuModuleUnload(self.mod)
-        self.mod = ctypes.c_void_p()
-        return self.cuda.cuModuleLoadData(ctypes.byref(self.mod), cubin) == 0
-
-    def get_func(self, name):
-        f = ctypes.c_void_p()
-        assert self.cuda.cuModuleGetFunction(ctypes.byref(f), self.mod, name.encode()) == 0
-        return f
-
-    def alloc(self, n):
-        p = ctypes.c_uint64()
-        assert self.cuda.cuMemAlloc_v2(ctypes.byref(p), n) == 0
-        return p.value
-
-    def free(self, p): self.cuda.cuMemFree_v2(ctypes.c_uint64(p))
-    def copy_to(self, p, d): self.cuda.cuMemcpyHtoD_v2(ctypes.c_uint64(p), d, len(d))
-    def copy_from(self, p, n):
-        b = (ctypes.c_uint8 * n)()
-        self.cuda.cuMemcpyDtoH_v2(b, ctypes.c_uint64(p), n)
-        return bytes(b)
-
-    def sync(self): return self.cuda.cuCtxSynchronize()
-
-    def launch(self, func, grid, block, args):
-        gx, gy, gz = grid if isinstance(grid, tuple) else (grid, 1, 1)
-        bx, by, bz = block if isinstance(block, tuple) else (block, 1, 1)
-        holders = []
-        ptrs = []
-        for a in args:
-            h = ctypes.c_uint64(a) if isinstance(a, int) and a > 0xFFFFFFFF else ctypes.c_int32(a)
-            holders.append(h)
-            ptrs.append(ctypes.cast(ctypes.byref(h), ctypes.c_void_p))
-        aa = (ctypes.c_void_p * len(ptrs))(*ptrs)
-        return self.cuda.cuLaunchKernel(func, gx, gy, gz, bx, by, bz, 0, None, aa, None)
-
-    def close(self):
-        if self.mod.value: self.cuda.cuModuleUnload(self.mod)
-        if self.ctx.value: self.cuda.cuCtxDestroy_v2(self.ctx)
-
-
-@pytest.fixture(scope="module")
-def cuda_ctx():
-    if _CUDA is None: pytest.skip("No CUDA")
-    c = CUDAContext()
-    yield c
-    c.close()
+try:
+    import ctypes; _c = ctypes.cdll.LoadLibrary("nvcuda.dll"); _CUDA = _c.cuInit(0) == 0
+except Exception:
+    _CUDA = False
+gpu = pytest.mark.skipif(not _CUDA, reason="No CUDA GPU")
 
 
 # ============================================================
@@ -341,9 +279,10 @@ _PTX_ATOM_OR = """
 .target sm_120
 .address_size 64
 .visible .entry atom_or(.param .u64 p_out) {
-    .reg .u32 %r<2>; .reg .u64 %rd<2>;
+    .reg .u32 %r<4>; .reg .u64 %rd<2>;
+    mov.u32 %r1, 0xFF;
     ld.param.u64 %rd0, [p_out];
-    atom.global.or.b32 %r0, [%rd0], 0xFF;
+    atom.global.or.b32 %r0, [%rd0], %r1;
     ret;
 }
 """
@@ -353,10 +292,10 @@ _PTX_ATOM_MINMAX_U = """
 .target sm_120
 .address_size 64
 .visible .entry atom_minmax_u(.param .u64 p_min, .param .u64 p_max) {
-    .reg .u32 %r<4>; .reg .u64 %rd<4>;
+    .reg .u32 %r<4>; .reg .s32 %s<4>; .reg .u64 %rd<4>;
     mov.u32 %r0, %tid.x; add.u32 %r1, %r0, 1;
-    ld.param.u64 %rd0, [p_min]; atom.global.min.u32 %r2, [%rd0], %r1;
-    ld.param.u64 %rd1, [p_max]; atom.global.max.u32 %r3, [%rd1], %r1;
+    ld.param.u64 %rd0, [p_min]; atom.global.min.s32 %s0, [%rd0], %r1;
+    ld.param.u64 %rd1, [p_max]; atom.global.max.s32 %s1, [%rd1], %r1;
     ret;
 }
 """
@@ -364,7 +303,7 @@ _PTX_ATOM_MINMAX_U = """
 
 @gpu
 class TestAtomicVariants:
-    @pytest.mark.xfail(reason="Untested instruction variant - encoding bug")
+
     def test_atomic_or(self, cuda_ctx):
         cubins = compile_ptx_source(_PTX_ATOM_OR)
         assert cuda_ctx.load(cubins['atom_or'])
@@ -376,13 +315,13 @@ class TestAtomicVariants:
         assert val == 0xFF
         cuda_ctx.free(d)
 
-    @pytest.mark.xfail(reason="Untested instruction variant - encoding bug")
-    def test_atomic_min_max_u32(self, cuda_ctx):
+
+    def test_atomic_min_max_s32(self, cuda_ctx):
         cubins = compile_ptx_source(_PTX_ATOM_MINMAX_U)
         assert cuda_ctx.load(cubins['atom_minmax_u'])
         func = cuda_ctx.get_func('atom_minmax_u')
         d_min = cuda_ctx.alloc(4); d_max = cuda_ctx.alloc(4)
-        cuda_ctx.copy_to(d_min, struct.pack('<I', 0xFFFFFFFF))
+        cuda_ctx.copy_to(d_min, struct.pack('<i', 0x7FFFFFFF))
         cuda_ctx.copy_to(d_max, struct.pack('<I', 0))
         cuda_ctx.launch(func, (1,1,1), (32,1,1), [d_min, d_max])
         assert cuda_ctx.sync() == 0
@@ -402,20 +341,22 @@ _PTX_SETP_VARIANTS = """
 .target sm_120
 .address_size 64
 .visible .entry setp_variants(.param .u64 p_out) {
-    .reg .u32 %r<16>; .reg .u64 %rd<2>; .reg .pred %p<8>;
+    .reg .u32 %r<8>; .reg .u64 %rd<2>; .reg .pred %p<2>;
     mov.u32 %r0, 5; mov.u32 %r1, 10;
+    mov.u32 %r3, 0;
     setp.eq.s32 %p0, %r0, %r1; selp.u32 %r2, 1, 0, %p0;
-    setp.ne.s32 %p1, %r0, %r1; selp.u32 %r3, 1, 0, %p1;
-    setp.lt.s32 %p2, %r0, %r1; selp.u32 %r4, 1, 0, %p2;
-    setp.le.s32 %p3, %r0, %r1; selp.u32 %r5, 1, 0, %p3;
-    setp.gt.s32 %p4, %r0, %r1; selp.u32 %r6, 1, 0, %p4;
-    setp.ge.s32 %p5, %r0, %r1; selp.u32 %r7, 1, 0, %p5;
-    shl.b32 %r2, %r2, 5; shl.b32 %r3, %r3, 4;
-    shl.b32 %r4, %r4, 3; shl.b32 %r5, %r5, 2;
-    shl.b32 %r6, %r6, 1;
-    or.b32 %r8, %r2, %r3; or.b32 %r8, %r8, %r4;
-    or.b32 %r8, %r8, %r5; or.b32 %r8, %r8, %r6; or.b32 %r8, %r8, %r7;
-    ld.param.u64 %rd0, [p_out]; st.global.u32 [%rd0], %r8;
+    shl.b32 %r2, %r2, 5; or.b32 %r3, %r3, %r2;
+    setp.ne.s32 %p0, %r0, %r1; selp.u32 %r2, 1, 0, %p0;
+    shl.b32 %r2, %r2, 4; or.b32 %r3, %r3, %r2;
+    setp.lt.s32 %p0, %r0, %r1; selp.u32 %r2, 1, 0, %p0;
+    shl.b32 %r2, %r2, 3; or.b32 %r3, %r3, %r2;
+    setp.le.s32 %p0, %r0, %r1; selp.u32 %r2, 1, 0, %p0;
+    shl.b32 %r2, %r2, 2; or.b32 %r3, %r3, %r2;
+    setp.gt.s32 %p0, %r0, %r1; selp.u32 %r2, 1, 0, %p0;
+    shl.b32 %r2, %r2, 1; or.b32 %r3, %r3, %r2;
+    setp.ge.s32 %p0, %r0, %r1; selp.u32 %r2, 1, 0, %p0;
+    or.b32 %r3, %r3, %r2;
+    ld.param.u64 %rd0, [p_out]; st.global.u32 [%rd0], %r3;
     ret;
 }
 """
@@ -423,7 +364,7 @@ _PTX_SETP_VARIANTS = """
 
 @gpu
 class TestSetpVariants:
-    @pytest.mark.xfail(reason="Untested instruction variant - encoding bug")
+
     def test_integer_comparisons(self, cuda_ctx):
         cubins = compile_ptx_source(_PTX_SETP_VARIANTS)
         assert cuda_ctx.load(cubins['setp_variants'])
@@ -440,22 +381,34 @@ class TestSetpVariants:
 # Wide math (mul.hi, mul.wide)
 # ============================================================
 
-_PTX_WIDE_MATH = """
+_PTX_MUL_HI = """
 .version 9.0
 .target sm_120
 .address_size 64
-.visible .entry wide_math(.param .u64 p_out) {
-    .reg .u32 %r<8>; .reg .u64 %rd<4>;
+.visible .entry mul_hi(.param .u64 p_out) {
+    .reg .u32 %r<4>; .reg .u64 %rd<2>;
     mov.u32 %r0, 0x80000000; mov.u32 %r1, 2;
     mul.hi.u32 %r2, %r0, %r1;
+    ld.param.u64 %rd0, [p_out];
+    st.global.u32 [%rd0], %r2;
+    ret;
+}
+"""
+
+_PTX_MUL_WIDE = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry mul_wide(.param .u64 p_out) {
+    .reg .u32 %r<4>; .reg .u64 %rd<4>;
+    mov.u32 %r0, 0x80000000;
     mul.wide.u32 %rd0, %r0, 3;
     ld.param.u64 %rd1, [p_out];
-    st.global.u32 [%rd1], %r2;
+    cvt.u32.u64 %r1, %rd0;
+    st.global.u32 [%rd1], %r1;
     add.u64 %rd2, %rd1, 4;
-    cvt.u32.u64 %r4, %rd0;
-    shr.u64 %rd3, %rd0, 32; cvt.u32.u64 %r5, %rd3;
-    st.global.u32 [%rd2], %r4;
-    add.u64 %rd2, %rd2, 4; st.global.u32 [%rd2], %r5;
+    shr.u64 %rd3, %rd0, 32; cvt.u32.u64 %r2, %rd3;
+    st.global.u32 [%rd2], %r2;
     ret;
 }
 """
@@ -463,18 +416,28 @@ _PTX_WIDE_MATH = """
 
 @gpu
 class TestWideMath:
-    @pytest.mark.xfail(reason="Untested instruction variant - encoding bug")
-    def test_mul_hi_and_wide(self, cuda_ctx):
-        cubins = compile_ptx_source(_PTX_WIDE_MATH)
-        assert cuda_ctx.load(cubins['wide_math'])
-        func = cuda_ctx.get_func('wide_math')
-        d = cuda_ctx.alloc(12); cuda_ctx.copy_to(d, b'\x00' * 12)
+
+    def test_mul_hi(self, cuda_ctx):
+        cubins = compile_ptx_source(_PTX_MUL_HI)
+        assert cuda_ctx.load(cubins['mul_hi'])
+        func = cuda_ctx.get_func('mul_hi')
+        d = cuda_ctx.alloc(4); cuda_ctx.copy_to(d, b'\x00' * 4)
         cuda_ctx.launch(func, (1,1,1), (1,1,1), [d])
         assert cuda_ctx.sync() == 0
-        vals = struct.unpack('<III', cuda_ctx.copy_from(d, 12))
-        assert vals[0] == 1, f"mul.hi: {vals[0]}"
-        assert vals[1] == 0x80000000, f"wide.lo: {vals[1]:#x}"
-        assert vals[2] == 1, f"wide.hi: {vals[2]}"
+        val = struct.unpack('<I', cuda_ctx.copy_from(d, 4))[0]
+        assert val == 1, f"mul.hi: {val}"
+        cuda_ctx.free(d)
+
+    def test_mul_wide(self, cuda_ctx):
+        cubins = compile_ptx_source(_PTX_MUL_WIDE)
+        assert cuda_ctx.load(cubins['mul_wide'])
+        func = cuda_ctx.get_func('mul_wide')
+        d = cuda_ctx.alloc(8); cuda_ctx.copy_to(d, b'\x00' * 8)
+        cuda_ctx.launch(func, (1,1,1), (1,1,1), [d])
+        assert cuda_ctx.sync() == 0
+        lo, hi = struct.unpack('<II', cuda_ctx.copy_from(d, 8))
+        assert lo == 0x80000000, f"wide.lo: {lo:#x}"
+        assert hi == 1, f"wide.hi: {hi}"
         cuda_ctx.free(d)
 
 
@@ -502,7 +465,7 @@ _PTX_NEGABS = """
 
 @gpu
 class TestNegAbs:
-    @pytest.mark.xfail(reason="Untested instruction variant - encoding bug")
+
     def test_neg_abs_f32(self, cuda_ctx):
         cubins = compile_ptx_source(_PTX_NEGABS)
         assert cuda_ctx.load(cubins['negabs'])
@@ -514,3 +477,296 @@ class TestNegAbs:
         assert neg == -10.0, f"neg: {neg}"
         assert ab == 10.0, f"abs: {ab}"
         cuda_ctx.free(d)
+
+
+# ============================================================
+# FP32 division (div.approx.f32)
+# ============================================================
+
+_PTX_FDIV = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry fdiv_test(.param .u64 p_out) {
+    .reg .u64 %rd<2>; .reg .f32 %f<4>;
+    mov.f32 %f0, 0f41200000;
+    mov.f32 %f1, 0f40000000;
+    div.approx.f32 %f2, %f0, %f1;
+    ld.param.u64 %rd0, [p_out];
+    st.global.f32 [%rd0], %f2;
+    ret;
+}
+"""
+
+
+@gpu
+class TestFDiv:
+    def test_div_approx_f32(self, cuda_ctx):
+        """div.approx.f32: 10.0 / 2.0 = 5.0."""
+        cubins = compile_ptx_source(_PTX_FDIV)
+        assert cuda_ctx.load(cubins['fdiv_test'])
+        func = cuda_ctx.get_func('fdiv_test')
+        d = cuda_ctx.alloc(4); cuda_ctx.copy_to(d, b'\x00' * 4)
+        cuda_ctx.launch(func, (1,1,1), (1,1,1), [d])
+        assert cuda_ctx.sync() == 0
+        val = struct.unpack('<f', cuda_ctx.copy_from(d, 4))[0]
+        assert abs(val - 5.0) < 0.01, f"div.approx: {val}"
+        cuda_ctx.free(d)
+
+
+# ============================================================
+# Integer division (div.u32, div.s32)
+# ============================================================
+
+_PTX_IDIVU = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry idivu_test(.param .u64 p_out, .param .u64 p_a, .param .u64 p_b) {
+    .reg .u32 %r<4>; .reg .u64 %rd<4>;
+    ld.param.u64 %rd0, [p_a]; ld.global.u32 %r0, [%rd0];
+    ld.param.u64 %rd1, [p_b]; ld.global.u32 %r1, [%rd1];
+    div.u32 %r2, %r0, %r1;
+    ld.param.u64 %rd2, [p_out];
+    st.global.u32 [%rd2], %r2;
+    ret;
+}
+"""
+
+
+@gpu
+class TestIntDiv:
+    
+    def test_div_u32(self, cuda_ctx):
+        cubins = compile_ptx_source(_PTX_IDIVU)
+        assert cuda_ctx.load(cubins['idivu_test'])
+        func = cuda_ctx.get_func('idivu_test')
+        d_a = cuda_ctx.alloc(4); cuda_ctx.copy_to(d_a, struct.pack('<I', 100))
+        d_b = cuda_ctx.alloc(4); cuda_ctx.copy_to(d_b, struct.pack('<I', 7))
+        d = cuda_ctx.alloc(4); cuda_ctx.copy_to(d, b'\x00' * 4)
+        cuda_ctx.launch(func, (1,1,1), (1,1,1), [d, d_a, d_b])
+        assert cuda_ctx.sync() == 0
+        val = struct.unpack('<I', cuda_ctx.copy_from(d, 4))[0]
+        assert val == 14, f"div.u32: 100/7={val}"
+        cuda_ctx.free(d_a); cuda_ctx.free(d_b); cuda_ctx.free(d)
+
+
+# ============================================================
+# XOR (xor.b32)
+# ============================================================
+
+_PTX_XOR = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry xor_test(.param .u64 p_out) {
+    .reg .u32 %r<4>; .reg .u64 %rd<2>;
+    mov.u32 %r0, 0xFF00FF00;
+    mov.u32 %r1, 0x0F0F0F0F;
+    xor.b32 %r2, %r0, %r1;
+    ld.param.u64 %rd0, [p_out];
+    st.global.u32 [%rd0], %r2;
+    ret;
+}
+"""
+
+
+@gpu
+class TestXOR:
+    def test_xor_b32(self, cuda_ctx):
+        cubins = compile_ptx_source(_PTX_XOR)
+        assert cuda_ctx.load(cubins['xor_test'])
+        func = cuda_ctx.get_func('xor_test')
+        d = cuda_ctx.alloc(4); cuda_ctx.copy_to(d, b'\x00' * 4)
+        cuda_ctx.launch(func, (1,1,1), (1,1,1), [d])
+        assert cuda_ctx.sync() == 0
+        val = struct.unpack('<I', cuda_ctx.copy_from(d, 4))[0]
+        assert val == 0xF00FF00F, f"xor.b32: {val:#010x}"
+        cuda_ctx.free(d)
+
+
+# ============================================================
+# Float comparisons (setp.lt.f32 + selp)
+# ============================================================
+
+_PTX_FSETP = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry fsetp_test(.param .u64 p_out) {
+    .reg .u32 %r<4>; .reg .u64 %rd<2>; .reg .f32 %f<4>; .reg .pred %p<2>;
+    mov.f32 %f0, 0f40A00000;
+    mov.f32 %f1, 0f41200000;
+    setp.lt.f32 %p0, %f0, %f1;
+    selp.u32 %r0, 1, 0, %p0;
+    setp.gt.f32 %p0, %f0, %f1;
+    selp.u32 %r1, 1, 0, %p0;
+    shl.b32 %r0, %r0, 1;
+    or.b32 %r2, %r0, %r1;
+    ld.param.u64 %rd0, [p_out];
+    st.global.u32 [%rd0], %r2;
+    ret;
+}
+"""
+
+
+@gpu
+class TestFsetp:
+    def test_fsetp_lt_gt(self, cuda_ctx):
+        """setp.lt.f32(5.0, 10.0) = 1, setp.gt.f32(5.0, 10.0) = 0 -> 0b10 = 2."""
+        cubins = compile_ptx_source(_PTX_FSETP)
+        assert cuda_ctx.load(cubins['fsetp_test'])
+        func = cuda_ctx.get_func('fsetp_test')
+        d = cuda_ctx.alloc(4); cuda_ctx.copy_to(d, b'\x00' * 4)
+        cuda_ctx.launch(func, (1,1,1), (1,1,1), [d])
+        assert cuda_ctx.sync() == 0
+        val = struct.unpack('<I', cuda_ctx.copy_from(d, 4))[0]
+        assert val == 2, f"fsetp: got {val:02b}, expected 10"
+        cuda_ctx.free(d)
+
+
+# ============================================================
+# Divergent branch control flow
+# ============================================================
+
+_PTX_BRANCH = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry branch_test(.param .u64 p_out) {
+    .reg .u32 %r<4>; .reg .u64 %rd<4>; .reg .pred %p<2>;
+    mov.u32 %r0, %tid.x;
+    setp.lt.u32 %p0, %r0, 16;
+    @%p0 bra THEN;
+    mov.u32 %r1, 200;
+    bra DONE;
+THEN:
+    mov.u32 %r1, 100;
+DONE:
+    ld.param.u64 %rd0, [p_out];
+    cvt.u64.u32 %rd1, %r0; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd0, %rd0, %rd1;
+    st.global.u32 [%rd0], %r1;
+    ret;
+}
+"""
+
+
+@gpu
+class TestBranch:
+    def test_divergent_branch(self, cuda_ctx):
+        """Threads 0-15 write 100, threads 16-31 write 200."""
+        cubins = compile_ptx_source(_PTX_BRANCH)
+        assert cuda_ctx.load(cubins['branch_test'])
+        func = cuda_ctx.get_func('branch_test')
+        d = cuda_ctx.alloc(128); cuda_ctx.copy_to(d, b'\x00' * 128)
+        cuda_ctx.launch(func, (1,1,1), (32,1,1), [d])
+        assert cuda_ctx.sync() == 0
+        vals = struct.unpack('<32I', cuda_ctx.copy_from(d, 128))
+        for i in range(16):
+            assert vals[i] == 100, f"tid {i}: {vals[i]}"
+        for i in range(16, 32):
+            assert vals[i] == 200, f"tid {i}: {vals[i]}"
+        cuda_ctx.free(d)
+
+
+# ============================================================
+# FP64 arithmetic chain (dmul + dadd)
+# ============================================================
+
+_PTX_FP64 = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry fp64_test(.param .u64 p_out) {
+    .reg .u64 %rd<4>; .reg .f64 %fd<4>;
+    mov.f64 %fd0, 0d4024000000000000;
+    mov.f64 %fd1, 0d4000000000000000;
+    mul.f64 %fd2, %fd0, %fd1;
+    add.f64 %fd3, %fd2, %fd1;
+    ld.param.u64 %rd0, [p_out];
+    st.global.f64 [%rd0], %fd3;
+    ret;
+}
+"""
+
+
+@gpu
+class TestFP64:
+    def test_fp64_chain(self, cuda_ctx):
+        """10.0 * 2.0 + 2.0 = 22.0 (FP64)."""
+        cubins = compile_ptx_source(_PTX_FP64)
+        assert cuda_ctx.load(cubins['fp64_test'])
+        func = cuda_ctx.get_func('fp64_test')
+        d = cuda_ctx.alloc(8); cuda_ctx.copy_to(d, b'\x00' * 8)
+        cuda_ctx.launch(func, (1,1,1), (1,1,1), [d])
+        assert cuda_ctx.sync() == 0
+        val = struct.unpack('<d', cuda_ctx.copy_from(d, 8))[0]
+        assert val == 22.0, f"fp64: {val}"
+        cuda_ctx.free(d)
+
+
+# ============================================================
+# Float min/max chain
+# ============================================================
+
+_PTX_FMIN = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry fmin_test(.param .u64 p_out, .param .u64 p_a, .param .u64 p_b) {
+    .reg .u64 %rd<4>; .reg .f32 %f<4>;
+    ld.param.u64 %rd0, [p_a]; ld.global.f32 %f0, [%rd0];
+    ld.param.u64 %rd1, [p_b]; ld.global.f32 %f1, [%rd1];
+    min.f32 %f2, %f0, %f1;
+    ld.param.u64 %rd2, [p_out];
+    st.global.f32 [%rd2], %f2;
+    ret;
+}
+"""
+
+_PTX_FMAX = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry fmax_test(.param .u64 p_out, .param .u64 p_a, .param .u64 p_b) {
+    .reg .u64 %rd<4>; .reg .f32 %f<4>;
+    ld.param.u64 %rd0, [p_a]; ld.global.f32 %f0, [%rd0];
+    ld.param.u64 %rd1, [p_b]; ld.global.f32 %f1, [%rd1];
+    max.f32 %f2, %f0, %f1;
+    ld.param.u64 %rd2, [p_out];
+    st.global.f32 [%rd2], %f2;
+    ret;
+}
+"""
+
+
+@gpu
+class TestFMinMax:
+    def test_min_f32(self, cuda_ctx):
+        cubins = compile_ptx_source(_PTX_FMIN)
+        assert cuda_ctx.load(cubins['fmin_test'])
+        d_a = cuda_ctx.alloc(4); cuda_ctx.copy_to(d_a, struct.pack('<f', 10.0))
+        d_b = cuda_ctx.alloc(4); cuda_ctx.copy_to(d_b, struct.pack('<f', 5.0))
+        d = cuda_ctx.alloc(4); cuda_ctx.copy_to(d, b'\x00' * 4)
+        cuda_ctx.launch(cuda_ctx.get_func('fmin_test'), (1,1,1), (1,1,1), [d, d_a, d_b])
+        assert cuda_ctx.sync() == 0
+        val = struct.unpack('<f', cuda_ctx.copy_from(d, 4))[0]
+        assert val == 5.0, f"min: {val}"
+        cuda_ctx.free(d_a); cuda_ctx.free(d_b); cuda_ctx.free(d)
+
+    def test_max_f32(self, cuda_ctx):
+        cubins = compile_ptx_source(_PTX_FMAX)
+        assert cuda_ctx.load(cubins['fmax_test'])
+        d_a = cuda_ctx.alloc(4); cuda_ctx.copy_to(d_a, struct.pack('<f', 5.0))
+        d_b = cuda_ctx.alloc(4); cuda_ctx.copy_to(d_b, struct.pack('<f', 15.0))
+        d = cuda_ctx.alloc(4); cuda_ctx.copy_to(d, b'\x00' * 4)
+        cuda_ctx.launch(cuda_ctx.get_func('fmax_test'), (1,1,1), (1,1,1), [d, d_a, d_b])
+        assert cuda_ctx.sync() == 0
+        val = struct.unpack('<f', cuda_ctx.copy_from(d, 4))[0]
+        assert val == 15.0, f"max: {val}"
+        cuda_ctx.free(d_a); cuda_ctx.free(d_b); cuda_ctx.free(d)
+
+
+# ============================================================
+# Dot product (FMA chain with indexed loads)

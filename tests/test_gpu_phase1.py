@@ -35,96 +35,12 @@ from sass.pipeline import compile_ptx_source
 # GPU driver bootstrap
 # ---------------------------------------------------------------------------
 
-def _get_cuda():
-    try:
-        cuda = ctypes.cdll.LoadLibrary('nvcuda.dll')
-        err = cuda.cuInit(0)
-        if err != 0:
-            return None
-        return cuda
-    except Exception:
-        return None
 
-_CUDA = _get_cuda()
-gpu = pytest.mark.skipif(_CUDA is None, reason="No CUDA GPU available")
-
-
-class CUDAContext:
-    """CUDA context wrapper."""
-    def __init__(self):
-        self.cuda = _CUDA
-        self.ctx = ctypes.c_void_p()
-        self.mod = ctypes.c_void_p()
-        dev = ctypes.c_int()
-        err = self.cuda.cuDeviceGet(ctypes.byref(dev), 0)
-        assert err == 0, f"cuDeviceGet failed: {err}"
-        err = self.cuda.cuCtxCreate_v2(ctypes.byref(self.ctx), 0, dev)
-        assert err == 0, f"cuCtxCreate_v2 failed: {err}"
-
-    def load(self, cubin_bytes: bytes) -> bool:
-        if self.mod and self.mod.value:
-            self.cuda.cuModuleUnload(self.mod)
-            self.mod = ctypes.c_void_p()
-        err = self.cuda.cuModuleLoadData(ctypes.byref(self.mod), cubin_bytes)
-        return err == 0
-
-    def get_func(self, name: str):
-        func = ctypes.c_void_p()
-        err = self.cuda.cuModuleGetFunction(ctypes.byref(func), self.mod, name.encode())
-        assert err == 0, f"cuModuleGetFunction({name}) failed: {err}"
-        return func
-
-    def alloc(self, nbytes: int) -> int:
-        ptr = ctypes.c_uint64()
-        err = self.cuda.cuMemAlloc_v2(ctypes.byref(ptr), nbytes)
-        assert err == 0, f"cuMemAlloc_v2({nbytes}) failed: {err}"
-        return ptr.value
-
-    def copy_to(self, dev_ptr: int, host_data: bytes):
-        err = self.cuda.cuMemcpyHtoD_v2(ctypes.c_uint64(dev_ptr), host_data, len(host_data))
-        assert err == 0, f"cuMemcpyHtoD_v2 failed: {err}"
-
-    def copy_from(self, dev_ptr: int, nbytes: int) -> bytes:
-        buf = (ctypes.c_uint8 * nbytes)()
-        err = self.cuda.cuMemcpyDtoH_v2(buf, ctypes.c_uint64(dev_ptr), nbytes)
-        assert err == 0, f"cuMemcpyDtoH_v2 failed: {err}"
-        return bytes(buf)
-
-    def launch(self, func, grid, block, args_list, smem=0) -> int:
-        arg_holders = []
-        ptrs = []
-        for a in args_list:
-            holder = ctypes.c_uint64(a) if isinstance(a, int) and a > 0xFFFFFFFF else ctypes.c_int32(a)
-            arg_holders.append(holder)
-            ptrs.append(ctypes.cast(ctypes.byref(holder), ctypes.c_void_p))
-        args_arr = (ctypes.c_void_p * len(ptrs))(*ptrs)
-        gx, gy, gz = grid
-        bx, by, bz = block
-        return self.cuda.cuLaunchKernel(func, gx, gy, gz, bx, by, bz, smem, None, args_arr, None)
-
-    def free(self, ptr: int):
-        self.cuda.cuMemFree_v2(ctypes.c_uint64(ptr))
-
-    def sync(self) -> int:
-        return self.cuda.cuCtxSynchronize()
-
-    def close(self):
-        if self.mod and self.mod.value:
-            self.cuda.cuModuleUnload(self.mod)
-            self.mod = ctypes.c_void_p()
-        if self.ctx and self.ctx.value:
-            self.cuda.cuCtxSynchronize()
-            self.cuda.cuCtxDestroy_v2(self.ctx)
-            self.ctx = ctypes.c_void_p()
-
-
-@pytest.fixture(scope="module")
-def cuda_ctx():
-    if _CUDA is None:
-        pytest.skip("No CUDA GPU available")
-    cctx = CUDAContext()
-    yield cctx
-    cctx.close()
+try:
+    import ctypes; _c = ctypes.cdll.LoadLibrary("nvcuda.dll"); _CUDA = _c.cuInit(0) == 0
+except Exception:
+    _CUDA = False
+gpu = pytest.mark.skipif(not _CUDA, reason="No CUDA GPU")
 
 
 def _compile(ptx_src: str) -> dict[str, bytes]:

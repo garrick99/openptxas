@@ -776,6 +776,23 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
             candidate = _WDEP_TO_RBAR.get(pw, 0x01)
             rbar = rbar | candidate
 
+        # SEL/FSEL read a predicate as operand, not as a guard.
+        # Must also wait for the ISETP that wrote that predicate.
+        # SEL R-R (0x207): pred at b8. SEL.IMM (0x807): pred at b11 & 0x07.
+        # FSEL (0x208): pred at b8. FSEL.IMM (0x808): pred at b11 & 0x07.
+        if opcode in (0x207, 0x208):
+            sel_pred = si.raw[8] & 0x07
+            if sel_pred in pending_pred_writes:
+                _, pw = pending_pred_writes[sel_pred]
+                candidate = _WDEP_TO_RBAR.get(pw, 0x01)
+                rbar = rbar | candidate
+        elif opcode in (0x807, 0x808):
+            sel_pred = si.raw[11] & 0x07
+            if sel_pred in pending_pred_writes:
+                _, pw = pending_pred_writes[sel_pred]
+                candidate = _WDEP_TO_RBAR.get(pw, 0x01)
+                rbar = rbar | candidate
+
         # BAR.SYNC: all threads synchronize, so all prior memory operations
         # are guaranteed complete. Clear pending_writes so post-barrier
         # instructions start with a clean scoreboard. Without this, stale

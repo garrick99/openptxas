@@ -37,7 +37,7 @@ def _check(err, msg=""):
 
 
 @pytest.fixture(scope="module")
-def cuda_ctx():
+def tma_cuda_ctx():
     if not HAS_GPU:
         pytest.skip("No CUDA driver available")
     _check(_cuda.cuInit(0), "cuInit")
@@ -64,7 +64,7 @@ def _load_cubin(path):
     return mod
 
 
-def test_tma_commit_wait_loads(cuda_ctx):
+def test_tma_commit_wait_loads(tma_cuda_ctx):
     """Verify the tma_commit_wait cubin loads on SM_120 GPU."""
     cubin = str(Path(__file__).parent.parent / "probe_work" / "tma_probes" / "tma_commit_wait.cubin")
     if not os.path.exists(cubin):
@@ -75,7 +75,7 @@ def test_tma_commit_wait_loads(cuda_ctx):
     assert err == 0, f"Failed to find kernel: error {err}"
 
 
-def test_tma_commit_wait_copies_data(cuda_ctx):
+def test_tma_commit_wait_copies_data(tma_cuda_ctx):
     """Run tma_commit_wait kernel and verify data is copied correctly.
 
     This kernel uses legacy cp.async: LDGSTS.E.128 + LDGDEPBAR + DEPBAR.LE
@@ -131,7 +131,7 @@ def test_tma_commit_wait_copies_data(cuda_ctx):
         assert h_dst[i] == h_src[i], f"byte[{i}]: got {h_dst[i]:#x}, expected {h_src[i]:#x}"
 
 
-def test_tma_bulk_copy_loads(cuda_ctx):
+def test_tma_bulk_copy_loads(tma_cuda_ctx):
     """Verify the tma_bulk_copy cubin loads on SM_120 GPU."""
     cubin = str(Path(__file__).parent.parent / "probe_work" / "tma_probes" / "tma_bulk_copy.cubin")
     if not os.path.exists(cubin):
@@ -142,7 +142,7 @@ def test_tma_bulk_copy_loads(cuda_ctx):
     assert err == 0, f"Failed to find kernel: error {err}"
 
 
-def test_tma_tensor_1d_loads(cuda_ctx):
+def test_tma_tensor_1d_loads(tma_cuda_ctx):
     """Verify the tma_tensor_1d cubin loads on SM_120 GPU."""
     cubin = str(Path(__file__).parent.parent / "probe_work" / "tma_probes" / "tma_tensor_1d.cubin")
     if not os.path.exists(cubin):

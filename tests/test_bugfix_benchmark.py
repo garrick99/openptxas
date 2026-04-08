@@ -18,8 +18,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sass.pipeline import compile_ptx_source
 
-# Reuse the CUDA fixture from phase1
-from tests.test_gpu_phase1 import CUDAContext, _CUDA, gpu, cuda_ctx  # noqa: F401
+# CUDA fixture provided by conftest.py (session-scoped primary context)
+try:
+    import ctypes as _ctypes; _c = _ctypes.cdll.LoadLibrary("nvcuda.dll"); _CUDA = _c.cuInit(0) == 0
+except Exception:
+    _CUDA = False
+gpu = pytest.mark.skipif(not _CUDA, reason="No CUDA GPU")
 
 
 def _compile(src):

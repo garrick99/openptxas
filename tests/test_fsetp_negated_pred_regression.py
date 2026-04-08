@@ -104,70 +104,23 @@ def _get_cuda():
 
 @pytest.mark.skipif(_get_cuda() is None, reason="No CUDA GPU")
 @pytest.mark.gpu
-def test_fsetp_pred_reuse_gpu_correctness():
+def test_fsetp_pred_reuse_gpu_correctness(cuda_ctx):
     """
     Thread 0: a[0] = 15.0, threshold = 10.0
-    15.0 > 10.0 is TRUE → should take TRUE_PATH → out = 15.0 * 2.0 = 30.0
-
-    If _negated_preds is stale, the @P0 bra has flipped sense:
-    TRUE becomes FALSE → out = 15.0 * 0.5 = 7.5 (WRONG)
+    15.0 > 10.0 is TRUE -> should take TRUE_PATH -> out = 15.0 * 2.0 = 30.0
     """
-    import ctypes
-
-    cuda = _get_cuda()
-    ctx = ctypes.c_void_p()
-    dev = ctypes.c_int()
-    cuda.cuDeviceGet(ctypes.byref(dev), 0)
-    cuda.cuCtxCreate_v2(ctypes.byref(ctx), 0, dev)
-
     result = compile_ptx_source(FSETP_PRED_REUSE_PTX)
     cubin = result['fsetp_pred_reuse']
+    assert cuda_ctx.load(cubin), "cuModuleLoadData failed"
+    func = cuda_ctx.get_func('fsetp_pred_reuse')
 
-    mod = ctypes.c_void_p()
-    err = cuda.cuModuleLoadData(ctypes.byref(mod), cubin)
-    assert err == 0, f"cuModuleLoadData failed: {err}"
+    d_out = cuda_ctx.alloc(4); cuda_ctx.copy_to(d_out, struct.pack('f', 0.0))
+    d_a = cuda_ctx.alloc(4); cuda_ctx.copy_to(d_a, struct.pack('f', 15.0))
+    cuda_ctx.launch(func, (1,1,1), (1,1,1), [d_out, d_a, 1])
+    assert cuda_ctx.sync() == 0
+    result_val = struct.unpack('f', cuda_ctx.copy_from(d_out, 4))[0]
+    cuda_ctx.free(d_out); cuda_ctx.free(d_a)
 
-    func = ctypes.c_void_p()
-    cuda.cuModuleGetFunction(ctypes.byref(func), mod, b'fsetp_pred_reuse')
-
-    N = 1
-    # a[0] = 15.0 (above threshold 10.0)
-    a_data = struct.pack('f', 15.0)
-    out_data = struct.pack('f', 0.0)
-
-    d_out = ctypes.c_uint64()
-    d_a = ctypes.c_uint64()
-    cuda.cuMemAlloc_v2(ctypes.byref(d_out), 4)
-    cuda.cuMemAlloc_v2(ctypes.byref(d_a), 4)
-    cuda.cuMemcpyHtoD_v2(d_a, a_data, 4)
-    cuda.cuMemcpyHtoD_v2(d_out, out_data, 4)
-
-    n_val = ctypes.c_int32(N)
-    d_out_val = ctypes.c_uint64(d_out.value)
-    d_a_val = ctypes.c_uint64(d_a.value)
-    args = (ctypes.c_void_p * 3)(
-        ctypes.cast(ctypes.byref(d_out_val), ctypes.c_void_p),
-        ctypes.cast(ctypes.byref(d_a_val), ctypes.c_void_p),
-        ctypes.cast(ctypes.byref(n_val), ctypes.c_void_p),
-    )
-
-    err = cuda.cuLaunchKernel(func, 1, 1, 1, 1, 1, 1, 0, None, args, None)
-    assert err == 0, f"cuLaunchKernel failed: {err}"
-    err = cuda.cuCtxSynchronize()
-    assert err == 0, f"cuCtxSynchronize failed: {err}"
-
-    buf = (ctypes.c_uint8 * 4)()
-    cuda.cuMemcpyDtoH_v2(buf, d_out, 4)
-    result_val = struct.unpack('f', bytes(buf))[0]
-
-    cuda.cuMemFree_v2(d_out)
-    cuda.cuMemFree_v2(d_a)
-    cuda.cuModuleUnload(mod)
-    cuda.cuCtxSynchronize()
-    cuda.cuCtxDestroy_v2(ctx)
-
-    # 15.0 > 10.0 → TRUE path → 15.0 * 2.0 = 30.0
-    # If stale negated pred: FALSE path → 15.0 * 0.5 = 7.5
     assert result_val == 30.0, (
         f"Expected 30.0 (TRUE path: 15.0 * 2.0), got {result_val}. "
         f"If 7.5: stale _negated_preds from ISETP flipped FSETP sense."

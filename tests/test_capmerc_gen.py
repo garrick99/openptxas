@@ -41,10 +41,10 @@ class TestCapmercStructure:
         prologue = cm[16:32]
         assert prologue == bytes.fromhex('010b040af80004000000410000040000')
 
-    def test_size_138_for_simple(self):
-        """Simple kernels (no LDG+branch) get 138B capmerc."""
+    def test_size_114_for_simple(self):
+        """Simple kernels (no LDG+branch) get 114B capmerc (ptxas ground truth)."""
         cm = build_capmerc(num_gprs=10, text_size=384)
-        assert len(cm) == 138
+        assert len(cm) == 114
 
     def test_size_170_for_ldg_branch(self):
         """LDG+ISETP+branch kernels get 170B capmerc."""

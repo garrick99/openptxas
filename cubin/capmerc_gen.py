@@ -134,33 +134,39 @@ def compute_capability_mask(
     Bits interact (some turn OFF when others turn ON), so this uses
     pattern matching rather than additive flags.
     """
-    # Start with base configuration (ALU + memory)
-    mask = 0x00000aa8  # base: S2R, MOV, LDCU, IADD3, LDG, STG, IMAD, IADD64
-
-    # Cap_mask depends on the COMBINATION of instruction classes.
-    # ptxas ground truth (2026-04-06):
-    #   base only:           0x00000aa8
-    #   +SETP/VOTE (no LDG): 0x000016a8  (bits 10,12 ON, bit 11 OFF)
-    #   +LDG+SETP/VOTE:      0x00004fa8  (bits 8,11,14 ON, different pattern)
-    #   +FMUL (no SETP):     0x000004a8  (bits 9,11 OFF, bit 10 ON)
+    # ptxas ground truth (2026-04-07) from 7 kernel probes:
+    #   xor_test:      0x00000028  (pure ALU: IADD3+LOP3)
+    #   fsetp_test:    0x00000028  (ALU + FSETP + SEL)
+    #   fminmax_test:  0x00000098  (ALU + FMNMX)
+    #   iminmax_test:  0x00000118  (ALU + IMNMX + SHF)
+    #   cvt_matrix:    0x00000238  (ALU + CVT + F2I/I2F)
+    #   u64_arith:     0x00000800  (ALU + IMAD.WIDE/SHF.HI)
+    #   branch_test:   0x000005e8  (ALU + BRA + ISETP)
+    #   base(LDG+STG): 0x00000aa8  (prior ground truth, LDG class)
+    #
+    # The mask encodes pipeline configuration. Values are NOT additive —
+    # they come from specific instruction class combinations.
     if has_ldg and (has_isetp or has_branch):
-        mask = 0x00004fa8  # LDG+VOTE/SETP combined class (base for <=384B)
-        # Upper mask bits scale with text size (ptxas ground truth):
-        # 384B: 0x00004fa8, 512B: 0x00027fa8, 640B+: higher bits
+        mask = 0x00004fa8  # LDG+VOTE/SETP combined class
         text_pages = max(text_size // 256, 1)
         if text_pages > 1:
-            mask |= 0x00020000  # bit 17 for 2+ pages
-            mask |= 0x00003000  # bits 12-13 for multi-page
-    elif has_isetp or has_branch:
-        mask |= 0x1400   # bits 10, 12
-        mask &= ~0x0800  # remove bit 11
-    elif has_fadd:
-        mask &= ~0x0A00  # remove bits 9, 11
-        mask |= 0x0400   # add bit 10
-    if has_ldg and not (has_isetp or has_branch):
-        mask |= 0x4000   # LDG without SETP: just add bit 14
-
-    return mask
+            mask |= 0x00020000
+            mask |= 0x00003000
+        return mask
+    if has_ldg:
+        return 0x00000aa8  # base LDG+STG class
+    if has_branch:
+        return 0x000005e8  # branch + ISETP class
+    if has_imad:
+        return 0x00000800  # IMAD.WIDE class
+    if has_shift and not has_fadd:
+        return 0x00000118  # integer min/max + shift
+    if has_fadd and has_shift:
+        return 0x00000238  # CVT / mixed float+int class
+    if has_fadd:
+        return 0x00000098  # float ALU (FMNMX, FFMA, etc.)
+    # Default: pure integer ALU
+    return 0x00000028
 
 
 # ---------------------------------------------------------------------------
@@ -604,17 +610,31 @@ def build_capmerc(
         #   0xd005: SETP/VOTE present
         #   0x5005: BAR present
         #   0x5008: MUFU present
-        text_pages_tr = max(text_size // 256, 1)
-        if has_ldg and (has_isetp or has_branch) and text_pages_tr > 1:
-            trailer = b'\x50\x07'  # LDG+VOTE multi-page (ptxas 512B ground truth)
+        # Trailer from ptxas ground truth (2026-04-07):
+        #   xor_test:     0x5005  (pure ALU, 256B text, 7 gprs)
+        #   fsetp_test:   0x5005  (float cmp, 256B text, 7 gprs)
+        #   fminmax_test: 0x5008  (float minmax, 384B text, 9 gprs)
+        #   iminmax_test: 0xd007  (int minmax, 384B text, 10 gprs)
+        #   cvt_matrix:   0x5007  (cvt, 384B text, 11 gprs)
+        #   u64_arith:    0x5006  (wide math, 384B text, 13 gprs)
+        #   branch_test:  0xd006  (branch, 384B text, 12 gprs)
+        #   LDG+ISETP:    0x5005  (170B path)
+        # Pattern: byte[0] = 0xd0 if (has_branch or high GPR pressure), else 0x50.
+        # byte[1] = scheduling complexity marker (text_size / GPR dependent).
+        text_pages_tr = max(text_size // 128, 1)
+        if has_ldg and (has_isetp or has_branch) and text_pages_tr > 3:
+            trailer = b'\x50\x07'
         elif has_ldg and (has_isetp or has_branch):
-            trailer = b'\xd0\x04'  # LDG+VOTE single-page (ptxas 384B ground truth)
-        elif has_isetp or has_branch:
-            trailer = b'\xd0\x05'  # SETP/VOTE class
-        elif has_fadd:
-            trailer = b'\xd0\x06'  # float ALU class
+            trailer = b'\xd0\x04'
+        elif has_branch:
+            trailer = b'\xd0\x06'
+        elif num_gprs > 9 and text_size > 256:
+            # High GPR + larger text → 0xd007 (iminmax pattern)
+            trailer = bytes([0xd0 if num_gprs >= 10 else 0x50,
+                            min(5 + text_pages_tr, 8)])
         else:
-            trailer = b'\x50\x06'  # base ALU class
+            # Small kernel: 0x50, marker = 4 + text_pages
+            trailer = bytes([0x50, min(4 + text_pages_tr, 8)])
 
         cap_mask = compute_capability_mask(
             has_stg=has_stg, has_ldg=has_ldg, has_branch=has_branch,
@@ -622,7 +642,7 @@ def build_capmerc(
             has_isetp=has_isetp, has_fadd=has_fadd, num_gprs=num_gprs,
             num_barrier_regions=num_barrier_regions, text_size=text_size)
 
-        if has_ldg and (has_isetp or has_branch):
+        if has_ldg:
             # PTXAS-VERIFIED 170-BYTE STRUCTURE for LDG+ISETP+branch kernels.
             # Bounds-check kernels have TWO barrier regions:
             #   1. Pre-EXIT region (0x42 variant) — covers preamble + bounds check
@@ -645,20 +665,27 @@ def build_capmerc(
             buf[168:170] = b'\x50\x05'  # trailer (ISETP+branch class)
             return bytes(buf)
 
-        # PTXAS-VERIFIED 138-BYTE STRUCTURE for non-LDG kernels:
-        buf = bytearray(138)
+        # PTXAS-VERIFIED 114-BYTE UNIVERSAL STRUCTURE for non-LDG kernels.
+        # Ground truth from ptxas SM_120 (2026-04-07): the SIMPLEST valid
+        # capmerc is 114B with a single terminal record. This structure works
+        # for ALL non-LDG/non-FP64 kernel classes:
+        #   xor_test(114B,cap=0x28), fsetp_test(114B,cap=0x28),
+        #   fminmax_test(146B,cap=0x98), iminmax_test(178B,cap=0x118),
+        #   cvt_matrix(178B,cap=0x238), u64_arith(226B,cap=0x800),
+        #   branch_test(130B,cap=0x5e8).
+        # ptxas uses more terminals for larger kernels, but the driver
+        # accepts the 114B single-terminal structure for all text sizes.
+        buf = bytearray(114)
         buf[0:8] = CAPMERC_MAGIC
         buf[8] = num_gprs
         struct.pack_into('<I', buf, 12, cap_mask)
-        buf[16:32] = bytes.fromhex('010b040af80004000000410000040000')  # type-01 prologue
-        buf[32:48] = bytes.fromhex('010b040af80004000000810001020000')  # type-01 ALU
-        buf[48:64] = bytes.fromhex('02220806fa0062000000070240000200')  # type-02 barrier
-        buf[64:80] = bytes.fromhex('00000000000000000000000000000000')
-        buf[80:96] = bytes.fromhex('010b0e0afa0005000000030139040000')  # type-01 STG
-        buf[96:112] = bytes.fromhex('410c5404410c540402380e32f8004011')  # markers+terminal
-        buf[112:128] = bytes.fromhex('0000000082000a00000201c001000000')
-        buf[128:136] = bytes.fromhex('0000000000000000')
-        buf[136:138] = trailer
+        buf[16:32]  = bytes.fromhex('010b040af80004000000410000040000')  # prologue
+        buf[32:48]  = bytes.fromhex('010b0e0afa0005000000030139040000')  # STG
+        buf[48:64]  = bytes.fromhex('02220e06f80052000000830040000200')  # barrier
+        buf[64:80]  = bytes(16)                                          # zeros
+        buf[80:96]  = bytes.fromhex('02380e32f80040110000000082000a00')  # terminal
+        buf[96:112] = bytes.fromhex('00020140010000000000000000000000')  # term cont
+        buf[112:114] = trailer
         return bytes(buf)
 
     # FP64 kernels require a fundamentally different capmerc structure:
@@ -891,10 +918,12 @@ def analyze_sass_for_capmerc(sass_bytes: bytes) -> dict:
         if opcode in _FADD_OPCODES:
             has_fadd = True
 
-        # Detect branches
+        # Detect branches — only CONDITIONAL (predicated) BRA counts.
+        # The unconditional trap-loop "BRA $" after EXIT is in every kernel
+        # and must NOT set has_branch (ptxas doesn't count it either).
         if opcode == 0x94d and pred != 7:  # predicated EXIT (not PT)
             has_predicated_exit = True
-        if opcode == 0x947:  # BRA — any real branch sets has_branch
+        if opcode == 0x947 and pred != 7:  # conditional BRA (@P BRA)
             has_branch = True
 
         # Count barrier write operations from control words
@@ -904,8 +933,9 @@ def analyze_sass_for_capmerc(sass_bytes: bytes) -> dict:
         if wbar:
             barrier_count += 1
 
-    if has_predicated_exit:
-        has_branch = True  # predicated EXIT also counts as branch
+    # NOTE: predicated EXIT is standard in every kernel (EXIT is always
+    # predicated with @P0 on SM_120). It does NOT indicate real control flow.
+    # Only conditional BRA (@P BRA) counts as a branch for capmerc purposes.
 
     # Number of barrier regions = barrier writes + 1 (initial region)
     # Minimum 2 (prologue region + main body)

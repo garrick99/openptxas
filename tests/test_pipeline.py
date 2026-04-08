@@ -604,7 +604,7 @@ def test_div_u32_compiles():
     assert 0x306 in opcodes, "I2F.U32.RP not found — div.u32 NR not emitted"
     assert 0x308 in opcodes, "MUFU.RCP not found — div.u32 NR not emitted"
     assert 0x305 in opcodes, "F2I.FTZ.U32 not found — div.u32 NR not emitted"
-    assert 0x227 in opcodes, "IMAD.HI.U32 not found — div.u32 NR not emitted"
+    assert 0x225 in opcodes or 0x227 in opcodes, "IMAD.WIDE/HI not found — div.u32 NR not emitted"
     # Verify NOPs are scheduling-only (not TODO NOPs from unimplemented instrs).
     # Exclude trailing NOPs (text section padding after EXIT+BRA trap).
     last_real = max(i for i, opc in enumerate(opcodes) if opc != 0x918)
@@ -1256,7 +1256,7 @@ SELP_IMM_KERNEL = """\
 
 
 def test_selp_imm_compiles():
-    """selp with immediate sources materializes via IADD3_IMM; emits SEL (0x207)."""
+    """selp with immediate sources uses predicated IADD3 (no SEL barrier race)."""
     results = compile_ptx_source(SELP_IMM_KERNEL)
     cubin = results['selp_imm_kernel']
     assert cubin[:4] == b'\x7fELF'
@@ -1264,8 +1264,7 @@ def test_selp_imm_compiles():
     text = elf.section_data('.text.selp_imm_kernel')
     opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
                for off in range(0, len(text), 16)]
-    assert 0x207 in opcodes, f"SEL (0x207) not found; opcodes={[hex(o) for o in set(opcodes)]}"
-    assert 0x810 in opcodes, f"IADD3_IMM (0x810) not found (immediate materialization)"
+    assert 0x810 in opcodes, f"IADD3_IMM (0x810) not found (predicated MOV for selp)"
 
 
 TESTP_FINITE_KERNEL = """\

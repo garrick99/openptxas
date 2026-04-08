@@ -1617,8 +1617,10 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
     for bb in ordered_blocks:
         # Record label position and mark the first instruction with label tag
         block_start_idx = len(output)
+        _label_tag = None
         if bb.label:
             ctx.label_map[bb.label] = len(output) * 16
+            _label_tag = bb.label  # tag first emitted instruction for BRA fixup
 
         for _instr_idx, instr in enumerate(bb.instructions):
             if hasattr(ctx, '_skip_instrs') and id(instr) in ctx._skip_instrs:

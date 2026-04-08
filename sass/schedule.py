@@ -512,6 +512,9 @@ def _fill_ldcu_latency(instrs: list[SassInstr]) -> list[SassInstr]:
                 # Stop at branch/exit
                 if opc_j in (0x947, 0x94d):
                     break
+                # Stop at label-tagged instructions (BRA fixup needs them in position)
+                if sj.comment.startswith('// ') and ':' in sj.comment[:20]:
+                    break
                 # This instruction is safe to move past
                 hoist_to = j
             if hoist_to < i:

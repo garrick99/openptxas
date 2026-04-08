@@ -733,26 +733,13 @@ def compile_function(fn: Function, verbose: bool = False,
             s2r_pos = idx + 1
             break
 
-    # Step 2: Insert preamble LDCUs right after S2R
+    # Step 2: Insert ALL preamble LDCUs + UR4 descriptor right after S2R.
+    # SM_120 rule: ALL LDCUs must be in the preamble window.
     preamble_ldcus = getattr(ctx, '_preamble_ldcus', [])
-    for pi, pldcu in enumerate(preamble_ldcus):
+    all_preamble = preamble_ldcus + [ur4_desc_instr]
+    for pi, pldcu in enumerate(all_preamble):
         body_instrs.insert(s2r_pos + pi, pldcu)
-
-    # Step 3: Find insert_idx for UR4 descriptor (after predicated EXIT)
-    insert_idx = s2r_pos + len(preamble_ldcus)
-    for idx in range(insert_idx, len(body_instrs)):
-        si = body_instrs[idx]
-        opcode = struct.unpack_from('<Q', si.raw, 0)[0] & 0xFFF
-        guard_nibble = (si.raw[1] >> 4) & 0xF
-        is_predicated = guard_nibble != 0x7
-        if opcode == 0x94d and is_predicated:
-            insert_idx = idx + 1
-            break
-    # Skip past post-EXIT deferred LDCU.64 instructions
-    while (insert_idx < len(body_instrs) and
-           'post-EXIT' in body_instrs[insert_idx].comment):
-        insert_idx += 1
-    body_instrs.insert(insert_idx, ur4_desc_instr)
+    insert_idx = s2r_pos  # for label adjustment reference
 
     # Update ctx.label_map and _bra_fixups to reflect ALL insertions:
     # - preamble LDCUs at s2r_pos (len = len(preamble_ldcus))

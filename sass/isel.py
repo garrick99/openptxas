@@ -864,7 +864,7 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
         # For post-EXIT params (after bounds check), materialize immediately
         # via LDCU.64 UR6 + _emit_ur_to_gpr so LDCU stays in post-EXIT region.
         if ctx and ctx.sm_version == 120:
-            # Ensure UR6:UR7 are declared in ELF metadata
+            # UR4+5 for descriptor, UR6+7 reserved. Params start at UR8.
             if ctx._next_ur < 8:
                 ctx._next_ur = 8
             # Safety: predicated ld.param.u64 is in a divergent path (if-converted).

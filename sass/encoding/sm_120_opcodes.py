@@ -4000,7 +4000,9 @@ def encode_depbar_le(sb=0, count=0, ctrl=0):
 # Opcode: 0x23e (byte0=0x3e, byte1=0x72)
 
 def encode_f2fp_f16_f32(dest, src, ctrl=0):
-    """F2FP.F16.F32.PACK_AB Rdest, RZ, Rsrc — FP32 to packed FP16 pair."""
+    """F2FP.F16.F32.PACK_AB Rdest, RZ, Rsrc — FP32 to packed FP16 pair.
+    NOTE: ptxas uses opcode 0x304 (not F2FP) for cvt.f16.f32. This encoder
+    produces wrong packing order. Needs replacement with 0x304 encoder."""
     if ctrl == 0: ctrl = _CTRL_DEFAULT
     return _build(0x3e, 0x72, b2=dest, b3=RZ, b4=src, b8=0xFF,
                   b9=0x00, b10=0x00, b11=0x00, ctrl=ctrl)

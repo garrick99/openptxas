@@ -2416,9 +2416,18 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             gbase = gmem_op.base
                             gbase_n = gbase if gbase.startswith('%') else f'%{gbase}'
                             ur_params = getattr(ctx, '_ur_params', {})
+                            deferred = getattr(ctx, '_deferred_ur_params', {})
                             gpr_written = getattr(ctx, '_gpr_written', set())
                             if gbase_n in gpr_written and gbase in ctx.ra.int_regs:
                                 glob_r = ctx.ra.lo(gbase)
+                            elif gbase_n in deferred:
+                                param_off = deferred.get(gbase_n)
+                                ur_tmp = 6
+                                addr = _alloc_gpr_pair(ctx)
+                                output.append(SassInstr(encode_ldcu_64(ur_tmp, 0, param_off),
+                                    f'LDCU.64 UR{ur_tmp}, c[0][0x{param_off:x}]  // deferred cp.async addr'))
+                                output.extend(_emit_ur_to_gpr(addr, ur_tmp, "deferred UR->GPR cp.async"))
+                                glob_r = addr
                             elif gbase_n in ur_params:
                                 ur_idx = ur_params[gbase_n]
                                 addr = getattr(ctx, '_addr_scratch_lo', None)
@@ -2428,7 +2437,21 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 glob_r = addr
                             elif gbase in ctx.ra.int_regs:
                                 glob_r = ctx.ra.lo(gbase)
-                        output.append(SassInstr(encode_ldgsts_e(smem_r, glob_r, ctx.ur_desc),
+                        ldgsts_raw = encode_ldgsts_e(smem_r, glob_r, ctx.ur_desc)
+                        # cp.async may be in a conditional fall-through (after @%p bra).
+                        # The parser doesn't always if-convert this. Scan backward in the
+                        # current block for a conditional BRA and inherit its negated guard.
+                        if not instr.pred:
+                            for prev_inst in reversed(bb.instructions[:_instr_idx]):
+                                if prev_inst.op == 'bra' and prev_inst.pred:
+                                    pred_name = prev_inst.pred
+                                    pd = ctx.ra.pred(pred_name) if pred_name in ctx.ra.pred_regs else 0
+                                    neg = not prev_inst.neg  # fall-through = negated
+                                    if hasattr(ctx, '_negated_preds') and pd in ctx._negated_preds:
+                                        neg = not neg
+                                    ldgsts_raw = patch_pred(ldgsts_raw, pred=pd, neg=neg)
+                                    break
+                        output.append(SassInstr(ldgsts_raw,
                             f'LDGSTS.E [R{smem_r}], desc[UR{ctx.ur_desc}][R{glob_r}.64]  // cp.async.ca.shared.global'))
                     elif 'bulk' in instr.types:
                         # cp.async.bulk.* — TMA instructions

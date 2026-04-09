@@ -683,19 +683,21 @@ class _Parser:
                 self._expect("PUNCT", "]")
             return MemOp(base=base, offset=offset)
 
-        # Vector operand: {%r0, %r1, ...}  (treat as first register)
+        # Vector operand: {%r0, %r1, ...}  — collect all register names
         if tok.kind == "PUNCT" and tok.value == "{":
             self._advance()
-            first = self._peek()
-            result = None
-            if first and first.kind == "REGNAME":
-                result = RegOp(first.value)
+            regs = []
             while not self._at_end():
                 t = self._peek()
                 if t and t.kind == "PUNCT" and t.value == "}":
                     self._advance(); break
+                if t and t.kind == "REGNAME":
+                    regs.append(t.value)
                 self._advance()
-            return result
+            if not regs:
+                return None
+            from ptx.ir import VectorRegOp
+            return VectorRegOp(regs[0], tuple(regs))
 
         # Float hex literal: 0fXXXXXXXX (32-bit) or 0dXXXXXXXXXXXXXXXX (64-bit)
         if tok.kind == "FP_HEX":

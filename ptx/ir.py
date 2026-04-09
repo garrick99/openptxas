@@ -70,6 +70,14 @@ class RegOp:
         return self.name
 
 @dataclass(frozen=True)
+class VectorRegOp(RegOp):
+    """Vector register operand from {%r0, %r1, ...}.  Preserves all register names."""
+    regs: tuple = ()
+
+    def __str__(self) -> str:
+        return '{' + ', '.join(self.regs) + '}'
+
+@dataclass(frozen=True)
 class ImmOp:
     """Immediate integer operand."""
     value: int

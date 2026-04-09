@@ -938,13 +938,13 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
         _has_vote_fn = getattr(ctx, '_has_vote', False) if ctx else False
 
         if _has_vote_fn:
-            # VOTE present: skip body LDC. Record param for preamble load.
-            # SM_120 rule #25: body LDC with scoreboard ctrl causes ERR715.
-            # The pipeline will add a preamble LDC for this param.
+            # VOTE present: load param in preamble (body LDC causes ERR715).
             if ctx:
-                if not hasattr(ctx, '_vote_param_loads'):
-                    ctx._vote_param_loads = []
-                ctx._vote_param_loads.append((d, byte_off, param_name))
+                if not hasattr(ctx, '_preamble_ldcus'):
+                    ctx._preamble_ldcus = []
+                ctx._preamble_ldcus.append(
+                    SassInstr(encode_ldc(d, 0, byte_off),
+                              f'LDC R{d}, c[0][0x{byte_off:x}]  // preamble setp param'))
             return []
         else:
             return [SassInstr(encode_ldc(d, 0, byte_off, ctrl=0x7f1),
@@ -1680,6 +1680,49 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
             _neg_preds_snapshot = set(ctx._negated_preds) if hasattr(ctx, '_negated_preds') else set()
 
             try:
+                # Vector unpack: mov.b64 {%rLo, %rHi}, %rdSrc
+                # Split 64-bit source into two 32-bit destinations.
+                from ptx.ir import VectorRegOp
+                if (op == 'mov' and typ in ('b64', 'u64', 's64')
+                        and isinstance(instr.dest, VectorRegOp)
+                        and len(instr.dest.regs) == 2
+                        and isinstance(instr.srcs[0], RegOp)):
+                    src_name = instr.srcs[0].name
+                    s_lo = ctx.ra.lo(src_name)
+                    s_hi = s_lo + 1
+                    d_lo = ctx.ra.r32(instr.dest.regs[0])
+                    d_hi = ctx.ra.r32(instr.dest.regs[1])
+                    instrs = []
+                    if d_lo != s_lo:
+                        instrs.append(SassInstr(encode_iadd3(d_lo, s_lo, RZ, RZ),
+                                      f'MOV R{d_lo}, R{s_lo}  // {instr.dest.regs[0]} = {src_name}.lo'))
+                    if d_hi != s_hi:
+                        instrs.append(SassInstr(encode_iadd3(d_hi, s_hi, RZ, RZ),
+                                      f'MOV R{d_hi}, R{s_hi}  // {instr.dest.regs[1]} = {src_name}.hi'))
+                    output.extend(instrs or [_nop(f'unpack {src_name} (same regs, elided)')])
+                    continue
+
+                # Vector pack: mov.b64 %rdDest, {%rLo, %rHi}
+                # Assemble two 32-bit sources into one 64-bit destination.
+                if (op == 'mov' and typ in ('b64', 'u64', 's64')
+                        and isinstance(instr.srcs[0], VectorRegOp)
+                        and len(instr.srcs[0].regs) == 2
+                        and isinstance(instr.dest, RegOp)):
+                    dest_name = instr.dest.name
+                    d_lo = ctx.ra.lo(dest_name)
+                    d_hi = d_lo + 1
+                    s_lo = ctx.ra.r32(instr.srcs[0].regs[0])
+                    s_hi = ctx.ra.r32(instr.srcs[0].regs[1])
+                    instrs = []
+                    if d_lo != s_lo:
+                        instrs.append(SassInstr(encode_iadd3(d_lo, s_lo, RZ, RZ),
+                                      f'MOV R{d_lo}, R{s_lo}  // {dest_name}.lo = {instr.srcs[0].regs[0]}'))
+                    if d_hi != s_hi:
+                        instrs.append(SassInstr(encode_iadd3(d_hi, s_hi, RZ, RZ),
+                                      f'MOV R{d_hi}, R{s_hi}  // {dest_name}.hi = {instr.srcs[0].regs[1]}'))
+                    output.extend(instrs or [_nop(f'pack {dest_name} (same regs, elided)')])
+                    continue
+
                 if op == 'mov' and typ in ('u32', 's32', 'b32', 'f32', 'u64', 's64', 'b64', 'f64'):
                     # Immediate source: load via IADD3_IMM32 (integer) or FMUL_IMM (float)
                     if isinstance(instr.srcs[0], ImmOp) and typ in ('u32', 's32', 'b32', 'f32'):

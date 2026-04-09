@@ -699,16 +699,20 @@ def _select_add_u64(instr: Instruction, ra: RegAlloc,
             ]
         else:
             # Both in GPR → IADD3 + IADD3.X R-R
-            a_lo = ra.lo(a.name); a_hi = a_lo + 1
-            b_lo = ra.lo(b.name); b_hi = b_lo + 1
+            a_lo = ra.lo(a.name)
+            a_hi = (ctx._pair_hi_override.get(a.name, a_lo + 1)
+                    if ctx and hasattr(ctx, '_pair_hi_override') else a_lo + 1)
+            b_lo = ra.lo(b.name)
+            b_hi = (ctx._pair_hi_override.get(b.name, b_lo + 1)
+                    if ctx and hasattr(ctx, '_pair_hi_override') else b_lo + 1)
             d_lo = ra.lo(dest.name); d_hi = d_lo + 1
             if ctx:
                 ctx._gpr_written.add(dest.name)
             return [
                 SassInstr(encode_iadd3(d_lo, a_lo, b_lo, RZ),
-                          f'IADD3 R{d_lo}, R{a_lo}, R{b_lo}, RZ  // add.u64 lo'),
+                          f'IADD3 R{d_lo}, R{a_lo}, R{b_lo}, RZ  // add.u64 lo (R-R safe)'),
                 SassInstr(encode_iadd3x(d_hi, a_hi, b_hi, RZ),
-                          f'IADD3.X R{d_hi}, R{a_hi}, R{b_hi}, RZ  // add.u64 hi'),
+                          f'IADD3.X R{d_hi}, R{a_hi}, R{b_hi}, RZ  // add.u64 hi (R-R safe)'),
             ]
 
     # SM_120 path
@@ -778,8 +782,11 @@ def _select_add_u64(instr: Instruction, ra: RegAlloc,
         # Both operands in R bank.
         # SM_120 rule: IADD.64 R-R (0x235) is broken (causes 715).
         # Use IADD3 + IADD3.X pair instead (same as SM_89 path).
-        a_lo = ra.lo(a.name); a_hi = a_lo + 1
-        b_lo = ra.lo(b.name); b_hi = b_lo + 1
+        _hi_map = getattr(ctx, '_pair_hi_override', {}) if ctx else {}
+        a_lo = ra.lo(a.name)
+        a_hi = _hi_map.get(a.name, a_lo + 1)
+        b_lo = ra.lo(b.name)
+        b_hi = _hi_map.get(b.name, b_lo + 1)
         d_lo = ra.lo(dest.name); d_hi = d_lo + 1
         if ctx:
             ctx._gpr_written.add(dest.name)
@@ -1681,7 +1688,9 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
 
             try:
                 # Vector unpack: mov.b64 {%rLo, %rHi}, %rdSrc
-                # Split 64-bit source into two 32-bit destinations.
+                # Alias the 32-bit destinations to the 64-bit source pair.
+                # This avoids materializing MOVs — subsequent consumers of
+                # %rLo/%rHi will directly use the accumulator registers.
                 from ptx.ir import VectorRegOp
                 if (op == 'mov' and typ in ('b64', 'u64', 's64')
                         and isinstance(instr.dest, VectorRegOp)
@@ -1690,37 +1699,31 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     src_name = instr.srcs[0].name
                     s_lo = ctx.ra.lo(src_name)
                     s_hi = s_lo + 1
-                    d_lo = ctx.ra.r32(instr.dest.regs[0])
-                    d_hi = ctx.ra.r32(instr.dest.regs[1])
-                    instrs = []
-                    if d_lo != s_lo:
-                        instrs.append(SassInstr(encode_iadd3(d_lo, s_lo, RZ, RZ),
-                                      f'MOV R{d_lo}, R{s_lo}  // {instr.dest.regs[0]} = {src_name}.lo'))
-                    if d_hi != s_hi:
-                        instrs.append(SassInstr(encode_iadd3(d_hi, s_hi, RZ, RZ),
-                                      f'MOV R{d_hi}, R{s_hi}  // {instr.dest.regs[1]} = {src_name}.hi'))
-                    output.extend(instrs or [_nop(f'unpack {src_name} (same regs, elided)')])
+                    # Alias: make %rLo and %rHi point to same physical regs
+                    lo_name = instr.dest.regs[0]
+                    hi_name = instr.dest.regs[1]
+                    ctx.ra.int_regs[lo_name] = s_lo
+                    ctx.ra.int_regs[hi_name] = s_hi
+                    # No instructions needed — pure alias
                     continue
 
                 # Vector pack: mov.b64 %rdDest, {%rLo, %rHi}
-                # Assemble two 32-bit sources into one 64-bit destination.
+                # Always alias — track non-consecutive hi separately.
                 if (op == 'mov' and typ in ('b64', 'u64', 's64')
                         and isinstance(instr.srcs[0], VectorRegOp)
                         and len(instr.srcs[0].regs) == 2
                         and isinstance(instr.dest, RegOp)):
                     dest_name = instr.dest.name
-                    d_lo = ctx.ra.lo(dest_name)
-                    d_hi = d_lo + 1
                     s_lo = ctx.ra.r32(instr.srcs[0].regs[0])
                     s_hi = ctx.ra.r32(instr.srcs[0].regs[1])
-                    instrs = []
-                    if d_lo != s_lo:
-                        instrs.append(SassInstr(encode_iadd3(d_lo, s_lo, RZ, RZ),
-                                      f'MOV R{d_lo}, R{s_lo}  // {dest_name}.lo = {instr.srcs[0].regs[0]}'))
-                    if d_hi != s_hi:
-                        instrs.append(SassInstr(encode_iadd3(d_hi, s_hi, RZ, RZ),
-                                      f'MOV R{d_hi}, R{s_hi}  // {dest_name}.hi = {instr.srcs[0].regs[1]}'))
-                    output.extend(instrs or [_nop(f'pack {dest_name} (same regs, elided)')])
+                    ctx.ra.int_regs[dest_name] = s_lo
+                    if s_hi != s_lo + 1:
+                        # Non-consecutive: record actual hi register
+                        if not hasattr(ctx, '_pair_hi_override'):
+                            ctx._pair_hi_override = {}
+                        ctx._pair_hi_override[dest_name] = s_hi
+                    elif hasattr(ctx, '_pair_hi_override') and dest_name in ctx._pair_hi_override:
+                        del ctx._pair_hi_override[dest_name]
                     continue
 
                 if op == 'mov' and typ in ('u32', 's32', 'b32', 'f32', 'u64', 's64', 'b64', 'f64'):

@@ -46,22 +46,19 @@ class TestCapmercStructure:
         cm = build_capmerc(num_gprs=10, text_size=384)
         assert len(cm) == 114
 
-    def test_size_170_for_ldg_branch(self):
-        """LDG+ISETP+branch kernels get 170B capmerc."""
+    def test_size_114_for_ldg_branch(self):
+        """LDG kernels use 114B universal capmerc (170B path disabled)."""
         cm = build_capmerc(num_gprs=12, text_size=384,
                            has_ldg=True, has_isetp=True, has_branch=True)
-        assert len(cm) == 170
+        assert len(cm) == 114
 
-    def test_170_has_dual_barriers(self):
-        """170B path has two type02 barrier records (0x42 pre-EXIT + 0x62 body)."""
+    def test_114_has_barrier(self):
+        """114B path has a type02 barrier record."""
         cm = build_capmerc(num_gprs=12, text_size=384,
                            has_ldg=True, has_isetp=True, has_branch=True)
-        barriers = []
-        for i in range(16, len(cm) - 1):
-            if cm[i] == 0x02 and cm[i+1] == 0x22:
-                barriers.append(cm[i+6] if i+6 < len(cm) else None)
-        assert 0x42 in barriers, "Missing pre-EXIT barrier (0x42)"
-        assert 0x62 in barriers, "Missing body barrier (0x62)"
+        has_barrier = any(cm[i] == 0x02 and cm[i+1] == 0x22
+                         for i in range(16, len(cm) - 1))
+        assert has_barrier, "Missing barrier record"
 
     def test_trailer_present(self):
         cm = build_capmerc(num_gprs=10, text_size=384)
@@ -96,22 +93,12 @@ class TestCapmercGpuVerified:
     These tests use the 170B path which was GPU-verified against ptxas.
     """
 
-    def test_170_byte_exact_structure(self):
-        """170B path body matches ptxas ground truth (excluding header/ctrl)."""
+    def test_114_byte_ldg_structure(self):
+        """LDG kernels use 114B universal structure (170B path disabled)."""
         cm = build_capmerc(num_gprs=12, text_size=384,
                            has_ldg=True, has_isetp=True, has_branch=True)
-        # Prologue (always identical)
+        assert len(cm) == 114
+        # Prologue
         assert cm[16:32] == bytes.fromhex('010b040af80004000000410000040000')
-        # ALU record
-        assert cm[32:48] == bytes.fromhex('010b040af80004000000810001020000')
-        # Pre-EXIT barrier (0x42)
-        assert cm[48:54] == bytes.fromhex('02220806fa00')
-        assert cm[54] == 0x42
-        # EXIT boundary marker
-        assert cm[76] == 0x10
-        # Body barrier (0x62)
-        assert cm[86] == 0x62
         # STG record
-        assert cm[112:128] == bytes.fromhex('010b0e0afa0005000000030139040000')
-        # Trailer
-        assert cm[168:170] == b'\x50\x05'
+        assert cm[32:48] == bytes.fromhex('010b0e0afa0005000000030139040000')

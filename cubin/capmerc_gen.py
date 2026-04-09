@@ -642,7 +642,7 @@ def build_capmerc(
             has_isetp=has_isetp, has_fadd=has_fadd, num_gprs=num_gprs,
             num_barrier_regions=num_barrier_regions, text_size=text_size)
 
-        if has_ldg:
+        if has_ldg and False:  # DISABLED: 170B path limits GPR to R0-R18
             # PTXAS-VERIFIED 170-BYTE STRUCTURE for LDG+ISETP+branch kernels.
             # Bounds-check kernels have TWO barrier regions:
             #   1. Pre-EXIT region (0x42 variant) — covers preamble + bounds check

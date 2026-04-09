@@ -677,7 +677,7 @@ def compile_function(fn: Function, verbose: bool = False,
     # All instruction classes now compile natively.
     # Complex CF+STG (>4 blocks with stores) was the last gate;
     # if-conversion + deferred params handle this correctly.
-    ctx._has_vote = False
+    ctx._has_vote = _has_vote_shfl
 
     # Pre-scan: identify u32 params consumed ONLY by setp.
     # These don't need a GPR LDC — setp handler emits LDCU.32 directly.
@@ -1149,15 +1149,11 @@ def compile_function(fn: Function, verbose: bool = False,
         s2r_offset=s2r_offset,
         smem_size=smem_size,
         num_uniform=alloc.num_uniform,
-        # Pass ptxas capmerc to emitter for ELF section sizing — UNLESS our kernel
-        # needs more GPRs than ptxas's (high-register kernel). In that case use
-        # None so the emitter calls build_capmerc_from_sass with 0x2000 capability
-        # bit and full-range type-02 barrier records (byte[10]=0x01), which is
-        # required to enable R14+ access on SM_120 Mercury.
-        # Deferred params change instruction stream; use our generated capmerc.
-        # Always use our generated capmerc — ptxas capmerc has region-specific
-        # GPR allocations that don't match our instruction stream.
-        ptxas_capmerc=None,
+        # Use ptxas capmerc when available — it has correct instruction class
+        # records that our simpler generator may miss. Patch GPR count to match
+        # our actual allocation since ptxas may allocate differently.
+        ptxas_capmerc=_patch_ptxas_capmerc_gprs(
+            ptxas_meta.get('capmerc'), _final_gprs) if ptxas_meta else None,
         ptxas_merc_info=None,
     )
     if sm_version == 89:
@@ -1186,10 +1182,31 @@ def compile_function(fn: Function, verbose: bool = False,
         # SM_120 rule #25: complex kernels with LDG + sync require
         # ptxas fallback. Our native backend's instruction stream differs
         # from ptxas in ways that cause 700/715 for these patterns.
-        # Group A (LDG + sync/shfl): full ptxas cubin fallback required
-        # Group B (LDG + complex CF/params/atoms, no sync): try native
-        #   SASS + ptxas capmerc (capmerc was the missing piece, not SASS)
-        if ctx._has_vote and ptxas_meta:
+        # Fallback: vote/shfl, global atoms, complex CF (>4 blocks),
+        # scalar LDG from raw param pointer (SASS structural issue, not capmerc).
+        _has_ldg_atom = _has_ldg and _has_atom
+        # Scalar LDG: ld.global from raw param pointer (no add.u64 offset).
+        _param_regs = set()
+        _offset_regs = set()
+        for bb in fn.blocks:
+            for inst in bb.instructions:
+                if not hasattr(inst, 'op'):
+                    continue
+                if inst.op == 'ld' and 'param' in inst.types and inst.dest:
+                    _param_regs.add(inst.dest.name)
+                if inst.op in ('add', 'mul', 'mad', 'cvt', 'shl') and inst.dest:
+                    _offset_regs.add(inst.dest.name)
+        _has_scalar_ldg = _has_ldg and any(
+            inst.op == 'ld' and 'global' in inst.types and inst.srcs
+            and any(hasattr(s, 'base') and s.base in _param_regs
+                    and s.base not in _offset_regs
+                    for s in inst.srcs if hasattr(s, 'base'))
+            for bb in fn.blocks for inst in bb.instructions
+            if hasattr(inst, 'op'))
+        _needs_full_fallback = (ctx._has_vote or _has_ldg_atom
+                                or _has_complex_cf or _has_scalar_ldg
+                                or _has_bar)
+        if _needs_full_fallback and ptxas_meta:
             ptxas_cubin = ptxas_meta.get('cubin_bytes')
             if ptxas_cubin:
                 cubin_bytes = ptxas_cubin
@@ -1291,6 +1308,15 @@ def _patch_ptxas_metadata(cubin_bytes: bytes, ptxas_meta: dict,
                     patch.extend(bytearray(sh_size - len(patch)))
                 data[sh_offset_val:sh_offset_val + sh_size] = patch
     return bytes(data)
+
+
+def _patch_ptxas_capmerc_gprs(capmerc: bytes | None, num_gprs: int) -> bytes | None:
+    """Patch ptxas capmerc GPR count to match our native allocation."""
+    if capmerc is None:
+        return None
+    cm = bytearray(capmerc)
+    cm[8] = max(num_gprs, 8)  # byte[8] = GPR count, minimum 8
+    return bytes(cm)
 
 
 def _extract_ptxas_metadata(ptx_src: str) -> dict[str, dict]:

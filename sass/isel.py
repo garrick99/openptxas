@@ -875,15 +875,15 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
                 dr = ctx.ra.lo(dest.name)
                 ctx._gpr_written.add(dest.name)
                 return [
-                    SassInstr(encode_ldc(dr, 0, byte_off),
-                              f'LDC R{dr}, c[0][0x{byte_off:x}]  // {param_name} lo (divergent fallback)'),
-                    SassInstr(encode_ldc(dr + 1, 0, byte_off + 4),
-                              f'LDC R{dr+1}, c[0][0x{byte_off + 4:x}]  // {param_name} hi (divergent fallback)'),
+                    SassInstr(encode_ldc_64(dr, 0, byte_off),
+                              f'LDC.64 R{dr}, c[0][0x{byte_off:x}]  // {param_name} (divergent fallback)'),
                 ]
             # Preamble preload: assign UR pair, record for preamble emission.
             # The LDCU is emitted by compile_function in the preamble window.
             # Body code uses _ur_params to find the UR index.
             ur_idx = ctx._next_ur
+            if ur_idx % 2 != 0:
+                ur_idx += 1          # LDCU.64 requires even-aligned UR
             ctx._next_ur = ur_idx + 2
             if not hasattr(ctx, '_preamble_ldcus'):
                 ctx._preamble_ldcus = []
@@ -1718,13 +1718,13 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 # descriptor LDCU overwrites UR4 before IMAD finishes reading it.
                                 sr_code = _SPECIAL_REGS[instr.srcs[0].name]
                                 sr_label = instr.srcs[0].name.lstrip('%').replace('.', '_').upper()
-                                # SM_120 rule: keep UR max < 14. When UR space is
-                                # exhausted (5+ params), reuse UR4 for S2UR. The
-                                # IMAD that reads this UR executes before the mem
-                                # desc LDCU.64 overwrites UR4 (ptxas does this too).
+                                # SM_120 rule: S2UR for ctaid uses UR6 when UR
+                                # space is exhausted. UR4 holds the mem descriptor
+                                # and must not be clobbered. UR6 is safe: it's
+                                # consumed by IMAD immediately and not used again.
                                 _has_deferred = getattr(ctx, '_had_deferred_params', False)
                                 if ctx._next_ur >= 14 or _has_deferred:
-                                    ur_ctaid = 4  # reuse UR4 (consumed before mem desc)
+                                    ur_ctaid = 6  # UR6 is safe (UR4 = mem desc)
                                 else:
                                     ur_ctaid = ctx._next_ur; ctx._next_ur += 1
                                 ctx._ur_for_param[instr.dest.name] = ur_ctaid
@@ -2169,6 +2169,13 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                                 f'LDS R{dest_r}, [UR4+0x0]  // ld.shared'))
 
                 elif op == 'bar':
+                    # SM_120: BSYNC before BAR.SYNC for shared memory visibility
+                    _has_sts_in_kernel = any(
+                        inst2.op == 'st' and 'shared' in inst2.types
+                        for bb2 in fn.blocks for inst2 in bb2.instructions)
+                    if _has_sts_in_kernel:
+                        BSYNC_RAW = bytes.fromhex('41790000000000000002800300ea1f00')
+                        output.append(SassInstr(BSYNC_RAW, 'BSYNC  // pre-barrier sync'))
                     output.append(SassInstr(encode_bar_sync(0),
                                             f'BAR.SYNC 0'))
 
@@ -2787,6 +2794,10 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 output.append(SassInstr(
                                     encode_iadd3(d_lo+1, RZ, RZ, RZ),
                                     f'MOV R{d_lo+1}, RZ  // cvt.64.32 hi=0 (CSE)'))
+                                # Record for IMAD.WIDE fusion (CSE path)
+                                if not hasattr(ctx, '_cvt_src_map'):
+                                    ctx._cvt_src_map = {}
+                                ctx._cvt_src_map[d.name] = s_r
                                 continue
                             d_lo = ctx.ra.lo(d.name)
                             ctx._cvt_cache[s.name] = d_lo

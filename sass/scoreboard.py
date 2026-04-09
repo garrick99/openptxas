@@ -163,7 +163,7 @@ _OPCODES_LDC = {0xb82, 0x7ac, 0x919, 0x9c3,  # SM_120: LDC, LDCU, S2R, S2UR
 _OPCODES_LDS = {0x984, 0x83b}  # LDS, LDSM (load shared to matrix)
 _OPCODES_STG = {0x986, 0xf9d}  # STG, SUST
 _OPCODES_STS = {0x988, 0x388}
-_OPCODES_BAR = {0xb1d}
+_OPCODES_BAR = {0xb1d, 0x941}  # BAR.SYNC + BSYNC
 _OPCODES_DFPU  = {0x229, 0x228, 0x22b, 0xc2b}  # DADD, DMUL, DFMA (R-R b1=0x72), DFMA-UR-UR (b1=0x7c)
 _OPCODES_DSETP = {0x22a}                 # DSETP (FP64 compare → predicate; reads pairs, no GPR dest)
 _OPCODES_F2F   = {0x310}                 # F2F (float-to-float precision conversion; long-latency, wdep=0x33)
@@ -572,6 +572,7 @@ _OPCODE_MISC: dict[int, int] = {
     0x947: 1,   # BRA: misc=1 (ptxas-verified: @P0 BRA and loop-back BRA both use 1)
     0x94d: 5,   # EXIT: misc=5 (ptxas-verified: same for predicated and unconditional)
     0xb1d: 6,   # BAR.SYNC: misc=6 (ptxas-verified 2026-04-08 from bar_probe)
+    0x941: 5,   # BSYNC: misc=5 (ptxas-verified 2026-04-09 from shared_copy)
     0x221: 1,   # FADD: misc=1 (ptxas-verified 2026-04-08 bar_probe; counter-misc causes ERR715)
     0x388: 1,   # STS (store shared): misc=1 (ptxas-verified 2026-04-08)
     0x984: 2,   # LDS (load shared): misc=2 (ptxas-verified 2026-04-08)

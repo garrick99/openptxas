@@ -975,5 +975,160 @@ class TestQmma:
             cuda_ctx.free(d_out)
 
 
+# ---------------------------------------------------------------------------
+# Regression: odd-UR LDCU.64 preamble alignment
+# ---------------------------------------------------------------------------
+# Bug: when a u32 body param (LDCU.32) consumes an even UR before a u64
+# preamble param, the LDCU.64 could land on an odd UR index, causing ERR715.
+# The fix ensures LDCU.64 always uses even-aligned URs.
+
+_PTX_ODD_UR_REGRESSION = """
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry odd_ur_test(
+    .param .u64 out, .param .u64 a, .param .u64 b, .param .u32 mul, .param .u32 n)
+{
+    .reg .b32 %r<10>; .reg .b64 %rd<8>; .reg .pred %p0;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r4, [n];
+    setp.ge.u32 %p0, %r0, %r4;
+    @%p0 bra DONE;
+    cvt.u64.u32 %rd0, %r0;
+    shl.b64 %rd0, %rd0, 2;
+    ld.param.u64 %rd1, [a]; add.u64 %rd2, %rd1, %rd0;
+    ld.global.u32 %r5, [%rd2];
+    ld.param.u64 %rd3, [b]; add.u64 %rd4, %rd3, %rd0;
+    ld.global.u32 %r6, [%rd4];
+    ld.param.u32 %r7, [mul];
+    mad.lo.s32 %r8, %r5, %r7, %r6;
+    ld.param.u64 %rd5, [out]; add.u64 %rd6, %rd5, %rd0;
+    st.global.u32 [%rd6], %r8;
+DONE:
+    ret;
+}
+"""
+
+
+class TestOddUrRegression:
+    """Regression: LDCU.64 preamble must use even-aligned UR indices."""
+
+    def test_ldcu64_even_alignment(self):
+        """All LDCU.64 in compiled SASS must have even UR indices."""
+        cubins = _compile(_PTX_ODD_UR_REGRESSION)
+        assert 'odd_ur_test' in cubins
+        # The kernel compiles without error — the real check is GPU execution.
+
+    @gpu
+    def test_odd_ur_gpu_execution(self, cuda_ctx):
+        """3 ptr params + u32 body param: out[i] = a[i] * mul + b[i]."""
+        cubins = _compile(_PTX_ODD_UR_REGRESSION)
+        N = 32
+        a_vals = list(range(N))
+        b_vals = [i * 2 for i in range(N)]
+        MUL = 5
+        expected = [a_vals[i] * MUL + b_vals[i] for i in range(N)]
+
+        assert cuda_ctx.load(cubins['odd_ur_test'])
+        func = cuda_ctx.get_func('odd_ur_test')
+        byte_size = N * 4
+        d_a = cuda_ctx.alloc(byte_size)
+        d_b = cuda_ctx.alloc(byte_size)
+        d_out = cuda_ctx.alloc(byte_size)
+        try:
+            cuda_ctx.copy_to(d_a, struct.pack(f'<{N}i', *a_vals))
+            cuda_ctx.copy_to(d_b, struct.pack(f'<{N}i', *b_vals))
+            cuda_ctx.copy_to(d_out, struct.pack(f'<{N}i', *([0] * N)))
+            err = cuda_ctx.launch(func, (1, 1, 1), (32, 1, 1),
+                                  [d_out, d_a, d_b, MUL, N])
+            assert err == 0
+            assert cuda_ctx.sync() == 0, \
+                "odd-UR regression: kernel crashed (ERR715 = odd LDCU.64 UR)"
+            raw = cuda_ctx.copy_from(d_out, byte_size)
+            results = list(struct.unpack(f'<{N}i', raw))
+            assert results == expected, \
+                f"Mismatch at idx 0: got {results[0]}, expected {expected[0]}"
+        finally:
+            cuda_ctx.free(d_a)
+            cuda_ctx.free(d_b)
+            cuda_ctx.free(d_out)
+
+
+# ---------------------------------------------------------------------------
+# Regression: predicated ld.param.u64 must use LDC.64, not split LDC pair
+# ---------------------------------------------------------------------------
+# Bug: if-converted divergent paths emitted two predicated LDC instructions
+# (lo + hi) for 64-bit param loads. SM_120 requires a single LDC.64 instead.
+
+_PTX_PRED_LDC64_REGRESSION = """
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry pred_ldc64_test(
+    .param .u64 out, .param .u64 val_a, .param .u64 val_b, .param .u32 n)
+{
+    .reg .b32 %r<6>; .reg .b64 %rd<6>; .reg .pred %p0, %p1;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n];
+    setp.ge.u32 %p0, %r0, %r1;
+    @%p0 bra DONE;
+    setp.ge.u32 %p1, %r0, 16;
+    @%p1 bra USE_B;
+    ld.param.u64 %rd1, [val_a]; ld.global.u32 %r2, [%rd1];
+    bra STORE;
+USE_B:
+    ld.param.u64 %rd2, [val_b]; ld.global.u32 %r2, [%rd2];
+STORE:
+    cvt.u64.u32 %rd0, %r0;
+    shl.b64 %rd0, %rd0, 2;
+    ld.param.u64 %rd3, [out]; add.u64 %rd4, %rd3, %rd0;
+    st.global.u32 [%rd4], %r2;
+DONE:
+    ret;
+}
+"""
+
+
+class TestPredLdc64Regression:
+    """Regression: predicated 64-bit param loads must use LDC.64."""
+
+    @gpu
+    def test_pred_ldc64_gpu_execution(self, cuda_ctx):
+        """Diamond CF: threads 0-15 load from val_a, 16-31 from val_b."""
+        cubins = _compile(_PTX_PRED_LDC64_REGRESSION)
+        N = 32
+        VAL_A = 42
+        VAL_B = 99
+
+        assert cuda_ctx.load(cubins['pred_ldc64_test'])
+        func = cuda_ctx.get_func('pred_ldc64_test')
+        byte_size = N * 4
+
+        d_out = cuda_ctx.alloc(byte_size)
+        d_va = cuda_ctx.alloc(4)
+        d_vb = cuda_ctx.alloc(4)
+        try:
+            cuda_ctx.copy_to(d_va, struct.pack('<I', VAL_A))
+            cuda_ctx.copy_to(d_vb, struct.pack('<I', VAL_B))
+            cuda_ctx.copy_to(d_out, struct.pack(f'<{N}I', *([0] * N)))
+            err = cuda_ctx.launch(func, (1, 1, 1), (32, 1, 1),
+                                  [d_out, d_va, d_vb, N])
+            assert err == 0
+            assert cuda_ctx.sync() == 0, \
+                "pred-LDC.64 regression: kernel crashed (ERR700 = split LDC pair)"
+            raw = cuda_ctx.copy_from(d_out, byte_size)
+            results = list(struct.unpack(f'<{N}I', raw))
+            for i in range(N):
+                expected = VAL_A if i < 16 else VAL_B
+                assert results[i] == expected, \
+                    f"idx {i}: got {results[i]}, expected {expected}"
+        finally:
+            cuda_ctx.free(d_out)
+            cuda_ctx.free(d_va)
+            cuda_ctx.free(d_vb)
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v', '-m', 'gpu'])

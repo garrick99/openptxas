@@ -316,7 +316,9 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
             # if name in ur_only_f64_regs:
             #     continue
             first = reg_first_def.get(name, 0)
-            last = reg_last_use.get(name, len(all_instrs))
+            # Dead registers (defined but never read) get last_use = first_def,
+            # so their pair is freed immediately for reuse.
+            last = reg_last_use.get(name, first)
             reg_info.append((name, is_64, first, last))
 
     # Sort by first definition

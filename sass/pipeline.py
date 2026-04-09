@@ -615,7 +615,7 @@ def compile_function(fn: Function, verbose: bool = False,
         param_offsets=alloc.param_offsets,
         ur_desc=4,  # UR4 for memory descriptors (ptxas convention)
         _const_pool_base=lit_pool_base,
-        _next_gpr=_addr_scratch_base + 2,  # pool-based scratch starts above addr pair
+        _next_gpr=_addr_scratch_base,  # scratch allocated on demand, not pre-reserved
         _next_pred=alloc.num_pred,
         sm_version=sm_version,
     )

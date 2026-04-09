@@ -2146,10 +2146,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     need_cross1 = b_hi not in _zero_regs
                     need_cross2 = a_hi not in _zero_regs
                     if need_cross1 or need_cross2:
-                        t = _alloc_gpr(ctx)
-                        if t % 2 != 0:
-                            t = _alloc_gpr(ctx)
-                        _alloc_gpr(ctx)  # reserve t+1
+                        t = _alloc_gpr_pair(ctx)
                     if need_cross1:
                         # cross1: t = a_lo * b_hi (low 32 of wide product)
                         output.append(SassInstr(encode_imad_wide_rr(t, a_lo, b_hi, RZ),
@@ -2162,6 +2159,9 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             f'IMAD.WIDE R{t}, R{a_hi}, R{b_lo}, RZ  // cross a_hi*b_lo'))
                         output.append(SassInstr(encode_iadd3(d_lo+1, d_lo+1, t, RZ),
                             f'IADD3 R{d_lo+1}, R{d_lo+1}, R{t}, RZ  // d_hi += cross2'))
+                    if need_cross1 or need_cross2:
+                        # Free cross-product scratch for reuse
+                        _free_scratch(ctx, [t, t + 1])
 
                 elif op == 'st' and 'shared' in instr.types:
                     from ptx.ir import MemOp

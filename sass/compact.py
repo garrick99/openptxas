@@ -150,6 +150,18 @@ GPR_FIELDS: dict[int, list[tuple[int, str]]] = {
     # All groups have fixed widths (no shape dispatch).
     0x237: [(2, 'dst_quad'), (3, 'src_a_quad'), (4, 'src_b_pair'), (8, 'src_c_quad')],
 
+    # --- Tensor core: DMMA (FP64 matrix multiply-accumulate) ---
+    # Opcode 0x23f covers DMMA.8x8x4 (m8n8k4, single encoded form on SM_120):
+    #   A: 1 .f64 = 2 GPRs (pair), B: 1 .f64 = 2 GPRs (pair)
+    #   C/D: 2 .f64 = 4 GPRs (quad)
+    #   raw[9]=0x00, raw[10]=0x00 (no shape modifier, single form)
+    # byte[2] = dst   (4-register QUAD, 4-aligned)
+    # byte[3] = src_a (2-register PAIR, 2-aligned)
+    # byte[4] = src_b (2-register PAIR, 2-aligned)
+    # byte[8] = src_c (4-register QUAD, 4-aligned)
+    # Ground truth: DMMA.8x8x4 R8, R2, R4, R8
+    0x23f: [(2, 'dst_quad'), (3, 'src_a_pair'), (4, 'src_b_pair'), (8, 'src_c_quad')],
+
     # --- BRA variants (no GPR fields) ---
     0x547: [],  # BRA (predicated/relative variant)
 

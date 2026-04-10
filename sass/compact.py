@@ -139,6 +139,17 @@ GPR_FIELDS: dict[int, list[tuple[int, str]]] = {
     # Width-dependent fields use special names handled in collect_used_gprs.
     0x23c: [(2, 'dst_quad'), (3, 'hmma_a'), (4, 'hmma_b'), (8, 'src_c_quad')],
 
+    # --- Tensor core: IMMA (INT8 matrix multiply-accumulate) ---
+    # Opcode 0x237 covers IMMA.16832.S8.S8 (only encoded form):
+    #   m16n8k32, A: 4 INT8 regs, B: 2 INT8 regs, C/D: 4 INT32 regs
+    #   byte[9]=0x5c (shape+type), byte[10]=0x40 (signed flag)
+    # byte[2] = dst (4-register QUAD group: dst..dst+3)
+    # byte[3] = src_a (4-register QUAD group: src_a..src_a+3, INT8 packed)
+    # byte[4] = src_b (2-register PAIR: src_b..src_b+1, INT8 packed)
+    # byte[8] = src_c (4-register QUAD group: src_c..src_c+3)
+    # All groups have fixed widths (no shape dispatch).
+    0x237: [(2, 'dst_quad'), (3, 'src_a_quad'), (4, 'src_b_pair'), (8, 'src_c_quad')],
+
     # --- BRA variants (no GPR fields) ---
     0x547: [],  # BRA (predicated/relative variant)
 
@@ -182,7 +193,8 @@ def kernel_is_compactable(sass_instrs: list) -> tuple[bool, set[int]]:
 
 
 def _is_64bit_field(name: str) -> bool:
-    return '64' in name
+    """Field is a 2-register group: 64-bit lo/hi pair OR vector pair (e.g., MMA src_b)."""
+    return '64' in name or 'pair' in name
 
 
 def _is_quad_field(name: str) -> bool:

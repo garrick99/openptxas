@@ -110,15 +110,16 @@ def compile_ptxas(ptx):
     with tempfile.TemporaryDirectory() as tmp:
         pf = Path(tmp) / "k.ptx"
         cf = Path(tmp) / "k.cubin"
-        pf.write_text(ptx)
+        pf.write_text(ptx, encoding="utf-8")
         t0 = time.perf_counter()
         r = subprocess.run(
             ["ptxas", "-arch=sm_120", "-o", str(cf), str(pf)],
-            capture_output=True, text=True
+            capture_output=True,  # bytes mode — avoid Windows cp1252 decode
         )
         dt = time.perf_counter() - t0
         if r.returncode != 0:
-            raise RuntimeError(f"ptxas: {r.stderr}")
+            err = r.stderr.decode("utf-8", errors="replace")
+            raise RuntimeError(f"ptxas: {err}")
         return cf.read_bytes(), dt
 
 

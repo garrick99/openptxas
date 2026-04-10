@@ -371,6 +371,308 @@ def harness_hmma_zero(ctx: CUDAContext, func, mode: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# WB-6 catalog expansion — broader stress kernels.
+# ---------------------------------------------------------------------------
+
+# conv2d_unrolled — 9 tap fully-unrolled 3x3 conv (structural contrast vs
+# the looped variant; same semantics, different liveness shape).
+_PTX_CONV2D_UNROLLED_PATH = REPO_FORGE / "benchmarks" / "fb0_baseline" / "conv2d_open.ptx"
+
+
+def harness_conv2d_unrolled(ctx: CUDAContext, func, mode: str) -> dict:
+    """Same harness as conv2d_looped — 128x128 u64 grid, all-ones input."""
+    return harness_conv2d_looped(ctx, func, mode)
+
+
+# vecadd_large — 1M-thread u64 vector add with bounds check (memory-bound).
+# Stresses the multi-param + multi-LDG path.
+_PTX_VECADD_LARGE = """
+.version 8.7
+.target sm_120
+.address_size 64
+
+.visible .entry vecadd_large(
+    .param .u64 p_out,
+    .param .u64 p_a,
+    .param .u64 p_b,
+    .param .u32 p_n
+)
+{
+    .reg .u32 %r<8>;
+    .reg .u64 %rd<10>;
+    .reg .pred %p<2>;
+
+    mov.u32 %r0, %tid.x;
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mad.lo.u32 %r3, %r1, %r2, %r0;
+
+    ld.param.u32 %r4, [p_n];
+    setp.ge.u32 %p0, %r3, %r4;
+    @%p0 ret;
+
+    shl.b32 %r5, %r3, 2;
+    cvt.u64.u32 %rd0, %r5;
+
+    ld.param.u64 %rd1, [p_a];
+    add.u64 %rd2, %rd1, %rd0;
+    ld.global.u32 %r6, [%rd2];
+
+    ld.param.u64 %rd3, [p_b];
+    add.u64 %rd4, %rd3, %rd0;
+    ld.global.u32 %r7, [%rd4];
+
+    add.u32 %r6, %r6, %r7;
+
+    ld.param.u64 %rd5, [p_out];
+    add.u64 %rd6, %rd5, %rd0;
+    st.global.u32 [%rd6], %r6;
+    ret;
+}
+"""
+
+
+def harness_vecadd_large(ctx: CUDAContext, func, mode: str) -> dict:
+    """1<<20 element u32 vector add: a[i]+b[i] -> c[i]; verify a sample."""
+    N = 1 << 20
+    block = 256
+    grid = (N + block - 1) // block
+
+    d_a = ctx.alloc(N * 4)
+    d_b = ctx.alloc(N * 4)
+    d_out = ctx.alloc(N * 4)
+    try:
+        a_host = (ctypes.c_uint32 * N)(*[i for i in range(N)])
+        b_host = (ctypes.c_uint32 * N)(*[i * 2 for i in range(N)])
+        ctx.copy_to(d_a, bytes(a_host))
+        ctx.copy_to(d_b, bytes(b_host))
+        ctx.copy_to(d_out, b"\x00" * (N * 4))
+
+        a_out = ctypes.c_uint64(d_out)
+        a_a   = ctypes.c_uint64(d_a)
+        a_b   = ctypes.c_uint64(d_b)
+        a_n   = ctypes.c_uint32(N)
+        args, _hold = _make_args(a_out, a_a, a_b, a_n)
+        ctx.cuda.cuLaunchKernel(func, grid, 1, 1, block, 1, 1,
+                                0, None, args, None)
+        assert ctx.sync() == 0, "vecadd_large kernel crashed"
+
+        # Verify first 1024 + last 1024
+        first_raw = ctx.copy_from(d_out, 1024 * 4)
+        first = struct.unpack(f"<{1024}I", first_raw)
+        correct = all(first[i] == i * 3 for i in range(1024))
+        if correct:
+            tail_off = (N - 1024) * 4
+            last_raw = ctx.copy_from(d_out + tail_off, 1024 * 4)
+            last = struct.unpack(f"<{1024}I", last_raw)
+            correct = all(last[j] == (N - 1024 + j) * 3 for j in range(1024))
+
+        time_ms = None
+        if mode == "bench":
+            time_ms = _bench_launch(
+                ctx, func, (grid, 1, 1), (block, 1, 1), args
+            )
+    finally:
+        ctx.free(d_a)
+        ctx.free(d_b)
+        ctx.free(d_out)
+    return {"correct": correct, "time_ms": time_ms}
+
+
+# multi_ldg — load+add aliasing pattern (the canary that exposed
+# FB-5.1's address-pair quarantine bug).
+_PTX_MULTI_LDG = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry multi_ldg_test(.param .u64 pin, .param .u64 pout) {
+    .reg .u32 %r<8>;
+    .reg .u64 %rd<16>;
+    .reg .f32 %f<4>;
+    ld.param.u64 %rd0, [pin];
+    ld.param.u64 %rd1, [pout];
+    mov.u32 %r0, %tid.x;
+    shl.b32 %r1, %r0, 2;
+    cvt.u64.u32 %rd2, %r1;
+    add.u64 %rd3, %rd0, %rd2;
+    ld.global.f32 %f0, [%rd3];
+    add.u64 %rd4, %rd3, 4;
+    ld.global.f32 %f1, [%rd4];
+    add.f32 %f2, %f0, %f1;
+    add.u64 %rd5, %rd1, %rd2;
+    st.global.f32 [%rd5], %f2;
+    ret;
+}
+"""
+
+
+def harness_multi_ldg(ctx: CUDAContext, func, mode: str) -> dict:
+    """Each thread reads in[i] + in[i+1], writes to out[i]."""
+    N = 4
+    in_vals = [float(i + 1) for i in range(N + 1)]
+    d_in = ctx.alloc((N + 1) * 4)
+    d_out = ctx.alloc(N * 4)
+    try:
+        ctx.copy_to(d_in, struct.pack(f"<{N+1}f", *in_vals))
+        ctx.copy_to(d_out, b"\x00" * (N * 4))
+        a_in  = ctypes.c_uint64(d_in)
+        a_out = ctypes.c_uint64(d_out)
+        args, _hold = _make_args(a_in, a_out)
+        ctx.cuda.cuLaunchKernel(func, 1, 1, 1, N, 1, 1, 0, None, args, None)
+        assert ctx.sync() == 0, "multi_ldg kernel crashed"
+        out = struct.unpack(f"<{N}f", ctx.copy_from(d_out, N * 4))
+        correct = all(out[i] == in_vals[i] + in_vals[i + 1] for i in range(N))
+        time_ms = None
+        if mode == "bench":
+            time_ms = _bench_launch(ctx, func, (1, 1, 1), (N, 1, 1), args)
+    finally:
+        ctx.free(d_in)
+        ctx.free(d_out)
+    return {"correct": correct, "time_ms": time_ms}
+
+
+# smem_exchange — shared memory write/barrier/read roundtrip.
+_PTX_SMEM_EXCHANGE = """
+.version 8.7
+.target sm_120
+.address_size 64
+
+.visible .entry smem_exchange(
+    .param .u64 p_out
+)
+{
+    .reg .u32 %r<12>;
+    .reg .u64 %rd<6>;
+    .shared .align 4 .b32 smem[256];
+
+    mov.u32 %r0, %tid.x;
+    shl.b32 %r1, %r0, 2;
+    add.u32 %r2, %r0, 1;
+    st.shared.b32 [%r1], %r2;
+    bar.sync 0;
+
+    add.u32 %r3, %r1, 4;
+    sub.u32 %r4, %r1, 4;
+    ld.shared.b32 %r5, [%r1];
+    ld.param.u64 %rd0, [p_out];
+    add.u64 %rd0, %rd0, 0;
+    cvt.u64.u32 %rd1, %r1;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r5;
+    ret;
+}
+"""
+
+
+def harness_smem_exchange(ctx: CUDAContext, func, mode: str) -> dict:
+    """32 threads write tid+1 to smem, barrier, read own slot back, store."""
+    N = 32
+    d_out = ctx.alloc(N * 4)
+    try:
+        ctx.copy_to(d_out, b"\x00" * (N * 4))
+        a_out = ctypes.c_uint64(d_out)
+        args, _hold = _make_args(a_out)
+        ctx.cuda.cuLaunchKernel(func, 1, 1, 1, N, 1, 1, 1024, None, args, None)
+        assert ctx.sync() == 0, "smem_exchange kernel crashed"
+        out = struct.unpack(f"<{N}I", ctx.copy_from(d_out, N * 4))
+        correct = all(out[i] == i + 1 for i in range(N))
+        time_ms = None
+        if mode == "bench":
+            time_ms = _bench_launch(
+                ctx, func, (1, 1, 1), (N, 1, 1), args, smem=1024,
+            )
+    finally:
+        ctx.free(d_out)
+    return {"correct": correct, "time_ms": time_ms}
+
+
+# atomg_add — atom.global.add.u32 (different atomic class than atom_or).
+_PTX_ATOMG_ADD = """
+.version 8.7
+.target sm_120
+.address_size 64
+
+.visible .entry atomg_add_test(
+    .param .u64 p_out,
+    .param .u32 p_addend
+)
+{
+    .reg .u32 %r<4>;
+    .reg .u64 %rd<2>;
+
+    ld.param.u64 %rd0, [p_out];
+    ld.param.u32 %r0, [p_addend];
+    atom.global.add.u32 %r1, [%rd0], %r0;
+    ret;
+}
+"""
+
+
+def harness_atomg_add(ctx: CUDAContext, func, mode: str) -> dict:
+    """32 threads each atomic-add 1 → counter = 32."""
+    d = ctx.alloc(4)
+    try:
+        ctx.copy_to(d, struct.pack("<I", 0))
+        a_out = ctypes.c_uint64(d)
+        a_add = ctypes.c_uint32(1)
+        args, _hold = _make_args(a_out, a_add)
+        ctx.cuda.cuLaunchKernel(func, 1, 1, 1, 32, 1, 1, 0, None, args, None)
+        assert ctx.sync() == 0, "atomg_add kernel crashed"
+        val = struct.unpack("<I", ctx.copy_from(d, 4))[0]
+        correct = (val == 32)
+        time_ms = None
+        if mode == "bench":
+            time_ms = _bench_launch(ctx, func, (1, 1, 1), (32, 1, 1), args)
+    finally:
+        ctx.free(d)
+    return {"correct": correct, "time_ms": time_ms}
+
+
+# fmax_kernel — scalar ALU sanity (FMNMX path).
+_PTX_FMAX = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry fmax_test(.param .u64 p_out, .param .u64 p_a, .param .u64 p_b) {
+    .reg .u64 %rd<4>; .reg .f32 %f<4>;
+    ld.param.u64 %rd0, [p_a]; ld.global.f32 %f0, [%rd0];
+    ld.param.u64 %rd1, [p_b]; ld.global.f32 %f1, [%rd1];
+    max.f32 %f2, %f0, %f1;
+    ld.param.u64 %rd2, [p_out];
+    st.global.f32 [%rd2], %f2;
+    ret;
+}
+"""
+
+
+def harness_fmax(ctx: CUDAContext, func, mode: str) -> dict:
+    """max(a, b) for f32 scalars; expect b's larger value."""
+    d_a = ctx.alloc(4)
+    d_b = ctx.alloc(4)
+    d_out = ctx.alloc(4)
+    try:
+        ctx.copy_to(d_a, struct.pack("<f", 3.5))
+        ctx.copy_to(d_b, struct.pack("<f", 7.25))
+        ctx.copy_to(d_out, b"\x00" * 4)
+        a_out = ctypes.c_uint64(d_out)
+        a_a   = ctypes.c_uint64(d_a)
+        a_b   = ctypes.c_uint64(d_b)
+        args, _hold = _make_args(a_out, a_a, a_b)
+        ctx.cuda.cuLaunchKernel(func, 1, 1, 1, 1, 1, 1, 0, None, args, None)
+        assert ctx.sync() == 0, "fmax kernel crashed"
+        result = struct.unpack("<f", ctx.copy_from(d_out, 4))[0]
+        correct = (result == 7.25)
+        time_ms = None
+        if mode == "bench":
+            time_ms = _bench_launch(ctx, func, (1, 1, 1), (1, 1, 1), args)
+    finally:
+        ctx.free(d_a)
+        ctx.free(d_b)
+        ctx.free(d_out)
+    return {"correct": correct, "time_ms": time_ms}
+
+
+# ---------------------------------------------------------------------------
 # IMMA / DMMA / QMMA zero kernels (sibling tensor cores).  Same all-zero
 # input pattern as hmma_zero — exercises every tensor backend variant.
 # ---------------------------------------------------------------------------
@@ -764,6 +1066,49 @@ KERNELS: dict[str, dict] = {
         "kernel_name": "atom_or",
         "harness": harness_atom_or,
     },
+    # WB-6 additions
+    "conv2d_unrolled": {
+        "display": "conv2d 3x3 fully-unrolled (u64)",
+        "ptx_path": _PTX_CONV2D_UNROLLED_PATH,
+        "ptx_inline": None,
+        "kernel_name": "conv2d",
+        "harness": harness_conv2d_unrolled,
+    },
+    "vecadd_large": {
+        "display": "vecadd_large (1M-thread, 4-param, bounds check)",
+        "ptx_path": None,
+        "ptx_inline": _PTX_VECADD_LARGE,
+        "kernel_name": "vecadd_large",
+        "harness": harness_vecadd_large,
+    },
+    "multi_ldg": {
+        "display": "multi_ldg aliased base (FB-5 canary)",
+        "ptx_path": None,
+        "ptx_inline": _PTX_MULTI_LDG,
+        "kernel_name": "multi_ldg_test",
+        "harness": harness_multi_ldg,
+    },
+    "smem_exchange": {
+        "display": "shared-memory write/barrier/read",
+        "ptx_path": None,
+        "ptx_inline": _PTX_SMEM_EXCHANGE,
+        "kernel_name": "smem_exchange",
+        "harness": harness_smem_exchange,
+    },
+    "atomg_add": {
+        "display": "atom.global.add.u32",
+        "ptx_path": None,
+        "ptx_inline": _PTX_ATOMG_ADD,
+        "kernel_name": "atomg_add_test",
+        "harness": harness_atomg_add,
+    },
+    "fmax": {
+        "display": "max.f32 scalar (FMNMX)",
+        "ptx_path": None,
+        "ptx_inline": _PTX_FMAX,
+        "kernel_name": "fmax_test",
+        "harness": harness_fmax,
+    },
 }
 
 
@@ -992,6 +1337,31 @@ SUITES: dict[str, list[str]] = {
         "reduce_sum", "conv2d_looped",
         "hmma_zero", "imma_zero", "dmma_zero", "qmma_zero",
         "cp_async", "warp_reduce", "atom_or",
+    ],
+    # WB-6 suites
+    "stress": [
+        "vecadd_large",   # memory bandwidth, multi-param, bounds check
+        "smem_exchange",  # shared memory + barrier
+        "multi_ldg",      # multi-LDG, aliased base address chains
+    ],
+    "contrast": [
+        "conv2d_looped",
+        "conv2d_unrolled",
+        "warp_reduce",
+        "hmma_zero",
+    ],
+    "wb6": [
+        # Everything new in WB-6 (sanity that all build + correct + measure)
+        "conv2d_unrolled", "vecadd_large", "multi_ldg",
+        "smem_exchange", "atomg_add", "fmax",
+    ],
+    "all": [
+        # Whole catalog (everything)
+        "reduce_sum", "conv2d_looped", "conv2d_unrolled",
+        "hmma_zero", "imma_zero", "dmma_zero", "qmma_zero",
+        "cp_async", "warp_reduce",
+        "atom_or", "atomg_add",
+        "vecadd_large", "multi_ldg", "smem_exchange", "fmax",
     ],
 }
 

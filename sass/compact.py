@@ -122,6 +122,12 @@ GPR_FIELDS: dict[int, list[tuple[int, str]]] = {
     0x9a8: [(2, 'dst'), (3, 'addr64'), (4, 'data')],              # ATOMG.E.MIN/MAX
     0x3a9: [(2, 'dst64'), (3, 'addr64'), (4, 'data64'), (8, 'swap64')],  # ATOMG.E.CAS.64
 
+    # --- Async copy (cp.async) ---
+    # LDGSTS.E [smem_addr], desc[UR][glob_addr.64]
+    # byte[2] = smem_addr (32-bit GPR), byte[3] = glob_addr (64-bit pair base)
+    # byte[8] = ur_desc (UR, not GPR). bytes[4-7] = unused.
+    0xfae: [(2, 'smem_addr'), (3, 'addr64')],                     # LDGSTS.E (cp.async)
+
     # --- BRA variants (no GPR fields) ---
     0x547: [],  # BRA (predicated/relative variant)
 

@@ -196,31 +196,90 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
                     next_pred += 1
 
     # SM_120: identify u64 param registers that will be loaded into UR via LDCU.64
-    # and are ONLY consumed by add.u64 (address computation). These never need GPRs.
+    # and never require a GPR pair.  Two consumer classes qualify (FB-5.1):
+    #   1. Pointer arithmetic: add / sub / mul / shl on the 64-bit value.
+    #      add.u64 has an R-UR form (IADD.64 R-UR), so the param can be sourced
+    #      directly from UR with no GPR mapping.
+    #   2. Direct global memory address: ld / st / atom with 'global' in types
+    #      where this vreg is the MemOp base.  isel materializes via the
+    #      reserved _addr_scratch_lo pair (UR -> GPR move), no static GPR
+    #      reservation required.
+    # Predicated ld.param.u64 (divergent fallback path) is excluded — that
+    # path materializes the result into ra.lo(dest) and needs the GPR mapping.
     ur_param_regs: set[str] = set()
     if sm_version == 120:
+        # Collect u64 ld.param dests, tracking whether the load is predicated.
+        # Also count def sites — a vreg redefined after the param load (e.g.
+        # `add.u64 %rd0, %rd0, 4`) needs a real GPR because the increment
+        # writes a new value into the same name.  Such vregs are NOT pure
+        # param values and cannot be UR-bound.
         param_u64_names: set[str] = set()
+        param_u64_predicated: set[str] = set()
+        u64_def_count: dict[str, int] = {}
         for inst in all_instrs:
+            if inst.dest and isinstance(inst.dest, RegOp):
+                u64_def_count[inst.dest.name] = u64_def_count.get(inst.dest.name, 0) + 1
             if (inst.op == 'ld' and 'param' in inst.types
                     and any(t in ('u64', 's64', 'b64') for t in inst.types)
                     and isinstance(inst.dest, RegOp)):
                 param_u64_names.add(inst.dest.name)
+                if inst.pred:
+                    param_u64_predicated.add(inst.dest.name)
         for pname in param_u64_names:
-            only_add64 = True
+            if pname in param_u64_predicated:
+                continue  # divergent fallback needs GPR
+            if u64_def_count.get(pname, 0) > 1:
+                continue  # rewritten after param load — needs real GPR
+            only_safe = True
             for inst in all_instrs:
                 for src in inst.srcs:
                     src_name = (src.name if isinstance(src, RegOp) else
                                 (src.base if isinstance(src, MemOp) and
                                  isinstance(src.base, str) else None))
                     if src_name == pname:
-                        if not (inst.op in ('add', 'sub', 'mul', 'shl')
-                                and any(t in ('u64', 's64', 'b64') for t in inst.types)):
-                            only_add64 = False
+                        # Class 1: add.u64 has IADD.64 R-UR form (only add — sub
+                        # falls through to GPR IADD3, mul.lo uses IMAD.WIDE
+                        # which is GPR-only, shl is also GPR-only).
+                        arith_ok = (inst.op == 'add'
+                                    and any(t in ('u64', 's64', 'b64') for t in inst.types))
+                        # Class 2: global memory address base (FB-5.1 broadening)
+                        base_ok = (isinstance(src, MemOp)
+                                   and inst.op in ('ld', 'st', 'atom')
+                                   and 'global' in inst.types)
+                        if not (arith_ok or base_ok):
+                            only_safe = False
                             break
-                if not only_add64:
+                if not only_safe:
                     break
-            if only_add64:
+            if only_safe:
                 ur_param_regs.add(pname)
+
+        # FB-5.1 second pass: IADD.64-UR has only ONE UR source slot.  If a
+        # single add.u64 has BOTH source operands in ur_param_regs, one must
+        # fall back to a GPR allocation.  Exclude the second-listed source.
+        for inst in all_instrs:
+            if not (inst.op == 'add'
+                    and any(t in ('u64', 's64', 'b64') for t in inst.types)):
+                continue
+            ur_srcs = [s.name for s in inst.srcs
+                       if isinstance(s, RegOp) and s.name in ur_param_regs]
+            if len(ur_srcs) >= 2:
+                for extra in ur_srcs[1:]:
+                    ur_param_regs.discard(extra)
+
+        # FB-5.1 opt-out: kernels containing an mma.sync with f64 operands
+        # (DMMA) currently rely on the linear scan landing the f64 dst pair
+        # at a 4-aligned base by *accident* (the existing quad-alignment
+        # logic only covers 32-bit dest tuples — HMMA / IMMA / QMMA).
+        # Honoring ur_param_regs in DMMA kernels can pull the f64 dst down
+        # to a non-4-aligned base, which the hardware rejects with ERR715.
+        # Quad handling is explicitly out of scope for FB-5.1, so just skip
+        # the honoring entirely for these kernels.
+        for inst in all_instrs:
+            if (inst.op == 'mma' and 'sync' in inst.types
+                    and 'f64' in inst.types):
+                ur_param_regs.clear()
+                break
 
     # SM_120: identify f64 param registers that will be loaded into UR via LDCU.64.
     # DFMA R-R-UR-UR handles them directly; no GPR needed.  Keeping these in UR
@@ -338,6 +397,12 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
                 continue
             if name in cbuf_only_regs:
                 continue  # SM_89: skip GPR for cbuf-inline params
+            # FB-5.1: u64 params resolved by ur_param_regs analysis are
+            # consumed entirely via UR (LDCU.64 -> R-UR add / _addr_scratch_lo
+            # materialization).  No phys GPR is ever written to those slots,
+            # so reserving a pair just inflates next_gpr.  Skip them here.
+            if name in ur_param_regs:
+                continue
             first = reg_first_def.get(name, 0)
             # Dead registers (defined but never read) get last_use = first_def,
             # so their pair is freed immediately for reuse.
@@ -347,21 +412,45 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
     # Sort by first definition
     reg_info.sort(key=lambda x: x[2])
 
+    # FB-5.1: u64 vregs used as memory address bases (ld/st/atom MemOp.base).
+    # When such a vreg expires, its pair must NOT be immediately reused as the
+    # destination of the next 64-bit allocation: the next IADD.64-UR would
+    # write the same R4:R5 the in-flight LDG.E is still consuming as address,
+    # producing a WAR hazard the existing single-NOP wait-state pass cannot
+    # cover.  We defer such pair into a one-step "quarantine" so it is only
+    # available to the allocation AFTER the immediate next one.
+    addr_vregs: set[str] = set()
+    for inst in all_instrs:
+        if inst.op in ('ld', 'st', 'atom') and 'global' in inst.types:
+            for src in inst.srcs:
+                if isinstance(src, MemOp) and isinstance(src.base, str):
+                    bn = src.base if src.base.startswith('%') else f'%{src.base}'
+                    addr_vregs.add(bn)
+
     # Linear scan: assign physical registers, reclaiming dead ones
     # active = [(name, phys_reg, last_use, is_64)]
     active: list[tuple[str, int, int, bool]] = []
     free_regs_64: list[int] = []  # available even-aligned register pairs
     free_regs_32: list[int] = []  # available single registers
+    quarantine_64: list[int] = []  # FB-5.1: address pairs in 1-step cooldown
     next_gpr = 2  # R0-R1 reserved
 
     for name, is_64, first_def, last_use in reg_info:
+        # FB-5.1: previous step's quarantine becomes available now.
+        if quarantine_64:
+            free_regs_64.extend(quarantine_64)
+            quarantine_64 = []
+
         # Expire old intervals: free registers whose last use is before this def
         new_active = []
         for aname, areg, alast, a64 in active:
             if alast < first_def:
                 # This register is dead — reclaim it
                 if a64:
-                    free_regs_64.append(areg)
+                    if aname in addr_vregs:
+                        quarantine_64.append(areg)  # FB-5.1: 1-step cooldown
+                    else:
+                        free_regs_64.append(areg)
                 else:
                     free_regs_32.append(areg)
             else:
@@ -402,6 +491,16 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
                                 free_regs_32.remove(phys)
                             if phys + 1 in free_regs_32:
                                 free_regs_32.remove(phys + 1)
+                            # FB-5.1 prerequisite: if phys+1 is the next fresh
+                            # GPR (or beyond), advance next_gpr past the hi
+                            # half so a later 32-bit allocation cannot reuse
+                            # it.  Without this, the colocated pair's hi half
+                            # collides with the next-allocated 32-bit reg.
+                            # The bug was latent until ur_param_regs skipping
+                            # pulled allocations down to low addresses where
+                            # next_gpr == phys+1 became common.
+                            if next_gpr <= phys + 1:
+                                next_gpr = phys + 2
                             # Remove source from active — its GPR slot is now
                             # owned by the 64-bit dest. Without this, the
                             # source's expiry would free the GPR while the

@@ -936,6 +936,54 @@ def compile_function(fn: Function, verbose: bool = False,
             for bra_idx, target_label in ctx._bra_fixups
         ]
 
+    # WB-8: LDCU.128 param packing.
+    #
+    # Replace pairs of LDCU.64 instructions whose:
+    #   - dest URs are 4-aligned and consecutive (URa, URa+2)
+    #   - cbuf byte offsets are X and X+8
+    #   - X is 16-byte aligned (i.e. qword index even)
+    # ...with one LDCU.128 (lower UR, lower offset) + a NOP placeholder
+    # for the partner.
+    #
+    # The replacement is done in-place by flipping byte[9] from 0x0a
+    # (64-bit) to 0x0c (128-bit) on the lower-offset LDCU and NOP-ing
+    # the higher-offset partner.  This preserves the scoreboard ctrl
+    # bytes the existing assign_ctrl pass set up.
+    def _wb8_pack_ldcu_128(instrs):
+        from sass.encoding.sm_120_opcodes import encode_nop
+        # Collect all LDCU.64 (b9=0x0a) param-load instructions.
+        ldcu64 = []
+        for j, si in enumerate(instrs):
+            opc = (si.raw[0] | (si.raw[1] << 8)) & 0xFFF
+            if opc == 0x7ac and si.raw[9] == 0x0a:
+                ldcu64.append((j, si.raw[2], si.raw[5] * 8))
+        by_key: dict[tuple, int] = {(d, b): j for j, d, b in ldcu64}
+        replacements: dict[int, SassInstr] = {}
+        paired: set[int] = set()
+        for j, d, b in ldcu64:
+            if j in paired:
+                continue
+            if d % 4 != 0 or b % 16 != 0:
+                continue
+            partner_j = by_key.get((d + 2, b + 8))
+            if partner_j is None or partner_j in paired:
+                continue
+            # Patch: flip byte[9] 0x0a -> 0x0c on the lower-offset LDCU.
+            packed_raw = bytearray(instrs[j].raw)
+            packed_raw[9] = 0x0c
+            replacements[j] = SassInstr(
+                bytes(packed_raw),
+                f'LDCU.128 UR{d}, c[0][0x{b:x}]  // WB-8 packed')
+            replacements[partner_j] = SassInstr(
+                encode_nop(), 'NOP  // WB-8: LDCU.128 absorbed')
+            paired.add(j)
+            paired.add(partner_j)
+        if not replacements:
+            return instrs
+        return [replacements.get(k, si) for k, si in enumerate(instrs)]
+
+    body_instrs = _wb8_pack_ldcu_128(body_instrs)
+
     # 4. Schedule: reorder for LDG latency, then assign ctrl via scoreboard
     raw_instrs = preamble + body_instrs
     reordered = schedule(raw_instrs)

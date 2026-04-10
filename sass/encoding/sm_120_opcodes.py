@@ -1603,6 +1603,53 @@ def encode_ldcu_64(dest_ur: int, const_bank: int, const_offset_bytes: int,
     return bytes(raw)
 
 
+# WB-8: LDCU.128 — 128-bit param load packing two consecutive u64 params
+# into a 4-UR group in one instruction.
+#
+# Ground truth (ptxas multi_ldg, sm_120):
+#   LDCU.128 UR8, c[0][0x380] -> ac7708ff00700000000c000800220e00
+#   b9 = 0x0c (vs 0x0a for 64-bit), other bytes match LDCU.64
+#
+# Constraints:
+#   - dest UR must be 4-aligned (UR0, UR4, UR8, UR12, ...)
+#   - cbuf byte offset must be 16-byte aligned
+#   - loads UR(d), UR(d+1), UR(d+2), UR(d+3) covering 16 bytes
+def encode_ldcu_128(dest_ur: int, const_bank: int, const_offset_bytes: int,
+                    ctrl: int = 0) -> bytes:
+    """Encode LDCU.128 dest_ur, c[bank][offset] — loads 4 consecutive URs.
+
+    The dest UR must be 4-aligned and the byte offset must be 16-byte
+    aligned (i.e. qword index must be even).
+    """
+    if dest_ur % 4 != 0:
+        raise ValueError(f"LDCU.128 dest UR{dest_ur} must be 4-aligned")
+    if const_offset_bytes % 16 != 0:
+        raise ValueError(f"LDCU.128 byte offset 0x{const_offset_bytes:x} "
+                         f"must be 16-byte aligned")
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    qword_offset = (const_offset_bytes // 8) & 0xFF
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0xac
+    raw[1] = 0x77
+    raw[2] = dest_ur & 0xFF
+    raw[3] = 0xFF
+    raw[4] = const_bank & 0xFF
+    raw[5] = qword_offset
+    raw[6] = 0x00
+    raw[7] = 0x00
+    raw[8] = 0x00
+    raw[9] = 0x0c    # 128-bit (vs 0x0a for 64-bit)
+    raw[10] = 0x00
+    raw[11] = 0x08   # LDCU-specific
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
 def encode_imad_r_imm(dest: int, src0: int, imm: int, src2: int,
                        ctrl: int = 0) -> bytes:
     """Encode IMAD dest, src0, imm, src2 (non-WIDE, 32-bit result).

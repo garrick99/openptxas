@@ -27,14 +27,16 @@ from __future__ import annotations
 import argparse
 import ctypes
 import json
+import math
 import os
+import platform
 import struct
 import subprocess
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from statistics import median
+from statistics import mean, median, pstdev
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
@@ -397,82 +399,329 @@ KERNELS: dict[str, dict] = {
 
 
 # ---------------------------------------------------------------------------
-# Output formatting + JSON artifact
+# Stats helpers
 # ---------------------------------------------------------------------------
-def _fmt_metric(label, ours, theirs, delta_str):
-    return f"    {label:<14} ours={ours:<10} ptxas={theirs:<10} delta={delta_str}"
-
-
-def print_block(name: str, kentry: dict, build_ok: bool, correct: bool,
-                ours: dict, theirs: dict | None, commits: dict) -> None:
-    print(f"[workbench] kernel={name}  ({kentry['display']})")
-    print(f"  build:    {'PASS' if build_ok else 'FAIL'}")
-    print(f"  correct:  {'PASS' if correct else 'FAIL'}")
-    print(f"  forge:     {commits['forge']}")
-    print(f"  opencuda:  {commits['opencuda']}")
-    print(f"  openptxas: {commits['openptxas']}")
-    print()
-    print("  ours:")
-    print(f"    regs:         {ours['regs']}")
-    print(f"    sass_total:   {ours['sass_total']}")
-    print(f"    sass_non_nop: {ours['sass_non_nop']}")
-    print(f"    time_ms:      {_fmt_time(ours.get('time_ms'))}")
-    print(f"    compile_ms:   {ours['compile_ms']:.1f}")
-    if theirs is not None:
-        print()
-        print("  ptxas:")
-        print(f"    regs:         {theirs['regs']}")
-        print(f"    sass_total:   {theirs['sass_total']}")
-        print(f"    sass_non_nop: {theirs['sass_non_nop']}")
-        print(f"    time_ms:      {_fmt_time(theirs.get('time_ms'))}")
-        print(f"    compile_ms:   {theirs['compile_ms']:.1f}")
-        print()
-        print("  delta:")
-        print(f"    regs:         {ours['regs'] - theirs['regs']:+d}")
-        print(f"    sass_total:   {ours['sass_total'] - theirs['sass_total']:+d}")
-        print(f"    sass_non_nop: {ours['sass_non_nop'] - theirs['sass_non_nop']:+d}")
-        if ours.get('time_ms') is not None and theirs.get('time_ms') is not None:
-            d = ours['time_ms'] - theirs['time_ms']
-            print(f"    time_ms:      {d:+.4f}")
+def _stats(values: list[float]) -> dict | None:
+    if not values:
+        return None
+    if len(values) == 1:
+        v = values[0]
+        return {"min": v, "max": v, "mean": v, "stddev": 0.0, "n": 1}
+    return {
+        "min":    min(values),
+        "max":    max(values),
+        "mean":   mean(values),
+        "stddev": pstdev(values),
+        "n":      len(values),
+    }
 
 
 def _fmt_time(t):
     return f"{t:.4f}" if t is not None else "(skipped)"
 
 
-def write_json(name: str, parameters: dict, build_ok: bool, correct: bool,
-               ours: dict, theirs: dict | None, commits: dict,
-               compact_meta: dict, results_dir: Path) -> Path:
+def _fmt_stat(s: dict | None) -> str:
+    if s is None:
+        return "(none)"
+    if s["n"] == 1:
+        return f"{s['mean']:.4f}"
+    return (f"mean={s['mean']:.4f}  sd={s['stddev']:.4f}  "
+            f"[{s['min']:.4f}..{s['max']:.4f}]  n={s['n']}")
+
+
+# ---------------------------------------------------------------------------
+# Per-kernel measurement.  Build openptxas + ptxas (each once), then run the
+# correctness/benchmark harness `repeat` times and aggregate timing into
+# stats.  Static metrics (regs, sass_total, sass_non_nop, compile_ms) come
+# from the cubin and never vary across repeats.
+# ---------------------------------------------------------------------------
+def measure_kernel(name: str, mode: str, do_compare: bool,
+                   repeat: int) -> dict:
+    if name not in KERNELS:
+        return {"kernel": name, "error": f"unknown kernel '{name}'"}
+
+    kentry = KERNELS[name]
+    if kentry["ptx_inline"] is not None:
+        ptx = kentry["ptx_inline"]
+        ptx_source = "(inline)"
+    else:
+        path = kentry["ptx_path"]
+        if not path.exists():
+            return {"kernel": name, "error": f"PTX file not found: {path}"}
+        ptx = path.read_text(encoding="utf-8")
+        ptx_source = str(path)
+
+    result = {
+        "kernel": name,
+        "display": kentry["display"],
+        "mode": mode,
+        "repeat": repeat,
+        "ptx_source": ptx_source,
+        "build": "FAIL",
+        "correctness": "FAIL",
+        "ours": None,
+        "ptxas": None,
+        "deltas": None,
+        "metadata": None,
+    }
+
+    # 1. Build through openptxas (with compaction-report capture)
+    try:
+        cubin_ours, t_compile_ours, report = compile_with_report(ptx)
+    except Exception as e:
+        result["error"] = f"openptxas build FAILED: {type(e).__name__}: {e}"
+        return result
+
+    ours = metrics_from_cubin(cubin_ours)
+    ours["compile_ms"] = t_compile_ours * 1000.0
+    ours["time_ms_runs"] = []
+    result["ours"] = ours
+    result["build"] = "PASS"
+
+    # 2. Build through ptxas (optional)
+    cubin_ptxas = None
+    if do_compare:
+        try:
+            cubin_ptxas, t_compile_ptxas = compile_ptxas(ptx)
+            theirs = metrics_from_cubin(cubin_ptxas)
+            theirs["compile_ms"] = t_compile_ptxas * 1000.0
+            theirs["time_ms_runs"] = []
+            result["ptxas"] = theirs
+        except Exception as e:
+            result["ptxas_error"] = f"{type(e).__name__}: {e}"
+
+    # 3. Launch + correctness (and optional benchmark) — repeat as requested
+    ctx = CUDAContext()
+    correct = True
+    try:
+        if not ctx.load(cubin_ours):
+            result["error"] = "cuModuleLoadData failed for openptxas cubin"
+            return result
+        func = ctx.get_func(kentry["kernel_name"])
+        for i in range(repeat):
+            r = kentry["harness"](ctx, func, mode)
+            if not r["correct"]:
+                correct = False
+            if r["time_ms"] is not None:
+                ours["time_ms_runs"].append(r["time_ms"])
+
+        if result["ptxas"] is not None and cubin_ptxas is not None:
+            if ctx.load(cubin_ptxas):
+                func_p = ctx.get_func(kentry["kernel_name"])
+                for i in range(repeat):
+                    rp = kentry["harness"](ctx, func_p, mode)
+                    if rp["time_ms"] is not None:
+                        result["ptxas"]["time_ms_runs"].append(rp["time_ms"])
+            else:
+                result["ptxas_error"] = "cuModuleLoadData failed for ptxas cubin"
+    finally:
+        ctx.close()
+
+    result["correctness"] = "PASS" if correct else "FAIL"
+
+    # 4. Stats + deltas
+    ours["time_ms_stats"] = _stats(ours["time_ms_runs"])
+    if result["ptxas"] is not None:
+        result["ptxas"]["time_ms_stats"] = _stats(result["ptxas"]["time_ms_runs"])
+        theirs = result["ptxas"]
+        deltas = {
+            "regs":         ours["regs"]         - theirs["regs"],
+            "sass_total":   ours["sass_total"]   - theirs["sass_total"],
+            "sass_non_nop": ours["sass_non_nop"] - theirs["sass_non_nop"],
+        }
+        if (ours["time_ms_stats"] is not None
+                and theirs["time_ms_stats"] is not None):
+            deltas["time_ms_mean"] = (ours["time_ms_stats"]["mean"]
+                                      - theirs["time_ms_stats"]["mean"])
+        result["deltas"] = deltas
+
+    # 5. Compaction metadata
+    if report is not None:
+        result["metadata"] = {
+            "compaction_attempted": report.attempted,
+            "compaction_covered":   report.covered,
+            "compacted":            report.gpr_fields_rewritten > 0,
+            "compact_regs_before":  report.regs_before,
+            "compact_regs_after":   report.regs_after,
+            "compacted_insts":      report.compacted_insts,
+            "gpr_fields_rewritten": report.gpr_fields_rewritten,
+        }
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Output formatting
+# ---------------------------------------------------------------------------
+def print_block(result: dict, commits: dict) -> None:
+    name = result["kernel"]
+    print(f"[workbench] kernel={name}  ({result.get('display', '')})")
+    if "error" in result:
+        print(f"  ERROR: {result['error']}")
+        return
+    print(f"  build:    {result['build']}")
+    print(f"  correct:  {result['correctness']}")
+    print(f"  repeat:   {result['repeat']}")
+    print(f"  forge:     {commits['forge']}")
+    print(f"  opencuda:  {commits['opencuda']}")
+    print(f"  openptxas: {commits['openptxas']}")
+
+    ours = result["ours"]
+    if ours is not None:
+        print()
+        print("  ours:")
+        print(f"    regs:         {ours['regs']}")
+        print(f"    sass_total:   {ours['sass_total']}")
+        print(f"    sass_non_nop: {ours['sass_non_nop']}")
+        print(f"    compile_ms:   {ours['compile_ms']:.1f}")
+        print(f"    time_ms:      {_fmt_stat(ours.get('time_ms_stats'))}")
+
+    theirs = result.get("ptxas")
+    if theirs is not None:
+        print()
+        print("  ptxas:")
+        print(f"    regs:         {theirs['regs']}")
+        print(f"    sass_total:   {theirs['sass_total']}")
+        print(f"    sass_non_nop: {theirs['sass_non_nop']}")
+        print(f"    compile_ms:   {theirs['compile_ms']:.1f}")
+        print(f"    time_ms:      {_fmt_stat(theirs.get('time_ms_stats'))}")
+        print()
+        print("  delta:")
+        d = result["deltas"]
+        print(f"    regs:         {d['regs']:+d}")
+        print(f"    sass_total:   {d['sass_total']:+d}")
+        print(f"    sass_non_nop: {d['sass_non_nop']:+d}")
+        if "time_ms_mean" in d:
+            print(f"    time_ms_mean: {d['time_ms_mean']:+.4f}")
+    elif "ptxas_error" in result:
+        print()
+        print(f"  ptxas: skipped ({result['ptxas_error']})")
+
+
+def write_kernel_json(result: dict, commits: dict,
+                      results_dir: Path) -> Path:
     results_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     artifact = {
-        "kernel": name,
+        "schema": "workbench.kernel/v1",
         "timestamp": ts,
-        "parameters": parameters,
-        "build": "PASS" if build_ok else "FAIL",
-        "correctness": "PASS" if correct else "FAIL",
         "commits": commits,
-        "ours": ours,
-        "ptxas": theirs,
-        "deltas": (
-            {
-                "regs": ours["regs"] - theirs["regs"],
-                "sass_total": ours["sass_total"] - theirs["sass_total"],
-                "sass_non_nop": ours["sass_non_nop"] - theirs["sass_non_nop"],
-                "time_ms": (
-                    ours["time_ms"] - theirs["time_ms"]
-                    if ours.get("time_ms") is not None
-                    and theirs.get("time_ms") is not None
-                    else None
-                ),
-            }
-            if theirs is not None
-            else None
-        ),
-        "metadata": compact_meta,
+        **result,
     }
-    out_path = results_dir / f"{ts}_{name}.json"
-    out_path.write_text(json.dumps(artifact, indent=2))
+    out_path = results_dir / f"{ts}_{result['kernel']}.json"
+    out_path.write_text(json.dumps(artifact, indent=2, default=str))
+    return out_path
+
+
+# ---------------------------------------------------------------------------
+# Suite mode + leaderboard
+# ---------------------------------------------------------------------------
+SUITES: dict[str, list[str]] = {
+    "core": ["reduce_sum", "conv2d_looped", "hmma_zero"],
+}
+
+
+def classify_kernel(result: dict) -> str:
+    """Bucket a kernel result into PARITY / NATIVE_WIN / GAP / NO_COMPARE."""
+    if result.get("ptxas") is None or result.get("deltas") is None:
+        return "NO_COMPARE"
+    d = result["deltas"]
+    # Compare static metrics first; then bench time if both present.
+    metric_diffs = [d["regs"], d["sass_total"], d["sass_non_nop"]]
+    if all(m == 0 for m in metric_diffs):
+        # Static parity.  If we also have time stats and ours is faster
+        # by ≥1 stddev of ptxas, count as a win; otherwise still parity.
+        return "PARITY"
+    if all(m <= 0 for m in metric_diffs) and any(m < 0 for m in metric_diffs):
+        return "NATIVE_WIN"
+    if all(m >= 0 for m in metric_diffs) and any(m > 0 for m in metric_diffs):
+        return "GAP"
+    return "MIXED"
+
+
+def print_leaderboard(results: list[dict]) -> dict[str, list[str]]:
+    buckets: dict[str, list[str]] = {
+        "PARITY": [], "NATIVE_WIN": [], "GAP": [],
+        "MIXED": [], "NO_COMPARE": [],
+    }
+    for r in results:
+        if "error" in r:
+            continue
+        buckets[classify_kernel(r)].append(r["kernel"])
+
+    print()
+    print("=" * 64)
+    print("LEADERBOARD")
+    print("=" * 64)
+
+    def _section(label: str, key: str, header: str):
+        if not buckets[key]:
+            return
+        print()
+        print(f"  {label}  ({len(buckets[key])} kernels)")
+        print(f"    {header}")
+        for r in results:
+            if r["kernel"] not in buckets[key]:
+                continue
+            d = r.get("deltas") or {}
+            print(f"    {r['kernel']:18s} "
+                  f"regs={d.get('regs', 0):+d}  "
+                  f"sass_total={d.get('sass_total', 0):+d}  "
+                  f"sass_non_nop={d.get('sass_non_nop', 0):+d}")
+
+    _section("A. EXACT PARITY (regs / sass / non-NOP all match ptxas)",
+             "PARITY",
+             "kernel             deltas")
+    _section("B. NATIVE WINS (ours <= ptxas on every metric, < on at least one)",
+             "NATIVE_WIN",
+             "kernel             deltas")
+    _section("C. REMAINING GAPS (ours >= ptxas on every metric, > on at least one)",
+             "GAP",
+             "kernel             deltas")
+    _section("D. MIXED (some better, some worse)",
+             "MIXED",
+             "kernel             deltas")
+    _section("X. NO COMPARE (ptxas unavailable / failed)",
+             "NO_COMPARE",
+             "kernel             deltas")
+    print()
+    return buckets
+
+
+def write_suite_json(suite_name: str, results: list[dict],
+                     buckets: dict[str, list[str]],
+                     commits: dict, repeat: int, mode: str,
+                     do_compare: bool, results_dir: Path) -> Path:
+    results_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    machine = {
+        "platform": platform.platform(),
+        "python":   platform.python_version(),
+        "node":     platform.node(),
+    }
+    aggregate = {
+        "kernels":     len(results),
+        "parity":      len(buckets.get("PARITY", [])),
+        "native_wins": len(buckets.get("NATIVE_WIN", [])),
+        "gaps":        len(buckets.get("GAP", [])),
+        "mixed":       len(buckets.get("MIXED", [])),
+        "no_compare":  len(buckets.get("NO_COMPARE", [])),
+    }
+    artifact = {
+        "schema":     "workbench.suite/v1",
+        "suite":      suite_name,
+        "timestamp":  ts,
+        "mode":       mode,
+        "repeat":     repeat,
+        "compare":    "ptxas" if do_compare else None,
+        "commits":    commits,
+        "machine":    machine,
+        "aggregate":  aggregate,
+        "ranking":    buckets,
+        "kernels":    results,
+    }
+    out_path = results_dir / f"{ts}_suite_{suite_name}.json"
+    out_path.write_text(json.dumps(artifact, indent=2, default=str))
     return out_path
 
 
@@ -483,135 +732,75 @@ def metrics_from_cubin(cubin: bytes) -> dict:
     return cubin_metrics(cubin)
 
 
-def run_kernel(name: str, mode: str, do_compare: bool,
-               results_dir: Path) -> int:
-    if name not in KERNELS:
-        print(f"[workbench] unknown kernel '{name}'. "
-              f"Available: {', '.join(sorted(KERNELS))}", file=sys.stderr)
-        return 2
-
-    kentry = KERNELS[name]
-    if kentry["ptx_inline"] is not None:
-        ptx = kentry["ptx_inline"]
-        ptx_source = "(inline)"
-    else:
-        path = kentry["ptx_path"]
-        if not path.exists():
-            print(f"[workbench] PTX file not found: {path}", file=sys.stderr)
-            return 3
-        ptx = path.read_text(encoding="utf-8")
-        ptx_source = str(path)
-
-    commits = {
+def collect_commits() -> dict:
+    return {
         "openptxas": _git_short(REPO_OPENPTXAS),
         "forge":     _git_short(REPO_FORGE),
         "opencuda":  _git_short(REPO_OPENCUDA),
     }
 
-    # 1. Build through openptxas (with compaction-report capture)
-    build_ok = True
-    cubin_ours = None
-    report = None
-    t_compile_ours = 0.0
-    try:
-        cubin_ours, t_compile_ours, report = compile_with_report(ptx)
-    except Exception as e:
-        print(f"[workbench] openptxas build FAILED: {type(e).__name__}: {e}",
-              file=sys.stderr)
-        build_ok = False
 
-    if not build_ok:
-        return 4
-
-    ours = metrics_from_cubin(cubin_ours)
-    ours["compile_ms"] = t_compile_ours * 1000.0
-    ours["time_ms"] = None
-
-    # 2. Build through ptxas (optional)
-    cubin_ptxas = None
-    theirs = None
-    if do_compare:
-        try:
-            cubin_ptxas, t_compile_ptxas = compile_ptxas(ptx)
-            theirs = metrics_from_cubin(cubin_ptxas)
-            theirs["compile_ms"] = t_compile_ptxas * 1000.0
-            theirs["time_ms"] = None
-        except Exception as e:
-            print(f"[workbench] ptxas build skipped: "
-                  f"{type(e).__name__}: {e}")
-            theirs = None
-
-    # 3. Launch + correctness (and optional benchmark)
-    ctx = CUDAContext()
-    correct = False
-    try:
-        if not ctx.load(cubin_ours):
-            print("[workbench] cuModuleLoadData failed for openptxas cubin",
-                  file=sys.stderr)
-            return 5
-        func = ctx.get_func(kentry["kernel_name"])
-        result = kentry["harness"](ctx, func, mode)
-        correct = result["correct"]
-        ours["time_ms"] = result["time_ms"]
-
-        if theirs is not None:
-            if not ctx.load(cubin_ptxas):
-                print("[workbench] cuModuleLoadData failed for ptxas cubin",
-                      file=sys.stderr)
-            else:
-                func_p = ctx.get_func(kentry["kernel_name"])
-                result_p = kentry["harness"](ctx, func_p, mode)
-                # we trust ours-vs-ptxas correctness equivalence;
-                # workbench measures ours' correctness directly
-                theirs["time_ms"] = result_p["time_ms"]
-    finally:
-        ctx.close()
-
-    # 4. Compaction metadata for the JSON artifact
-    compact_meta = {
-        "compaction_attempted": False,
-        "compaction_covered":   False,
-        "compacted":            False,
-        "compact_regs_before":  None,
-        "compact_regs_after":   None,
-    }
-    if report is not None:
-        compact_meta = {
-            "compaction_attempted": report.attempted,
-            "compaction_covered":   report.covered,
-            "compacted":            report.gpr_fields_rewritten > 0,
-            "compact_regs_before":  report.regs_before,
-            "compact_regs_after":   report.regs_after,
-            "compacted_insts":      report.compacted_insts,
-            "gpr_fields_rewritten": report.gpr_fields_rewritten,
-        }
-
-    # 5. Print canonical block + write JSON
-    print_block(name, kentry, build_ok, correct, ours, theirs, commits)
-
-    parameters = {
-        "kernel": name,
-        "mode": mode,
-        "ptx_source": ptx_source,
-    }
-    artifact = write_json(name, parameters, build_ok, correct, ours, theirs,
-                          commits, compact_meta, results_dir)
+def run_kernel(name: str, mode: str, do_compare: bool, repeat: int,
+               results_dir: Path) -> int:
+    commits = collect_commits()
+    result = measure_kernel(name, mode, do_compare, repeat)
+    print_block(result, commits)
+    if "error" in result:
+        return 2
+    artifact = write_kernel_json(result, commits, results_dir)
     print()
     print(f"[workbench] artifact: {artifact}")
-    return 0 if correct else 1
+    return 0 if result["correctness"] == "PASS" else 1
+
+
+def run_suite(suite_name: str, mode: str, do_compare: bool, repeat: int,
+              results_dir: Path) -> int:
+    if suite_name not in SUITES:
+        print(f"[workbench] unknown suite '{suite_name}'. "
+              f"Available: {', '.join(sorted(SUITES))}", file=sys.stderr)
+        return 2
+    commits = collect_commits()
+    print(f"[workbench] running suite '{suite_name}' ({len(SUITES[suite_name])} kernels)")
+    print(f"  mode={mode}  repeat={repeat}  compare={'ptxas' if do_compare else 'none'}")
+    print(f"  forge={commits['forge']}  opencuda={commits['opencuda']}  openptxas={commits['openptxas']}")
+    print()
+
+    results: list[dict] = []
+    for kname in SUITES[suite_name]:
+        print(f"--- {kname} ---")
+        r = measure_kernel(kname, mode, do_compare, repeat)
+        results.append(r)
+        print_block(r, commits)
+        print()
+
+    buckets = print_leaderboard(results)
+    artifact = write_suite_json(
+        suite_name, results, buckets, commits, repeat, mode,
+        do_compare, results_dir,
+    )
+    print(f"[workbench] suite artifact: {artifact}")
+
+    # Exit code: non-zero if any kernel failed correctness or build
+    bad = sum(1 for r in results
+              if "error" in r or r.get("correctness") != "PASS")
+    return 0 if bad == 0 else 1
 
 
 def main():
     p = argparse.ArgumentParser(
         prog="workbench",
-        description="WB-0: kernel workbench for the openptxas/forge/ptxas stack",
+        description="WB-1: kernel workbench (multi-run + suite + leaderboard)",
     )
     p.add_argument("--kernel", default=None,
                    help=f"one of: {', '.join(sorted(KERNELS))}")
+    p.add_argument("--suite", default=None,
+                   help=f"one of: {', '.join(sorted(SUITES))}")
     p.add_argument("--mode", choices=["correct", "bench"], default="correct",
                    help="correct = build+correctness, bench = +benchmark")
     p.add_argument("--compare", choices=["ptxas"], default=None,
                    help="if set, also compile via ptxas and report deltas")
+    p.add_argument("--repeat", type=int, default=1,
+                   help="number of measurement repeats (default: 1)")
     p.add_argument("--results-dir", default=str(ROOT / "results"),
                    help="directory for JSON artifacts")
     p.add_argument("--list", action="store_true",
@@ -622,15 +811,33 @@ def main():
         print("Available kernels:")
         for k, v in KERNELS.items():
             print(f"  {k:20s} {v['display']}")
+        print()
+        print("Available suites:")
+        for s, ks in SUITES.items():
+            print(f"  {s:20s} ({len(ks)}) {', '.join(ks)}")
         return 0
 
-    if not args.kernel:
-        p.error("--kernel is required (use --list to see options)")
+    if args.repeat < 1:
+        p.error("--repeat must be >= 1")
+    if args.kernel and args.suite:
+        p.error("--kernel and --suite are mutually exclusive")
+    if not args.kernel and not args.suite:
+        p.error("one of --kernel / --suite is required (use --list)")
 
+    do_compare = (args.compare == "ptxas")
+    if args.suite:
+        return run_suite(
+            suite_name=args.suite,
+            mode=args.mode,
+            do_compare=do_compare,
+            repeat=args.repeat,
+            results_dir=Path(args.results_dir),
+        )
     return run_kernel(
         name=args.kernel,
         mode=args.mode,
-        do_compare=(args.compare == "ptxas"),
+        do_compare=do_compare,
+        repeat=args.repeat,
         results_dir=Path(args.results_dir),
     )
 

@@ -52,6 +52,29 @@ GPR_FIELDS: dict[int, list[tuple[int, str]]] = {
     0x981: [(2, 'dst_var'), (3, 'addr64')],                       # LDG.E (dst width from byte[9])
     0x986: [(3, 'addr64'), (4, 'data_var')],                      # STG.E (data width from byte[9])
 
+    # --- Shared memory (32-bit forms) ---
+    # LDS opcode 0x984 has two address modes:
+    #   - encode_lds: byte[3]=0xFF (filtered by < 254), byte[4]=ur_addr (UR)
+    #   - encode_lds_r: byte[3]=addr_reg (GPR), byte[4]=0
+    # Both forms safely handled by declaring byte[2]=dst, byte[3]=addr (RZ filtered).
+    0x984: [(2, 'dst'), (3, 'addr')],                             # LDS / LDS.R (32-bit shared load)
+
+    # STS opcode 0x988 (UR-addressed): byte[3]=0xFF, byte[4]=data, byte[8]=ur_addr
+    # STS opcode 0x388 (GPR-addressed): byte[3]=addr, byte[4]=data
+    0x988: [(4, 'data')],                                         # STS UR-addressed
+    0x388: [(3, 'addr'), (4, 'data')],                            # STS R-addressed
+
+    # --- Barriers (no GPR fields) ---
+    0xb1d: [],  # BAR.SYNC
+    0x941: [],  # BSYNC
+
+    # --- Float ALU (32-bit) ---
+    0x221: [(2, 'dst'), (3, 'src0'), (4, 'src1')],                # FADD
+    0x223: [(2, 'dst'), (3, 'src0'), (4, 'src1'), (8, 'src2')],   # FFMA / FMUL (FFMA with src2)
+
+    # --- BRA variants (no GPR fields) ---
+    0x547: [],  # BRA (predicated/relative variant)
+
     # --- Special reg read ---
     0x919: [(2, 'dst')],                                          # S2R (dst GPR, src is SR code)
 
@@ -298,11 +321,13 @@ def compact(sass_instrs: list,
     max_after = max(remap.values())
 
     if max_after == max_before:
-        # Already dense — no rewrite needed
+        # Already dense — no rewrite needed. Return 0 to signal "no rewrite"
+        # so the pipeline uses allocator high-water (compaction's view may
+        # miss registers in opcodes without explicit metadata).
         report.regs_after = max_before + 1
         if verbose:
             print(report.format())
-        return sass_instrs, max_before + 1
+        return sass_instrs, 0
 
     new_instrs, n_insts, n_fields = apply_remap(sass_instrs, remap)
     report.compacted_insts = n_insts

@@ -1118,24 +1118,17 @@ def compile_function(fn: Function, verbose: bool = False,
                 s2r_offset = i
                 break
 
-    # FB-4.4: post-SASS register accounting. Use compaction's count when
-    # compaction was attempted (it knows about implicit hi halves of pairs).
-    # Otherwise fall back to comment scan (pessimistic for unknown opcodes).
+    # FB-4.4: post-SASS register accounting. Use the MAX of compaction count
+    # and allocator high-water — never report fewer registers than the
+    # allocator allocated, even if compaction's view is lower (some scratch
+    # may be allocated but not visible in our field metadata).
     _allocator_count = max(alloc.num_gprs, ctx._next_gpr,
                            getattr(ctx, '_scratch_highwater', 0))
     if _compact_count > 0:
+        # Compaction succeeded with rewrite — its count IS the truth
         _final_gprs = max(_compact_count, 2)
     else:
-        import re as _re
-        _used_regs: set[int] = set()
-        for _si in sass_instrs:
-            for _m in _re.finditer(r'(?<!U)R(\d+)', _si.comment or ''):
-                _r = int(_m.group(1))
-                if _r < 254:
-                    _used_regs.add(_r)
-        _real_max_reg = max(_used_regs) if _used_regs else -1
-        _real_count = _real_max_reg + 1 if _real_max_reg >= 0 else 0
-        _final_gprs = max(_real_count, 2)
+        _final_gprs = max(_allocator_count, 2)
     if verbose and _final_gprs != _allocator_count:
         print(f"[pipeline] FB-4.4: final regs={_final_gprs} "
               f"(allocator reported {_allocator_count})")

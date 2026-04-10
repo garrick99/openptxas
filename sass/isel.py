@@ -231,29 +231,37 @@ def _alloc_gpr(ctx: 'ISelContext') -> int:
     return 0
 
 
-def analyze_mma_zero_subst(fn) -> tuple[dict, set]:
-    """WB-2: HMMA-only "all-zero inputs" optimization.
+def analyze_mma_zero_subst(fn, enable: set[str] | None = None) -> tuple[dict, set]:
+    """WB-2/WB-4: mma "all-zero inputs" optimization.
 
     Detect mma.sync instructions whose source operand vregs are provably
     zero (defined exactly once by `mov X, 0` and used only by this mma's
     input slots — possibly multiple slots of the same mma).
 
-    For HMMA shapes, the math is D = A*B + C, so any of A/B/C being all
-    zero forces D = 0 (mod NaN/inf).  ptxas exploits this by substituting
-    RZ for B and C in the encoding and aliasing src_a with the dst quad,
-    eliding all input-init MOVs entirely.
+    For any mma shape, the math is D = A*B + C, so any of A/B/C being
+    all zero forces D = 0 (mod NaN/inf).  ptxas exploits this by
+    substituting RZ for B and C in the encoding and aliasing src_a with
+    the dst quad, eliding all input-init MOVs entirely.
 
-    Returns:
-        rz_subst: dict[id(mma_instr) -> set[str]]   subset of {'a','b','c'}
-                  marking which encoding slots should use RZ.
-        dead_movs: set[id(mov_instr)]               init MOVs that can be
-                  skipped because their target vreg is no longer read by
-                  any non-substituted slot.
+    Parameters
+    ----------
+    enable : optional set of {'hmma', 'imma', 'dmma', 'qmma'}.  Only mma
+        instructions of an enabled class will be considered for
+        substitution.  Defaults to {'hmma', 'imma', 'qmma'} (WB-4.1).
+        DMMA is added separately in WB-4.2.
 
-    Restricted to HMMA (mma.sync with .f16/.bf16/.tf32 + .f32 accum) so
-    IMMA / DMMA / QMMA paths are untouched in this run.
+    Returns
+    -------
+    rz_subst : dict[id(mma_instr) -> set[str]]
+        Subset of {'a','b','c'} marking which encoding slots should
+        use RZ.
+    dead_movs : set[id(mov_instr)]
+        Init MOVs that can be skipped because their target vreg is no
+        longer read by any non-substituted slot.
     """
-    from ptx.ir import RegOp, ImmOp, VectorRegOp
+    if enable is None:
+        enable = {'hmma', 'imma', 'qmma', 'dmma'}  # WB-4.2: full coverage
+    from ptx.ir import RegOp, ImmOp, VectorRegOp, MemOp
 
     all_instrs = []
     for bb in fn.blocks:
@@ -307,15 +315,45 @@ def analyze_mma_zero_subst(fn) -> tuple[dict, set]:
             return (src.name,)
         return ()
 
-    def _is_hmma(inst):
+    def _mma_class(inst):
+        """Classify an mma instruction by its operand types.
+        Returns one of {'hmma','imma','dmma','qmma'} or None."""
         if inst.op != 'mma' or 'sync' not in inst.types:
-            return False
+            return None
         ts = set(inst.types)
-        # HMMA: f16/bf16/tf32 inputs with f32 accumulator.
-        if 'f64' in ts:    return False  # DMMA
-        if 's8' in ts or 'u8' in ts: return False  # IMMA
-        if 'e4m3' in ts or 'e5m2' in ts: return False  # QMMA
-        return True
+        if 'f64' in ts:
+            return 'dmma'
+        if 'e4m3' in ts or 'e5m2' in ts:
+            return 'qmma'
+        if 's8' in ts or 'u8' in ts:
+            return 'imma'
+        return 'hmma'  # f16/bf16/tf32 + f32 accumulator
+
+    # Per-class encoding metadata.
+    #
+    # ENCODED: slots that have a real GPR field in the SASS encoding.
+    #     For QMMA the encoder forces src_a := dst (hardware constraint
+    #     "dest == src_a"), so the PTX-level A vregs are never actually
+    #     encoded.  src_a is implicitly "substituted" — it consumes no
+    #     register from the analysis's perspective.
+    #
+    # RZ_SUBST: subset of ENCODED that we are allowed to set to RZ.
+    #     Plus by convention, slot 'a' is rewired to `dst` (alias).
+    #     QMMA explicitly excludes 'b' from RZ_SUBST: SM_120 QMMA
+    #     hardware requires the B register base to be < 8 and rejects
+    #     RZ (R255).  ptxas works around this with CS2R-zeroed R2.
+    ENCODED_SLOTS = {
+        'hmma': {'a', 'b', 'c'},
+        'imma': {'a', 'b', 'c'},
+        'qmma': {'b', 'c'},          # a is auto-aliased to dst
+        'dmma': {'a', 'b', 'c'},     # WB-4.2 — not yet enabled
+    }
+    RZ_SUBST_SLOTS = {
+        'hmma': {'a', 'b', 'c'},
+        'imma': {'a', 'b', 'c'},
+        'qmma': {'a', 'c'},          # 'a' marker for dead-mov bookkeeping
+        'dmma': {'a', 'b', 'c'},     # WB-4.2
+    }
 
     # Pre-compute per-vreg def positions (instruction indices) so we can
     # bound use-counting to the live range of a particular def.
@@ -340,7 +378,8 @@ def analyze_mma_zero_subst(fn) -> tuple[dict, set]:
         return n
 
     for mma_idx, inst in enumerate(all_instrs):
-        if not _is_hmma(inst):
+        cls = _mma_class(inst)
+        if cls is None or cls not in enable:
             continue
         srcs = inst.srcs or []
         if len(srcs) < 3:
@@ -349,43 +388,105 @@ def analyze_mma_zero_subst(fn) -> tuple[dict, set]:
         slot_vregs: dict[str, tuple] = {
             slot: _slot_vregs(srcs[i]) for i, slot in enumerate(slots)
         }
-        every_vreg = set()
-        for vs in slot_vregs.values():
-            every_vreg.update(vs)
-        if not every_vreg:
-            continue
-        if not all(v in zero_def_inst for v in every_vreg):
-            continue
-        # For each vreg flowing into this mma: the zero-init mov must be
-        # the most recent def, and the only use BETWEEN the mov and this
-        # mma must be this mma itself.  Uses AFTER the mma read the mma's
-        # dst-write (a different value) and don't matter.
-        ok = True
-        for v in every_vreg:
-            mov_inst = zero_def_inst[v]
-            mov_idx = next(i for i, x in enumerate(all_instrs) if x is mov_inst)
-            if mov_idx >= mma_idx:
-                ok = False
+        encoded = ENCODED_SLOTS[cls]
+        rz_sub_class = RZ_SUBST_SLOTS[cls]
+
+        # vreg → set of slots it appears in within this mma.
+        vreg_slots: dict[str, set[str]] = {}
+        for slot, vs in slot_vregs.items():
+            for v in vs:
+                vreg_slots.setdefault(v, set()).add(slot)
+
+        # Iterative fixpoint: a slot is RZ-substituted iff it's in
+        # rz_sub_class AND all its vregs become "eliminable" — that is,
+        # they have no remaining encoded use anywhere in this mma after
+        # substitution.  A vreg in slot 'a' for QMMA has 0 encoded uses
+        # from 'a' regardless (encoder forces src_a := dst), so it's
+        # eliminable from the outset for that slot.
+        sub_slots = set(rz_sub_class)
+        eliminable: set[str] = set()
+        while True:
+            new_eliminable: set[str] = set()
+            for v, vslots in vreg_slots.items():
+                remaining = [s for s in vslots
+                             if s in encoded and s not in sub_slots]
+                if not remaining:
+                    new_eliminable.add(v)
+            new_sub: set[str] = set()
+            for s in sub_slots:
+                if all(v in new_eliminable for v in slot_vregs.get(s, ())):
+                    new_sub.add(s)
+            if new_sub == sub_slots and new_eliminable == eliminable:
+                eliminable = new_eliminable
                 break
+            sub_slots = new_sub
+            eliminable = new_eliminable
+
+        if not sub_slots:
+            continue
+
+        # Per-vreg liveness: only mark a mov dead if its vreg is
+        # eliminable AND has no live def/use between the mov and this
+        # mma.  A vreg in `eliminable` whose mov fails this check stays
+        # alive — we keep the slot substituted (the encoded bytes don't
+        # depend on the mov), the init mov just isn't elided.
+        candidate_dead: set[str] = set()
+        for v in eliminable:
+            if v not in zero_def_inst:
+                continue
+            mov_inst = zero_def_inst[v]
+            try:
+                mov_idx = next(i for i, x in enumerate(all_instrs) if x is mov_inst)
+            except StopIteration:
+                continue
+            if mov_idx >= mma_idx:
+                continue
             # No intervening def between mov and mma.
+            bad = False
             for d_idx in vreg_defs.get(v, []):
                 if mov_idx < d_idx < mma_idx:
-                    ok = False
+                    bad = True
                     break
-            if not ok:
-                break
-            # No intervening uses other than the mma itself.
+            if bad:
+                continue
+            # No intervening use (mma itself excluded).
             if _uses_in_range(v, mov_idx, mma_idx - 1, inst) > 0:
-                ok = False
-                break
-            # Uses AT mma_idx that are this mma's srcs are fine (we're
-            # substituting them away).  Skip explicit check.
-        if not ok:
-            continue
-        # All three slots substitutable.
-        rz_subst[id(inst)] = {'a', 'b', 'c'}
-        for v in every_vreg:
+                continue
+            candidate_dead.add(v)
+
+        rz_subst[id(inst)] = sub_slots
+        for v in candidate_dead:
             dead_movs.add(id(zero_def_inst[v]))
+
+    # WB-4.1: when at least one mma was substituted, also elide any
+    # zero-init mov whose dest vreg is never read anywhere in the
+    # function ("dead-on-def" padding inits).  This catches the
+    # `mov.b32 %r6, 0; mov.b32 %r7, 0` pattern in the QMMA canary
+    # where the test author wrote 2 padding inits to push the D/A
+    # quad to the next 4-aligned boundary — those vregs are never
+    # consumed but the regalloc + isel still emit IADD3 R, RZ, 0, RZ
+    # for them.  Restricting to "kernel has a substituted mma" keeps
+    # this gated to the WB-4 optimization scope; we don't run a
+    # general dead-store-elimination pass.
+    if rz_subst:
+        all_used: set[str] = set()
+        for inst in all_instrs:
+            for src in (inst.srcs or []):
+                if isinstance(src, VectorRegOp):
+                    all_used.update(src.regs)
+                elif isinstance(src, RegOp):
+                    all_used.add(src.name)
+                elif isinstance(src, MemOp) and isinstance(src.base, str):
+                    bn = src.base if src.base.startswith('%') else f'%{src.base}'
+                    all_used.add(bn)
+        for inst in all_instrs:
+            if (inst.op == 'mov' and inst.srcs
+                    and isinstance(inst.srcs[0], ImmOp)
+                    and inst.srcs[0].value == 0
+                    and isinstance(inst.dest, RegOp)
+                    and not isinstance(inst.dest, VectorRegOp)
+                    and inst.dest.name not in all_used):
+                dead_movs.add(id(inst))
 
     return rz_subst, dead_movs
 

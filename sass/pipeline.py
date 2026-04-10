@@ -627,49 +627,74 @@ def compile_function(fn: Function, verbose: bool = False,
     ctx._hmma_rz_subst = _hmma_rz_subst
     ctx._hmma_dead_movs = _hmma_dead_movs
 
-    # WB-2: When the HMMA RZ-substitution leaves dead vregs in the
-    # allocation map (the inits are no longer emitted, so their phys
-    # slots have no SASS reader), rebase the address scratch pair into
-    # the lowest such freed even-aligned pair.  Without this, the
-    # scratch lands above alloc.num_gprs and inflates the kernel's
-    # register footprint by 2 even though those low slots are dead.
-    # HMMA-only triggered: only fires if at least one HMMA was
-    # substituted in this kernel.
+    # WB-2 / WB-4: When mma RZ-substitution leaves the address scratch
+    # above the kernel's true register high-water, rebase it down into
+    # the lowest even-aligned pair whose phys slots are NOT live at
+    # the address-materialization point.
+    #
+    # A phys is live-at-mat iff its vreg has any source use AFTER the
+    # last mma in the function.  Vregs whose last use is the mma itself
+    # are dead by the time isel needs the address scratch (which is
+    # always after every mma in the kernel — there are no LDG/STG
+    # operations interleaved with mma in the kernels we currently
+    # support, and the scratch only matters at store time).
+    #
+    # Earlier WB-2 logic checked vreg membership in `dead_movs`, which
+    # was wrong: a vreg can have its INIT mov be dead (eliminated by
+    # RZ-substitution) and STILL be alive post-mma because the mma's
+    # dst tuple writes the same vreg name and a downstream store reads
+    # it.  HMMA happened to work by accident because R2:R3 was empty.
+    # QMMA has live B operands at R2:R3, so the search would skip past
+    # them and pick R4:R5 — which collides with the dst quad.
     if _hmma_dead_movs:
-        from ptx.ir import RegOp, VectorRegOp
-        # Collect dead vreg names from the dead MOV instructions.
-        _dead_vregs: set[str] = set()
+        from ptx.ir import RegOp, VectorRegOp, MemOp, ScalarKind
         _all_instrs = []
         for bb in fn.blocks:
             _all_instrs.extend(bb.instructions)
-        for inst in _all_instrs:
-            if id(inst) in _hmma_dead_movs and isinstance(inst.dest, RegOp):
-                _dead_vregs.add(inst.dest.name)
-        # Compute live phys slots (anything in int_regs whose vreg is NOT
-        # dead and whose width covers the slot).
+
+        # Build reg_last_use (source-use index per vreg, including all
+        # vector tuple components and MemOp bases).
+        _last_use: dict[str, int] = {}
+        for idx, inst in enumerate(_all_instrs):
+            for src in (inst.srcs or []):
+                if isinstance(src, VectorRegOp):
+                    for v in src.regs:
+                        _last_use[v] = idx
+                elif isinstance(src, RegOp):
+                    _last_use[src.name] = idx
+                elif isinstance(src, MemOp) and isinstance(src.base, str):
+                    bn = src.base if src.base.startswith('%') else f'%{src.base}'
+                    _last_use[bn] = idx
+
+        _last_mma_idx = max(
+            (i for i, inst in enumerate(_all_instrs)
+             if inst.op == 'mma' and 'sync' in inst.types),
+            default=-1,
+        )
+
         _u64_vreg_names: set[str] = set()
-        from ptx.ir import ScalarKind
         for rd in fn.reg_decls:
             if rd.type.kind == ScalarKind.PRED:
                 continue
             if rd.type.width >= 64:
                 _u64_vreg_names.update(rd.names)
-        _live_phys: set[int] = {0, 1}  # always reserved
+
+        _live_phys: set[int] = {0, 1}
         for vreg, phys in alloc.ra.int_regs.items():
-            if vreg in _dead_vregs:
-                continue
-            _live_phys.add(phys)
-            if vreg in _u64_vreg_names:
-                _live_phys.add(phys + 1)
-        # Find smallest even-aligned pair where both halves are dead.
-        # Cap search at the original _addr_scratch_base so we never
-        # *increase* the scratch position.
+            last = _last_use.get(vreg, -1)
+            # A phys is live at the address-materialization point iff
+            # its vreg has any source use strictly after the last mma.
+            if last > _last_mma_idx:
+                _live_phys.add(phys)
+                if vreg in _u64_vreg_names:
+                    _live_phys.add(phys + 1)
+
         for _r in range(2, _addr_scratch_base + 1, 2):
             if _r not in _live_phys and (_r + 1) not in _live_phys:
                 if _r < _addr_scratch_base:
                     _addr_scratch_base = _r
                     ctx._addr_scratch_lo = _r
-                    ctx._next_gpr = _r  # subsequent scratch starts here
+                    ctx._next_gpr = _r
                 break
     # Both SM_89 and SM_120 now have full register range available.
     # SM_89: no capmerc DRM.

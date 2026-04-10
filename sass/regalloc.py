@@ -195,6 +195,33 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
                     pred_regs[name] = next_pred
                     next_pred += 1
 
+    # SM_120: identify u64 param registers that will be loaded into UR via LDCU.64
+    # and are ONLY consumed by add.u64 (address computation). These never need GPRs.
+    ur_param_regs: set[str] = set()
+    if sm_version == 120:
+        param_u64_names: set[str] = set()
+        for inst in all_instrs:
+            if (inst.op == 'ld' and 'param' in inst.types
+                    and any(t in ('u64', 's64', 'b64') for t in inst.types)
+                    and isinstance(inst.dest, RegOp)):
+                param_u64_names.add(inst.dest.name)
+        for pname in param_u64_names:
+            only_add64 = True
+            for inst in all_instrs:
+                for src in inst.srcs:
+                    src_name = (src.name if isinstance(src, RegOp) else
+                                (src.base if isinstance(src, MemOp) and
+                                 isinstance(src.base, str) else None))
+                    if src_name == pname:
+                        if not (inst.op in ('add', 'sub', 'mul', 'shl')
+                                and any(t in ('u64', 's64', 'b64') for t in inst.types)):
+                            only_add64 = False
+                            break
+                if not only_add64:
+                    break
+            if only_add64:
+                ur_param_regs.add(pname)
+
     # SM_120: identify f64 param registers that will be loaded into UR via LDCU.64.
     # DFMA R-R-UR-UR handles them directly; no GPR needed.  Keeping these in UR
     # frees GPR slots so all accumulators fit in R0-R13 (avoiding R14+ restriction).
@@ -311,9 +338,9 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
                 continue
             if name in cbuf_only_regs:
                 continue  # SM_89: skip GPR for cbuf-inline params
-            # Don't skip GPR for UR-loaded params — the isel's LDC fallback
-            # for 3rd+ params needs GPRs even for UR-declared params.
-            # if name in ur_only_f64_regs:
+            # Note: ur_param_regs are loaded into UR by isel, but the allocator
+            # still assigns GPRs because some code paths fall back to GPR LDC.
+            # The isel overrides the mapping at runtime.
             #     continue
             first = reg_first_def.get(name, 0)
             # Dead registers (defined but never read) get last_use = first_def,

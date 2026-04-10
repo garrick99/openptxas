@@ -1111,8 +1111,25 @@ def compile_function(fn: Function, verbose: bool = False,
                 s2r_offset = i
                 break
 
-    _final_gprs = max(alloc.num_gprs, ctx._next_gpr,
-                      getattr(ctx, '_scratch_highwater', 0))
+    # FB-4.4: post-SASS register accounting. Scan instruction comments for
+    # actual R## references. Returns the true highest register used, which
+    # may be lower than the allocator's high-water mark when params get
+    # rerouted to URs and never touch GPR.
+    import re as _re
+    _real_max_reg = -1
+    for _si in sass_instrs:
+        for _m in _re.finditer(r'R(\d+)', _si.comment or ''):
+            _r = int(_m.group(1))
+            if _r < 254:  # exclude RZ (255)
+                _real_max_reg = max(_real_max_reg, _r)
+    _real_count = _real_max_reg + 1 if _real_max_reg >= 0 else 0
+    _allocator_count = max(alloc.num_gprs, ctx._next_gpr,
+                           getattr(ctx, '_scratch_highwater', 0))
+    # Use the actual count, but never below R2 (R0:R1 are reserved).
+    _final_gprs = max(_real_count, 2)
+    if verbose and _final_gprs != _allocator_count:
+        print(f"[pipeline] FB-4.4: SASS scan reports {_real_count} regs, "
+              f"allocator reported {_allocator_count} -> using {_final_gprs}")
     # For deferred-param kernels, the actual UR usage is lower than regalloc's
     # estimate (deferred params use post-EXIT URs, not pre-allocated ones).
     # Cap num_uniform to ctx._next_ur to avoid LAUNCH_OUT_OF_RESOURCES (716).

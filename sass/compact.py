@@ -71,6 +71,56 @@ GPR_FIELDS: dict[int, list[tuple[int, str]]] = {
     # --- Float ALU (32-bit) ---
     0x221: [(2, 'dst'), (3, 'src0'), (4, 'src1')],                # FADD
     0x223: [(2, 'dst'), (3, 'src0'), (4, 'src1'), (8, 'src2')],   # FFMA / FMUL (FFMA with src2)
+    0x209: [(2, 'dst'), (3, 'src0'), (4, 'src1')],                # FMNMX
+    0x20b: [(3, 'src0'), (4, 'src1')],                            # FSETP (predicate dst)
+    0x820: [(2, 'dst'), (3, 'src0')],                             # FMUL.IMM (src1 is imm, no src2)
+    0x808: [(2, 'dst'), (3, 'src0')],                             # FSEL.imm (src1 is imm)
+    0x80a: [(2, 'dst'), (3, 'src0')],                             # FSEL.step (src1 is imm)
+
+    # --- Integer ALU extras ---
+    0x224: [(2, 'dst'), (3, 'src0'), (4, 'src1'), (8, 'src2')],   # IMAD R-R-R-R
+    0x207: [(2, 'dst'), (3, 'src0'), (4, 'src1')],                # SEL (selp)
+    0x248: [(2, 'dst'), (3, 'src0'), (4, 'src1')],                # VIMNMX (imax/imin)
+    0x226: [(2, 'dst'), (3, 'src0'), (4, 'src1'), (8, 'src2')],   # IDP.4A
+
+    # --- FP64 ---
+    0x208: [(2, 'dst'), (3, 'src0'), (4, 'src1')],                # FSEL (f64 selp path)
+    0x228: [(2, 'dst'), (3, 'src0'), (4, 'src1')],                # DMUL
+    0x229: [(2, 'dst'), (3, 'src0'), (8, 'src1')],                # DADD (src1 at byte[8])
+    0x22a: [(3, 'src0'), (4, 'src1')],                            # DSETP (src1 at byte[4])
+
+    # --- Single-source converts / special functions (src at byte[4], byte[3] unused) ---
+    0x245: [(2, 'dst'), (4, 'src0')],                             # I2FP
+    0x304: [(2, 'dst'), (4, 'src0')],                             # CVT.F16.F32
+    0x305: [(2, 'dst'), (4, 'src0')],                             # F2I
+    0x306: [(2, 'dst'), (4, 'src0')],                             # I2F
+    0x308: [(2, 'dst'), (4, 'src0')],                             # MUFU
+    0x309: [(2, 'dst'), (4, 'src0')],                             # POPC
+    0x300: [(2, 'dst'), (4, 'src0')],                             # FLO
+    0x301: [(2, 'dst'), (4, 'src0')],                             # BREV
+    0x310: [(2, 'dst'), (4, 'src0')],                             # F2F.F64.F32
+
+    # PRMT has imm at byte[4-7]; sources at byte[3] and byte[8]
+    0x416: [(2, 'dst'), (3, 'src0'), (8, 'src2')],                # PRMT
+
+    # --- Predicated MOV / MOV R,UR ---
+    # @P MOV R,R: byte[2]=dst, byte[4]=src (byte[3] unused)
+    0x202: [(2, 'dst'), (4, 'src0')],                             # @P MOV
+    0xc02: [(2, 'dst')],                                          # MOV R, UR
+
+    # --- Vote / redux ---
+    0x806: [(2, 'dst')],                                          # VOTE (src is predicate)
+    0x3c4: [(3, 'src0')],                                         # REDUX (dst is UR)
+
+    # --- Memory barriers (no GPR fields) ---
+    0x91a: [],  # DEPBAR.LE
+    0x992: [],  # MEMBAR
+    0x9af: [],  # LDGDEPBAR
+
+    # --- Atomics ---
+    0x9a3: [(2, 'dst'), (3, 'addr64'), (4, 'data')],              # ATOMG.E.ADD
+    0x9a8: [(2, 'dst'), (3, 'addr64'), (4, 'data')],              # ATOMG.E.MIN/MAX
+    0x3a9: [(2, 'dst64'), (3, 'addr64'), (4, 'data64'), (8, 'swap64')],  # ATOMG.E.CAS.64
 
     # --- BRA variants (no GPR fields) ---
     0x547: [],  # BRA (predicated/relative variant)

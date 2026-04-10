@@ -25,3 +25,6 @@ probe_work/
 
 # Local machine-specific junction (points to ptxas repro files)
 ptxas_bug/
+
+# WB-0 workbench artifacts (per-run JSON outputs)
+results/

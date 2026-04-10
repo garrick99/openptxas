@@ -162,6 +162,22 @@ GPR_FIELDS: dict[int, list[tuple[int, str]]] = {
     # Ground truth: DMMA.8x8x4 R8, R2, R4, R8
     0x23f: [(2, 'dst_quad'), (3, 'src_a_pair'), (4, 'src_b_pair'), (8, 'src_c_quad')],
 
+    # --- Tensor core: QMMA (FP8 matrix multiply-accumulate, SM_120 only) ---
+    # Opcode 0x27a covers QMMA.16832.F32 (m16n8k32 FP8 → FP32 accumulate):
+    #   byte[9] = 0x2c → E4M3.E4M3
+    #   byte[9] = 0xec → E5M2.E5M2
+    # Both formats have identical operand widths (no shape dispatch).
+    # Hardware constraints:
+    #   D: 4-register quad, 4-aligned
+    #   A: 4-register quad, 4-aligned
+    #   B: 2-register pair, base must be < 8
+    #   C: 4-register quad (or RZ=255 for no accumulation, filtered by reg<254)
+    # byte[2] = dst   (4-register QUAD, 4-aligned)
+    # byte[3] = src_a (4-register QUAD, 4-aligned)
+    # byte[4] = src_b (2-register PAIR, 2-aligned)
+    # byte[8] = src_c (4-register QUAD, 4-aligned) [or RZ]
+    0x27a: [(2, 'dst_quad'), (3, 'src_a_quad'), (4, 'src_b_pair'), (8, 'src_c_quad')],
+
     # --- BRA variants (no GPR fields) ---
     0x547: [],  # BRA (predicated/relative variant)
 

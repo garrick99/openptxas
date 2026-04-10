@@ -146,7 +146,7 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
     coalesces = _find_ldg_coalesces(fn)
 
     # Liveness analysis: compute live ranges (first def, last use) per register
-    from ptx.ir import RegOp, MemOp, LabelOp
+    from ptx.ir import RegOp, MemOp, LabelOp, ImmOp
     used_regs: set[str] = set()
     reg_first_def: dict[str, int] = {}  # name → instruction index of first write
     reg_last_use: dict[str, int] = {}   # name → instruction index of last read
@@ -347,6 +347,69 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
             if _n_uses == 1 and _n_base_uses == 1:
                 direct_ldc_params.add(_pname)
                 ur_param_regs.discard(_pname)
+
+        # WB-10: multi-param atom kernels (atom_cas64-style).
+        # When the kernel is dominated by a single atomic op consuming
+        # multiple u64 params (each as either an atom operand or as a
+        # store base), each param is single-use after stripping the
+        # PTX `add.u64 %rd, %rd, 0` "materialize-to-GPR" hints.
+        # Direct LDC.64 loads them straight into the GPR pairs the
+        # ATOMG.CAS path needs, eliminating the LDCU.64 + IADD.64-UR
+        # materialization chain (saves one instruction per param).
+        #
+        # Restricted to multi-param (>= 2) so this doesn't fire on
+        # single-u64-param atom kernels (atom_or, atomg_add,
+        # multi_block_atomic) which are excluded for reg-pressure
+        # reasons.
+        if not direct_ldc_params and _has_atom and len(_u64_param_dests) >= 2:
+            _eligible: set[str] = set()
+            for _pn in _u64_param_dests:
+                ok = True
+                for inst in all_instrs:
+                    if not ok:
+                        break
+                    # Self-add-zero hint: ignore (we'll skip emission too).
+                    is_self_add_zero = (
+                        inst.op == 'add'
+                        and any(t in ('u64', 's64', 'b64') for t in inst.types)
+                        and isinstance(inst.dest, RegOp)
+                        and inst.dest.name == _pn
+                        and len(inst.srcs) >= 2
+                        and isinstance(inst.srcs[0], RegOp)
+                        and inst.srcs[0].name == _pn
+                        and isinstance(inst.srcs[1], ImmOp)
+                        and inst.srcs[1].value == 0
+                    )
+                    if is_self_add_zero:
+                        continue
+                    for src in inst.srcs:
+                        sn = (src.name if isinstance(src, RegOp) else
+                              (src.base if isinstance(src, MemOp)
+                               and isinstance(src.base, str) else None))
+                        if sn != _pn:
+                            continue
+                        # Allowed: MemOp base in global ld/st/atom
+                        if (isinstance(src, MemOp)
+                                and inst.op in ('ld', 'st', 'atom')
+                                and 'global' in inst.types):
+                            continue
+                        # Allowed: RegOp source in atom global (cmp/new
+                        # operands of atom.global.cas)
+                        if (isinstance(src, RegOp)
+                                and inst.op == 'atom'
+                                and 'global' in inst.types):
+                            continue
+                        # Anything else disqualifies the param.
+                        ok = False
+                        break
+                if ok:
+                    _eligible.add(_pn)
+            # Only switch ALL params at once — partial conversion
+            # would mix LDC and UR paths in unpredictable ways.
+            if len(_eligible) == len(_u64_param_dests):
+                direct_ldc_params.update(_eligible)
+                for _p in _eligible:
+                    ur_param_regs.discard(_p)
 
     # SM_120: identify f64 param registers that will be loaded into UR via LDCU.64.
     # DFMA R-R-UR-UR handles them directly; no GPR needed.  Keeping these in UR

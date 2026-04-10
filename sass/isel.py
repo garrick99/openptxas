@@ -952,6 +952,17 @@ def _select_add_u64(instr: Instruction, ra: RegAlloc,
     a    = instr.srcs[0]
     b    = instr.srcs[1]
     sm_ver = ctx.sm_version if ctx else 120
+    # WB-10: skip self-add-zero (`add.u64 %X, %X, 0`) — used in PTX
+    # as a "materialize to GPR" hint that's redundant when the param
+    # is already loaded directly via LDC.64 (direct_ldc_params path).
+    # Only fires when the param vreg is in direct_ldc_params, so
+    # legitimate `add.u64 X, X, 0` outside that context still emits
+    # (preserves whatever side-effect the original code expected).
+    if (isinstance(a, RegOp) and isinstance(dest, RegOp)
+            and a.name == dest.name
+            and isinstance(b, ImmOp) and b.value == 0
+            and dest.name in getattr(ctx, '_direct_ldc_params', set())):
+        return []
 
     # Handle immediate operand: add.u64 dest, a, imm  (e.g. loop counter increment by 1)
     if isinstance(b, ImmOp) and isinstance(dest, RegOp) and isinstance(a, RegOp):

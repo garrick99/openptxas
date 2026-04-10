@@ -338,10 +338,6 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
                 continue
             if name in cbuf_only_regs:
                 continue  # SM_89: skip GPR for cbuf-inline params
-            # Note: ur_param_regs are loaded into UR by isel, but the allocator
-            # still assigns GPRs because some code paths fall back to GPR LDC.
-            # The isel overrides the mapping at runtime.
-            #     continue
             first = reg_first_def.get(name, 0)
             # Dead registers (defined but never read) get last_use = first_def,
             # so their pair is freed immediately for reuse.

@@ -1060,6 +1060,11 @@ def compile_function(fn: Function, verbose: bool = False,
                     break
 
     # 3. Concatenate SASS bytes
+    # FB-4.2: field-safe register compaction. Only runs if all opcodes have
+    # GPR field metadata. Skips entirely on coverage gating failure.
+    from sass.compact import compact as _fb42_compact
+    sass_instrs, _compact_count = _fb42_compact(sass_instrs, verbose=verbose)
+
     sass_bytes = b''.join(si.raw for si in sass_instrs)
 
     # 4. Build param size list

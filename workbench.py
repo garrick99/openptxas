@@ -371,6 +371,333 @@ def harness_hmma_zero(ctx: CUDAContext, func, mode: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# IMMA / DMMA / QMMA zero kernels (sibling tensor cores).  Same all-zero
+# input pattern as hmma_zero — exercises every tensor backend variant.
+# ---------------------------------------------------------------------------
+_PTX_IMMA_ZERO = """
+.version 8.7
+.target sm_120
+.address_size 64
+
+.visible .entry imma_zero_kernel(.param .u64 p_out)
+{
+    .reg .s32 %r<6>;
+    .reg .u64 %rd<1>;
+
+    ld.param.u64    %rd0, [p_out];
+
+    mov.b32 %r4, 0;
+    mov.b32 %r5, 0;
+    mov.b32 %r0, 0;
+    mov.b32 %r1, 0;
+    mov.b32 %r2, 0;
+    mov.b32 %r3, 0;
+
+    mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32
+        {%r0, %r1, %r2, %r3},
+        {%r0, %r1, %r2, %r3},
+        {%r4, %r5},
+        {%r0, %r1, %r2, %r3};
+
+    st.global.u32 [%rd0], %r0;
+    ret;
+}
+"""
+
+
+def harness_imma_zero(ctx: CUDAContext, func, mode: str) -> dict:
+    """IMMA.16832.S8 with all-zero inputs — output must be 0."""
+    d_out = ctx.alloc(4)
+    try:
+        ctx.copy_to(d_out, b"\x00\x00\x00\x00")
+        a_out = ctypes.c_uint64(d_out)
+        args, _hold = _make_args(a_out)
+        ctx.cuda.cuLaunchKernel(func, 1, 1, 1, 32, 1, 1, 0, None, args, None)
+        assert ctx.sync() == 0, "imma kernel crashed"
+        result = struct.unpack("<i", ctx.copy_from(d_out, 4))[0]
+        correct = (result == 0)
+        time_ms = None
+        if mode == "bench":
+            time_ms = _bench_launch(ctx, func, (1, 1, 1), (32, 1, 1), args)
+    finally:
+        ctx.free(d_out)
+    return {"correct": correct, "time_ms": time_ms}
+
+
+_PTX_DMMA_ZERO = """
+.version 8.7
+.target sm_120
+.address_size 64
+
+.visible .entry dmma_zero_kernel(.param .u64 p_out)
+{
+    .reg .f64 %fd<4>;
+    .reg .u64 %rd<1>;
+
+    ld.param.u64    %rd0, [p_out];
+
+    mov.f64 %fd0, 0d0000000000000000;
+    mov.f64 %fd1, 0d0000000000000000;
+    mov.f64 %fd2, 0d0000000000000000;
+    mov.f64 %fd3, 0d0000000000000000;
+
+    mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64
+        {%fd0, %fd1},
+        {%fd2},
+        {%fd3},
+        {%fd0, %fd1};
+
+    st.global.f64 [%rd0], %fd0;
+    ret;
+}
+"""
+
+
+def harness_dmma_zero(ctx: CUDAContext, func, mode: str) -> dict:
+    """DMMA.8x8x4 with all-zero inputs — output must be 0.0."""
+    d_out = ctx.alloc(8)
+    try:
+        ctx.copy_to(d_out, b"\x00" * 8)
+        a_out = ctypes.c_uint64(d_out)
+        args, _hold = _make_args(a_out)
+        ctx.cuda.cuLaunchKernel(func, 1, 1, 1, 32, 1, 1, 0, None, args, None)
+        assert ctx.sync() == 0, "dmma kernel crashed"
+        result = struct.unpack("<d", ctx.copy_from(d_out, 8))[0]
+        correct = (result == 0.0)
+        time_ms = None
+        if mode == "bench":
+            time_ms = _bench_launch(ctx, func, (1, 1, 1), (32, 1, 1), args)
+    finally:
+        ctx.free(d_out)
+    return {"correct": correct, "time_ms": time_ms}
+
+
+_PTX_QMMA_ZERO = """
+.version 8.7
+.target sm_120
+.address_size 64
+
+.visible .entry qmma_zero_kernel(.param .u64 p_out)
+{
+    .reg .b32 %r<8>;
+    .reg .u64 %rd<1>;
+
+    ld.param.u64    %rd0, [p_out];
+
+    mov.b32 %r4, 0;
+    mov.b32 %r5, 0;
+    mov.b32 %r6, 0;
+    mov.b32 %r7, 0;
+    mov.b32 %r0, 0;
+    mov.b32 %r1, 0;
+    mov.b32 %r2, 0;
+    mov.b32 %r3, 0;
+
+    mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32
+        {%r0, %r1, %r2, %r3},
+        {%r0, %r1, %r2, %r3},
+        {%r4, %r5},
+        {%r0, %r1, %r2, %r3};
+
+    st.global.u32 [%rd0], %r0;
+    ret;
+}
+"""
+
+
+def harness_qmma_zero(ctx: CUDAContext, func, mode: str) -> dict:
+    """QMMA.16832.F32.E4M3.E4M3 with all-zero inputs — output must be 0.0f."""
+    d_out = ctx.alloc(4)
+    try:
+        ctx.copy_to(d_out, b"\x00\x00\x00\x00")
+        a_out = ctypes.c_uint64(d_out)
+        args, _hold = _make_args(a_out)
+        ctx.cuda.cuLaunchKernel(func, 1, 1, 1, 32, 1, 1, 0, None, args, None)
+        assert ctx.sync() == 0, "qmma kernel crashed"
+        result = struct.unpack("<f", ctx.copy_from(d_out, 4))[0]
+        correct = (result == 0.0)
+        time_ms = None
+        if mode == "bench":
+            time_ms = _bench_launch(ctx, func, (1, 1, 1), (32, 1, 1), args)
+    finally:
+        ctx.free(d_out)
+    return {"correct": correct, "time_ms": time_ms}
+
+
+# ---------------------------------------------------------------------------
+# cp.async — async global → shared copy with commit/wait, then broadcast.
+# Exercises LDGSTS, BAR.SYNC, shared-memory load.
+# ---------------------------------------------------------------------------
+_PTX_CP_ASYNC = """
+.version 8.7
+.target sm_120
+.address_size 64
+
+.visible .entry cp_async_test(
+    .param .u64 p_out,
+    .param .u64 p_in
+)
+{
+    .reg .u32 %r<8>;
+    .reg .u64 %rd<8>;
+    .reg .pred %p0;
+    .shared .align 4 .b32 smem[256];
+
+    mov.u32 %r0, %tid.x;
+    setp.ne.u32 %p0, %r0, 0;
+    @%p0 bra SKIP_COPY;
+
+    mov.u32 %r1, 0;
+    ld.param.u64 %rd0, [p_in];
+    cp.async.ca.shared.global [%r1], [%rd0], 4;
+
+SKIP_COPY:
+    cp.async.commit_group;
+    cp.async.wait_group 0;
+    bar.sync 0;
+
+    mov.u32 %r2, 0;
+    ld.shared.b32 %r3, [%r2];
+
+    shl.b32 %r4, %r0, 2;
+    cvt.u64.u32 %rd1, %r4;
+    ld.param.u64 %rd2, [p_out];
+    add.u64 %rd3, %rd2, %rd1;
+    st.global.u32 [%rd3], %r3;
+    ret;
+}
+"""
+
+
+def harness_cp_async(ctx: CUDAContext, func, mode: str) -> dict:
+    """cp.async copy of 4B from global to shared, broadcast across warp."""
+    N = 32
+    magic = 0xDEADBEEF
+    d_in = ctx.alloc(4)
+    d_out = ctx.alloc(N * 4)
+    try:
+        ctx.copy_to(d_in, struct.pack("<I", magic))
+        ctx.copy_to(d_out, b"\x00" * (N * 4))
+        a_out = ctypes.c_uint64(d_out)
+        a_in  = ctypes.c_uint64(d_in)
+        args, _hold = _make_args(a_out, a_in)
+        ctx.cuda.cuLaunchKernel(func, 1, 1, 1, N, 1, 1, 1024, None, args, None)
+        assert ctx.sync() == 0, "cp_async kernel crashed"
+        results = struct.unpack(f"<{N}I", ctx.copy_from(d_out, N * 4))
+        correct = all(v == magic for v in results)
+        time_ms = None
+        if mode == "bench":
+            time_ms = _bench_launch(
+                ctx, func, (1, 1, 1), (N, 1, 1), args, smem=1024,
+            )
+    finally:
+        ctx.free(d_in)
+        ctx.free(d_out)
+    return {"correct": correct, "time_ms": time_ms}
+
+
+# ---------------------------------------------------------------------------
+# warp_reduce — fp32 warp-level butterfly via shfl.down (5 stages).
+# Exercises SHFL scoreboard slots and the warp shuffle path.
+# ---------------------------------------------------------------------------
+_PTX_WARP_REDUCE = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry warp_reduce(
+    .param .u64 p_out, .param .u64 p_in, .param .u32 n)
+{
+    .reg .u32 %r<8>; .reg .u64 %rd<8>; .reg .f32 %f<4>; .reg .pred %p0;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    cvt.u64.u32 %rd0, %r0; shl.b64 %rd0, %rd0, 2;
+    ld.param.u64 %rd1, [p_in]; add.u64 %rd2, %rd1, %rd0;
+    ld.global.f32 %f0, [%rd2];
+
+    shfl.sync.down.b32 %f1, %f0, 16, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %f1;
+    shfl.sync.down.b32 %f1, %f0, 8, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %f1;
+    shfl.sync.down.b32 %f1, %f0, 4, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %f1;
+    shfl.sync.down.b32 %f1, %f0, 2, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %f1;
+    shfl.sync.down.b32 %f1, %f0, 1, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %f1;
+
+    setp.ne.u32 %p0, %r0, 0; @%p0 ret;
+    ld.param.u64 %rd3, [p_out];
+    st.global.f32 [%rd3], %f0;
+    ret;
+}
+"""
+
+
+def harness_warp_reduce(ctx: CUDAContext, func, mode: str) -> dict:
+    """Warp-level fp32 sum of [1.0, 2.0, ..., 32.0] = 528.0."""
+    N = 32
+    expected = float(N * (N + 1) // 2)  # 528
+    vals = [float(i + 1) for i in range(N)]
+    d_in = ctx.alloc(N * 4)
+    d_out = ctx.alloc(4)
+    try:
+        ctx.copy_to(d_in, struct.pack(f"<{N}f", *vals))
+        ctx.copy_to(d_out, b"\x00\x00\x00\x00")
+        a_out = ctypes.c_uint64(d_out)
+        a_in  = ctypes.c_uint64(d_in)
+        a_n   = ctypes.c_uint32(N)
+        args, _hold = _make_args(a_out, a_in, a_n)
+        ctx.cuda.cuLaunchKernel(func, 1, 1, 1, N, 1, 1, 0, None, args, None)
+        assert ctx.sync() == 0, "warp_reduce kernel crashed"
+        result = struct.unpack("<f", ctx.copy_from(d_out, 4))[0]
+        correct = (result == expected)
+        time_ms = None
+        if mode == "bench":
+            time_ms = _bench_launch(ctx, func, (1, 1, 1), (N, 1, 1), args)
+    finally:
+        ctx.free(d_in)
+        ctx.free(d_out)
+    return {"correct": correct, "time_ms": time_ms}
+
+
+# ---------------------------------------------------------------------------
+# atom_or — single-warp atomic OR into a global location.
+# Exercises ATOMG.E.OR.b32 path (non-tensor, non-shared).
+# ---------------------------------------------------------------------------
+_PTX_ATOM_OR = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry atom_or(.param .u64 p_out) {
+    .reg .u32 %r<4>; .reg .u64 %rd<2>;
+    mov.u32 %r1, 0xFF;
+    ld.param.u64 %rd0, [p_out];
+    atom.global.or.b32 %r0, [%rd0], %r1;
+    ret;
+}
+"""
+
+
+def harness_atom_or(ctx: CUDAContext, func, mode: str) -> dict:
+    """32 lanes each OR 0xFF into the same word — final value must be 0xFF."""
+    d = ctx.alloc(4)
+    try:
+        ctx.copy_to(d, struct.pack("<I", 0))
+        a = ctypes.c_uint64(d)
+        args, _hold = _make_args(a)
+        ctx.cuda.cuLaunchKernel(func, 1, 1, 1, 32, 1, 1, 0, None, args, None)
+        assert ctx.sync() == 0, "atom_or kernel crashed"
+        val = struct.unpack("<I", ctx.copy_from(d, 4))[0]
+        correct = (val == 0xFF)
+        time_ms = None
+        if mode == "bench":
+            time_ms = _bench_launch(ctx, func, (1, 1, 1), (32, 1, 1), args)
+    finally:
+        ctx.free(d)
+    return {"correct": correct, "time_ms": time_ms}
+
+
+# ---------------------------------------------------------------------------
 # Catalog
 # ---------------------------------------------------------------------------
 KERNELS: dict[str, dict] = {
@@ -394,6 +721,48 @@ KERNELS: dict[str, dict] = {
         "ptx_inline": _PTX_HMMA_ZERO,
         "kernel_name": "hmma_zero_kernel",
         "harness": harness_hmma_zero,
+    },
+    "imma_zero": {
+        "display": "IMMA m16n8k32 S8 zero accumulator",
+        "ptx_path": None,
+        "ptx_inline": _PTX_IMMA_ZERO,
+        "kernel_name": "imma_zero_kernel",
+        "harness": harness_imma_zero,
+    },
+    "dmma_zero": {
+        "display": "DMMA m8n8k4 F64 zero accumulator",
+        "ptx_path": None,
+        "ptx_inline": _PTX_DMMA_ZERO,
+        "kernel_name": "dmma_zero_kernel",
+        "harness": harness_dmma_zero,
+    },
+    "qmma_zero": {
+        "display": "QMMA m16n8k32 E4M3 zero accumulator",
+        "ptx_path": None,
+        "ptx_inline": _PTX_QMMA_ZERO,
+        "kernel_name": "qmma_zero_kernel",
+        "harness": harness_qmma_zero,
+    },
+    "cp_async": {
+        "display": "cp.async global->shared broadcast",
+        "ptx_path": None,
+        "ptx_inline": _PTX_CP_ASYNC,
+        "kernel_name": "cp_async_test",
+        "harness": harness_cp_async,
+    },
+    "warp_reduce": {
+        "display": "warp_reduce fp32 shfl.down butterfly",
+        "ptx_path": None,
+        "ptx_inline": _PTX_WARP_REDUCE,
+        "kernel_name": "warp_reduce",
+        "harness": harness_warp_reduce,
+    },
+    "atom_or": {
+        "display": "atom.global.or.b32",
+        "ptx_path": None,
+        "ptx_inline": _PTX_ATOM_OR,
+        "kernel_name": "atom_or",
+        "harness": harness_atom_or,
     },
 }
 
@@ -617,7 +986,13 @@ def write_kernel_json(result: dict, commits: dict,
 # Suite mode + leaderboard
 # ---------------------------------------------------------------------------
 SUITES: dict[str, list[str]] = {
-    "core": ["reduce_sum", "conv2d_looped", "hmma_zero"],
+    "core":     ["reduce_sum", "conv2d_looped", "hmma_zero"],
+    "tensor":   ["hmma_zero", "imma_zero", "dmma_zero", "qmma_zero"],
+    "extended": [
+        "reduce_sum", "conv2d_looped",
+        "hmma_zero", "imma_zero", "dmma_zero", "qmma_zero",
+        "cp_async", "warp_reduce", "atom_or",
+    ],
 }
 
 

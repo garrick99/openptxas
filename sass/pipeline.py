@@ -549,12 +549,27 @@ def compile_function(fn: Function, verbose: bool = False,
     # 0b. Sink ld.param from entry block to first-use block (reduces GPR pressure)
     _sink_param_loads(fn)
 
+    # WB-7: pre-allocator address-fold analysis.  Detects
+    # `add.u64 %A, %B, IMM` patterns whose only consumer folds the
+    # offset into a load/store.  The dead-add's dest vreg is then
+    # excluded from regalloc so its phys pair is never reserved.
+    from sass.isel import analyze_addr_offset_fold
+    _addr_fold_map, _addr_fold_dead_adds = analyze_addr_offset_fold(fn)
+    _addr_fold_dead_vregs: set[str] = set()
+    if _addr_fold_dead_adds:
+        from ptx.ir import RegOp
+        for bb in fn.blocks:
+            for inst in bb.instructions:
+                if (id(inst) in _addr_fold_dead_adds
+                        and isinstance(inst.dest, RegOp)):
+                    _addr_fold_dead_vregs.add(inst.dest.name)
+
     # 1. Register allocation
     from sass.regalloc import PARAM_BASE_SM120, PARAM_BASE_SM89
     param_base = PARAM_BASE_SM89 if sm_version == 89 else PARAM_BASE_SM120
     has_capmerc = ptxas_meta is not None and 'capmerc' in (ptxas_meta or {})
     alloc = allocate(fn, param_base=param_base, has_capmerc=has_capmerc,
-                     sm_version=sm_version)
+                     sm_version=sm_version, skip_vregs=_addr_fold_dead_vregs)
 
     if verbose:
         print(f"[pipeline] {fn.name}: {alloc.num_gprs} GPRs, "
@@ -620,6 +635,11 @@ def compile_function(fn: Function, verbose: bool = False,
         sm_version=sm_version,
     )
     ctx._addr_scratch_lo = _addr_scratch_base  # dedicated addr pair: R(base):R(base+1)
+    # WB-7: aliased-base address-chain folding (analysis ran above
+    # before allocate() so the dead vregs are excluded from int_regs).
+    # Pass the maps to isel via ctx.
+    ctx._addr_fold_map = _addr_fold_map
+    ctx._addr_fold_dead_adds = _addr_fold_dead_adds
     # WB-5.0: tiny-kernel direct LDC.64 path.  When a kernel has a
     # single-use u64 pointer param, the allocator gives it a real GPR
     # pair and tags it for _select_ld_param to emit LDC.64 directly

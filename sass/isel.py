@@ -491,6 +491,104 @@ def analyze_mma_zero_subst(fn, enable: set[str] | None = None) -> tuple[dict, se
     return rz_subst, dead_movs
 
 
+def analyze_addr_offset_fold(fn) -> tuple[dict, set]:
+    """WB-7: aliased-base address chain folding.
+
+    Detect `add.u64 %A, %B, IMM` patterns where:
+      - IMM is a small constant (fits in LDG.E's 24-bit signed offset)
+      - %A's only use is as a single MemOp.base in a global ld/st/atom
+      - %A has a single def (the add)
+
+    For each match, record `%A → (%B, IMM)` so the consuming load/store
+    isel emits LDG.E [%B + IMM] instead of materializing a new address
+    pair.  The add.u64 is marked dead and skipped at emission time.
+
+    Returns
+    -------
+    fold_map : dict[str, tuple[str, int]]
+        vreg name → (base vreg, immediate offset)
+    dead_adds : set[int]
+        id() of add.u64 instructions to skip
+    """
+    from ptx.ir import RegOp, ImmOp, MemOp, VectorRegOp
+
+    all_instrs = []
+    for bb in fn.blocks:
+        all_instrs.extend(bb.instructions)
+
+    def _dest_vregs(dst):
+        if isinstance(dst, VectorRegOp):
+            return tuple(dst.regs)
+        if isinstance(dst, RegOp):
+            return (dst.name,)
+        return ()
+
+    # Count defs per vreg.
+    def_count: dict[str, int] = {}
+    for inst in all_instrs:
+        for nm in _dest_vregs(inst.dest):
+            def_count[nm] = def_count.get(nm, 0) + 1
+
+    # Count uses per vreg (across the whole function), by category.
+    base_uses: dict[str, int] = {}    # uses as MemOp.base in ld/st/atom global
+    other_uses: dict[str, int] = {}   # any other source use
+    for inst in all_instrs:
+        for src in (inst.srcs or []):
+            if isinstance(src, MemOp) and isinstance(src.base, str):
+                bn = src.base if src.base.startswith('%') else f'%{src.base}'
+                if (inst.op in ('ld', 'st', 'atom')
+                        and 'global' in inst.types):
+                    base_uses[bn] = base_uses.get(bn, 0) + 1
+                else:
+                    other_uses[bn] = other_uses.get(bn, 0) + 1
+            elif isinstance(src, VectorRegOp):
+                for v in src.regs:
+                    other_uses[v] = other_uses.get(v, 0) + 1
+            elif isinstance(src, RegOp):
+                other_uses[src.name] = other_uses.get(src.name, 0) + 1
+
+    fold_map: dict[str, tuple[str, int]] = {}
+    dead_adds: set[int] = set()
+
+    # 24-bit signed range for the LDG.E offset field.
+    OFF_MAX = (1 << 23) - 1
+    OFF_MIN = -(1 << 23)
+
+    for inst in all_instrs:
+        if (inst.op != 'add'
+                or not any(t in ('u64', 's64', 'b64') for t in inst.types)):
+            continue
+        if not isinstance(inst.dest, RegOp) or len(inst.srcs or []) < 2:
+            continue
+        a, b = inst.srcs[0], inst.srcs[1]
+        # Only fold the form (reg, imm).  (imm, reg) is rare in PTX.
+        if not isinstance(a, RegOp) or not isinstance(b, ImmOp):
+            continue
+        imm = b.value
+        if not (OFF_MIN <= imm <= OFF_MAX):
+            continue
+        dest_name = inst.dest.name
+        # %A must have exactly one def (this add) and exactly one use,
+        # and that use must be a MemOp.base in a global ld/st/atom.
+        if def_count.get(dest_name, 0) != 1:
+            continue
+        if base_uses.get(dest_name, 0) != 1:
+            continue
+        if other_uses.get(dest_name, 0) != 0:
+            continue
+        # Base vreg must still be alive at the consumer.  We don't model
+        # liveness here precisely; we trust that PTX vregs aren't
+        # redefined in the typical aliased-base pattern.  If %B has more
+        # than one def, skip — its value at the load may differ from
+        # what the add saw.
+        if def_count.get(a.name, 0) != 1:
+            continue
+        fold_map[dest_name] = (a.name, imm)
+        dead_adds.add(id(inst))
+
+    return fold_map, dead_adds
+
+
 def _alloc_gpr_pair(ctx: 'ISelContext') -> int:
     """Allocate an even-aligned GPR pair (lo, lo+1) for 64-bit scratch use.
 
@@ -845,6 +943,11 @@ def _select_add_u64(instr: Instruction, ra: RegAlloc,
                     ctx: 'ISelContext' = None) -> list[SassInstr]:
     """add.u64 dest, a, b → IADD.64 (SM_120) or IADD3+IADD3.X (SM_89)."""
     from sass.encoding.sm_120_opcodes import encode_iadd64_ur
+    # WB-7: skip add.u64 marked dead by analyze_addr_offset_fold —
+    # the immediate offset has been folded into the consuming load/store
+    # and this add.u64's destination is no longer needed.
+    if id(instr) in getattr(ctx, '_addr_fold_dead_adds', set()):
+        return []
     dest = instr.dest
     a    = instr.srcs[0]
     b    = instr.srcs[1]
@@ -1248,6 +1351,18 @@ def _select_ld_global(instr: Instruction, ra: RegAlloc,
     typ = instr.types[-1] if instr.types else 'u32'
     is_64 = typ in ('u64', 's64', 'b64', 'f64')
 
+    # WB-7: address-chain fold.  If the MemOp.base is a vreg defined
+    # ONLY by `add.u64 %X, %B, IMM`, redirect the base to %B and add
+    # IMM to the immediate offset.  The add.u64 is marked dead and
+    # will be skipped by _select_add_u64.
+    fold_map = getattr(ctx, '_addr_fold_map', {}) if ctx else {}
+    extra_offset = 0
+    base_name_raw = src.base if src.base.startswith('%') else f'%{src.base}'
+    if base_name_raw in fold_map:
+        new_base, extra_offset = fold_map[base_name_raw]
+        # Rebuild src with new base; keep src.offset (may be 0).
+        src = MemOp(base=new_base, offset=src.offset)
+
     base_name = src.base if src.base.startswith('%') else f'%{src.base}'
 
     # Resolve address register: if the register was written to GPR (by add.u64 etc.),
@@ -1292,14 +1407,15 @@ def _select_ld_global(instr: Instruction, ra: RegAlloc,
     else:
         addr = RZ
 
+    off_str = f' + 0x{extra_offset:x}' if extra_offset else ''
     if is_64:
         d = ra.lo(dest.name)
-        result.append(SassInstr(encode_ldg_e_64(d, ur_desc, addr),
-                          f'LDG.E.64 R{d}, desc[UR{ur_desc}][R{addr}.64]'))
+        result.append(SassInstr(encode_ldg_e_64(d, ur_desc, addr, imm_offset=extra_offset),
+                          f'LDG.E.64 R{d}, desc[UR{ur_desc}][R{addr}.64{off_str}]'))
     else:
         d = ra.r32(dest.name)
-        result.append(SassInstr(encode_ldg_e(d, ur_desc, addr, width=32),
-                          f'LDG.E R{d}, desc[UR{ur_desc}][R{addr}.64]'))
+        result.append(SassInstr(encode_ldg_e(d, ur_desc, addr, width=32, imm_offset=extra_offset),
+                          f'LDG.E R{d}, desc[UR{ur_desc}][R{addr}.64{off_str}]'))
     return result
 
 
@@ -1588,6 +1704,14 @@ def _select_st_global(instr: Instruction, ra: RegAlloc,
     typ = instr.types[-1] if instr.types else 'u32'
     is_64 = typ in ('u64', 's64', 'b64', 'f64')
 
+    # WB-7: address-chain fold (same logic as ld.global).
+    fold_map = getattr(ctx, '_addr_fold_map', {}) if ctx else {}
+    extra_offset = 0
+    base_name_raw = dest_op.base if dest_op.base.startswith('%') else f'%{dest_op.base}'
+    if base_name_raw in fold_map:
+        new_base, extra_offset = fold_map[base_name_raw]
+        dest_op = MemOp(base=new_base, offset=dest_op.offset)
+
     base_name = dest_op.base if dest_op.base.startswith('%') else f'%{dest_op.base}'
 
     # Resolve address: prefer GPR (if written by add.u64) over stale UR entry
@@ -1615,21 +1739,23 @@ def _select_st_global(instr: Instruction, ra: RegAlloc,
     else:
         addr = RZ
 
+    off_str = f' + 0x{extra_offset:x}' if extra_offset else ''
+
     # Handle materialized immediate
     if not isinstance(src_op, RegOp):
         data = t  # from materialized temp above
-        result = prefix + preamble + [SassInstr(encode_stg_e(ur_desc, addr, data, width=32, ctrl=0xff1),
-                                       f'STG.E desc[UR{ur_desc}][R{addr}.64], R{data}')]
+        result = prefix + preamble + [SassInstr(encode_stg_e(ur_desc, addr, data, width=32, imm_offset=extra_offset, ctrl=0xff1),
+                                       f'STG.E desc[UR{ur_desc}][R{addr}.64{off_str}], R{data}')]
         return result
 
     if is_64:
         data = ra.lo(src_op.name)
-        return prefix + [SassInstr(encode_stg_e_64(ur_desc, addr, data, ctrl=0xff1),
-                          f'STG.E.64 desc[UR{ur_desc}][R{addr}.64], R{data}')]
+        return prefix + [SassInstr(encode_stg_e_64(ur_desc, addr, data, imm_offset=extra_offset, ctrl=0xff1),
+                          f'STG.E.64 desc[UR{ur_desc}][R{addr}.64{off_str}], R{data}')]
     else:
         data = ra.r32(src_op.name)
-        return prefix + [SassInstr(encode_stg_e(ur_desc, addr, data, width=32, ctrl=0xff1),
-                          f'STG.E desc[UR{ur_desc}][R{addr}.64], R{data}')]
+        return prefix + [SassInstr(encode_stg_e(ur_desc, addr, data, width=32, imm_offset=extra_offset, ctrl=0xff1),
+                          f'STG.E desc[UR{ur_desc}][R{addr}.64{off_str}], R{data}')]
 
 
 # ---------------------------------------------------------------------------

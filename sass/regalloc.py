@@ -123,14 +123,21 @@ def _find_ldg_coalesces(fn: Function) -> dict[str, tuple[str, int]]:
 
 
 def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
-             has_capmerc: bool = False, sm_version: int = 120) -> AllocResult:
+             has_capmerc: bool = False, sm_version: int = 120,
+             skip_vregs: set | None = None) -> AllocResult:
     """
     Allocate physical registers for a PTX function.
 
     Walks fn.reg_decls to assign GPR indices, then fn.params to compute
     constant-bank offsets.  Returns an AllocResult with a filled RegAlloc
     and param_offsets dict ready for the instruction selector.
+
+    `skip_vregs` (WB-7): vreg names whose producing instruction will be
+    elided by isel (e.g. address-fold dead `add.u64`).  These vregs are
+    excluded from reg_info so no phys pair is reserved.
     """
+    if skip_vregs is None:
+        skip_vregs = set()
     int_regs: dict[str, int] = {}
     pred_regs: dict[str, int] = {}
     unif_regs: dict[str, int] = {}
@@ -474,6 +481,11 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
             # materialization).  No phys GPR is ever written to those slots,
             # so reserving a pair just inflates next_gpr.  Skip them here.
             if name in ur_param_regs:
+                continue
+            # WB-7: vregs whose producing instruction is elided by isel
+            # (e.g. address-fold dead add.u64).  No SASS reads or writes
+            # the slot, so don't reserve one.
+            if name in skip_vregs:
                 continue
             first = reg_first_def.get(name, 0)
             # Dead registers (defined but never read) get last_use = first_def,

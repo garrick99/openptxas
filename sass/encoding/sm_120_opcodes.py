@@ -677,64 +677,76 @@ def encode_imad_rr(dest: int, src0: int, src1: int, src2: int,
 # All 64 instances in JSON are identical — single unique load pattern.
 
 def encode_ldg_e(dest: int, ur_desc: int, src_addr: int,
-                  width: int = 32, ctrl: int = 0) -> bytes:
-    """Encode LDG.E dest, desc[ur_desc][src_addr.64] with variable width (32/64/128 bits)."""
+                  width: int = 32, imm_offset: int = 0,
+                  ctrl: int = 0) -> bytes:
+    """Encode LDG.E dest, desc[ur_desc][src_addr.64] with variable width
+    (32/64/128 bits) and an optional 24-bit signed immediate byte offset.
+
+    The offset is encoded little-endian in bytes 5..7 (ground truth from
+    ptxas: `LDG.E R7, [R4 + 4]` has byte[5]=0x04).  Range: -8MB..+8MB.
+    """
     if ctrl == 0:
         ctrl = _CTRL_DEFAULT
     b9_map = {32: 0x19, 64: 0x1b, 128: 0x1d}
-    return _build(0x81, 0x79,
+    raw = bytearray(_build(0x81, 0x79,
                   b2=dest, b3=src_addr, b4=ur_desc & 0xFF,
                   b8=0x00,
                   b9=b9_map.get(width, 0x9b), b10=0x1e, b11=0x0c,
-                  ctrl=ctrl)
+                  ctrl=ctrl))
+    if imm_offset:
+        off = imm_offset & 0xFFFFFF
+        raw[5] = off & 0xFF
+        raw[6] = (off >> 8) & 0xFF
+        raw[7] = (off >> 16) & 0xFF
+    return bytes(raw)
 
 
 def encode_stg_e(ur_desc: int, src_addr: int, src_data: int,
-                  width: int = 32, ctrl: int = 0) -> bytes:
-    """Encode STG.E desc[ur_desc][src_addr.64], src_data with variable width.
+                  width: int = 32, imm_offset: int = 0,
+                  ctrl: int = 0) -> bytes:
+    """Encode STG.E desc[ur_desc][src_addr.64], src_data with variable
+    width and optional 24-bit signed immediate byte offset.
 
     Field layout (verified against ptxas):
-      b2=0x00, b3=addr_reg, b4=data_reg, b8=ur_desc_idx
+      b2=0x00, b3=addr_reg, b4=data_reg, b8=ur_desc_idx,
+      bytes[5..7]=imm_offset (little-endian, signed 24-bit)
     """
     if ctrl == 0:
         ctrl = _CTRL_DEFAULT
     b9_map = {32: 0x19, 64: 0x1b, 128: 0x1d}
-    return _build(0x86, 0x79,
+    raw = bytearray(_build(0x86, 0x79,
                   b2=0x00, b3=src_addr, b4=src_data & 0xFF,
                   b8=ur_desc & 0xFF,
                   b9=b9_map.get(width, 0x1b), b10=0x10, b11=0x0c,
-                  ctrl=ctrl)
+                  ctrl=ctrl))
+    if imm_offset:
+        off = imm_offset & 0xFFFFFF
+        raw[5] = off & 0xFF
+        raw[6] = (off >> 8) & 0xFF
+        raw[7] = (off >> 16) & 0xFF
+    return bytes(raw)
 
 
 def encode_ldg_e_64(dest: int, ur_desc: int, src_addr: int,
-                    ctrl: int = 0) -> bytes:
+                    imm_offset: int = 0, ctrl: int = 0) -> bytes:
     """
     Encode LDG.E.64 dest, desc[ur_desc][src_addr.64] to 16 bytes.
 
-    64-bit global memory load using a descriptor-based addressing mode.
-    Loads 64 bits (two consecutive 32-bit registers starting at dest) from
-    the address given by (uniform register ur_desc, base register src_addr).
-
-    Args:
-        dest:     Destination register pair base index (0..253).
-        ur_desc:  Uniform register index for the memory descriptor (e.g. UR4=4).
-        src_addr: Base address register index (0..254).
-        ctrl:     23-bit scheduling control word (0 = default 0x7e0).
-
-    Returns:
-        16-byte little-endian instruction encoding.
-
-    Ground truth:
-        encode_ldg_e_64(2, 4, 2, ctrl=0x1771)
-            -> bytes.fromhex('8179020204000000001b1e0c00e22e00')
+    Optional 24-bit signed immediate byte offset (bytes[5..7]).
     """
     if ctrl == 0:
         ctrl = _CTRL_DEFAULT
-    return _build(0x81, 0x79,
+    raw = bytearray(_build(0x81, 0x79,
                   b2=dest, b3=src_addr, b4=ur_desc & 0xFF,
                   b8=0x00,
                   b9=0x1b, b10=0x1e, b11=0x0c,
-                  ctrl=ctrl)
+                  ctrl=ctrl))
+    if imm_offset:
+        off = imm_offset & 0xFFFFFF
+        raw[5] = off & 0xFF
+        raw[6] = (off >> 8) & 0xFF
+        raw[7] = (off >> 16) & 0xFF
+    return bytes(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -751,34 +763,25 @@ def encode_ldg_e_64(dest: int, ur_desc: int, src_addr: int,
 #   ctrl=0x7f1: raw=0xfe2 -> b13=0xe2, b14=0x0f  ✓
 
 def encode_stg_e_64(ur_desc: int, src_addr: int, src_data: int,
-                    ctrl: int = 0) -> bytes:
+                    imm_offset: int = 0, ctrl: int = 0) -> bytes:
     """
     Encode STG.E.64 desc[ur_desc][src_addr.64], src_data to 16 bytes.
 
-    64-bit global memory store using a descriptor-based addressing mode.
-    Stores 64 bits (two consecutive 32-bit registers from src_data) to the
-    address given by (uniform register ur_desc, base register src_addr).
-
-    Args:
-        ur_desc:  Uniform register index for the memory descriptor (e.g. UR4=4).
-        src_addr: Base address register index (0..254).
-        src_data: Source data register pair base index (0..253).
-        ctrl:     23-bit scheduling control word (0 = default 0x7e0).
-
-    Returns:
-        16-byte little-endian instruction encoding.
-
-    Ground truth:
-        encode_stg_e_64(4, 6, 4, ctrl=0x7f1)
-            -> bytes.fromhex('8679000604000000041b100c00e20f00')
+    Optional 24-bit signed immediate byte offset (bytes[5..7]).
     """
     if ctrl == 0:
         ctrl = _CTRL_DEFAULT
-    return _build(0x86, 0x79,
+    raw = bytearray(_build(0x86, 0x79,
                   b2=0x00, b3=src_addr, b4=src_data & 0xFF,
                   b8=ur_desc & 0xFF,
                   b9=0x1b, b10=0x10, b11=0x0c,
-                  ctrl=ctrl)
+                  ctrl=ctrl))
+    if imm_offset:
+        off = imm_offset & 0xFFFFFF
+        raw[5] = off & 0xFF
+        raw[6] = (off >> 8) & 0xFF
+        raw[7] = (off >> 16) & 0xFF
+    return bytes(raw)
 
 
 # ---------------------------------------------------------------------------

@@ -419,9 +419,12 @@ def emit_cubin(kernel: KernelDesc) -> bytes:
                 from sass.encoding.sm_120_opcodes import encode_exit
                 sass.extend(encode_exit())
         sass.extend(encode_bra(-16))
+    # Pad to 128-byte alignment.  WB-5.1: the previous 384-byte minimum
+    # was a conservative floor that inflated tiny kernels (notably the
+    # *_zero tensor canaries) by an entire 128B page.  ptxas's smallest
+    # kernels go down to 256B; only the 128B alignment is a real
+    # requirement.
     while len(sass) % 128 != 0:
-        sass.extend(encode_nop())
-    while len(sass) < 384:
         sass.extend(encode_nop())
     text_data = bytes(sass)
 

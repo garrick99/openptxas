@@ -620,6 +620,11 @@ def compile_function(fn: Function, verbose: bool = False,
         sm_version=sm_version,
     )
     ctx._addr_scratch_lo = _addr_scratch_base  # dedicated addr pair: R(base):R(base+1)
+    # WB-5.0: tiny-kernel direct LDC.64 path.  When a kernel has a
+    # single-use u64 pointer param, the allocator gives it a real GPR
+    # pair and tags it for _select_ld_param to emit LDC.64 directly
+    # (no LDCU.64 + IADD.64 R-UR materialization).
+    ctx._direct_ldc_params = alloc.direct_ldc_params
     # WB-2: HMMA "all-zero inputs" RZ-substitution analysis.
     # Restricted to HMMA shapes; IMMA / DMMA / QMMA paths are unaffected.
     from sass.isel import analyze_mma_zero_subst
@@ -796,12 +801,22 @@ def compile_function(fn: Function, verbose: bool = False,
 
     # SM_120 requires at least one S2R before LDCU param loads.
     # If the body has no S2R, insert a dummy S2R R0, SR_TID.X.
+    #
+    # WB-5.0: skip the dummy S2R for tiny-kernel direct-LDC mode.  When
+    # the only param is loaded via LDC.64 (not LDCU.64), the body has
+    # no LDCU.64 param load and no S2R is needed before the descriptor
+    # LDCU.64.  ptxas's DMMA confirms this pattern works.
     from sass.encoding.sm_120_opcodes import encode_s2r, SR_TID_X
     has_s2r = any(
         struct.unpack_from('<Q', si.raw, 0)[0] & 0xFFF in (0x919, 0x9c3)
         for si in body_instrs
     )
-    if not has_s2r:
+    body_has_ldcu_param = any(
+        (struct.unpack_from('<Q', si.raw, 0)[0] & 0xFFF) == 0x7ac
+        and si.raw[9] == 0x0a
+        for si in body_instrs
+    )
+    if not has_s2r and (body_has_ldcu_param or not ctx._direct_ldc_params):
         body_instrs.insert(0, SassInstr(encode_s2r(0, SR_TID_X),
                                          'S2R R0, SR_TID.X  // required for LDCU init'))
 

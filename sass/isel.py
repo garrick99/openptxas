@@ -1125,6 +1125,22 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
         ]
 
     if typ in ('u64', 's64', 'b64'):
+        # WB-5.0: tiny-kernel direct LDC.64 path.  Set by the allocator
+        # when this is the only u64 param AND its only use is a single
+        # MemOp.base in a global memory op.  Loading via LDC.64 avoids
+        # the LDCU.64 + IADD.64 R-UR materialization (saves 2 SASS
+        # instructions) AND lets the kernel skip the unconditional S2R
+        # because no LDCU param load remains in the body.  Matches
+        # ptxas's tight tiny-kernel pattern.
+        if (ctx and ctx.sm_version == 120
+                and dest.name in getattr(ctx, '_direct_ldc_params', set())
+                and dest.name in ra.int_regs):
+            dr = ctx.ra.lo(dest.name)
+            ctx._gpr_written.add(dest.name)
+            return [
+                SassInstr(encode_ldc_64(dr, 0, byte_off),
+                          f'LDC.64 R{dr}, c[0][0x{byte_off:x}]  // {param_name} (tiny direct)'),
+            ]
         # SM_120 preamble interleaving: ALL pointer params are deferred.
         # Each add.u64 / ld.global / atom emits inline LDCU.64 UR6 + IADD.64,
         # reusing UR6 each time. No UR pressure, no clobber hazards.

@@ -89,6 +89,11 @@ class AllocResult:
     num_gprs: int                     # total GPRs used (for .nv.info)
     num_pred: int                     # predicate regs used
     num_uniform: int                  # uniform regs used
+    direct_ldc_params: set = None     # WB-5.0: u64 params eligible for LDC.64
+
+    def __post_init__(self):
+        if self.direct_ldc_params is None:
+            self.direct_ldc_params = set()
 
 
 def _find_ldg_coalesces(fn: Function) -> dict[str, tuple[str, int]]:
@@ -271,6 +276,70 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
         # the linear scan now enforces 4-alignment for f64 vregs that are
         # mma dst tuple bases (and places the lone follower at base+2),
         # so honoring ur_param_regs in DMMA kernels is safe.
+
+    # WB-5.0: tiny-kernel direct LDC.64 path.
+    #
+    # If the kernel has exactly one u64 ld.param dest AND that vreg's
+    # only use is as a single MemOp.base in a global memory op, AND
+    # the kernel has at least one mma whose inputs will be RZ-
+    # substituted by analyze_mma_zero_subst (so the dst quad has no
+    # competing live operands at low GPR slots), use LDC.64 to load
+    # the param directly into a GPR pair.
+    #
+    # Saves:
+    #   - LDCU.64 UR8 for the param
+    #   - IADD.64 R-UR materialization
+    #   - the unconditional S2R R0 (becomes unnecessary because no
+    #     LDCU param load is left in the body)
+    #
+    # Excluded (proven to regress on regs):
+    #   - kernels with a QMMA (its B operand cannot be RZ-substituted
+    #     due to the hardware base<8 constraint, so it claims R4..R5
+    #     and forces the dst quad up by +4)
+    #   - kernels with atom ops (have their own scratch register
+    #     interaction with the addr-mat path)
+    direct_ldc_params: set[str] = set()
+    if sm_version == 120:
+        _u64_param_dests = [
+            inst.dest.name for inst in all_instrs
+            if (inst.op == 'ld' and 'param' in inst.types
+                and any(t in ('u64', 's64', 'b64') for t in inst.types)
+                and isinstance(inst.dest, RegOp)
+                and not inst.pred)
+        ]
+        _has_hmma_imma_dmma = any(
+            inst.op == 'mma' and 'sync' in inst.types
+            and 'e4m3' not in inst.types and 'e5m2' not in inst.types
+            for inst in all_instrs
+        )
+        _has_qmma = any(
+            inst.op == 'mma' and 'sync' in inst.types
+            and ('e4m3' in inst.types or 'e5m2' in inst.types)
+            for inst in all_instrs
+        )
+        _has_atom = any(inst.op == 'atom' for inst in all_instrs)
+        if (len(_u64_param_dests) == 1
+                and _has_hmma_imma_dmma
+                and not _has_qmma
+                and not _has_atom):
+            _pname = _u64_param_dests[0]
+            _n_uses = 0
+            _n_base_uses = 0
+            for inst in all_instrs:
+                for src in inst.srcs:
+                    if (isinstance(src, MemOp)
+                            and isinstance(src.base, str)
+                            and inst.op in ('ld', 'st', 'atom')
+                            and 'global' in inst.types):
+                        bn = src.base if src.base.startswith('%') else f'%{src.base}'
+                        if bn == _pname:
+                            _n_uses += 1
+                            _n_base_uses += 1
+                    elif isinstance(src, RegOp) and src.name == _pname:
+                        _n_uses += 1
+            if _n_uses == 1 and _n_base_uses == 1:
+                direct_ldc_params.add(_pname)
+                ur_param_regs.discard(_pname)
 
     # SM_120: identify f64 param registers that will be loaded into UR via LDCU.64.
     # DFMA R-R-UR-UR handles them directly; no GPR needed.  Keeping these in UR
@@ -731,4 +800,5 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
         num_gprs=next_gpr,
         num_pred=max(next_pred, 1),
         num_uniform=max(next_ur, 5),
+        direct_ldc_params=direct_ldc_params if sm_version == 120 else set(),
     )

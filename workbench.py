@@ -673,6 +673,378 @@ def harness_fmax(ctx: CUDAContext, func, mode: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# WB-9 frontier kernels — broader sampling of memory + atomic + sync
+# patterns to find out whether vecadd_large is the *last* real GAP or
+# just the last gap in the current 15-kernel catalog.
+# ---------------------------------------------------------------------------
+
+# smem_cycle — single-warp shared-memory write/barrier/read cycle.
+# Different shape than smem_exchange (uses param-loaded base value).
+_PTX_SMEM_CYCLE = """
+.version 8.7
+.target sm_120
+.address_size 64
+
+.visible .entry smem_cycle(
+    .param .u64 p_out,
+    .param .u32 p_val
+)
+{
+    .reg .u32 %r<8>;
+    .reg .u64 %rd<4>;
+    .shared .align 4 .b32 smem[256];
+
+    mov.u32 %r0, %tid.x;
+    shl.b32 %r1, %r0, 2;
+
+    ld.param.u32 %r2, [p_val];
+    add.u32 %r2, %r2, %r0;
+
+    st.shared.b32 [%r1], %r2;
+    bar.sync 0;
+
+    ld.shared.b32 %r3, [%r1];
+
+    ld.param.u64 %rd0, [p_out];
+    add.u64 %rd0, %rd0, 0;
+    cvt.u64.u32 %rd1, %r1;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r3;
+    ret;
+}
+"""
+
+
+def harness_smem_cycle(ctx: CUDAContext, func, mode: str) -> dict:
+    """Each thread writes (param+tid) to smem, barrier, reads back, stores."""
+    N = 32
+    base_val = 100
+    d_out = ctx.alloc(N * 4)
+    try:
+        ctx.copy_to(d_out, b"\x00" * (N * 4))
+        a_out = ctypes.c_uint64(d_out)
+        a_val = ctypes.c_uint32(base_val)
+        args, _hold = _make_args(a_out, a_val)
+        ctx.cuda.cuLaunchKernel(func, 1, 1, 1, N, 1, 1, 256 * 4, None, args, None)
+        assert ctx.sync() == 0, "smem_cycle kernel crashed"
+        out = struct.unpack(f"<{N}I", ctx.copy_from(d_out, N * 4))
+        correct = all(out[i] == base_val + i for i in range(N))
+        time_ms = None
+        if mode == "bench":
+            time_ms = _bench_launch(
+                ctx, func, (1, 1, 1), (N, 1, 1), args, smem=256 * 4,
+            )
+    finally:
+        ctx.free(d_out)
+    return {"correct": correct, "time_ms": time_ms}
+
+
+# bar_ldc_xor — barrier + late LDC of param + XOR.
+# Tests the LDC-after-bar-sync correctness path that historically was
+# poison-prone (FB-3 era bug).
+_PTX_BAR_LDC_XOR = """
+.version 8.7
+.target sm_120
+.address_size 64
+
+.visible .entry bar_ldc_xor(
+    .param .u64 p_out,
+    .param .u32 p_n,
+    .param .u32 p_mask
+)
+{
+    .reg .u32 %r<8>;
+    .reg .u64 %rd<4>;
+    .reg .pred %p0;
+    .shared .align 4 .b32 smem[256];
+
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r5, [p_n];
+    setp.ge.u32 %p0, %r0, %r5;
+    @%p0 bra DONE;
+
+    shl.b32 %r1, %r0, 2;
+    add.u32 %r2, %r0, 42;
+    st.shared.b32 [%r1], %r2;
+    bar.sync 0;
+
+    ld.param.u32 %r3, [p_mask];
+    xor.b32 %r4, %r2, %r3;
+
+    ld.param.u64 %rd0, [p_out];
+    cvt.u64.u32 %rd1, %r1;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r4;
+DONE:
+    ret;
+}
+"""
+
+
+def harness_bar_ldc_xor(ctx: CUDAContext, func, mode: str) -> dict:
+    """tid+42 -> shared, barrier, then xor with mask, store. Verify."""
+    N = 32
+    mask = 0x55
+    d_out = ctx.alloc(N * 4)
+    try:
+        ctx.copy_to(d_out, b"\x00" * (N * 4))
+        a_out  = ctypes.c_uint64(d_out)
+        a_n    = ctypes.c_uint32(N)
+        a_mask = ctypes.c_uint32(mask)
+        args, _hold = _make_args(a_out, a_n, a_mask)
+        ctx.cuda.cuLaunchKernel(func, 1, 1, 1, N, 1, 1, 256 * 4, None, args, None)
+        assert ctx.sync() == 0, "bar_ldc_xor kernel crashed"
+        out = struct.unpack(f"<{N}I", ctx.copy_from(d_out, N * 4))
+        correct = all(out[tid] == ((tid + 42) ^ mask) & 0xFFFFFFFF
+                      for tid in range(N))
+        time_ms = None
+        if mode == "bench":
+            time_ms = _bench_launch(
+                ctx, func, (1, 1, 1), (N, 1, 1), args, smem=256 * 4,
+            )
+    finally:
+        ctx.free(d_out)
+    return {"correct": correct, "time_ms": time_ms}
+
+
+# dual_ldg64_dadd — two LDG.E.64 -> DADD -> STG.E.64.
+# FP64 sibling of multi_ldg.  Tests that the second LDG isn't zeroed
+# by scoreboard collision (the FB-3 LDG dual-load bug).
+_PTX_DUAL_LDG64_DADD = """
+.version 8.7
+.target sm_120
+.address_size 64
+
+.visible .entry dual_ldg64_dadd(
+    .param .u64 p_out,
+    .param .u64 p_a,
+    .param .u64 p_b,
+    .param .u32 p_n
+)
+{
+    .reg .u32 %r<4>;
+    .reg .u64 %rd<16>;
+    .reg .f64 %fd<4>;
+    .reg .pred %p0;
+
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [p_n];
+    setp.ge.u32 %p0, %r0, %r1;
+    @%p0 bra DONE;
+
+    cvt.u64.u32 %rd0, %r0;
+    shl.b64 %rd0, %rd0, 3;
+
+    ld.param.u64 %rd1, [p_a];
+    add.u64 %rd2, %rd1, %rd0;
+    ld.global.f64 %fd0, [%rd2];
+
+    ld.param.u64 %rd3, [p_b];
+    add.u64 %rd4, %rd3, %rd0;
+    ld.global.f64 %fd1, [%rd4];
+
+    add.f64 %fd2, %fd0, %fd1;
+
+    ld.param.u64 %rd5, [p_out];
+    add.u64 %rd6, %rd5, %rd0;
+    st.global.f64 [%rd6], %fd2;
+DONE:
+    ret;
+}
+"""
+
+
+def harness_dual_ldg64_dadd(ctx: CUDAContext, func, mode: str) -> dict:
+    """Per-thread f64 a[i] + b[i]; verify."""
+    N = 32
+    a_vals = [float(i) * 1.5 + 100.0 for i in range(N)]
+    b_vals = [float(i) * 2.5 + 200.0 for i in range(N)]
+    d_a = ctx.alloc(N * 8)
+    d_b = ctx.alloc(N * 8)
+    d_out = ctx.alloc(N * 8)
+    try:
+        ctx.copy_to(d_a, struct.pack(f"<{N}d", *a_vals))
+        ctx.copy_to(d_b, struct.pack(f"<{N}d", *b_vals))
+        ctx.copy_to(d_out, b"\x00" * (N * 8))
+        a_out = ctypes.c_uint64(d_out)
+        a_a   = ctypes.c_uint64(d_a)
+        a_b   = ctypes.c_uint64(d_b)
+        a_n   = ctypes.c_uint32(N)
+        args, _hold = _make_args(a_out, a_a, a_b, a_n)
+        ctx.cuda.cuLaunchKernel(func, 1, 1, 1, N, 1, 1, 0, None, args, None)
+        assert ctx.sync() == 0, "dual_ldg64_dadd kernel crashed"
+        results = struct.unpack(f"<{N}d", ctx.copy_from(d_out, N * 8))
+        correct = all(abs(results[i] - (a_vals[i] + b_vals[i])) < 1e-9
+                      for i in range(N))
+        time_ms = None
+        if mode == "bench":
+            time_ms = _bench_launch(ctx, func, (1, 1, 1), (N, 1, 1), args)
+    finally:
+        ctx.free(d_a)
+        ctx.free(d_b)
+        ctx.free(d_out)
+    return {"correct": correct, "time_ms": time_ms}
+
+
+# multi_block_atomic — 64 blocks x 256 threads each atomic-add 1.
+# Grid-wide contention pattern (vs the single-warp atom_or / atomg_add).
+_PTX_MULTI_BLOCK_ATOMIC = """
+.version 8.7
+.target sm_120
+.address_size 64
+
+.visible .entry multi_block_atomic(
+    .param .u64 p_counter
+)
+{
+    .reg .u32 %r<4>;
+    .reg .u64 %rd<4>;
+
+    ld.param.u64 %rd0, [p_counter];
+    add.u64 %rd0, %rd0, 0;
+
+    mov.u32 %r0, 1;
+    atom.global.add.u32 %r1, [%rd0], %r0;
+    ret;
+}
+"""
+
+
+def harness_multi_block_atomic(ctx: CUDAContext, func, mode: str) -> dict:
+    """64 blocks * 256 threads atomic-add 1 -> counter == 16384."""
+    num_blocks = 64
+    block_size = 256
+    expected = num_blocks * block_size
+    d = ctx.alloc(4)
+    try:
+        ctx.copy_to(d, struct.pack("<I", 0))
+        a_d = ctypes.c_uint64(d)
+        args, _hold = _make_args(a_d)
+        ctx.cuda.cuLaunchKernel(func, num_blocks, 1, 1, block_size, 1, 1,
+                                0, None, args, None)
+        assert ctx.sync() == 0, "multi_block_atomic kernel crashed"
+        val = struct.unpack("<I", ctx.copy_from(d, 4))[0]
+        correct = (val == expected)
+        time_ms = None
+        if mode == "bench":
+            # Reset between runs is too expensive; just time a fresh launch.
+            time_ms = _bench_launch(
+                ctx, func, (num_blocks, 1, 1), (block_size, 1, 1), args
+            )
+    finally:
+        ctx.free(d)
+    return {"correct": correct, "time_ms": time_ms}
+
+
+# atom_cas64 — 64-bit compare-and-swap.  Distinct atomic class from
+# atom.add / atom.or; exercises the CAS-64 encoding path.
+_PTX_ATOM_CAS64 = """
+.version 8.7
+.target sm_120
+.address_size 64
+
+.visible .entry atom_cas64_test(
+    .param .u64 p_addr,
+    .param .u64 p_cmp,
+    .param .u64 p_new,
+    .param .u64 p_out
+)
+{
+    .reg .u64 %rd<8>;
+    .reg .u32 %r<4>;
+
+    ld.param.u64 %rd0, [p_addr];
+    ld.param.u64 %rd1, [p_cmp];
+    ld.param.u64 %rd2, [p_new];
+
+    add.u64 %rd0, %rd0, 0;
+    add.u64 %rd1, %rd1, 0;
+    add.u64 %rd2, %rd2, 0;
+
+    atom.global.cas.b64 %rd3, [%rd0], %rd1, %rd2;
+    ld.param.u64 %rd4, [p_out];
+    st.global.u64 [%rd4], %rd3;
+    ret;
+}
+"""
+
+
+def harness_atom_cas64(ctx: CUDAContext, func, mode: str) -> dict:
+    """Successful CAS: returns old value, mem becomes new."""
+    old_val = 0xDEADBEEFCAFEBABE
+    cmp_val = 0xDEADBEEFCAFEBABE
+    new_val = 0x1234567890ABCDEF
+    d_addr = ctx.alloc(8)
+    d_out = ctx.alloc(8)
+    try:
+        ctx.copy_to(d_addr, struct.pack("<Q", old_val))
+        ctx.copy_to(d_out, struct.pack("<Q", 0))
+        a_addr = ctypes.c_uint64(d_addr)
+        a_cmp  = ctypes.c_uint64(cmp_val)
+        a_new  = ctypes.c_uint64(new_val)
+        a_out  = ctypes.c_uint64(d_out)
+        args, _hold = _make_args(a_addr, a_cmp, a_new, a_out)
+        ctx.cuda.cuLaunchKernel(func, 1, 1, 1, 1, 1, 1, 0, None, args, None)
+        assert ctx.sync() == 0, "atom_cas64 kernel crashed"
+        returned = struct.unpack("<Q", ctx.copy_from(d_out, 8))[0]
+        mem_now  = struct.unpack("<Q", ctx.copy_from(d_addr, 8))[0]
+        correct = (returned == old_val and mem_now == new_val)
+        time_ms = None
+        if mode == "bench":
+            time_ms = _bench_launch(ctx, func, (1, 1, 1), (1, 1, 1), args)
+    finally:
+        ctx.free(d_addr)
+        ctx.free(d_out)
+    return {"correct": correct, "time_ms": time_ms}
+
+
+# redux_sum — REDUX.SYNC.ADD warp aggregation (vs shfl-based warp_reduce).
+_PTX_REDUX_SUM = """
+.version 8.7
+.target sm_120
+.address_size 64
+
+.visible .entry redux_sum_kernel(
+    .param .u64 p_out,
+    .param .u32 p_val
+)
+{
+    .reg .u32 %r<4>;
+    .reg .u64 %rd<2>;
+
+    ld.param.u64    %rd0, [p_out];
+    ld.param.u32    %r0, [p_val];
+
+    redux.sync.add.s32 %r1, %r0, 0xffffffff;
+
+    st.global.u32 [%rd0], %r1;
+    ret;
+}
+"""
+
+
+def harness_redux_sum(ctx: CUDAContext, func, mode: str) -> dict:
+    """Single thread: redux.sync.add.s32 of 1 lane == input value."""
+    p_val = 42
+    d_out = ctx.alloc(4)
+    try:
+        ctx.copy_to(d_out, b"\x00\x00\x00\x00")
+        a_out = ctypes.c_uint64(d_out)
+        a_val = ctypes.c_uint32(p_val)
+        args, _hold = _make_args(a_out, a_val)
+        ctx.cuda.cuLaunchKernel(func, 1, 1, 1, 1, 1, 1, 0, None, args, None)
+        assert ctx.sync() == 0, "redux_sum kernel crashed"
+        result = struct.unpack("<I", ctx.copy_from(d_out, 4))[0]
+        correct = (result == p_val)
+        time_ms = None
+        if mode == "bench":
+            time_ms = _bench_launch(ctx, func, (1, 1, 1), (1, 1, 1), args)
+    finally:
+        ctx.free(d_out)
+    return {"correct": correct, "time_ms": time_ms}
+
+
+# ---------------------------------------------------------------------------
 # IMMA / DMMA / QMMA zero kernels (sibling tensor cores).  Same all-zero
 # input pattern as hmma_zero — exercises every tensor backend variant.
 # ---------------------------------------------------------------------------
@@ -1109,6 +1481,49 @@ KERNELS: dict[str, dict] = {
         "kernel_name": "fmax_test",
         "harness": harness_fmax,
     },
+    # WB-9 frontier additions
+    "smem_cycle": {
+        "display": "smem write/barrier/read cycle (param-base)",
+        "ptx_path": None,
+        "ptx_inline": _PTX_SMEM_CYCLE,
+        "kernel_name": "smem_cycle",
+        "harness": harness_smem_cycle,
+    },
+    "bar_ldc_xor": {
+        "display": "bar.sync + LDC param + XOR",
+        "ptx_path": None,
+        "ptx_inline": _PTX_BAR_LDC_XOR,
+        "kernel_name": "bar_ldc_xor",
+        "harness": harness_bar_ldc_xor,
+    },
+    "dual_ldg64_dadd": {
+        "display": "dual LDG.E.64 + DADD (FP64 multi-load)",
+        "ptx_path": None,
+        "ptx_inline": _PTX_DUAL_LDG64_DADD,
+        "kernel_name": "dual_ldg64_dadd",
+        "harness": harness_dual_ldg64_dadd,
+    },
+    "multi_block_atomic": {
+        "display": "64-block atom.add scatter (grid contention)",
+        "ptx_path": None,
+        "ptx_inline": _PTX_MULTI_BLOCK_ATOMIC,
+        "kernel_name": "multi_block_atomic",
+        "harness": harness_multi_block_atomic,
+    },
+    "atom_cas64": {
+        "display": "atom.global.cas.b64 (64-bit CAS)",
+        "ptx_path": None,
+        "ptx_inline": _PTX_ATOM_CAS64,
+        "kernel_name": "atom_cas64_test",
+        "harness": harness_atom_cas64,
+    },
+    "redux_sum": {
+        "display": "redux.sync.add.s32 (warp REDUX)",
+        "ptx_path": None,
+        "ptx_inline": _PTX_REDUX_SUM,
+        "kernel_name": "redux_sum_kernel",
+        "harness": harness_redux_sum,
+    },
 }
 
 
@@ -1362,6 +1777,14 @@ SUITES: dict[str, list[str]] = {
         "cp_async", "warp_reduce",
         "atom_or", "atomg_add",
         "vecadd_large", "multi_ldg", "smem_exchange", "fmax",
+        # WB-9 frontier
+        "smem_cycle", "bar_ldc_xor", "dual_ldg64_dadd",
+        "multi_block_atomic", "atom_cas64", "redux_sum",
+    ],
+    # WB-9: the 6 new kernels in isolation
+    "frontier": [
+        "smem_cycle", "bar_ldc_xor", "dual_ldg64_dadd",
+        "multi_block_atomic", "atom_cas64", "redux_sum",
     ],
 }
 

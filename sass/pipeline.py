@@ -1062,8 +1062,10 @@ def compile_function(fn: Function, verbose: bool = False,
     # 3. Concatenate SASS bytes
     # FB-4.2: field-safe register compaction. Only runs if all opcodes have
     # GPR field metadata. Skips entirely on coverage gating failure.
+    # FB-4.3: per-kernel compaction report (kernel name + counters).
     from sass.compact import compact as _fb42_compact
-    sass_instrs, _compact_count = _fb42_compact(sass_instrs, verbose=verbose)
+    sass_instrs, _compact_count = _fb42_compact(
+        sass_instrs, verbose=verbose, kernel_name=fn.name)
 
     sass_bytes = b''.join(si.raw for si in sass_instrs)
 
@@ -1116,23 +1118,27 @@ def compile_function(fn: Function, verbose: bool = False,
                 s2r_offset = i
                 break
 
-    # FB-4.4: post-SASS register accounting. Scan instruction comments for
-    # actual R## references. Returns the true highest register used.
-    import re as _re
-    _used_regs: set[int] = set()
-    for _si in sass_instrs:
-        for _m in _re.finditer(r'R(\d+)', _si.comment or ''):
-            _r = int(_m.group(1))
-            if _r < 254:  # exclude RZ (255)
-                _used_regs.add(_r)
-    _real_max_reg = max(_used_regs) if _used_regs else -1
-    _real_count = _real_max_reg + 1 if _real_max_reg >= 0 else 0
+    # FB-4.4: post-SASS register accounting. Use compaction's count when
+    # compaction was attempted (it knows about implicit hi halves of pairs).
+    # Otherwise fall back to comment scan (pessimistic for unknown opcodes).
     _allocator_count = max(alloc.num_gprs, ctx._next_gpr,
                            getattr(ctx, '_scratch_highwater', 0))
-    _final_gprs = max(_real_count, 2)
+    if _compact_count > 0:
+        _final_gprs = max(_compact_count, 2)
+    else:
+        import re as _re
+        _used_regs: set[int] = set()
+        for _si in sass_instrs:
+            for _m in _re.finditer(r'(?<!U)R(\d+)', _si.comment or ''):
+                _r = int(_m.group(1))
+                if _r < 254:
+                    _used_regs.add(_r)
+        _real_max_reg = max(_used_regs) if _used_regs else -1
+        _real_count = _real_max_reg + 1 if _real_max_reg >= 0 else 0
+        _final_gprs = max(_real_count, 2)
     if verbose and _final_gprs != _allocator_count:
-        print(f"[pipeline] FB-4.4: SASS scan reports {_real_count} regs, "
-              f"allocator reported {_allocator_count} -> using {_final_gprs}")
+        print(f"[pipeline] FB-4.4: final regs={_final_gprs} "
+              f"(allocator reported {_allocator_count})")
     # For deferred-param kernels, the actual UR usage is lower than regalloc's
     # estimate (deferred params use post-EXIT URs, not pre-allocated ones).
     # Cap num_uniform to ctx._next_ur to avoid LAUNCH_OUT_OF_RESOURCES (716).

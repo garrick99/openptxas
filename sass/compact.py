@@ -77,16 +77,18 @@ def opcode_of(raw: bytes) -> int:
     return (raw[0] | (raw[1] << 8)) & 0xFFF
 
 
-def kernel_is_compactable(sass_instrs: list) -> tuple[bool, int | None]:
+def kernel_is_compactable(sass_instrs: list) -> tuple[bool, set[int]]:
     """Check if all instructions in the kernel have field metadata.
 
-    Returns (True, None) if fully covered, else (False, blocking_opcode).
+    Returns (covered, uncovered_opcodes).
+    covered is True iff uncovered_opcodes is empty.
     """
+    uncovered: set[int] = set()
     for si in sass_instrs:
         op = opcode_of(si.raw)
         if op not in GPR_FIELDS:
-            return False, op
-    return True, None
+            uncovered.add(op)
+    return (len(uncovered) == 0), uncovered
 
 
 def _is_64bit_field(name: str) -> bool:
@@ -178,7 +180,8 @@ def apply_remap(sass_instrs: list, remap: dict[int, int]) -> tuple[list, int]:
     import re
 
     new_instrs = []
-    n_changed = 0
+    n_insts_changed = 0
+    n_fields_rewritten = 0
     for si in sass_instrs:
         op = opcode_of(si.raw)
         fields = GPR_FIELDS.get(op, [])
@@ -193,6 +196,7 @@ def apply_remap(sass_instrs: list, remap: dict[int, int]) -> tuple[list, int]:
             if old in remap and remap[old] != old:
                 raw[byte_pos] = remap[old]
                 changed = True
+                n_fields_rewritten += 1
 
         if not changed:
             new_instrs.append(si)
@@ -200,33 +204,93 @@ def apply_remap(sass_instrs: list, remap: dict[int, int]) -> tuple[list, int]:
 
         # Update comment to reflect new register numbers
         comment = si.comment or ''
-        # Replace in descending order of old reg id to avoid substring collisions
         for old in sorted(remap.keys(), reverse=True):
             new = remap[old]
             if new != old:
                 comment = re.sub(rf'R{old}(?!\d)', f'R{new}', comment)
 
         new_instrs.append(SassInstr(bytes(raw), comment))
-        n_changed += 1
+        n_insts_changed += 1
 
-    return new_instrs, n_changed
+    return new_instrs, n_insts_changed, n_fields_rewritten
 
 
-def compact(sass_instrs: list, verbose: bool = False) -> tuple[list, int]:
+class CompactReport:
+    """Per-kernel compaction report (Phase 0 of FB-4.3)."""
+    def __init__(self, kernel_name: str):
+        self.kernel_name = kernel_name
+        self.attempted = False      # did we try compaction?
+        self.covered = False        # all opcodes have metadata?
+        self.uncovered: set[int] = set()
+        self.regs_before = 0
+        self.regs_after = 0
+        self.sass_before = 0
+        self.sass_after = 0
+        self.total_insts = 0
+        self.compacted_insts = 0
+        self.gpr_fields_rewritten = 0
+        self.correct: str = 'unknown'  # 'PASS', 'FAIL', 'unknown'
+
+    def format(self) -> str:
+        lines = [f"[compact] kernel={self.kernel_name}"]
+        lines.append(f"  attempted: {'yes' if self.attempted else 'no'}")
+        lines.append(f"  covered: {'yes' if self.covered else 'no'}")
+        if self.uncovered:
+            opcode_list = ', '.join(f'0x{op:03x}' for op in sorted(self.uncovered))
+            lines.append(f"  uncovered: [{opcode_list}]")
+        else:
+            lines.append(f"  uncovered: []")
+        lines.append(f"  regs: {self.regs_before} -> {self.regs_after}")
+        lines.append(f"  sass: {self.sass_before} -> {self.sass_after}")
+        lines.append(f"  total_insts: {self.total_insts}")
+        lines.append(f"  compacted_insts: {self.compacted_insts}")
+        lines.append(f"  gpr_fields_rewritten: {self.gpr_fields_rewritten}")
+        lines.append(f"  correct: {self.correct}")
+        return '\n'.join(lines)
+
+
+def compact(sass_instrs: list,
+            verbose: bool = False,
+            kernel_name: str = '<unknown>',
+            report: 'CompactReport | None' = None) -> tuple[list, int]:
     """Run field-safe register compaction on a kernel.
 
     Returns (new_sass_instrs, new_num_gprs).
-    If coverage gating fails, returns (sass_instrs, current_max + 1) unchanged.
-    """
-    ok, blocking = kernel_is_compactable(sass_instrs)
-    if not ok:
-        if verbose:
-            print(f"[compact] coverage gate blocked: opcode 0x{blocking:03x}")
-        used, _ = collect_used_gprs(sass_instrs)
-        return sass_instrs, (max(used) + 1 if used else 0)
+    If coverage gating fails, returns sass_instrs unchanged.
 
+    If `report` is provided, fills it with per-kernel diagnostics.
+    """
+    if report is None:
+        report = CompactReport(kernel_name)
+    else:
+        report.kernel_name = kernel_name
+
+    report.total_insts = len(sass_instrs)
+    report.sass_before = len(sass_instrs)
+    report.sass_after = len(sass_instrs)  # compaction doesn't change SASS count
+
+    # Coverage gating
+    covered, uncovered = kernel_is_compactable(sass_instrs)
+    report.covered = covered
+    report.uncovered = uncovered
+
+    # Baseline register count (what we'd have without compaction)
+    used_pre, _ = collect_used_gprs(sass_instrs)
+    report.regs_before = (max(used_pre) + 1) if used_pre else 0
+    report.regs_after = report.regs_before  # default: no change
+
+    if not covered:
+        report.attempted = False
+        if verbose:
+            print(report.format())
+        return sass_instrs, report.regs_before
+
+    # Covered — attempt compaction
+    report.attempted = True
     used, pair_bases = collect_used_gprs(sass_instrs)
     if not used:
+        if verbose:
+            print(report.format())
         return sass_instrs, 0
 
     remap = build_dense_remap(used, pair_bases)
@@ -234,10 +298,17 @@ def compact(sass_instrs: list, verbose: bool = False) -> tuple[list, int]:
     max_after = max(remap.values())
 
     if max_after == max_before:
+        # Already dense — no rewrite needed
+        report.regs_after = max_before + 1
+        if verbose:
+            print(report.format())
         return sass_instrs, max_before + 1
 
-    new_instrs, n_changed = apply_remap(sass_instrs, remap)
+    new_instrs, n_insts, n_fields = apply_remap(sass_instrs, remap)
+    report.compacted_insts = n_insts
+    report.gpr_fields_rewritten = n_fields
+    report.regs_after = max_after + 1
+
     if verbose:
-        print(f"[compact] used={len(used)} pairs={len(pair_bases)} "
-              f"max {max_before}->{max_after} (changed {n_changed} instrs)")
+        print(report.format())
     return new_instrs, max_after + 1

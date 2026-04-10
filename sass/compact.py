@@ -128,6 +128,17 @@ GPR_FIELDS: dict[int, list[tuple[int, str]]] = {
     # byte[8] = ur_desc (UR, not GPR). bytes[4-7] = unused.
     0xfae: [(2, 'smem_addr'), (3, 'addr64')],                     # LDGSTS.E (cp.async)
 
+    # --- Tensor core: HMMA (FP16 matrix multiply-accumulate) ---
+    # Opcode 0x23c covers multiple shapes:
+    #   byte[9] = 0x10 → m16n8k8 (A: 2 regs, B: 1 reg)
+    #   byte[9] = 0x18 → m16n8k16 (A: 4 regs, B: 2 regs)
+    # byte[2] = dst (4-register QUAD group: dst..dst+3)
+    # byte[3] = src_a (k8: 2 regs, k16: 4 regs) — dispatched via byte[9]
+    # byte[4] = src_b (k8: 1 reg, k16: 2 regs) — dispatched via byte[9]
+    # byte[8] = src_c (4-register QUAD group: src_c..src_c+3)
+    # Width-dependent fields use special names handled in collect_used_gprs.
+    0x23c: [(2, 'dst_quad'), (3, 'hmma_a'), (4, 'hmma_b'), (8, 'src_c_quad')],
+
     # --- BRA variants (no GPR fields) ---
     0x547: [],  # BRA (predicated/relative variant)
 
@@ -174,21 +185,43 @@ def _is_64bit_field(name: str) -> bool:
     return '64' in name
 
 
+def _is_quad_field(name: str) -> bool:
+    return 'quad' in name
+
+
 def _ldg_stg_data_is_64(raw: bytes) -> bool:
     """For LDG/STG opcodes, byte[9] indicates data width: 0x19=32, 0x1b=64, 0x1d=128."""
     b9 = raw[9]
     return b9 in (0x1b, 0x1d)  # 64-bit or 128-bit
 
 
-def collect_used_gprs(sass_instrs: list) -> tuple[set[int], set[int]]:
+def _hmma_field_width(raw: bytes, name: str) -> int:
+    """Return the number of registers for an HMMA field based on shape.
+
+    HMMA opcode 0x23c has two shape variants:
+      byte[9] = 0x10 → m16n8k8  (A: 2 regs, B: 1 reg)
+      byte[9] = 0x18 → m16n8k16 (A: 4 regs, B: 2 regs)
+    """
+    b9 = raw[9]
+    if name == 'hmma_a':
+        return 4 if b9 == 0x18 else 2
+    if name == 'hmma_b':
+        return 2 if b9 == 0x18 else 1
+    return 1
+
+
+def collect_used_gprs(sass_instrs: list) -> tuple[set[int], set[int], set[int]]:
     """Collect all GPR indices actually referenced.
 
-    Returns (used_regs, pair_bases) where pair_bases is the set of register
-    indices that are even-aligned bases of 64-bit pairs (their hi half is
-    implicitly used at base+1).
+    Returns (used_regs, pair_bases, quad_bases):
+      - used_regs: all registers referenced (including implicit hi halves and
+        quad-group members)
+      - pair_bases: even-aligned bases of 64-bit pairs (implicit +1)
+      - quad_bases: 4-aligned bases of 4-register groups (implicit +1, +2, +3)
     """
     used: set[int] = set()
     pair_bases: set[int] = set()
+    quad_bases: set[int] = set()
     for si in sass_instrs:
         op = opcode_of(si.raw)
         fields = GPR_FIELDS.get(op, [])
@@ -196,56 +229,99 @@ def collect_used_gprs(sass_instrs: list) -> tuple[set[int], set[int]]:
             reg = si.raw[byte_pos]
             if reg >= 254:
                 continue
-            # Determine if this field is 64-bit
+            used.add(reg)
+
+            # Quad group: 4 consecutive registers
+            if _is_quad_field(name):
+                used.add(reg + 1)
+                used.add(reg + 2)
+                used.add(reg + 3)
+                if reg % 4 == 0:
+                    quad_bases.add(reg)
+                continue
+
+            # 64-bit pair
             is_64 = False
             if _is_64bit_field(name):
                 is_64 = True
             elif name in ('dst_var', 'data_var') and op in (0x981, 0x986):
                 is_64 = _ldg_stg_data_is_64(si.raw)
-            used.add(reg)
             if is_64:
-                used.add(reg + 1)  # implicit hi half
+                used.add(reg + 1)
                 if reg % 2 == 0:
                     pair_bases.add(reg)
-    return used, pair_bases
+                continue
+
+            # HMMA width-dependent fields (hmma_a, hmma_b)
+            if name in ('hmma_a', 'hmma_b') and op == 0x23c:
+                width = _hmma_field_width(si.raw, name)
+                for i in range(1, width):
+                    used.add(reg + i)
+                # Track as a group so the base stays aligned
+                # (A and B don't require strict quad alignment, but keeping
+                # the group consecutive is essential)
+                if width >= 2:
+                    pair_bases.add(reg)  # at least pair alignment
+                if width == 4 and reg % 4 == 0:
+                    quad_bases.add(reg)
+    return used, pair_bases, quad_bases
 
 
 def build_dense_remap(used_regs: set[int],
                       pair_bases: set[int],
+                      quad_bases: set[int] = None,
                       preserve: set[int] = None) -> dict[int, int]:
     """Build a remap from old register indices to dense new indices.
 
     R0 and R1 are always preserved.
-    Pair bases (from opcode metadata) are kept consecutive and even-aligned.
+    Quad bases are kept as 4 consecutive regs, 4-aligned.
+    Pair bases are kept as 2 consecutive regs, 2-aligned.
     """
+    if quad_bases is None:
+        quad_bases = set()
     if preserve is None:
         preserve = {0, 1}
 
     remap: dict[int, int] = {r: r for r in preserve}
     to_compact = sorted(r for r in used_regs if r not in preserve)
 
+    # Precompute: which registers are hi-halves / quad-followers
+    # so we skip them (they get assigned together with their base).
+    followers: set[int] = set()
+    for base in quad_bases:
+        for i in (1, 2, 3):
+            if (base + i) in used_regs:
+                followers.add(base + i)
+    for base in pair_bases:
+        if base in quad_bases:
+            continue  # already handled above
+        if (base + 1) in used_regs:
+            followers.add(base + 1)
+
     next_slot = 2
-    assigned: set[int] = set()
     for r in to_compact:
-        if r in assigned:
+        if r in remap or r in followers:
             continue
-        if r in pair_bases:
-            # Pair: assign even-aligned, take both lo and hi
+        if r in quad_bases:
+            # Align to 4
+            if next_slot % 4 != 0:
+                next_slot = (next_slot + 3) & ~3
+            remap[r] = next_slot
+            for i in (1, 2, 3):
+                if (r + i) in used_regs:
+                    remap[r + i] = next_slot + i
+            next_slot += 4
+        elif r in pair_bases:
+            # Align to 2
             if next_slot % 2 != 0:
                 next_slot += 1
             remap[r] = next_slot
             if (r + 1) in used_regs:
                 remap[r + 1] = next_slot + 1
-                assigned.add(r + 1)
-            assigned.add(r)
             next_slot += 2
-        elif (r - 1) in pair_bases and (r - 1) in assigned:
-            # Already handled as pair hi
-            continue
         else:
-            # Singleton: take next slot
+            # Singleton
             remap[r] = next_slot
-            assigned.add(r)
             next_slot += 1
     return remap
 
@@ -354,7 +430,7 @@ def compact(sass_instrs: list,
     report.uncovered = uncovered
 
     # Baseline register count (what we'd have without compaction)
-    used_pre, _ = collect_used_gprs(sass_instrs)
+    used_pre, _, _ = collect_used_gprs(sass_instrs)
     report.regs_before = (max(used_pre) + 1) if used_pre else 0
     report.regs_after = report.regs_before  # default: no change
 
@@ -366,13 +442,13 @@ def compact(sass_instrs: list,
 
     # Covered — attempt compaction
     report.attempted = True
-    used, pair_bases = collect_used_gprs(sass_instrs)
+    used, pair_bases, quad_bases = collect_used_gprs(sass_instrs)
     if not used:
         if verbose:
             print(report.format())
         return sass_instrs, 0
 
-    remap = build_dense_remap(used, pair_bases)
+    remap = build_dense_remap(used, pair_bases, quad_bases)
     max_before = max(used)
     max_after = max(remap.values())
 

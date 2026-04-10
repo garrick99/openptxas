@@ -98,7 +98,11 @@ GPR_FIELDS: dict[int, list[tuple[int, str]]] = {
     0x309: [(2, 'dst'), (4, 'src0')],                             # POPC
     0x300: [(2, 'dst'), (4, 'src0')],                             # FLO
     0x301: [(2, 'dst'), (4, 'src0')],                             # BREV
-    0x310: [(2, 'dst'), (4, 'src0')],                             # F2F.F64.F32
+    # F2F has width-dispatched operands via byte[9]:
+    #   raw[9] = 0x18 → F2F.F64.F32 (widening): dst is f64 pair, src is f32
+    #   raw[9] = 0x10 → F2F.F32.F64 (narrowing): dst is f32, src is f64 pair
+    # Use named fields handled in collect_used_gprs.
+    0x310: [(2, 'f2f_dst'), (4, 'f2f_src')],
 
     # PRMT has imm at byte[4-7]; sources at byte[3] and byte[8]
     0x416: [(2, 'dst'), (3, 'src0'), (8, 'src2')],                # PRMT
@@ -250,6 +254,21 @@ def _hmma_field_width(raw: bytes, name: str) -> int:
     return 1
 
 
+def _f2f_field_width(raw: bytes, name: str) -> int:
+    """Return the number of registers for an F2F field based on shape.
+
+    F2F opcode 0x310 has two width variants:
+      byte[9] = 0x18 → F2F.F64.F32 (widening): dst is f64 pair, src is f32
+      byte[9] = 0x10 → F2F.F32.F64 (narrowing): dst is f32, src is f64 pair
+    """
+    b9 = raw[9]
+    if name == 'f2f_dst':
+        return 2 if b9 == 0x18 else 1
+    if name == 'f2f_src':
+        return 2 if b9 == 0x10 else 1
+    return 1
+
+
 def collect_used_gprs(sass_instrs: list) -> tuple[set[int], set[int], set[int]]:
     """Collect all GPR indices actually referenced.
 
@@ -304,6 +323,16 @@ def collect_used_gprs(sass_instrs: list) -> tuple[set[int], set[int], set[int]]:
                     pair_bases.add(reg)  # at least pair alignment
                 if width == 4 and reg % 4 == 0:
                     quad_bases.add(reg)
+                continue
+
+            # F2F width-dependent fields (f2f_dst, f2f_src)
+            if name in ('f2f_dst', 'f2f_src') and op == 0x310:
+                width = _f2f_field_width(si.raw, name)
+                if width == 2:
+                    used.add(reg + 1)
+                    if reg % 2 == 0:
+                        pair_bases.add(reg)
+                continue
     return used, pair_bases, quad_bases
 
 

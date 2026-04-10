@@ -267,19 +267,10 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
                 for extra in ur_srcs[1:]:
                     ur_param_regs.discard(extra)
 
-        # FB-5.1 opt-out: kernels containing an mma.sync with f64 operands
-        # (DMMA) currently rely on the linear scan landing the f64 dst pair
-        # at a 4-aligned base by *accident* (the existing quad-alignment
-        # logic only covers 32-bit dest tuples — HMMA / IMMA / QMMA).
-        # Honoring ur_param_regs in DMMA kernels can pull the f64 dst down
-        # to a non-4-aligned base, which the hardware rejects with ERR715.
-        # Quad handling is explicitly out of scope for FB-5.1, so just skip
-        # the honoring entirely for these kernels.
-        for inst in all_instrs:
-            if (inst.op == 'mma' and 'sync' in inst.types
-                    and 'f64' in inst.types):
-                ur_param_regs.clear()
-                break
+        # FB-5.2: DMMA opt-out is no longer needed.  The 64-bit branch of
+        # the linear scan now enforces 4-alignment for f64 vregs that are
+        # mma dst tuple bases (and places the lone follower at base+2),
+        # so honoring ur_param_regs in DMMA kernels is safe.
 
     # SM_120: identify f64 param registers that will be loaded into UR via LDCU.64.
     # DFMA R-R-UR-UR handles them directly; no GPR needed.  Keeping these in UR
@@ -340,27 +331,39 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
             if only_add64:
                 cbuf_only_regs.add(pname)
 
-    # Collect registers that require 4-register alignment (HMMA/DMMA/IMMA dest).
-    # mma.sync.aligned instructions write a 4-register accumulator; hardware
-    # requires dest % 4 == 0.  We note the first register of the dest tuple.
-    # We also mark the 3 following registers in the same .reg declaration as
-    # "quad followers" — they must be allocated consecutively after the base.
+    # Collect registers that require 4-register alignment (HMMA/IMMA/QMMA/DMMA
+    # accumulator).  mma.sync.aligned instructions write a 4-GPR accumulator;
+    # hardware requires the base % 4 == 0.
+    #
+    # The dst is a VectorRegOp whose .regs holds the actual tuple, e.g.
+    #   HMMA/IMMA/QMMA: {%f0, %f1, %f2, %f3}  → 4 vregs × 32-bit = 4 GPRs
+    #   DMMA:           {%fd0, %fd1}          → 2 vregs × 64-bit = 4 GPRs
+    # Only the FIRST element is the quad base; the rest are followers.
+    #
+    # FB-5.2: read followers from VectorRegOp.regs directly (not from the
+    # ambient .reg declaration's positional neighbors), so DMMA's f64 dst
+    # tuple is correctly modeled with one follower instead of three.
     quad_align_regs: set[str] = set()
     quad_follow_regs: set[str] = set()
-    from ptx.ir import RegOp as _RegOp
+    from ptx.ir import RegOp as _RegOp, VectorRegOp as _VectorRegOp
     for inst in all_instrs:
-        if inst.op == 'mma' and 'sync' in inst.types and inst.dest is not None:
-            if isinstance(inst.dest, _RegOp):
-                quad_align_regs.add(inst.dest.name)
-    # Find the following 3 registers in the same RegDecl for each quad base.
-    for rd in fn.reg_decls:
-        if rd.type.kind == ScalarKind.PRED:
+        if inst.op != 'mma' or 'sync' not in inst.types or inst.dest is None:
             continue
-        for i, nm in enumerate(rd.names):
-            if nm in quad_align_regs:
-                for j in range(1, 4):
-                    if i + j < len(rd.names):
-                        quad_follow_regs.add(rd.names[i + j])
+        if isinstance(inst.dest, _VectorRegOp) and inst.dest.regs:
+            quad_align_regs.add(inst.dest.regs[0])
+            for follower in inst.dest.regs[1:]:
+                quad_follow_regs.add(follower)
+        elif isinstance(inst.dest, _RegOp):
+            quad_align_regs.add(inst.dest.name)
+            # Fallback: positional neighbors (legacy behavior for non-vector dst)
+            for rd in fn.reg_decls:
+                if rd.type.kind == ScalarKind.PRED:
+                    continue
+                for i, nm in enumerate(rd.names):
+                    if nm == inst.dest.name:
+                        for j in range(1, 4):
+                            if i + j < len(rd.names):
+                                quad_follow_regs.add(rd.names[i + j])
 
     # Co-location preferences: cvt.u64.u32 dest should overlap with 32-bit source.
     # If the source is dead after the cvt, the 64-bit dest can start at the
@@ -463,6 +466,41 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
         # register range is available. Verified 2026-04-01 (commit 8d516ca).
         _MAX_GPR = 255
         if is_64:
+            # FB-5.2: f64 quad alignment for DMMA accumulator.
+            #
+            # DMMA writes a 4-GPR accumulator as two consecutive f64 pairs.
+            # The first pair (quad base) must land at a 4-aligned GPR; the
+            # second pair (the lone follower) must land at base+2 so the
+            # full quad is contiguous.
+            #
+            # We handle this BEFORE colocation/free-list/fresh allocation
+            # so the alignment constraint is respected unconditionally.
+            need_quad = name in quad_align_regs
+            is_quad_follower = name in quad_follow_regs
+            if need_quad:
+                # Stash any skipped slots into free_regs_32 for later use.
+                aligned_base = (next_gpr + 3) & ~3
+                if aligned_base != next_gpr:
+                    for r in range(next_gpr, aligned_base):
+                        free_regs_32.append(r)
+                    next_gpr = aligned_base
+                phys = next_gpr
+                next_gpr += 2
+                int_regs[name] = phys
+                active.append((name, phys, last_use, True))
+                continue
+            if is_quad_follower:
+                # Place at next_gpr; the quad base just consumed next_gpr..
+                # next_gpr+1, so this lands at base+2 (still 2-aligned).
+                if next_gpr % 2 != 0:
+                    free_regs_32.append(next_gpr)
+                    next_gpr += 1
+                phys = next_gpr
+                next_gpr += 2
+                int_regs[name] = phys
+                active.append((name, phys, last_use, True))
+                continue
+
             # Co-location: if this is a cvt.u64.u32 dest, try to place it
             # at the source register's GPR (so the MOV copy becomes a no-op).
             colocated = False

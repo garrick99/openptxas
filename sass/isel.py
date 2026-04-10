@@ -231,6 +231,165 @@ def _alloc_gpr(ctx: 'ISelContext') -> int:
     return 0
 
 
+def analyze_mma_zero_subst(fn) -> tuple[dict, set]:
+    """WB-2: HMMA-only "all-zero inputs" optimization.
+
+    Detect mma.sync instructions whose source operand vregs are provably
+    zero (defined exactly once by `mov X, 0` and used only by this mma's
+    input slots — possibly multiple slots of the same mma).
+
+    For HMMA shapes, the math is D = A*B + C, so any of A/B/C being all
+    zero forces D = 0 (mod NaN/inf).  ptxas exploits this by substituting
+    RZ for B and C in the encoding and aliasing src_a with the dst quad,
+    eliding all input-init MOVs entirely.
+
+    Returns:
+        rz_subst: dict[id(mma_instr) -> set[str]]   subset of {'a','b','c'}
+                  marking which encoding slots should use RZ.
+        dead_movs: set[id(mov_instr)]               init MOVs that can be
+                  skipped because their target vreg is no longer read by
+                  any non-substituted slot.
+
+    Restricted to HMMA (mma.sync with .f16/.bf16/.tf32 + .f32 accum) so
+    IMMA / DMMA / QMMA paths are untouched in this run.
+    """
+    from ptx.ir import RegOp, ImmOp, VectorRegOp
+
+    all_instrs = []
+    for bb in fn.blocks:
+        all_instrs.extend(bb.instructions)
+
+    def _dest_vregs(dst):
+        if isinstance(dst, VectorRegOp):
+            return tuple(dst.regs)
+        if isinstance(dst, RegOp):
+            return (dst.name,)
+        return ()
+
+    # 1. Find single-def zero-init vregs (mov X, 0  where X has no other def).
+    def_count: dict[str, int] = {}
+    zero_def_inst: dict[str, object] = {}
+    for inst in all_instrs:
+        for nm in _dest_vregs(inst.dest):
+            def_count[nm] = def_count.get(nm, 0) + 1
+        if (inst.op == 'mov' and inst.srcs
+                and isinstance(inst.srcs[0], ImmOp)
+                and inst.srcs[0].value == 0
+                and isinstance(inst.dest, RegOp)
+                and not isinstance(inst.dest, VectorRegOp)):
+            zero_def_inst[inst.dest.name] = inst
+
+    # Drop vregs with too many defs.  We allow up to 2 defs: the zero mov
+    # + at most one mma redefinition (the mma's dst write, which doesn't
+    # flow values BACK into the mma's input read).
+    for nm in list(zero_def_inst):
+        if def_count.get(nm, 0) > 2:
+            del zero_def_inst[nm]
+            continue
+        if def_count.get(nm, 0) == 2:
+            ok = False
+            for inst in all_instrs:
+                if (inst.op == 'mma' and 'sync' in inst.types
+                        and nm in _dest_vregs(inst.dest)):
+                    ok = True
+                    break
+            if not ok:
+                del zero_def_inst[nm]
+
+    # 2. For each mma.sync, determine the substitutable slots.
+    rz_subst: dict[int, set[str]] = {}
+    dead_movs: set[int] = set()
+
+    def _slot_vregs(src):
+        if isinstance(src, VectorRegOp):
+            return tuple(src.regs)
+        if isinstance(src, RegOp):
+            return (src.name,)
+        return ()
+
+    def _is_hmma(inst):
+        if inst.op != 'mma' or 'sync' not in inst.types:
+            return False
+        ts = set(inst.types)
+        # HMMA: f16/bf16/tf32 inputs with f32 accumulator.
+        if 'f64' in ts:    return False  # DMMA
+        if 's8' in ts or 'u8' in ts: return False  # IMMA
+        if 'e4m3' in ts or 'e5m2' in ts: return False  # QMMA
+        return True
+
+    # Pre-compute per-vreg def positions (instruction indices) so we can
+    # bound use-counting to the live range of a particular def.
+    vreg_defs: dict[str, list[int]] = {}
+    for idx, inst in enumerate(all_instrs):
+        for nm in _dest_vregs(inst.dest):
+            vreg_defs.setdefault(nm, []).append(idx)
+
+    def _uses_in_range(vreg: str, lo_excl: int, hi_incl: int,
+                       skip_inst: object) -> int:
+        """Count source uses of `vreg` in instructions (lo_excl, hi_incl],
+        excluding `skip_inst`."""
+        n = 0
+        for j in range(lo_excl + 1, hi_incl + 1):
+            o = all_instrs[j]
+            if o is skip_inst:
+                continue
+            for s in (o.srcs or []):
+                if vreg in _slot_vregs(s):
+                    n += 1
+                    break
+        return n
+
+    for mma_idx, inst in enumerate(all_instrs):
+        if not _is_hmma(inst):
+            continue
+        srcs = inst.srcs or []
+        if len(srcs) < 3:
+            continue
+        slots = ('a', 'b', 'c')
+        slot_vregs: dict[str, tuple] = {
+            slot: _slot_vregs(srcs[i]) for i, slot in enumerate(slots)
+        }
+        every_vreg = set()
+        for vs in slot_vregs.values():
+            every_vreg.update(vs)
+        if not every_vreg:
+            continue
+        if not all(v in zero_def_inst for v in every_vreg):
+            continue
+        # For each vreg flowing into this mma: the zero-init mov must be
+        # the most recent def, and the only use BETWEEN the mov and this
+        # mma must be this mma itself.  Uses AFTER the mma read the mma's
+        # dst-write (a different value) and don't matter.
+        ok = True
+        for v in every_vreg:
+            mov_inst = zero_def_inst[v]
+            mov_idx = next(i for i, x in enumerate(all_instrs) if x is mov_inst)
+            if mov_idx >= mma_idx:
+                ok = False
+                break
+            # No intervening def between mov and mma.
+            for d_idx in vreg_defs.get(v, []):
+                if mov_idx < d_idx < mma_idx:
+                    ok = False
+                    break
+            if not ok:
+                break
+            # No intervening uses other than the mma itself.
+            if _uses_in_range(v, mov_idx, mma_idx - 1, inst) > 0:
+                ok = False
+                break
+            # Uses AT mma_idx that are this mma's srcs are fine (we're
+            # substituting them away).  Skip explicit check.
+        if not ok:
+            continue
+        # All three slots substitutable.
+        rz_subst[id(inst)] = {'a', 'b', 'c'}
+        for v in every_vreg:
+            dead_movs.add(id(zero_def_inst[v]))
+
+    return rz_subst, dead_movs
+
+
 def _alloc_gpr_pair(ctx: 'ISelContext') -> int:
     """Allocate an even-aligned GPR pair (lo, lo+1) for 64-bit scratch use.
 
@@ -1727,6 +1886,10 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     continue
 
                 if op == 'mov' and typ in ('u32', 's32', 'b32', 'f32', 'u64', 's64', 'b64', 'f64'):
+                    # WB-2: skip mov if it's a zero-init that an HMMA RZ
+                    # substitution made dead.  See analyze_mma_zero_subst.
+                    if id(instr) in getattr(ctx, '_hmma_dead_movs', set()):
+                        continue
                     # Immediate source: load via IADD3_IMM32 (integer) or FMUL_IMM (float)
                     if isinstance(instr.srcs[0], ImmOp) and typ in ('u32', 's32', 'b32', 'f32'):
                         d = ctx.ra.r32(instr.dest.name)
@@ -2340,6 +2503,19 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     c_nm = _tuple_base(srcs[2]) if len(srcs) > 2 else None
                     def _r(nm): return ctx.ra.r32(nm) if nm else RZ
                     d = _r(d_nm); a = _r(a_nm); b = _r(b_nm); c = _r(c_nm)
+                    # WB-2: HMMA RZ-substitution.  When all input slots are
+                    # provably-zero (analyze_mma_zero_subst), B and C are
+                    # encoded as RZ and src_a is aliased to dst (matches
+                    # ptxas's hmma_zero pattern, lets the input init MOVs
+                    # be elided).  HMMA-only — IMMA/DMMA/QMMA branches
+                    # below are unaffected.
+                    _rz_slots = getattr(ctx, '_hmma_rz_subst', {}).get(id(instr), set())
+                    if 'a' in _rz_slots:
+                        a = d
+                    if 'b' in _rz_slots:
+                        b = RZ
+                    if 'c' in _rz_slots:
+                        c = RZ
                     if shape == 'm8n8k4' and 'f64' in _types_set:
                         output.append(SassInstr(encode_dmma_8x8x4(d, a, b, c),
                                                 f'DMMA.8x8x4 R{d}, R{a}, R{b}, R{c}'))

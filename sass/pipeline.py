@@ -620,6 +620,57 @@ def compile_function(fn: Function, verbose: bool = False,
         sm_version=sm_version,
     )
     ctx._addr_scratch_lo = _addr_scratch_base  # dedicated addr pair: R(base):R(base+1)
+    # WB-2: HMMA "all-zero inputs" RZ-substitution analysis.
+    # Restricted to HMMA shapes; IMMA / DMMA / QMMA paths are unaffected.
+    from sass.isel import analyze_mma_zero_subst
+    _hmma_rz_subst, _hmma_dead_movs = analyze_mma_zero_subst(fn)
+    ctx._hmma_rz_subst = _hmma_rz_subst
+    ctx._hmma_dead_movs = _hmma_dead_movs
+
+    # WB-2: When the HMMA RZ-substitution leaves dead vregs in the
+    # allocation map (the inits are no longer emitted, so their phys
+    # slots have no SASS reader), rebase the address scratch pair into
+    # the lowest such freed even-aligned pair.  Without this, the
+    # scratch lands above alloc.num_gprs and inflates the kernel's
+    # register footprint by 2 even though those low slots are dead.
+    # HMMA-only triggered: only fires if at least one HMMA was
+    # substituted in this kernel.
+    if _hmma_dead_movs:
+        from ptx.ir import RegOp, VectorRegOp
+        # Collect dead vreg names from the dead MOV instructions.
+        _dead_vregs: set[str] = set()
+        _all_instrs = []
+        for bb in fn.blocks:
+            _all_instrs.extend(bb.instructions)
+        for inst in _all_instrs:
+            if id(inst) in _hmma_dead_movs and isinstance(inst.dest, RegOp):
+                _dead_vregs.add(inst.dest.name)
+        # Compute live phys slots (anything in int_regs whose vreg is NOT
+        # dead and whose width covers the slot).
+        _u64_vreg_names: set[str] = set()
+        from ptx.ir import ScalarKind
+        for rd in fn.reg_decls:
+            if rd.type.kind == ScalarKind.PRED:
+                continue
+            if rd.type.width >= 64:
+                _u64_vreg_names.update(rd.names)
+        _live_phys: set[int] = {0, 1}  # always reserved
+        for vreg, phys in alloc.ra.int_regs.items():
+            if vreg in _dead_vregs:
+                continue
+            _live_phys.add(phys)
+            if vreg in _u64_vreg_names:
+                _live_phys.add(phys + 1)
+        # Find smallest even-aligned pair where both halves are dead.
+        # Cap search at the original _addr_scratch_base so we never
+        # *increase* the scratch position.
+        for _r in range(2, _addr_scratch_base + 1, 2):
+            if _r not in _live_phys and (_r + 1) not in _live_phys:
+                if _r < _addr_scratch_base:
+                    _addr_scratch_base = _r
+                    ctx._addr_scratch_lo = _r
+                    ctx._next_gpr = _r  # subsequent scratch starts here
+                break
     # Both SM_89 and SM_120 now have full register range available.
     # SM_89: no capmerc DRM.
     # SM_120: capmerc byte[10] fix (0x81→0x01, 0xc1→0x01) unlocks R12+.

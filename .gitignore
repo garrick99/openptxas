@@ -28,3 +28,24 @@ ptxas_bug/
 
 # WB-0 workbench artifacts (per-run JSON outputs)
 results/
+
+# Logs / temp
+*.log
+*.out
+logs/
+tmp/
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.suo
+
+# Secrets / local env
+.env
+.env.local
+*.pem
+*.key
+
+# OS junk
+.DS_Store
+Thumbs.db

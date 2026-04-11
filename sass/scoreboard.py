@@ -347,6 +347,15 @@ def _get_src_regs(raw: bytes) -> set[int]:
         if raw[3] < 255: regs.add(raw[3])
         if raw[8] < 255: regs |= {raw[8], raw[8]+1}
         return regs
+    if opcode == 0x202:
+        # MOV (register-to-register copy).
+        # Encoder ground truth (sm_120_opcodes.py line 198):
+        #   b2 = dest, b3 = 0x00 (fixed), b4 = src.
+        # The src is at b4 — NOT at b3 — so the generic ALU fallback
+        # that returns {b3} produced {R0} regardless of the real source.
+        # FG-2.5 fix: return {b4} explicitly.
+        if raw[4] < 255: regs.add(raw[4])
+        return regs
 
     if opcode in _OPCODES_LDG:
         # LDG: src_addr at b3
@@ -578,6 +587,15 @@ _FORWARDING_SAFE_PAIRS: set[tuple[int, int]] = {
     (0x235, 0x986),   # IADD.64    → STG.E
     # SHF → ISETP R-R: SHF's output forwarded into ISETP compare stage.
     (0x819, 0x20c),   # SHF (R-imm) → ISETP R-R
+    # FG-2.5: surfaced by constructive proof engine.
+    # IADD.64-UR → IADD3.IMM: IADD.64-UR writes a pair; immediate
+    # IADD3 adds a constant to the low half as the second phase of
+    # a 64-bit accumulator update.  Observed in Forge reduce_step
+    # (passes gpu_correctness) and OURS's multi_block_atomic.
+    # IADD.64-UR's ctrl word (wdep=0x3e) broadcasts the result to
+    # the dependency network; the subsequent IADD3.IMM's rbar
+    # covers the forwarding window.
+    (0xc35, 0x810),   # IADD.64-UR → IADD3.IMM
 }
 
 

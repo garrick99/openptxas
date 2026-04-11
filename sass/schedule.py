@@ -19,9 +19,130 @@ Key observations from ptxas RE:
 
 from __future__ import annotations
 import struct
+from dataclasses import dataclass, field
+from enum import Enum
 
 from sass.isel import SassInstr
 from sass.encoding.sm_120_opcodes import encode_nop as _encode_nop
+
+
+# ---------------------------------------------------------------------------
+# FG-2.5 — proof object model for verify_schedule.
+#
+# The verifier used to return a list of "I noticed a hazard" strings, with
+# suppressions for known false positives.  That model could prove
+# "nothing looks wrong" but could never prove "this is safe under the
+# model."  FG-2.5 upgrades it to constructive classification: every
+# candidate producer→consumer edge is positively tagged with WHY it is
+# safe (or flagged as a VIOLATION).  `verify_schedule` preserves its
+# legacy list-of-strings API by formatting the VIOLATION edges from a
+# ProofReport.
+# ---------------------------------------------------------------------------
+
+class ProofClass(str, Enum):
+    """Classification of a single producer→consumer edge."""
+    LATENCY_INERT   = "LATENCY_INERT"    # writer has no min_gpr_gap in model
+    FORWARDING_SAFE = "FORWARDING_SAFE"  # pair on _FORWARDING_SAFE_PAIRS list
+    CTRLWORD_SAFE   = "CTRLWORD_SAFE"    # ctrl-word scoreboard covers latency
+    GAP_SAFE        = "GAP_SAFE"         # instruction-stream gap ≥ min_gpr_gap
+    VIOLATION       = "VIOLATION"        # no safe classification applies
+
+
+@dataclass(frozen=True)
+class ProofEdge:
+    """A single classified producer→consumer dependency edge.
+
+    Fields are deliberately minimal so ProofEdge is cheap to
+    construct and compare.  `regs` is a frozenset so edges are
+    hashable for set membership tests.
+    """
+    writer_idx: int
+    reader_idx: int
+    writer_opc: int
+    reader_opc: int
+    regs: frozenset[int]
+    gap: int
+    classification: ProofClass
+    rationale: str
+
+    @property
+    def writer_name(self) -> str:
+        """Pretty name for the writer, from _OPCODE_META if known."""
+        from sass.scoreboard import _OPCODE_META
+        meta = _OPCODE_META.get(self.writer_opc)
+        if meta is not None:
+            return meta.name
+        return f"opc=0x{self.writer_opc:03x}"
+
+    @property
+    def reader_name(self) -> str:
+        from sass.scoreboard import _OPCODE_META
+        meta = _OPCODE_META.get(self.reader_opc)
+        if meta is not None:
+            return meta.name
+        return f"opc=0x{self.reader_opc:03x}"
+
+    def legacy_str(self) -> str:
+        """Format for backward-compatible verify_schedule output.
+
+        Mirrors the pre-FG-2.5 string format so existing callers and
+        regex parsers (e.g. FG-2.3 INV C) keep working.
+        """
+        if self.writer_opc == 0x7ac:
+            # LDCU.64 pre-boundary gap violation
+            return (f"LDCU.64 UR{self.regs and min(self.regs) or '?'} "
+                    f"at [{self.writer_idx}] → consumer "
+                    f"opc=0x{self.reader_opc:03x} at [{self.reader_idx}]: "
+                    f"gap={self.gap} (need ≥3)")
+        return (f"{self.writer_name} at [{self.writer_idx}] writes "
+                f"{set(self.regs)} → opc=0x{self.reader_opc:03x} "
+                f"at [{self.reader_idx}] reads immediately (0-gap RAW)")
+
+
+@dataclass
+class ProofReport:
+    """Aggregate proof output for one instruction stream.
+
+    Holds every classified edge plus a per-class count and the final
+    safe/unsafe verdict.  `violations` is a convenience view of the
+    edges whose classification is VIOLATION.
+    """
+    edges: list[ProofEdge] = field(default_factory=list)
+
+    @property
+    def counts(self) -> dict[ProofClass, int]:
+        c = {cls: 0 for cls in ProofClass}
+        for e in self.edges:
+            c[e.classification] += 1
+        return c
+
+    @property
+    def violations(self) -> list[ProofEdge]:
+        return [e for e in self.edges if e.classification == ProofClass.VIOLATION]
+
+    @property
+    def safe(self) -> bool:
+        return len(self.violations) == 0
+
+    @property
+    def total(self) -> int:
+        return len(self.edges)
+
+    def verdict(self) -> str:
+        return "SAFE" if self.safe else "UNSAFE"
+
+    def summary_line(self, label: str = "") -> str:
+        c = self.counts
+        body = (
+            f"total={self.total}  "
+            f"INERT={c[ProofClass.LATENCY_INERT]}  "
+            f"FWD={c[ProofClass.FORWARDING_SAFE]}  "
+            f"CTRL={c[ProofClass.CTRLWORD_SAFE]}  "
+            f"GAP={c[ProofClass.GAP_SAFE]}  "
+            f"VIOL={c[ProofClass.VIOLATION]}"
+        )
+        prefix = f"{label}: " if label else ""
+        return f"{prefix}{self.verdict()}  {body}"
 
 
 # Ctrl templates from ptxas ground truth
@@ -357,17 +478,45 @@ def _enforce_gpr_latency(instrs: list[SassInstr]) -> list[SassInstr]:
     return result
 
 
-def verify_schedule(instrs: list[SassInstr]) -> list[str]:
-    """Check a final instruction stream for scheduling hazard violations.
+def verify_proof(instrs: list[SassInstr]) -> ProofReport:
+    """FG-2.5 constructive proof of schedule safety.
 
-    Returns a list of human-readable violation strings.  Empty list = no violations.
+    Enumerate every candidate producer→consumer dependency edge in
+    `instrs` and classify each one into exactly one of:
 
-    Checks:
-      • LDCU.64 minimum consumer gap ≥3 (R1) — excludes FG-2.4
-        whitelisted consumer opcodes whose ctrl word covers the gap
-      • ALU GPR 0-gap RAW (R8) — for opcodes with min_gpr_gap > 0 in
-        _OPCODE_META, excluding FG-2.4 forwarding-safe producer-consumer
-        pairs where hardware forwarding handles the RAW
+      LATENCY_INERT    — writer has no min_gpr_gap in the model, so
+                         any dest-reading reader is safe by virtue of
+                         the opcode class.  (Used only when there is
+                         an actual GPR overlap; edges without overlap
+                         are never recorded.)
+      FORWARDING_SAFE  — (writer_opc, reader_opc) is on
+                         sass.scoreboard._FORWARDING_SAFE_PAIRS,
+                         meaning hardware operand forwarding covers
+                         the 1-cycle latency.
+      CTRLWORD_SAFE    — writer is LDCU.64 and the consumer is on the
+                         FG-2.4 _LDCU_GAP_EXEMPT_CONSUMERS whitelist
+                         (consumer's own ctrl-word rbar/wdep slot
+                         covers the latency), OR the LDCU.64 is
+                         post-segment-boundary (handled by the
+                         preamble/body scoreboard split).
+      GAP_SAFE         — for rules with min_gpr_gap > 1, the
+                         instruction-stream distance between writer
+                         and reader satisfies the gap.  Included in
+                         the classification even though today every
+                         rule has min_gpr_gap == 1 (so the check
+                         reduces to "next instruction does not read
+                         the dest"); the classification is kept for
+                         future-proofing.
+      VIOLATION        — none of the above applies: the edge is a
+                         real hazard.
+
+    The returned ProofReport holds every recorded edge plus counts
+    and a final safe/unsafe verdict.  Its `safe` property is False
+    iff any edge is classified VIOLATION.
+
+    Callers that only need the legacy list-of-strings output should
+    use `verify_schedule`, which is now a thin wrapper over this
+    function.
     """
     from sass.scoreboard import (
         _OPCODE_META,
@@ -379,11 +528,11 @@ def verify_schedule(instrs: list[SassInstr]) -> list[str]:
     )
 
     _UR_CONSUMER_OPCODES = {0xc35, 0xc0c, 0xc24, 0x981}
-    violations: list[str] = []
+    report = ProofReport()
 
     # Find first predicated BRA/EXIT — segment boundary.
-    # Post-boundary LDCU.64s satisfy their gap via scoreboard ctrl (rbar/wdep),
-    # not instruction ordering, so they are excluded from the gap check.
+    # Post-boundary LDCU.64s satisfy their gap via scoreboard ctrl
+    # (rbar/wdep), not instruction ordering.
     boundary_idx = len(instrs)
     for k, sk in enumerate(instrs):
         opc_k = _get_opcode(sk.raw)
@@ -392,53 +541,123 @@ def verify_schedule(instrs: list[SassInstr]) -> list[str]:
             boundary_idx = k
             break
 
-    # R1: LDCU.64 must have ≥3 instructions before its first UR consumer.
-    # Only enforced for pre-boundary LDCU.64s (preamble section) AND
-    # only when the consumer is not on the FG-2.4 ctrl-word-handled
-    # exemption list.
+    # ---- LDCU.64 → first UR consumer (rule R1) -----------------------------
     for i, si in enumerate(instrs):
-        if i >= boundary_idx:
-            break
         if _get_opcode(si.raw) != 0x7ac or si.raw[9] != 0x0a:
-            continue
+            continue  # not an LDCU.64
         ur_dest = si.raw[2]
+
+        # Find the first UR consumer of this LDCU.64.
+        cons_j = None
         for j in range(i + 1, len(instrs)):
             opc_j = _get_opcode(instrs[j].raw)
             if opc_j in _UR_CONSUMER_OPCODES and instrs[j].raw[4] == ur_dest:
-                # FG-2.4: ctrl-word-handled consumers exempt
-                if opc_j in _LDCU_GAP_EXEMPT_CONSUMERS:
-                    break
-                gap = j - i - 1
-                if gap < 3:
-                    violations.append(
-                        f"LDCU.64 UR{ur_dest} at [{i}] → consumer opc=0x{opc_j:03x} "
-                        f"at [{j}]: gap={gap} (need ≥3)")
+                cons_j = j
                 break
+        if cons_j is None:
+            continue  # UR is never consumed; no edge
 
-    # R8: ALU GPR 0-gap RAW.  A writer with min_gpr_gap > 0 followed
-    # by a reader that touches the writer's dest is flagged UNLESS the
-    # pair is on the FG-2.4 forwarding-safe whitelist (see
-    # sass.scoreboard._FORWARDING_SAFE_PAIRS).
+        gap = cons_j - i - 1
+        opc_j = _get_opcode(instrs[cons_j].raw)
+
+        # Classify the LDCU.64 → UR-consumer edge.
+        if i >= boundary_idx:
+            cls = ProofClass.CTRLWORD_SAFE
+            rat = (f"post-boundary LDCU.64 at [{i}]: preamble/body split "
+                   f"scoreboard handles the consumer gap")
+        elif opc_j in _LDCU_GAP_EXEMPT_CONSUMERS:
+            cls = ProofClass.CTRLWORD_SAFE
+            rat = (f"consumer opc=0x{opc_j:03x} is on FG-2.4 "
+                   f"_LDCU_GAP_EXEMPT_CONSUMERS whitelist: consumer's "
+                   f"own ctrl word covers the latency")
+        elif gap >= 3:
+            cls = ProofClass.GAP_SAFE
+            rat = f"instruction-stream gap {gap} ≥ 3 (LDCU.64 rule R1)"
+        else:
+            cls = ProofClass.VIOLATION
+            rat = (f"LDCU.64 UR{ur_dest} → consumer opc=0x{opc_j:03x} "
+                   f"at gap={gap}, needs ≥3")
+
+        report.edges.append(ProofEdge(
+            writer_idx=i,
+            reader_idx=cons_j,
+            writer_opc=0x7ac,
+            reader_opc=opc_j,
+            regs=frozenset({ur_dest}),  # UR index, tagged for display
+            gap=gap,
+            classification=cls,
+            rationale=rat,
+        ))
+
+    # ---- ALU GPR writer → adjacent reader (rule R8) ------------------------
+    # For every pair (i, i+1) where the writer at i has a GPR dest and
+    # the reader at i+1 reads any bit of that dest, emit a classified
+    # edge.  The min_gpr_gap in _OPCODE_META tells us whether any gap
+    # is required; an absence of entry means the writer is latency-
+    # inert for this rule.
     for i in range(len(instrs) - 1):
         opc_i = _sc_opc(instrs[i].raw)
-        meta_i = _OPCODE_META.get(opc_i)
-        if meta_i is None or meta_i.min_gpr_gap == 0:
-            continue
         dest_i = _sc_dest(instrs[i].raw)
         if not dest_i:
             continue
         src_j = _sc_src(instrs[i + 1].raw)
         overlap = dest_i & src_j
-        if overlap:
-            opc_j = _sc_opc(instrs[i + 1].raw)
-            # FG-2.4: skip known hardware-forwarded pairs
-            if _is_forwarding_safe_pair(opc_i, opc_j):
-                continue
-            violations.append(
-                f"{meta_i.name} at [{i}] writes {overlap} → "
-                f"opc=0x{opc_j:03x} at [{i+1}] reads immediately (0-gap RAW)")
+        if not overlap:
+            continue  # no RAW candidate — no edge to prove
+        opc_j = _sc_opc(instrs[i + 1].raw)
+        meta_i = _OPCODE_META.get(opc_i)
 
-    return violations
+        if meta_i is None or meta_i.min_gpr_gap == 0:
+            cls = ProofClass.LATENCY_INERT
+            rat = (f"writer opc=0x{opc_i:03x} has no min_gpr_gap entry; "
+                   f"opcode class is latency-inert for ALU RAW rule")
+        elif _is_forwarding_safe_pair(opc_i, opc_j):
+            cls = ProofClass.FORWARDING_SAFE
+            rat = (f"pair (0x{opc_i:03x}, 0x{opc_j:03x}) in FG-2.4 "
+                   f"_FORWARDING_SAFE_PAIRS: hardware operand "
+                   f"forwarding covers the 1-cycle latency")
+        elif meta_i.min_gpr_gap <= 1:
+            # The only way we reach here with min_gpr_gap=1 and an
+            # overlap at i+1 is if the pair is NOT forwarding-safe —
+            # that's a violation.  If in the future a min_gpr_gap>1
+            # writer is modeled, we would look ahead further and check
+            # gap distance; that branch is below.
+            cls = ProofClass.VIOLATION
+            rat = (f"0-gap RAW with no forwarding-safe exemption: "
+                   f"writer {meta_i.name} needs ≥{meta_i.min_gpr_gap} "
+                   f"instruction(s) before a reader of its dest")
+        else:
+            # Reserved for future producers with min_gpr_gap > 1.
+            # The current instruction-stream gap is 0 (adjacent),
+            # which is always < min_gpr_gap > 1 → VIOLATION here.
+            cls = ProofClass.VIOLATION
+            rat = (f"gap=0 < min_gpr_gap={meta_i.min_gpr_gap} for "
+                   f"writer {meta_i.name}")
+
+        report.edges.append(ProofEdge(
+            writer_idx=i,
+            reader_idx=i + 1,
+            writer_opc=opc_i,
+            reader_opc=opc_j,
+            regs=frozenset(overlap),
+            gap=0,
+            classification=cls,
+            rationale=rat,
+        ))
+
+    return report
+
+
+def verify_schedule(instrs: list[SassInstr]) -> list[str]:
+    """Legacy hazard-check API.
+
+    Returns a list of human-readable violation strings.  Empty list
+    means no violations.  Internally this is a thin formatter over
+    `verify_proof`; the two functions agree on classification in
+    every case.
+    """
+    report = verify_proof(instrs)
+    return [e.legacy_str() for e in report.violations]
 
 
 def _hoist_isetp_past_vote(instrs: list[SassInstr]) -> list[SassInstr]:

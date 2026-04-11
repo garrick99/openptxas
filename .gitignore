@@ -20,8 +20,10 @@ __pycache__/
 # Misc scratch
 *.bat
 
-# RE scratch directory
-probe_work/
+# RE scratch directory (contents ignored, directory itself kept so
+# tracked exception files below are reachable)
+probe_work/*
+!probe_work/fg40_adversarial_harness.py
 
 # Local machine-specific junction (points to ptxas repro files)
 ptxas_bug/

@@ -46,6 +46,7 @@ def patch_pred(raw: bytes, pred: int = PT, neg: bool = False) -> bytes:
     return bytes(buf)
 
 # SR codes for S2R
+SR_LANEID    = 0x00   # FG-2.6: %laneid — warp lane index (0..31)
 SR_TID_X     = 0x21
 SR_TID_Y     = 0x22
 SR_TID_Z     = 0x23

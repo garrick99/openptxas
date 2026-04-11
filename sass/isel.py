@@ -94,6 +94,7 @@ from sass.encoding.sm_120_opcodes import (
     SR_CTAID_X, SR_CTAID_Y, SR_CTAID_Z,
     SR_NTID_X, SR_NTID_Y, SR_NTID_Z,
     SR_NCTAID_X, SR_NCTAID_Y, SR_NCTAID_Z,
+    SR_LANEID,
     encode_tex, encode_tld_lz, encode_tld4, encode_txq,
     encode_suld, encode_sust,
     TEX_DIM_1D, TEX_DIM_2D, TEX_DIM_3D,
@@ -688,6 +689,10 @@ _SPECIAL_REGS = {
     '%ctaid.x': SR_CTAID_X, '%ctaid.y': SR_CTAID_Y, '%ctaid.z': SR_CTAID_Z,
     '%ntid.x': SR_NTID_X, '%ntid.y': SR_NTID_Y, '%ntid.z': SR_NTID_Z,
     '%nctaid.x': SR_NCTAID_X, '%nctaid.y': SR_NCTAID_Y, '%nctaid.z': SR_NCTAID_Z,
+    # FG-2.6: %laneid maps to SR_LANEID (0x00) — the warp lane index.
+    # PTXAS ground truth: `mov.u32 %r, %laneid;` lowers to
+    # `S2R R<n>, SR_LANEID` (bytes 19 79 00 00 00 00 00 00 ...).
+    '%laneid': SR_LANEID,
 }
 
 # Constant bank offsets for system values (driver-populated)

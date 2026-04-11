@@ -589,61 +589,119 @@ def verify_proof(instrs: list[SassInstr]) -> ProofReport:
             rationale=rat,
         ))
 
-    # ---- ALU GPR writer → adjacent reader (rule R8) ------------------------
-    # For every pair (i, i+1) where the writer at i has a GPR dest and
-    # the reader at i+1 reads any bit of that dest, emit a classified
-    # edge.  The min_gpr_gap in _OPCODE_META tells us whether any gap
-    # is required; an absence of entry means the writer is latency-
-    # inert for this rule.
-    for i in range(len(instrs) - 1):
+    # ---- ALU GPR writer → reader (rule R8, FG-3.0 bounded lookahead) -------
+    # For every writer at index i with a non-empty GPR dest, enumerate
+    # candidate reader edges in a bounded forward window.  The window
+    # size is derived from _OPCODE_META.min_gpr_gap (call it k):
+    #
+    #   * k == 0 or no meta entry: writer is LATENCY_INERT.  Only the
+    #     adjacent reader (j = i+1) gets an edge — informational —
+    #     preserving FG-2.5 semantics for the existing corpus.
+    #
+    #   * k == 1: only j = i+1 can be unsafe; anything at j ≥ i+2 is
+    #     trivially GAP_SAFE because gap ≥ 1 = k.  The engine emits
+    #     an edge only for j = i+1, preserving FG-2.5 counts exactly.
+    #
+    #   * k >  1: scan j in [i+1, i+k+1] (inclusive of first
+    #     gap == k position).  Each reader in the window gets a
+    #     classified edge.  Shadowing is tracked: if an intervening
+    #     instruction at j' overwrites one of the live dest regs, that
+    #     reg is removed from the live-dest set and no further readers
+    #     of it generate edges from this writer.  When the live-dest
+    #     set becomes empty the scan stops early.
+    #
+    # Classification inside the window:
+    #   gap == j-i-1, compare against k:
+    #     gap >= k                              → GAP_SAFE
+    #     gap == 0 and (opc_i,opc_j) forward    → FORWARDING_SAFE
+    #     otherwise                             → VIOLATION
+    # where "forward" means the pair is on FG-2.4 _FORWARDING_SAFE_PAIRS.
+    for i in range(len(instrs)):
         opc_i = _sc_opc(instrs[i].raw)
         dest_i = _sc_dest(instrs[i].raw)
         if not dest_i:
             continue
-        src_j = _sc_src(instrs[i + 1].raw)
-        overlap = dest_i & src_j
-        if not overlap:
-            continue  # no RAW candidate — no edge to prove
-        opc_j = _sc_opc(instrs[i + 1].raw)
         meta_i = _OPCODE_META.get(opc_i)
+        k = 0 if (meta_i is None or meta_i.min_gpr_gap == 0) else meta_i.min_gpr_gap
 
-        if meta_i is None or meta_i.min_gpr_gap == 0:
-            cls = ProofClass.LATENCY_INERT
-            rat = (f"writer opc=0x{opc_i:03x} has no min_gpr_gap entry; "
-                   f"opcode class is latency-inert for ALU RAW rule")
-        elif _is_forwarding_safe_pair(opc_i, opc_j):
-            cls = ProofClass.FORWARDING_SAFE
-            rat = (f"pair (0x{opc_i:03x}, 0x{opc_j:03x}) in FG-2.4 "
-                   f"_FORWARDING_SAFE_PAIRS: hardware operand "
-                   f"forwarding covers the 1-cycle latency")
-        elif meta_i.min_gpr_gap <= 1:
-            # The only way we reach here with min_gpr_gap=1 and an
-            # overlap at i+1 is if the pair is NOT forwarding-safe —
-            # that's a violation.  If in the future a min_gpr_gap>1
-            # writer is modeled, we would look ahead further and check
-            # gap distance; that branch is below.
-            cls = ProofClass.VIOLATION
-            rat = (f"0-gap RAW with no forwarding-safe exemption: "
-                   f"writer {meta_i.name} needs ≥{meta_i.min_gpr_gap} "
-                   f"instruction(s) before a reader of its dest")
-        else:
-            # Reserved for future producers with min_gpr_gap > 1.
-            # The current instruction-stream gap is 0 (adjacent),
-            # which is always < min_gpr_gap > 1 → VIOLATION here.
-            cls = ProofClass.VIOLATION
-            rat = (f"gap=0 < min_gpr_gap={meta_i.min_gpr_gap} for "
-                   f"writer {meta_i.name}")
+        if k <= 1:
+            # Adjacent-only emission — preserves FG-2.5 behavior exactly.
+            if i + 1 >= len(instrs):
+                continue
+            src_j = _sc_src(instrs[i + 1].raw)
+            overlap = dest_i & src_j
+            if not overlap:
+                continue
+            opc_j = _sc_opc(instrs[i + 1].raw)
+            if k == 0:
+                cls = ProofClass.LATENCY_INERT
+                rat = (f"writer opc=0x{opc_i:03x} has no min_gpr_gap entry; "
+                       f"opcode class is latency-inert for ALU RAW rule")
+            elif _is_forwarding_safe_pair(opc_i, opc_j):
+                cls = ProofClass.FORWARDING_SAFE
+                rat = (f"pair (0x{opc_i:03x}, 0x{opc_j:03x}) in FG-2.4 "
+                       f"_FORWARDING_SAFE_PAIRS: hardware operand "
+                       f"forwarding covers the 1-cycle latency")
+            else:
+                cls = ProofClass.VIOLATION
+                rat = (f"0-gap RAW with no forwarding-safe exemption: "
+                       f"writer {meta_i.name} needs ≥{meta_i.min_gpr_gap} "
+                       f"instruction(s) before a reader of its dest")
+            report.edges.append(ProofEdge(
+                writer_idx=i,
+                reader_idx=i + 1,
+                writer_opc=opc_i,
+                reader_opc=opc_j,
+                regs=frozenset(overlap),
+                gap=0,
+                classification=cls,
+                rationale=rat,
+            ))
+            continue
 
-        report.edges.append(ProofEdge(
-            writer_idx=i,
-            reader_idx=i + 1,
-            writer_opc=opc_i,
-            reader_opc=opc_j,
-            regs=frozenset(overlap),
-            gap=0,
-            classification=cls,
-            rationale=rat,
-        ))
+        # k > 1: bounded multi-step scan with shadow tracking.
+        live_dest = set(dest_i)
+        # Upper bound is exclusive; +k+2 so we include the first
+        # j with gap == k (which will classify as GAP_SAFE) and stop.
+        j_max = min(len(instrs), i + k + 2)
+        for j in range(i + 1, j_max):
+            if not live_dest:
+                break
+            src_j = _sc_src(instrs[j].raw)
+            overlap = live_dest & src_j
+            if overlap:
+                opc_j = _sc_opc(instrs[j].raw)
+                gap = j - i - 1
+                if gap >= k:
+                    cls = ProofClass.GAP_SAFE
+                    rat = (f"instruction-stream gap {gap} ≥ "
+                           f"min_gpr_gap={k} for writer {meta_i.name}")
+                elif gap == 0 and _is_forwarding_safe_pair(opc_i, opc_j):
+                    cls = ProofClass.FORWARDING_SAFE
+                    rat = (f"pair (0x{opc_i:03x}, 0x{opc_j:03x}) in "
+                           f"FG-2.4 _FORWARDING_SAFE_PAIRS: hardware "
+                           f"operand forwarding covers the 1-cycle "
+                           f"latency")
+                else:
+                    cls = ProofClass.VIOLATION
+                    rat = (f"non-adjacent RAW at gap={gap} < "
+                           f"min_gpr_gap={k} for writer {meta_i.name}")
+                report.edges.append(ProofEdge(
+                    writer_idx=i,
+                    reader_idx=j,
+                    writer_opc=opc_i,
+                    reader_opc=opc_j,
+                    regs=frozenset(overlap),
+                    gap=gap,
+                    classification=cls,
+                    rationale=rat,
+                ))
+            # Shadow tracking: if instr j overwrites part of live_dest,
+            # subsequent readers of those regs see the newer write, not
+            # this producer's.  Remove them from the live set.
+            dest_j = _sc_dest(instrs[j].raw)
+            if dest_j:
+                live_dest -= dest_j
 
     return report
 

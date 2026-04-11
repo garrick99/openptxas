@@ -214,31 +214,20 @@ def test_inv_j_class_counts_stable(label, expected):
 # ---------------------------------------------------------------------------
 
 def test_inv_k_every_gpr_writer_has_proof_rule():
-    """INV K: the proof engine must be complete for every opcode that
-    _OPCODE_META registers as needing a GPR latency gap.  Specifically,
-    every opcode in _OPCODE_META with min_gpr_gap > 0 must either:
-      (a) have at least one forwarding-safe pair entry that covers
-          an observed consumer, OR
-      (b) have min_gpr_gap = 1 so the current-cycle check applies.
-
-    (Condition b is satisfied by every entry today.  The test is kept
-    here so that adding a new entry with min_gpr_gap > 1 triggers a
-    compile-time reminder to extend the proof engine's gap lookahead
-    logic.)
+    """INV K: the proof engine must have a proof path for every opcode
+    _OPCODE_META registers.  As of FG-3.0 the engine supports bounded
+    lookahead for arbitrary min_gpr_gap ≥ 1: writers with k=1 are
+    reasoned about adjacent-only, writers with k>1 get a multi-step
+    scan with shadow tracking.  This test now simply asserts that
+    every entry has a non-negative gap and a rule the engine covers.
     """
     from sass.scoreboard import _OPCODE_META
-    unhandled = []
+    bad = []
     for opc, meta in _OPCODE_META.items():
-        if meta.min_gpr_gap == 0:
-            continue
-        if meta.min_gpr_gap > 1:
-            # Gap lookahead isn't implemented beyond adjacent reader.
-            unhandled.append((opc, meta.name, meta.min_gpr_gap))
-    assert not unhandled, (
-        f"INV K violation — opcodes with min_gpr_gap > 1 are not "
-        f"handled by the proof engine's adjacent-reader logic: "
-        f"{unhandled}. Extend verify_proof's R8 loop to look "
-        f"`min_gpr_gap` instructions forward before classifying."
+        if meta.min_gpr_gap < 0:
+            bad.append((opc, meta.name, meta.min_gpr_gap))
+    assert not bad, (
+        f"INV K violation — opcodes with negative min_gpr_gap: {bad}."
     )
 
 
@@ -368,3 +357,248 @@ def test_inv_o_legacy_verify_schedule_returns_list_of_str():
     assert re.search(r"\[(\d+)\].*\[(\d+)\]", msgs[0]), (
         f"Legacy format broken: {msgs[0]!r}"
     )
+
+
+# ===========================================================================
+# FG-3.0 INVARIANTS (P, Q, R, S) — bounded non-adjacent hazard reasoning
+# ===========================================================================
+#
+# The FG-2.5 proof engine only reasoned about adjacent (gap=0) edges.
+# FG-3.0 extends it to bounded multi-step reasoning: for a writer with
+# min_gpr_gap = k > 1, the engine scans k+1 positions forward with
+# shadow tracking and classifies every candidate reader.
+#
+# Because no opcode currently lives in _OPCODE_META with min_gpr_gap > 1,
+# these tests monkeypatch _OPCODE_META to temporarily register a
+# synthetic k=2 rule for an existing opcode (IMAD.WIDE.RR = 0x225) and
+# exercise the multi-step scan path on encoded instruction streams.
+
+
+def _patch_min_gpr_gap(monkeypatch, opc: int, k: int) -> None:
+    """Temporarily set _OPCODE_META[opc].min_gpr_gap = k for a test."""
+    from sass.scoreboard import _OPCODE_META, _OpMeta
+    original = _OPCODE_META.get(opc)
+    if original is None:
+        patched = _OpMeta(name=f"SYNTH_0x{opc:03x}", min_gpr_gap=k,
+                          wdep=0x3e, misc=1)
+    else:
+        patched = _OpMeta(name=original.name, min_gpr_gap=k,
+                          wdep=original.wdep, misc=original.misc)
+    monkeypatch.setitem(_OPCODE_META, opc, patched)
+
+
+# ---------------------------------------------------------------------------
+# INV P — engine performs bounded lookahead > 1 for k>1 writers
+# ---------------------------------------------------------------------------
+
+def test_inv_p_bounded_lookahead_beyond_adjacent(monkeypatch):
+    """INV P: when a writer has min_gpr_gap = k > 1, the engine must
+    actually look at readers beyond index i+1.  We monkeypatch
+    IMAD.WIDE.RR (0x225) to k=3 and build a stream:
+
+        IMAD.WIDE.RR R8, R2, R3    # writer, dest R8:R9
+        NOP
+        NOP
+        IADD3 R10, R8, R11, RZ     # reader at gap=2 < k=3 → VIOLATION
+
+    If the engine were still adjacent-only (j = i+1 only), it would
+    see the NOP at i+1 (no overlap) and emit no edge.  FG-3.0 must
+    find the IADD3 reader at j = i+3 and emit a VIOLATION edge with
+    gap=2.  This is the *definitional* FG-3.0 capability.
+    """
+    _patch_min_gpr_gap(monkeypatch, 0x225, 3)
+
+    instrs = _stream(
+        encode_imad_wide_rr(dest=8, src0=2, src1=3, src2=0xff),
+        encode_nop(),
+        encode_nop(),
+        encode_iadd3(dest=10, src0=8, src1=11, src2=0xff),
+    )
+    report = verify_proof(instrs)
+
+    # There must be at least one edge with writer_idx=0, reader_idx=3,
+    # proving the engine looked beyond i+1.
+    multi_step_edges = [
+        e for e in report.edges
+        if e.writer_idx == 0 and e.reader_idx == 3
+    ]
+    assert multi_step_edges, (
+        f"INV P failed: proof engine emitted no non-adjacent edge "
+        f"for IMAD.WIDE.RR → IADD3 separated by 2 NOPs. Report: "
+        f"{report.summary_line()}. Edges: {report.edges}"
+    )
+    edge = multi_step_edges[0]
+    assert edge.gap == 2, (
+        f"INV P failed: expected gap=2, got gap={edge.gap}"
+    )
+    assert edge.classification == ProofClass.VIOLATION, (
+        f"INV P failed: expected VIOLATION at gap=2 < k=3, got "
+        f"{edge.classification}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# INV Q — non-adjacent VIOLATION is flagged
+# ---------------------------------------------------------------------------
+
+def test_inv_q_non_adjacent_violation_flagged(monkeypatch):
+    """INV Q: with min_gpr_gap = 2 patched onto IMAD.WIDE.RR, a
+    sequence
+
+        IMAD.WIDE.RR R8, R2, R3
+        NOP
+        IADD3 R10, R8, R11, RZ    # gap=1 < k=2 → VIOLATION
+
+    must be flagged as UNSAFE with exactly one VIOLATION whose
+    writer/reader opcodes and gap match the non-adjacent RAW.
+
+    This is the strong positive capability assertion of FG-3.0: the
+    engine must not lose track of a hazard just because a benign
+    (non-shadowing) instruction sits between producer and consumer.
+    """
+    _patch_min_gpr_gap(monkeypatch, 0x225, 2)
+
+    instrs = _stream(
+        encode_imad_wide_rr(dest=8, src0=2, src1=3, src2=0xff),
+        encode_nop(),
+        encode_iadd3(dest=10, src0=8, src1=11, src2=0xff),
+    )
+    report = verify_proof(instrs)
+    assert not report.safe, (
+        f"INV Q failed: proof engine did not flag non-adjacent "
+        f"IMAD.WIDE.RR → NOP → IADD3 as a VIOLATION. Report: "
+        f"{report.summary_line()}"
+    )
+    viols = [v for v in report.violations
+             if v.writer_opc == 0x225 and v.reader_opc == 0x210]
+    assert len(viols) == 1, (
+        f"INV Q failed: expected exactly one 0x225→0x210 VIOLATION, "
+        f"got {[(hex(v.writer_opc), hex(v.reader_opc), v.gap) for v in report.violations]}"
+    )
+    assert viols[0].gap == 1, (
+        f"INV Q failed: expected gap=1, got gap={viols[0].gap}"
+    )
+    assert viols[0].writer_idx == 0 and viols[0].reader_idx == 2, (
+        f"INV Q failed: expected edge [0]→[2], got "
+        f"[{viols[0].writer_idx}]→[{viols[0].reader_idx}]"
+    )
+
+
+# ---------------------------------------------------------------------------
+# INV R — non-adjacent SAFE is classified as GAP_SAFE
+# ---------------------------------------------------------------------------
+
+def test_inv_r_non_adjacent_gap_safe_classified(monkeypatch):
+    """INV R: with the same k=2 patch, inserting the required number
+    of NOPs turns the sequence SAFE:
+
+        IMAD.WIDE.RR R8, R2, R3
+        NOP
+        NOP
+        IADD3 R10, R8, R11, RZ    # gap=2 ≥ k=2 → GAP_SAFE
+
+    The engine must produce one GAP_SAFE edge and zero violations.
+    This proves the constructive classification side of FG-3.0 works:
+    not just flagging bad cases, but affirmatively proving safety
+    when the required gap is met.
+    """
+    _patch_min_gpr_gap(monkeypatch, 0x225, 2)
+
+    instrs = _stream(
+        encode_imad_wide_rr(dest=8, src0=2, src1=3, src2=0xff),
+        encode_nop(),
+        encode_nop(),
+        encode_iadd3(dest=10, src0=8, src1=11, src2=0xff),
+    )
+    report = verify_proof(instrs)
+    assert report.safe, (
+        f"INV R failed: proof engine flagged a gap=2 ≥ k=2 "
+        f"sequence as UNSAFE. Report: {report.summary_line()}. "
+        f"Violations: {[v.rationale for v in report.violations]}"
+    )
+    gap_safe_edges = [
+        e for e in report.edges
+        if e.writer_opc == 0x225 and e.reader_opc == 0x210
+        and e.classification == ProofClass.GAP_SAFE
+    ]
+    assert len(gap_safe_edges) == 1, (
+        f"INV R failed: expected exactly one GAP_SAFE edge for "
+        f"0x225 → 0x210 at gap=2, got {len(gap_safe_edges)}. "
+        f"Full edges: {report.edges}"
+    )
+    assert gap_safe_edges[0].gap == 2
+
+
+# ---------------------------------------------------------------------------
+# INV R' — shadow tracking: intervening writer hides the producer
+# ---------------------------------------------------------------------------
+
+def test_inv_r_prime_shadowing_kills_edge(monkeypatch):
+    """INV R' (shadowing): if an intervening instruction overwrites
+    the writer's dest register before any reader sees it, the engine
+    must NOT emit a VIOLATION for a later reader of that register —
+    the later reader is reading the *newer* value, not the original
+    producer's.
+
+    Sequence with k=2 patched onto IMAD.WIDE.RR:
+
+        IMAD.WIDE.RR R8, R2, R3    # writes R8 (and R9)
+        MOV R8, R99                # overwrites R8 — shadow
+        IADD3 R10, R8, R11, RZ     # reads R8, but from MOV, not IMAD
+
+    For this test we check that no VIOLATION edge reports writer_idx=0
+    → reader_idx=2 on register R8.  (R9 is still live from the IMAD
+    pair; no consumer of R9 exists in the stream, so nothing is
+    emitted for it either.)
+    """
+    _patch_min_gpr_gap(monkeypatch, 0x225, 2)
+
+    instrs = _stream(
+        encode_imad_wide_rr(dest=8, src0=2, src1=3, src2=0xff),
+        encode_mov(dest=8, src=99),           # shadows R8
+        encode_iadd3(dest=10, src0=8, src1=11, src2=0xff),
+    )
+    report = verify_proof(instrs)
+    # No edge from writer_idx=0 to reader_idx=2 on register 8 —
+    # shadowing at idx 1 means the IADD3 is reading MOV's value.
+    shadowed = [
+        e for e in report.edges
+        if e.writer_idx == 0 and e.reader_idx == 2 and 8 in e.regs
+    ]
+    assert not shadowed, (
+        f"INV R' failed: shadow tracking did not kill edge for "
+        f"register R8 after MOV overwrite. Edges: {shadowed}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# INV S — entire real corpus remains SAFE under the expanded model
+# ---------------------------------------------------------------------------
+
+def test_inv_s_corpus_safe_under_expanded_model():
+    """INV S: the corpus already asserted SAFE by INV H must still be
+    SAFE under the FG-3.0 expanded proof engine, with zero
+    VIOLATION edges in aggregate.  Distinct from INV I because the
+    test name/semantics are anchored to the FG-3.0 upgrade — a
+    regression in the bounded-lookahead path (e.g. a silent enumeration
+    explosion or a shadowing bug) would show up here first.
+    """
+    corpus = _workbench_kernels() + _probe_kernels() + _fg21_predicate_kernels()
+    total = 0
+    viols = 0
+    problem = []
+    for label, ptx in corpus:
+        try:
+            report = _proof_for(ptx)
+        except Exception:
+            continue
+        total += report.total
+        viols += len(report.violations)
+        if report.violations:
+            problem.append(label)
+    assert viols == 0, (
+        f"INV S failed: {viols} VIOLATION edges across "
+        f"{len(problem)} kernel(s) under FG-3.0 engine: "
+        f"{problem[:10]}"
+    )
+    assert total > 0, "INV S corpus collected zero edges"

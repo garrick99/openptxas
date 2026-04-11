@@ -726,13 +726,40 @@ _WDEP_TO_RBAR_MASK: dict[int, int] = {
 }
 
 
-# FG-3.2: explicitly-declared no-track wdep slots.
-# A producer with wdep=0x3f is "not scoreboard-tracked" — the hardware
-# treats its result as immediately available.  This is the legitimate
-# "latency-inert" case, distinct from "not yet classified in the
-# model".  Observed on LDC descriptor loads (0xb82) and rare LDS
-# (0x984) in cp_async.
-_LATENCY_INERT_WDEPS: set[int] = {0x3f}
+# FG-3.2 + FG-3.3: explicitly-declared no-track wdep slots.
+# A producer with wdep ∈ _LATENCY_INERT_WDEPS is "not scoreboard-
+# tracked" — the hardware does not track its result via an rbar
+# slot.  A consumer therefore CANNOT wait on the producer via rbar;
+# it must rely on either instruction-stream gap distance or a
+# post-segment-boundary scoreboard reset.
+#
+#   0x3f — explicit no-tracking (descriptor loads, cp_async LDS,
+#          short-latency const fetches).
+#   0x37 — reserved LDCU/LDC slot with NO rbar bit (header comment
+#          line 27: "never use wdep=0x37").  ptxas emits this on a
+#          post-segment-boundary LDCU.64 (observed in reduce_sum);
+#          the hardware clears the scoreboard at the boundary, so
+#          the consumer does not need to wait at all.
+_LATENCY_INERT_WDEPS: set[int] = {0x37, 0x3f}
+
+
+# FG-3.3: LDCU.64 latency in instruction-stream slots.
+# This is the ptxas convention: a gap of >= 3 instructions between
+# an LDCU.64 producer and its UR consumer is sufficient to cover the
+# LDCU load latency even when the consumer's rbar does not carry the
+# producer's class bit.
+#
+# Evidence in the corpus (4 edges):
+#   hmma_zero   [1]→[5]  gap=3  LDCU.64 wdep=0x35 → STG, no rbar 0x08
+#   imma_zero   [1]→[5]  gap=3  (same pattern)
+#   dmma_zero   [1]→[5]  gap=3  (same pattern)
+#   fg114b_diag3[2]→[15] gap=12 LDCU.64 wdep=0x35 → STG, no rbar 0x08
+#
+# The original FG-2.4 R1 rule also used gap >= 3 as a safety class.
+# FG-3.3 preserves that empirical convention as a narrow, data-driven
+# rule folded into the unified R10 path instead of a legacy special
+# case.
+_LDCU_GAP_SAFE_MIN: int = 3
 
 
 def _get_rbar(raw: bytes) -> int:

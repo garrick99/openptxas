@@ -43,14 +43,16 @@ class ProofClass(str, Enum):
     """Classification of a single producer→consumer edge."""
     LATENCY_INERT          = "LATENCY_INERT"          # writer has no min_gpr_gap in model
     FORWARDING_SAFE        = "FORWARDING_SAFE"        # pair on _FORWARDING_SAFE_PAIRS list
-    CTRLWORD_SAFE          = "CTRLWORD_SAFE"          # LDCU.64 R1 ctrl-word rule
-    GAP_SAFE               = "GAP_SAFE"               # instruction-stream gap ≥ min_gpr_gap
+    CTRLWORD_SAFE          = "CTRLWORD_SAFE"          # reserved / legacy (unused after FG-3.3)
+    GAP_SAFE               = "GAP_SAFE"               # ALU: instruction-stream gap ≥ min_gpr_gap
     # FG-3.1 memory latency classes (GPR memory producers)
     MEMORY_SCOREBOARD_SAFE = "MEMORY_SCOREBOARD_SAFE"  # rbar wait bit proven in window
-    MEMORY_INERT           = "MEMORY_INERT"            # producer wdep=0x3f, no-track (FG-3.2)
+    MEMORY_INERT           = "MEMORY_INERT"            # producer wdep no-track (FG-3.2)
     MEMORY_VIOLATION       = "MEMORY_VIOLATION"        # memory read with no rbar wait
-    # FG-3.2 UR-destination memory / system producers (rule R10)
+    # FG-3.2 / FG-3.3 UR-destination memory / system producers (rule R10)
     UR_MEMORY_SCOREBOARD_SAFE = "UR_MEMORY_SCOREBOARD_SAFE"
+    UR_MEMORY_GAP_SAFE        = "UR_MEMORY_GAP_SAFE"      # FG-3.3: LDCU.64 gap >= _LDCU_GAP_SAFE_MIN
+    UR_MEMORY_INERT           = "UR_MEMORY_INERT"         # FG-3.3: producer wdep no-track
     UR_MEMORY_VIOLATION       = "UR_MEMORY_VIOLATION"
     VIOLATION              = "VIOLATION"               # ALU / general violation
 
@@ -147,12 +149,13 @@ class ProofReport:
             f"total={self.total}  "
             f"INERT={c[ProofClass.LATENCY_INERT]}  "
             f"FWD={c[ProofClass.FORWARDING_SAFE]}  "
-            f"CTRL={c[ProofClass.CTRLWORD_SAFE]}  "
             f"GAP={c[ProofClass.GAP_SAFE]}  "
             f"MSB={c[ProofClass.MEMORY_SCOREBOARD_SAFE]}  "
             f"MIN={c[ProofClass.MEMORY_INERT]}  "
             f"MVIOL={c[ProofClass.MEMORY_VIOLATION]}  "
             f"URSB={c[ProofClass.UR_MEMORY_SCOREBOARD_SAFE]}  "
+            f"URGAP={c[ProofClass.UR_MEMORY_GAP_SAFE]}  "
+            f"URIN={c[ProofClass.UR_MEMORY_INERT]}  "
             f"URVIOL={c[ProofClass.UR_MEMORY_VIOLATION]}  "
             f"VIOL={c[ProofClass.VIOLATION]}"
         )
@@ -494,40 +497,46 @@ def _enforce_gpr_latency(instrs: list[SassInstr]) -> list[SassInstr]:
 
 
 def verify_proof(instrs: list[SassInstr]) -> ProofReport:
-    """FG-2.5 constructive proof of schedule safety.
+    """Constructive proof of schedule safety (FG-2.5 → FG-3.3).
 
     Enumerate every candidate producer→consumer dependency edge in
     `instrs` and classify each one into exactly one of:
 
-      LATENCY_INERT    — writer has no min_gpr_gap in the model, so
-                         any dest-reading reader is safe by virtue of
-                         the opcode class.  (Used only when there is
-                         an actual GPR overlap; edges without overlap
-                         are never recorded.)
-      FORWARDING_SAFE  — (writer_opc, reader_opc) is on
-                         sass.scoreboard._FORWARDING_SAFE_PAIRS,
-                         meaning hardware operand forwarding covers
-                         the 1-cycle latency.
-      CTRLWORD_SAFE    — writer is LDCU.64 and the consumer is on the
-                         FG-2.4 _LDCU_GAP_EXEMPT_CONSUMERS whitelist
-                         (consumer's own ctrl-word rbar/wdep slot
-                         covers the latency), OR the LDCU.64 is
-                         post-segment-boundary (handled by the
-                         preamble/body scoreboard split).
-      GAP_SAFE         — for rules with min_gpr_gap > 1, the
-                         instruction-stream distance between writer
-                         and reader satisfies the gap.  Included in
-                         the classification even though today every
-                         rule has min_gpr_gap == 1 (so the check
-                         reduces to "next instruction does not read
-                         the dest"); the classification is kept for
-                         future-proofing.
-      VIOLATION        — none of the above applies: the edge is a
-                         real hazard.
+      LATENCY_INERT              — ALU writer with no min_gpr_gap in
+                                   the model; dest-reading readers
+                                   are safe by opcode class.
+      FORWARDING_SAFE            — (writer, reader) is on
+                                   sass.scoreboard._FORWARDING_SAFE_PAIRS;
+                                   hardware operand forwarding covers
+                                   the 1-cycle latency.
+      GAP_SAFE                   — ALU writer with min_gpr_gap = k
+                                   and reader at gap >= k (FG-3.0
+                                   bounded lookahead).
+      MEMORY_SCOREBOARD_SAFE     — GPR memory writer; consumer window
+                                   carries the rbar class bit for the
+                                   producer's wdep slot (FG-3.1).
+      MEMORY_INERT               — GPR memory writer with wdep in
+                                   _LATENCY_INERT_WDEPS (FG-3.2).
+      MEMORY_VIOLATION           — GPR memory writer without rbar
+                                   evidence / unknown wdep.
+      UR_MEMORY_SCOREBOARD_SAFE  — UR memory writer (LDCU/S2UR/REDUX
+                                   /ULDC.64) with rbar evidence in
+                                   window (FG-3.2; FG-3.3 folds LDCU
+                                   in).
+      UR_MEMORY_GAP_SAFE         — LDCU.64 with gap ≥
+                                   _LDCU_GAP_SAFE_MIN and no rbar
+                                   evidence; narrow data-driven
+                                   fallback (FG-3.3).
+      UR_MEMORY_INERT            — UR memory writer with wdep in
+                                   _LATENCY_INERT_WDEPS (FG-3.3).
+      UR_MEMORY_VIOLATION        — UR memory writer without safe
+                                   evidence.
+      VIOLATION                  — generic ALU violation fallthrough.
 
     The returned ProofReport holds every recorded edge plus counts
     and a final safe/unsafe verdict.  Its `safe` property is False
-    iff any edge is classified VIOLATION.
+    iff any VIOLATION / MEMORY_VIOLATION / UR_MEMORY_VIOLATION edge
+    exists.
 
     Callers that only need the legacy list-of-strings output should
     use `verify_schedule`, which is now a thin wrapper over this
@@ -539,9 +548,9 @@ def verify_proof(instrs: list[SassInstr]) -> ProofReport:
         _get_src_regs  as _sc_src,
         _get_opcode    as _sc_opc,
         _is_forwarding_safe_pair,
-        _LDCU_GAP_EXEMPT_CONSUMERS,
         _WDEP_TO_RBAR_MASK,
         _LATENCY_INERT_WDEPS,
+        _LDCU_GAP_SAFE_MIN,
         _get_rbar,
         _get_wdep,
         _is_memory_gpr_producer,
@@ -551,67 +560,14 @@ def verify_proof(instrs: list[SassInstr]) -> ProofReport:
         _UR_CONSUMER_OPCODES,
     )
 
-    _UR_CONSUMER_OPCODES = {0xc35, 0xc0c, 0xc24, 0x981}
     report = ProofReport()
 
-    # Find first predicated BRA/EXIT — segment boundary.
-    # Post-boundary LDCU.64s satisfy their gap via scoreboard ctrl
-    # (rbar/wdep), not instruction ordering.
-    boundary_idx = len(instrs)
-    for k, sk in enumerate(instrs):
-        opc_k = _get_opcode(sk.raw)
-        guard_k = (sk.raw[1] >> 4) & 0xF
-        if opc_k in (0x947, 0x94d) and guard_k != 0x7:
-            boundary_idx = k
-            break
-
-    # ---- LDCU.64 → first UR consumer (rule R1) -----------------------------
-    for i, si in enumerate(instrs):
-        if _get_opcode(si.raw) != 0x7ac or si.raw[9] != 0x0a:
-            continue  # not an LDCU.64
-        ur_dest = si.raw[2]
-
-        # Find the first UR consumer of this LDCU.64.
-        cons_j = None
-        for j in range(i + 1, len(instrs)):
-            opc_j = _get_opcode(instrs[j].raw)
-            if opc_j in _UR_CONSUMER_OPCODES and instrs[j].raw[4] == ur_dest:
-                cons_j = j
-                break
-        if cons_j is None:
-            continue  # UR is never consumed; no edge
-
-        gap = cons_j - i - 1
-        opc_j = _get_opcode(instrs[cons_j].raw)
-
-        # Classify the LDCU.64 → UR-consumer edge.
-        if i >= boundary_idx:
-            cls = ProofClass.CTRLWORD_SAFE
-            rat = (f"post-boundary LDCU.64 at [{i}]: preamble/body split "
-                   f"scoreboard handles the consumer gap")
-        elif opc_j in _LDCU_GAP_EXEMPT_CONSUMERS:
-            cls = ProofClass.CTRLWORD_SAFE
-            rat = (f"consumer opc=0x{opc_j:03x} is on FG-2.4 "
-                   f"_LDCU_GAP_EXEMPT_CONSUMERS whitelist: consumer's "
-                   f"own ctrl word covers the latency")
-        elif gap >= 3:
-            cls = ProofClass.GAP_SAFE
-            rat = f"instruction-stream gap {gap} ≥ 3 (LDCU.64 rule R1)"
-        else:
-            cls = ProofClass.VIOLATION
-            rat = (f"LDCU.64 UR{ur_dest} → consumer opc=0x{opc_j:03x} "
-                   f"at gap={gap}, needs ≥3")
-
-        report.edges.append(ProofEdge(
-            writer_idx=i,
-            reader_idx=cons_j,
-            writer_opc=0x7ac,
-            reader_opc=opc_j,
-            regs=frozenset({ur_dest}),  # UR index, tagged for display
-            gap=gap,
-            classification=cls,
-            rationale=rat,
-        ))
+    # FG-3.3: the legacy R1 (LDCU.64 → first-UR-consumer) rule has
+    # been retired.  LDCU now flows through the unified R10 path
+    # below alongside S2UR / REDUX / ULDC.64 — classified by the
+    # same wdep-based scoreboard proof mechanism as every other
+    # memory producer.  See FG-3.3 commit message for the inventory
+    # and the evidence for the narrow UR_MEMORY_GAP_SAFE rule.
 
     # ---- FG-3.1 memory-producer → GPR consumer (rule R9) -----------------
     # Memory-producing opcodes (LDG / LDS / LDC and siblings) are
@@ -743,27 +699,51 @@ def verify_proof(instrs: list[SassInstr]) -> ProofReport:
             if dest_j:
                 live_dest -= dest_j
 
-    # ---- FG-3.2 UR-memory producer → UR consumer (rule R10) --------------
-    # Parallel to R9 but for producers that write the UR register bank
-    # instead of GPR: S2UR (0x9c3), REDUX (0x3c4), ULDC.64 (0xab9).
-    # LDCU (0x7ac) is still handled by rule R1 above to preserve the
-    # existing FG-2.4 CTRLWORD_SAFE / GAP_SAFE classification shape.
+    # ---- Unified UR-memory producer → UR consumer (rule R10, FG-3.3) -----
+    # Single rule covering every UR-destination memory/system producer:
+    #     LDCU / LDCU.64 (0x7ac)     — FG-3.3: folded into R10,
+    #                                   replacing the legacy R1 path
+    #     S2UR  (0x9c3)              — FG-3.2
+    #     REDUX (0x3c4)              — FG-3.2
+    #     ULDC.64 (0xab9)            — FG-3.2 (SM_89, forward cover)
     #
-    # The proof mechanism is identical to R9: the producer's emitted
-    # wdep slot determines the class bit, and any instruction in
-    # [i+1, j] whose rbar has that bit set proves the scoreboard wait.
-    # The lookup table _UR_CONSUMER_OPCODES + _get_ur_src are used
-    # instead of GPR source decoding.
+    # The classification algorithm is identical to R9 for GPR memory
+    # producers.  The producer's actually emitted wdep slot determines
+    # the required consumer-side rbar class bit via
+    # _WDEP_TO_RBAR_MASK.  Any instruction in [writer+1, reader]
+    # whose rbar carries that class bit proves the scoreboard wait.
+    #
+    # Four additional classes cover cases that have NO rbar evidence
+    # but are still safe by construction:
+    #   - wdep in _LATENCY_INERT_WDEPS (0x37, 0x3f) →
+    #     UR_MEMORY_INERT.  Slot 0x37 has no rbar bit at all (header
+    #     comment at scoreboard.py:27); slot 0x3f is explicit
+    #     no-track.  In both cases the consumer cannot — and need not
+    #     — wait via rbar.
+    #   - Producer is LDCU.64 and instruction-stream gap is
+    #     ≥ _LDCU_GAP_SAFE_MIN (3) → UR_MEMORY_GAP_SAFE.
+    #     This is the ptxas convention for LDCU.64 latency; evidence
+    #     comes from four corpus edges (hmma_zero, imma_zero,
+    #     dmma_zero, fg114b_diag3) where the consumer's rbar does
+    #     not carry the LDG class bit yet the kernel runs correctly
+    #     because the hardware load completes inside three slots.
+    #     It is LDCU.64-specific and intentionally narrow.
+    #   - wdep unknown (not in _WDEP_TO_RBAR_MASK, not inert) →
+    #     UR_MEMORY_VIOLATION with "UNKNOWN wdep" rationale, so new
+    #     slot values fail loudly instead of leaking through.
+    #   - otherwise (wdep tracked but no rbar in window and not a
+    #     gap-safe LDCU.64) → UR_MEMORY_VIOLATION.
     for i in range(len(instrs)):
         opc_i = _sc_opc(instrs[i].raw)
         if not _is_memory_ur_producer(opc_i):
             continue
-        if opc_i == 0x7ac:
-            continue  # LDCU handled by R1 above
         ur_dest = _get_ur_dest(instrs[i].raw)
         if ur_dest < 0 or ur_dest >= 0xff:
             continue
         wdep_i = _get_wdep(instrs[i].raw)
+        raw_i = instrs[i].raw
+        is_ldcu_64 = (opc_i == 0x7ac and raw_i[9] == 0x0a)
+
         mode_inert = wdep_i in _LATENCY_INERT_WDEPS
         mode_scoreboard = wdep_i in _WDEP_TO_RBAR_MASK
         mode_unknown = not (mode_inert or mode_scoreboard)
@@ -789,13 +769,14 @@ def verify_proof(instrs: list[SassInstr]) -> ProofReport:
 
             gap = j - i - 1
             if mode_inert:
-                cls = ProofClass.UR_MEMORY_SCOREBOARD_SAFE
+                cls = ProofClass.UR_MEMORY_INERT
                 rat = (
                     f"UR memory writer opc=0x{opc_i:03x} "
                     f"(wdep=0x{wdep_i:02x}) → UR consumer "
-                    f"opc=0x{opc_j:03x} at gap={gap}: producer "
-                    f"wdep=0x3f is no-track, result immediately "
-                    f"available"
+                    f"opc=0x{opc_j:03x} at gap={gap}: producer wdep "
+                    f"is on _LATENCY_INERT_WDEPS (slot has no rbar "
+                    f"bit or is explicit no-track); the scoreboard "
+                    f"does not need to be waited on"
                 )
             elif mode_unknown:
                 cls = ProofClass.UR_MEMORY_VIOLATION
@@ -821,6 +802,18 @@ def verify_proof(instrs: list[SassInstr]) -> ProofReport:
                         f"opc=0x{opc_j:03x} at gap={gap}: ctrl rbar "
                         f"class bit 0x{class_bit:02x} set on instr "
                         f"[{wait_idx}] proves the scoreboard wait"
+                    )
+                elif is_ldcu_64 and gap >= _LDCU_GAP_SAFE_MIN:
+                    # FG-3.3: narrow, data-driven gap-safe rule for
+                    # LDCU.64.  Corpus evidence: hmma_zero / imma_zero
+                    # / dmma_zero / fg114b_diag3.
+                    cls = ProofClass.UR_MEMORY_GAP_SAFE
+                    rat = (
+                        f"UR memory writer LDCU.64 (wdep=0x{wdep_i:02x}"
+                        f") → UR consumer opc=0x{opc_j:03x} at gap="
+                        f"{gap}: no rbar evidence in window, but gap "
+                        f"≥ {_LDCU_GAP_SAFE_MIN} (LDCU.64 latency "
+                        f"convention, FG-3.3)"
                     )
                 else:
                     cls = ProofClass.UR_MEMORY_VIOLATION

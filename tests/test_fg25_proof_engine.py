@@ -23,6 +23,7 @@ from sass.encoding.sm_120_opcodes import (
     encode_imad_ur, encode_mov, encode_nop,
     encode_imad_wide_rr, encode_iadd3,
     encode_ldg_e, encode_lds, encode_ldc,
+    encode_ldcu_64,
 )
 
 
@@ -160,31 +161,40 @@ def test_inv_i_safe_kernels_have_zero_violations():
 # printed by probe_work/fg25_prove_corpus.py.
 
 _EXPECTED_COUNTS = {
-    # FG-3.2 11-tuple: (total, LATENCY_INERT, FORWARDING_SAFE,
+    # FG-3.3 13-tuple: (total, LATENCY_INERT, FORWARDING_SAFE,
     # CTRLWORD_SAFE, GAP_SAFE, MEMORY_SCOREBOARD_SAFE, MEMORY_INERT,
-    # MEMORY_VIOLATION, UR_MEMORY_SCOREBOARD_SAFE, UR_MEMORY_VIOLATION,
-    # VIOLATION).
+    # MEMORY_VIOLATION, UR_MEMORY_SCOREBOARD_SAFE, UR_MEMORY_GAP_SAFE,
+    # UR_MEMORY_INERT, UR_MEMORY_VIOLATION, VIOLATION).
     #
-    # Baselines regenerated 2026-04-11 for FG-3.2:
-    #   - Added MEMORY_INERT column (producer wdep=0x3f explicit class).
-    #   - Added UR_MEMORY_SCOREBOARD_SAFE column (rule R10 for S2UR,
-    #     REDUX, ULDC.64).  Every kernel gains +1 UR_SB edge from
-    #     the S2UR → consumer chain introduced by the preamble.
-    #   - reduce_sum gains +2 MSB edges because wdep=0x3b (rotating
-    #     LDG slot) is now explicitly classified as LDG-class.
-    "diag":                  (2, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0),
-    "diag3":                 (2, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0),
-    "min_store_guarded":     (3, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0),
-    "probe_fresh":           (3, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0),
-    "reduce_sum":            (16, 4, 6, 1, 1, 3, 0, 0, 1, 0, 0),
-    "conv2d_looped":         (107, 10, 0, 31, 1, 63, 0, 0, 2, 0, 0),
-    "conv2d_unrolled":       (89, 1, 8, 30, 1, 47, 0, 0, 2, 0, 0),
-    "fg21:k_ge":             (3, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0),
-    "fg21:k_lt":             (3, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0),
-    "fg21:k_gt":             (3, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0),
-    "fg21:k_le":             (3, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0),
-    "fg21:k_eq":             (3, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0),
-    "fg21:k_ne":             (3, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0),
+    # FG-3.3: legacy R1 rule (LDCU.64 → first UR consumer) retired.
+    # All LDCU edges now flow through the unified R10 path.  Changes
+    # from FG-3.2 baselines:
+    #   - CTRLWORD_SAFE and GAP_SAFE drop to 0 on every kernel that
+    #     used to rely on R1 (LDCU was the only emitter of those
+    #     classes in the corpus).
+    #   - UR_MEMORY_SCOREBOARD_SAFE grows: 150 + 34 + 22 + 15 = 221
+    #     new LDCU edges join the existing 16 S2UR/REDUX edges in
+    #     the UR scoreboard class.
+    #   - UR_MEMORY_GAP_SAFE: new column, 4 edges in corpus
+    #     (hmma_zero / imma_zero / dmma_zero / fg114b_diag3 — LDCU.64
+    #     wdep=0x35 → STG at gap ≥ 3 with no rbar evidence).
+    #   - UR_MEMORY_INERT: new column, 1 edge (reduce_sum post-
+    #     boundary LDCU.64 wdep=0x37).
+    #   - Totals grow by the number of LDCU edges R1 used to miss
+    #     (STG-consumer edges and LDCU.32 edges).
+    "diag":                  (4, 0, 0, 0, 0, 1, 0, 0, 3, 0, 0, 0, 0),
+    "diag3":                 (4, 0, 0, 0, 0, 1, 0, 0, 2, 1, 0, 0, 0),
+    "min_store_guarded":     (5, 0, 0, 0, 0, 1, 0, 0, 4, 0, 0, 0, 0),
+    "probe_fresh":           (5, 0, 0, 0, 0, 1, 0, 0, 4, 0, 0, 0, 0),
+    "reduce_sum":            (18, 4, 6, 0, 0, 3, 0, 0, 4, 0, 1, 0, 0),
+    "conv2d_looped":         (109, 10, 0, 0, 0, 63, 0, 0, 36, 0, 0, 0, 0),
+    "conv2d_unrolled":       (91, 1, 8, 0, 0, 47, 0, 0, 35, 0, 0, 0, 0),
+    "fg21:k_ge":             (5, 0, 0, 0, 0, 1, 0, 0, 4, 0, 0, 0, 0),
+    "fg21:k_lt":             (5, 0, 0, 0, 0, 1, 0, 0, 4, 0, 0, 0, 0),
+    "fg21:k_gt":             (5, 0, 0, 0, 0, 1, 0, 0, 4, 0, 0, 0, 0),
+    "fg21:k_le":             (5, 0, 0, 0, 0, 1, 0, 0, 4, 0, 0, 0, 0),
+    "fg21:k_eq":             (5, 0, 0, 0, 0, 1, 0, 0, 4, 0, 0, 0, 0),
+    "fg21:k_ne":             (5, 0, 0, 0, 0, 1, 0, 0, 4, 0, 0, 0, 0),
 }
 
 
@@ -213,6 +223,8 @@ def test_inv_j_class_counts_stable(label, expected):
         c[ProofClass.MEMORY_INERT],
         c[ProofClass.MEMORY_VIOLATION],
         c[ProofClass.UR_MEMORY_SCOREBOARD_SAFE],
+        c[ProofClass.UR_MEMORY_GAP_SAFE],
+        c[ProofClass.UR_MEMORY_INERT],
         c[ProofClass.UR_MEMORY_VIOLATION],
         c[ProofClass.VIOLATION],
     )
@@ -1179,4 +1191,243 @@ def test_inv_ac_prime_memory_inert_classified():
     assert report.safe, (
         f"INV AC': LDC wdep=0x3f → MOV must be SAFE; report="
         f"{report.summary_line()}"
+    )
+
+
+# ===========================================================================
+# FG-3.3 INVARIANTS (AD, AE, AF, AG, AH) — LDCU unification
+# ===========================================================================
+#
+# FG-3.3 retires the legacy R1 rule (LDCU.64 → first UR consumer via
+# a bespoke gap/whitelist classifier) and folds LDCU into the same
+# wdep-based rule R10 used for every other UR-destination producer.
+# The corpus evidence justified two additional UR classes beyond
+# UR_MEMORY_SCOREBOARD_SAFE:
+#   - UR_MEMORY_GAP_SAFE  — LDCU.64 with gap ≥ _LDCU_GAP_SAFE_MIN and
+#                           no rbar evidence (4 corpus edges).
+#   - UR_MEMORY_INERT     — producer wdep in _LATENCY_INERT_WDEPS
+#                           (reduce_sum wdep=0x37, 1 corpus edge).
+
+
+# ---------------------------------------------------------------------------
+# INV AD — no legacy R1 path remains for LDCU classification
+# ---------------------------------------------------------------------------
+
+def test_inv_ad_no_legacy_r1_path():
+    """INV AD: verify_proof contains no references to the legacy R1
+    mechanism — no `rule R1` comment token, no
+    `_LDCU_GAP_EXEMPT_CONSUMERS` import.  Detects accidental
+    re-introduction by source inspection of verify_proof.
+
+    (The same scoreboard.py set may still exist; schedule.py uses
+    LDCU.64 byte gates in OTHER scheduling passes which are not
+    part of the proof path — those are not in scope for INV AD.)
+    """
+    import re, inspect
+    from sass.schedule import verify_proof
+    src = inspect.getsource(verify_proof)
+    assert not re.search(r"\brule R1\b", src), (
+        "legacy 'rule R1' comment reappeared in verify_proof"
+    )
+    assert "_LDCU_GAP_EXEMPT_CONSUMERS" not in src, (
+        "legacy _LDCU_GAP_EXEMPT_CONSUMERS import reappeared "
+        "in verify_proof"
+    )
+    # The R1 rule gated LDCU.64 via si.raw[9] != 0x0a.  verify_proof
+    # no longer needs that gate — LDCU.64 is classified uniformly
+    # via wdep-based rule R10.
+    assert "raw[9] != 0x0a" not in src, (
+        "legacy LDCU.64 b9 gate reappeared in verify_proof"
+    )
+
+
+# ---------------------------------------------------------------------------
+# INV AE — every corpus LDCU edge is in a UR_* class under R10
+# ---------------------------------------------------------------------------
+
+def test_inv_ae_ldcu_edges_classified_unified():
+    """INV AE: every corpus edge whose writer is LDCU (0x7ac) is
+    classified by the unified R10 path — i.e. in one of the UR_*
+    classes.  No legacy CTRLWORD_SAFE / GAP_SAFE for LDCU.
+    """
+    corpus = _workbench_kernels() + _probe_kernels() + _fg21_predicate_kernels()
+    ok_classes = {
+        ProofClass.UR_MEMORY_SCOREBOARD_SAFE,
+        ProofClass.UR_MEMORY_GAP_SAFE,
+        ProofClass.UR_MEMORY_INERT,
+        ProofClass.UR_MEMORY_VIOLATION,
+    }
+    bad = []
+    count = 0
+    for label, ptx in corpus:
+        try:
+            report = _proof_for(ptx)
+        except Exception:
+            continue
+        for e in report.edges:
+            if e.writer_opc == 0x7ac:
+                count += 1
+                if e.classification not in ok_classes:
+                    bad.append((label, e.classification, e.rationale[:60]))
+    assert count > 0, (
+        "INV AE: no LDCU edges found in corpus — R10 never enumerated them"
+    )
+    assert not bad, (
+        f"INV AE: {len(bad)} LDCU edges classified outside UR_* classes: "
+        f"{bad[:5]}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# INV AF — synthetic unsafe LDCU.64 case is flagged
+# ---------------------------------------------------------------------------
+
+def test_inv_af_synthetic_unsafe_ldcu():
+    """INV AF: LDCU.64 with tracked wdep=0x35 followed by an IMAD.R-UR
+    at gap=0 with no rbar wait bit for LDG class must produce a
+    UR_MEMORY_VIOLATION.  Gap=0 excludes the gap-safe fallback
+    (_LDCU_GAP_SAFE_MIN = 3).
+    """
+    ldcu_ctrl = _mk_ctrl(rbar=0x01, wdep=0x35)
+    imad_ctrl = _mk_ctrl(rbar=0x01, wdep=0x3e)  # no LDG wait bit
+    instrs = _stream(
+        encode_ldcu_64(dest_ur=4, const_bank=0, const_offset_bytes=0x10,
+                       ctrl=ldcu_ctrl),
+        # IMAD R5, R3, UR4, R2 — reads UR4 at gap=0
+        encode_imad_ur(dest=5, src0=3, ur_src=4, src2=2,
+                       ctrl=imad_ctrl),
+    )
+    report = verify_proof(instrs)
+    assert not report.safe, (
+        f"INV AF failed: LDCU.64 → IMAD.R-UR at gap=0 with no rbar "
+        f"wait should be UNSAFE. Report: {report.summary_line()}"
+    )
+    viols = [v for v in report.violations
+             if v.classification == ProofClass.UR_MEMORY_VIOLATION]
+    assert len(viols) == 1, (
+        f"INV AF: expected one UR_MEMORY_VIOLATION, got "
+        f"{[(v.classification, v.rationale[:80]) for v in report.violations]}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# INV AG — synthetic safe LDCU.64 cases are classified SAFE
+# ---------------------------------------------------------------------------
+
+def test_inv_ag_synthetic_safe_ldcu_rbar():
+    """INV AG (rbar): LDCU.64 wdep=0x35 → IMAD.R-UR with rbar=0x09
+    (LDG class bit 3 set) at gap=0 must be UR_MEMORY_SCOREBOARD_SAFE.
+    This is the direct rbar-wait path.
+    """
+    ldcu_ctrl = _mk_ctrl(rbar=0x01, wdep=0x35)
+    imad_ctrl = _mk_ctrl(rbar=0x09, wdep=0x3e)  # LDG bit 3 set
+    instrs = _stream(
+        encode_ldcu_64(dest_ur=4, const_bank=0, const_offset_bytes=0x10,
+                       ctrl=ldcu_ctrl),
+        encode_imad_ur(dest=5, src0=3, ur_src=4, src2=2,
+                       ctrl=imad_ctrl),
+    )
+    report = verify_proof(instrs)
+    assert report.safe, (
+        f"INV AG (rbar) failed: rbar-guarded LDCU → IMAD UNSAFE. "
+        f"Report: {report.summary_line()}"
+    )
+    safe_edges = [e for e in report.edges
+                  if e.classification == ProofClass.UR_MEMORY_SCOREBOARD_SAFE]
+    assert len(safe_edges) == 1
+
+
+def test_inv_ag_synthetic_safe_ldcu_gap():
+    """INV AG (gap): LDCU.64 wdep=0x35 → NOP → NOP → NOP → IMAD.R-UR
+    (gap=3) with NO rbar wait bits must still be SAFE, classified as
+    UR_MEMORY_GAP_SAFE.  This is the ptxas LDCU.64 latency convention
+    made explicit under the unified model.
+    """
+    ldcu_ctrl = _mk_ctrl(rbar=0x01, wdep=0x35)
+    nop_ctrl  = _mk_ctrl(rbar=0x01, wdep=0x3e)
+    imad_ctrl = _mk_ctrl(rbar=0x01, wdep=0x3e)
+    instrs = _stream(
+        encode_ldcu_64(dest_ur=4, const_bank=0, const_offset_bytes=0x10,
+                       ctrl=ldcu_ctrl),
+        encode_nop(ctrl=nop_ctrl),
+        encode_nop(ctrl=nop_ctrl),
+        encode_nop(ctrl=nop_ctrl),
+        encode_imad_ur(dest=5, src0=3, ur_src=4, src2=2,
+                       ctrl=imad_ctrl),
+    )
+    report = verify_proof(instrs)
+    assert report.safe, (
+        f"INV AG (gap) failed: LDCU.64 at gap=3 should be SAFE. "
+        f"Report: {report.summary_line()}"
+    )
+    gap_edges = [e for e in report.edges
+                 if e.classification == ProofClass.UR_MEMORY_GAP_SAFE]
+    assert len(gap_edges) == 1, (
+        f"INV AG (gap) failed: expected one UR_MEMORY_GAP_SAFE edge, "
+        f"got {[(e.classification, e.rationale[:80]) for e in report.edges]}"
+    )
+
+
+def test_inv_ag_synthetic_safe_ldcu_inert():
+    """INV AG (inert): LDCU.64 with wdep=0x37 (reserved no-rbar slot)
+    followed by an IMAD.R-UR at gap=0 must be SAFE, classified as
+    UR_MEMORY_INERT.  Slot 0x37 carries no rbar bit so the hardware
+    cannot — and does not need to — wait via scoreboard.
+    """
+    ldcu_ctrl = _mk_ctrl(rbar=0x01, wdep=0x37)
+    imad_ctrl = _mk_ctrl(rbar=0x01, wdep=0x3e)
+    instrs = _stream(
+        encode_ldcu_64(dest_ur=4, const_bank=0, const_offset_bytes=0x10,
+                       ctrl=ldcu_ctrl),
+        encode_imad_ur(dest=5, src0=3, ur_src=4, src2=2,
+                       ctrl=imad_ctrl),
+    )
+    report = verify_proof(instrs)
+    assert report.safe, (
+        f"INV AG (inert) failed: wdep=0x37 should be SAFE via inert "
+        f"class. Report: {report.summary_line()}"
+    )
+    inert_edges = [e for e in report.edges
+                   if e.classification == ProofClass.UR_MEMORY_INERT]
+    assert len(inert_edges) == 1
+
+
+# ---------------------------------------------------------------------------
+# INV AH — the real corpus remains SAFE after LDCU unification
+# ---------------------------------------------------------------------------
+
+def test_inv_ah_corpus_safe_under_fg33():
+    """INV AH: the full corpus remains SAFE with zero VIOLATION,
+    MEMORY_VIOLATION, and UR_MEMORY_VIOLATION edges in aggregate
+    after the FG-3.3 LDCU unification.  Also verifies R10 now emits
+    at least one UR_MEMORY_GAP_SAFE or UR_MEMORY_INERT edge
+    somewhere, confirming those classes are not dead code.
+    """
+    corpus = _workbench_kernels() + _probe_kernels() + _fg21_predicate_kernels()
+    totals = {cls: 0 for cls in ProofClass}
+    problem = []
+    for label, ptx in corpus:
+        try:
+            report = _proof_for(ptx)
+        except Exception:
+            continue
+        for cls, n in report.counts.items():
+            totals[cls] += n
+        if report.violations:
+            problem.append(label)
+    assert totals[ProofClass.VIOLATION] == 0
+    assert totals[ProofClass.MEMORY_VIOLATION] == 0
+    assert totals[ProofClass.UR_MEMORY_VIOLATION] == 0
+    assert not problem, f"INV AH: violations in {problem[:10]}"
+    # CTRLWORD_SAFE and R1-flavored GAP_SAFE should be zero (no R1).
+    assert totals[ProofClass.CTRLWORD_SAFE] == 0, (
+        "INV AH: CTRLWORD_SAFE edges still exist — legacy R1 path "
+        "not fully retired"
+    )
+    # FG-3.3 UR_MEMORY_GAP_SAFE + UR_MEMORY_INERT should together
+    # have the 4+1 = 5 edges from the inventory.
+    assert (totals[ProofClass.UR_MEMORY_GAP_SAFE]
+            + totals[ProofClass.UR_MEMORY_INERT]) > 0, (
+        "INV AH: UR_MEMORY_GAP_SAFE and UR_MEMORY_INERT both empty "
+        "— narrow fallback rules are dead code"
     )

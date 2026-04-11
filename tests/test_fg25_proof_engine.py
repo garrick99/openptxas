@@ -22,6 +22,7 @@ from sass.schedule import verify_proof, verify_schedule, ProofClass, ProofReport
 from sass.encoding.sm_120_opcodes import (
     encode_imad_ur, encode_mov, encode_nop,
     encode_imad_wide_rr, encode_iadd3,
+    encode_ldg_e, encode_lds, encode_ldc,
 )
 
 
@@ -159,23 +160,28 @@ def test_inv_i_safe_kernels_have_zero_violations():
 # printed by probe_work/fg25_prove_corpus.py.
 
 _EXPECTED_COUNTS = {
-    # (kernel-label, (total, inert, fwd, ctrl, gap, viol))
-    # Labels match those produced by the corpus collectors (_probe_kernels
-    # uses short symbol names; _workbench_kernels uses bare kernel names;
-    # _fg21_predicate_kernels uses the "fg21:..." prefix).
-    "diag":                  (1, 1, 0, 0, 0, 0),
-    "diag3":                 (1, 1, 0, 0, 0, 0),
-    "min_store_guarded":     (2, 1, 0, 0, 1, 0),
-    "probe_fresh":           (2, 1, 0, 0, 1, 0),
-    "reduce_sum":            (13, 5, 6, 1, 1, 0),
-    "conv2d_looped":         (59, 27, 0, 31, 1, 0),
-    "conv2d_unrolled":       (50, 11, 8, 30, 1, 0),
-    "fg21:k_ge":             (2, 1, 0, 0, 1, 0),
-    "fg21:k_lt":             (2, 1, 0, 0, 1, 0),
-    "fg21:k_gt":             (2, 1, 0, 0, 1, 0),
-    "fg21:k_le":             (2, 1, 0, 0, 1, 0),
-    "fg21:k_eq":             (2, 1, 0, 0, 1, 0),
-    "fg21:k_ne":             (2, 1, 0, 0, 1, 0),
+    # (kernel-label, (total, inert, fwd, ctrl, gap, msb, mviol, viol))
+    # FG-3.1 8-tuple: total, LATENCY_INERT, FORWARDING_SAFE, CTRLWORD_SAFE,
+    # GAP_SAFE, MEMORY_SCOREBOARD_SAFE, MEMORY_VIOLATION, VIOLATION.
+    #
+    # Memory-producing opcodes (LDG / LDS / LDC / ATOMG) that used to
+    # classify as LATENCY_INERT under FG-2.5 now classify as
+    # MEMORY_SCOREBOARD_SAFE (or MEMORY_VIOLATION if no rbar evidence)
+    # under FG-3.1.  Baselines regenerated 2026-04-11 after the wdep-
+    # based scoreboard proof model was wired in.
+    "diag":                  (1, 0, 0, 0, 0, 1, 0, 0),
+    "diag3":                 (1, 0, 0, 0, 0, 1, 0, 0),
+    "min_store_guarded":     (2, 0, 0, 0, 1, 1, 0, 0),
+    "probe_fresh":           (2, 0, 0, 0, 1, 1, 0, 0),
+    "reduce_sum":            (13, 4, 6, 1, 1, 1, 0, 0),
+    "conv2d_looped":         (105, 10, 0, 31, 1, 63, 0, 0),
+    "conv2d_unrolled":       (87, 1, 8, 30, 1, 47, 0, 0),
+    "fg21:k_ge":             (2, 0, 0, 0, 1, 1, 0, 0),
+    "fg21:k_lt":             (2, 0, 0, 0, 1, 1, 0, 0),
+    "fg21:k_gt":             (2, 0, 0, 0, 1, 1, 0, 0),
+    "fg21:k_le":             (2, 0, 0, 0, 1, 1, 0, 0),
+    "fg21:k_eq":             (2, 0, 0, 0, 1, 1, 0, 0),
+    "fg21:k_ne":             (2, 0, 0, 0, 1, 1, 0, 0),
 }
 
 
@@ -200,6 +206,8 @@ def test_inv_j_class_counts_stable(label, expected):
         c[ProofClass.FORWARDING_SAFE],
         c[ProofClass.CTRLWORD_SAFE],
         c[ProofClass.GAP_SAFE],
+        c[ProofClass.MEMORY_SCOREBOARD_SAFE],
+        c[ProofClass.MEMORY_VIOLATION],
         c[ProofClass.VIOLATION],
     )
     assert actual == expected, (
@@ -602,3 +610,273 @@ def test_inv_s_corpus_safe_under_expanded_model():
         f"{problem[:10]}"
     )
     assert total > 0, "INV S corpus collected zero edges"
+
+
+# ===========================================================================
+# FG-3.1 INVARIANTS (T, U, V, W) — memory latency proof model
+# ===========================================================================
+#
+# FG-3.1 extends the proof engine into memory-latency domains.  Memory
+# producing opcodes (LDG / LDS / LDC and siblings) write GPRs through a
+# long-latency scoreboard slot; a consumer must wait via its ctrl-word
+# `rbar` bitmask.  The proof model uses the producer's EMITTED wdep
+# (not a static opcode→class map) to determine which rbar bit must be
+# set in the [writer+1, reader] window.
+#
+# Mapping (from sass.scoreboard._WDEP_TO_RBAR_MASK):
+#   wdep 0x31 (LDC) → rbar 0x03 (class bit 0x02)
+#   wdep 0x33 (LDS) → rbar 0x05 (class bit 0x04)
+#   wdep 0x35 (LDG) → rbar 0x09 (class bit 0x08)
+#
+# INV T — no memory edge can be SAFE without producer-wdep evidence
+# INV U — synthetic 0-gap memory reads without rbar wait are VIOLATION
+# INV V — synthetic memory reads with matching rbar wait are SAFE
+# INV W — the full real corpus is SAFE under the expanded model
+
+
+def _mk_ctrl(rbar: int = 0x01, wdep: int = 0x3f, misc: int = 0x1) -> int:
+    """Pack a 23-bit ctrl word from rbar / wdep / misc fields."""
+    return ((rbar & 0x1f) << 10) | ((wdep & 0x3f) << 4) | (misc & 0xf)
+
+
+# ---------------------------------------------------------------------------
+# INV T — no tracked memory writer produces an unclassified edge
+# ---------------------------------------------------------------------------
+
+def test_inv_t_memory_writers_are_classified():
+    """INV T: every edge whose writer is a tracked memory producer
+    (wdep in _WDEP_TO_RBAR_MASK and opcode in _OPCODES_MEMORY_GPR)
+    must be classified as MEMORY_SCOREBOARD_SAFE or MEMORY_VIOLATION —
+    never LATENCY_INERT, FORWARDING_SAFE, etc.  This ensures the
+    FG-3.1 rule claims ownership of memory edges rather than letting
+    them leak into the R8 ALU path.
+    """
+    from sass.scoreboard import _OPCODES_MEMORY_GPR, _WDEP_TO_RBAR_MASK, _get_wdep
+    corpus = _workbench_kernels() + _probe_kernels() + _fg21_predicate_kernels()
+    bad = []
+    for label, ptx in corpus:
+        try:
+            cubin, _ = compile_openptxas(ptx)
+        except Exception:
+            continue
+        for _sym, off, sz in _iter_text_sections(cubin):
+            instrs = [SassInstr(cubin[off + o:off + o + 16], "")
+                      for o in range(0, sz, 16)
+                      if off + o + 16 <= off + sz]
+            report = verify_proof(instrs)
+            for e in report.edges:
+                if e.writer_opc in _OPCODES_MEMORY_GPR:
+                    w = _get_wdep(instrs[e.writer_idx].raw)
+                    if w in _WDEP_TO_RBAR_MASK and e.classification not in (
+                            ProofClass.MEMORY_SCOREBOARD_SAFE,
+                            ProofClass.MEMORY_VIOLATION):
+                        bad.append((label, e.writer_idx, e.reader_idx,
+                                    hex(e.writer_opc), e.classification))
+    assert not bad, (
+        f"INV T failed: {len(bad)} edge(s) from tracked memory writers "
+        f"classified outside the MEMORY_* classes: {bad[:5]}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# INV U — synthetic unsafe memory reads are flagged as VIOLATION
+# ---------------------------------------------------------------------------
+
+def test_inv_u_synthetic_unsafe_ldg_flagged():
+    """INV U (LDG): LDG.E R4, [R2:R3] writing R4 with wdep=0x35
+    followed by a MOV R5, R4 at gap 0 with rbar=0x01 (no LDG wait)
+    must be flagged as MEMORY_VIOLATION.
+    """
+    # Producer: LDG.E with wdep=0x35 (LDG slot)
+    # Consumer: MOV with rbar=0x01 (no wait bit)
+    ldg_ctrl = _mk_ctrl(rbar=0x01, wdep=0x35)
+    mov_ctrl = _mk_ctrl(rbar=0x01, wdep=0x3e)
+    instrs = _stream(
+        encode_ldg_e(dest=4, ur_desc=0, src_addr=2, width=32, ctrl=ldg_ctrl),
+        encode_mov(dest=5, src=4, ctrl=mov_ctrl),
+    )
+    report = verify_proof(instrs)
+    assert not report.safe, (
+        f"INV U (LDG) failed: engine did not flag LDG→MOV at gap=0 "
+        f"without rbar wait. Report: {report.summary_line()}"
+    )
+    mviols = [v for v in report.violations
+              if v.classification == ProofClass.MEMORY_VIOLATION
+              and v.writer_idx == 0 and v.reader_idx == 1]
+    assert len(mviols) == 1, (
+        f"INV U (LDG) failed: expected one MEMORY_VIOLATION, got "
+        f"{[v.rationale for v in report.violations]}"
+    )
+
+
+def test_inv_u_synthetic_unsafe_lds_flagged():
+    """INV U (LDS): LDS with wdep=0x33 followed by a consumer with
+    rbar=0x01 at gap 0 must be flagged as MEMORY_VIOLATION.
+    """
+    lds_ctrl = _mk_ctrl(rbar=0x01, wdep=0x33)
+    mov_ctrl = _mk_ctrl(rbar=0x01, wdep=0x3e)
+    instrs = _stream(
+        encode_lds(dest=4, ur_addr=0, offset=0, ctrl=lds_ctrl),
+        encode_mov(dest=5, src=4, ctrl=mov_ctrl),
+    )
+    report = verify_proof(instrs)
+    assert not report.safe
+    mviols = [v for v in report.violations
+              if v.classification == ProofClass.MEMORY_VIOLATION]
+    assert len(mviols) == 1, (
+        f"INV U (LDS) failed: expected one MEMORY_VIOLATION, got "
+        f"{[v.rationale for v in report.violations]}"
+    )
+
+
+def test_inv_u_synthetic_unsafe_ldc_flagged():
+    """INV U (LDC): LDC with wdep=0x31 followed by a consumer with
+    rbar=0x01 at gap 0 must be flagged as MEMORY_VIOLATION.
+    """
+    ldc_ctrl = _mk_ctrl(rbar=0x01, wdep=0x31)
+    mov_ctrl = _mk_ctrl(rbar=0x01, wdep=0x3e)
+    instrs = _stream(
+        encode_ldc(dest=4, const_bank=0, const_offset_bytes=0x10,
+                   ctrl=ldc_ctrl),
+        encode_mov(dest=5, src=4, ctrl=mov_ctrl),
+    )
+    report = verify_proof(instrs)
+    assert not report.safe
+    mviols = [v for v in report.violations
+              if v.classification == ProofClass.MEMORY_VIOLATION]
+    assert len(mviols) == 1, (
+        f"INV U (LDC) failed: expected one MEMORY_VIOLATION, got "
+        f"{[v.rationale for v in report.violations]}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# INV V — synthetic safe memory reads are classified MEMORY_SCOREBOARD_SAFE
+# ---------------------------------------------------------------------------
+
+def test_inv_v_synthetic_safe_ldg_scoreboard_safe():
+    """INV V (LDG): LDG.E with wdep=0x35 followed by a consumer whose
+    ctrl word has rbar=0x09 (LDG class bit 0x08 set) at gap 0 must
+    be MEMORY_SCOREBOARD_SAFE — the consumer's own rbar proves the
+    scoreboard wait and no VIOLATION is emitted.
+    """
+    ldg_ctrl = _mk_ctrl(rbar=0x01, wdep=0x35)
+    mov_ctrl = _mk_ctrl(rbar=0x09, wdep=0x3e)   # LDG-wait bit 3 set
+    instrs = _stream(
+        encode_ldg_e(dest=4, ur_desc=0, src_addr=2, width=32, ctrl=ldg_ctrl),
+        encode_mov(dest=5, src=4, ctrl=mov_ctrl),
+    )
+    report = verify_proof(instrs)
+    assert report.safe, (
+        f"INV V (LDG) failed: engine flagged a properly rbar-guarded "
+        f"LDG→MOV as unsafe. Report: {report.summary_line()}"
+    )
+    safe_edges = [e for e in report.edges
+                  if e.classification == ProofClass.MEMORY_SCOREBOARD_SAFE
+                  and e.writer_idx == 0 and e.reader_idx == 1]
+    assert len(safe_edges) == 1, (
+        f"INV V (LDG) failed: expected one MEMORY_SCOREBOARD_SAFE edge, "
+        f"got {[(e.classification, e.rationale) for e in report.edges]}"
+    )
+
+
+def test_inv_v_synthetic_safe_lds_scoreboard_safe():
+    """INV V (LDS): LDS with wdep=0x33 followed by rbar=0x05 reader."""
+    lds_ctrl = _mk_ctrl(rbar=0x01, wdep=0x33)
+    mov_ctrl = _mk_ctrl(rbar=0x05, wdep=0x3e)  # LDS bit 2 set
+    instrs = _stream(
+        encode_lds(dest=4, ur_addr=0, offset=0, ctrl=lds_ctrl),
+        encode_mov(dest=5, src=4, ctrl=mov_ctrl),
+    )
+    report = verify_proof(instrs)
+    assert report.safe
+    safe_edges = [e for e in report.edges
+                  if e.classification == ProofClass.MEMORY_SCOREBOARD_SAFE]
+    assert len(safe_edges) == 1
+
+
+def test_inv_v_synthetic_safe_ldc_scoreboard_safe():
+    """INV V (LDC): LDC with wdep=0x31 followed by rbar=0x03 reader."""
+    ldc_ctrl = _mk_ctrl(rbar=0x01, wdep=0x31)
+    mov_ctrl = _mk_ctrl(rbar=0x03, wdep=0x3e)  # LDC bit 1 set
+    instrs = _stream(
+        encode_ldc(dest=4, const_bank=0, const_offset_bytes=0x10,
+                   ctrl=ldc_ctrl),
+        encode_mov(dest=5, src=4, ctrl=mov_ctrl),
+    )
+    report = verify_proof(instrs)
+    assert report.safe
+    safe_edges = [e for e in report.edges
+                  if e.classification == ProofClass.MEMORY_SCOREBOARD_SAFE]
+    assert len(safe_edges) == 1
+
+
+def test_inv_v_prime_barrier_between_proves_wait():
+    """INV V' (barrier): LDG with wdep=0x35 → NOP with rbar=0x09 (barrier
+    wait) → consumer with rbar=0x01 must still be SAFE because the
+    scan window [i+1, j] includes the barrier NOP whose rbar proves
+    the LDG wait.  This is exactly the pattern observed in reduce_sum
+    where a BSYNC between LDG and its consumer absorbs the wait.
+    """
+    ldg_ctrl = _mk_ctrl(rbar=0x01, wdep=0x35)
+    bar_ctrl = _mk_ctrl(rbar=0x09, wdep=0x3e)  # NOP with LDG-wait bit
+    mov_ctrl = _mk_ctrl(rbar=0x01, wdep=0x3e)  # consumer no wait
+    instrs = _stream(
+        encode_ldg_e(dest=4, ur_desc=0, src_addr=2, width=32, ctrl=ldg_ctrl),
+        encode_nop(ctrl=bar_ctrl),
+        encode_mov(dest=5, src=4, ctrl=mov_ctrl),
+    )
+    report = verify_proof(instrs)
+    assert report.safe, (
+        f"INV V' failed: barrier NOP between LDG and consumer did not "
+        f"absorb the scoreboard wait. Report: {report.summary_line()}"
+    )
+    safe_edges = [e for e in report.edges
+                  if e.classification == ProofClass.MEMORY_SCOREBOARD_SAFE
+                  and e.writer_idx == 0 and e.reader_idx == 2]
+    assert len(safe_edges) == 1, (
+        f"INV V' failed: expected one MEMORY_SCOREBOARD_SAFE edge at "
+        f"gap=1 via barrier, got {report.edges}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# INV W — entire real corpus remains SAFE under FG-3.1 memory model
+# ---------------------------------------------------------------------------
+
+def test_inv_w_corpus_safe_under_memory_model():
+    """INV W: with the FG-3.1 memory proof model active, every kernel
+    in the real corpus must remain SAFE — zero VIOLATION and zero
+    MEMORY_VIOLATION edges across the aggregate.  Any MEMORY_VIOLATION
+    surfacing here is a real hazard in the emitted SASS that the
+    previous latency-inert classification was hiding.
+    """
+    corpus = _workbench_kernels() + _probe_kernels() + _fg21_predicate_kernels()
+    agg_mviol = 0
+    agg_viol = 0
+    mem_safe = 0
+    problem = []
+    for label, ptx in corpus:
+        try:
+            report = _proof_for(ptx)
+        except Exception:
+            continue
+        c = report.counts
+        mem_safe += c[ProofClass.MEMORY_SCOREBOARD_SAFE]
+        agg_mviol += c[ProofClass.MEMORY_VIOLATION]
+        agg_viol += c[ProofClass.VIOLATION]
+        if c[ProofClass.MEMORY_VIOLATION] or c[ProofClass.VIOLATION]:
+            problem.append(label)
+    assert agg_viol == 0, (
+        f"INV W: ALU VIOLATION regression: {agg_viol} edges in "
+        f"{problem[:10]}"
+    )
+    assert agg_mviol == 0, (
+        f"INV W: {agg_mviol} MEMORY_VIOLATION edges in "
+        f"{len(problem)} kernel(s): {problem[:10]}"
+    )
+    # Sanity: the memory rule should actually be classifying edges.
+    assert mem_safe > 0, (
+        "INV W: zero MEMORY_SCOREBOARD_SAFE edges means the memory "
+        "rule never fired — regression in the FG-3.1 classifier"
+    )

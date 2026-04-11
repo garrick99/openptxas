@@ -625,6 +625,98 @@ _LDCU_GAP_EXEMPT_CONSUMERS: set[int] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# FG-3.1: memory-producer latency proof model
+# ---------------------------------------------------------------------------
+#
+# A memory-producing opcode writes a GPR result that is NOT ready on the
+# next cycle; the hardware scoreboard mechanism uses the consumer's ctrl
+# word `rbar` field (bits[14:10] of the 23-bit ctrl word) as a bitmask
+# telling the fetch unit which scoreboard slot classes to wait on before
+# issuing the instruction.
+#
+# Class → rbar bit:
+#   LDC / LDCU / ULDC / MOV cbuf / IMAD.MOV cbuf  → bit 1 (0x02)
+#   LDS / LDSM                                    → bit 2 (0x04)
+#   LDG / LDG.E / ATOMG / TEX / TLD / TLD4 /
+#   TXQ / SULD                                    → bit 3 (0x08)
+#
+# Scoreboard model:
+#   For a memory writer at i with GPR dest set D:
+#     1. Shadow-walk forward until first reader j of D (or until D is
+#        fully shadowed by intervening writes).
+#     2. Scan instructions in [i+1, j] inclusive and check rbar.  If
+#        ANY instruction in that window has the writer's class bit set
+#        in its rbar, the scoreboard has proven the wait — edge is
+#        MEMORY_SCOREBOARD_SAFE.
+#     3. Otherwise the edge is MEMORY_VIOLATION — gap=0/1/… reads of
+#        a memory-loaded register with no rbar wait evidence is a
+#        real latency hazard.
+#
+# LDCU.64 (UR dest) and ULDC.64 (UR dest) already have their own R1
+# rule in verify_proof; they are excluded from the GPR-dest memory rule.
+# S2R / S2UR are hardware special-register reads with zero latency and
+# are not considered memory producers.
+
+# Memory-producing opcodes with GPR dest (excluding LDCU/ULDC/S2UR
+# which write the UR bank and are handled by the FG-2.4 R1 rule).
+_OPCODES_MEMORY_GPR: set[int] = (
+    _OPCODES_LDG
+    | _OPCODES_ATOMG
+    | _OPCODES_LDS
+    | {0xb82,          # LDC (SM_120 GPR dest)
+       0x624, 0xa02}   # SM_89 IMAD.MOV cbuf, MOV cbuf
+)
+
+
+# Module-level version of the scheduler's _WDEP_TO_RBAR table.
+# Maps producer wdep slot → required consumer rbar bit mask (the value
+# the scheduler sets when a consumer reads a register produced in that
+# slot).  Used by the FG-3.1 memory proof model; kept in sync with the
+# duplicate inside `assign_ctrl` below.
+#
+#   0x31 → 0x03 : LDC/LDCU slot      (class bit 0x02)
+#   0x33 → 0x05 : LDS/LDCU.32 slot   (class bit 0x04)
+#   0x35 → 0x09 : LDG/ATOMG slot     (class bit 0x08)
+#   0x3e → 0x03 : ALU slot           (class bit 0x02)
+#
+# `class_bit = required_rbar & ~0x01` — rbar bit 0 (0x01) is the
+# "always-present" base bit and does not encode a class.
+_WDEP_TO_RBAR_MASK: dict[int, int] = {
+    0x31: 0x03,
+    0x33: 0x05,
+    0x35: 0x09,
+    0x3e: 0x03,
+}
+
+
+def _get_rbar(raw: bytes) -> int:
+    """Extract the 5-bit rbar field (ctrl bits [14:10]) from a raw
+    128-bit SASS instruction.  ctrl is packed into bytes 13–15 via
+    `_patch_ctrl`: raw24 = ctrl << 1; byte[13..15] = raw24 little-endian.
+    """
+    raw24 = raw[13] | (raw[14] << 8) | ((raw[15] & 0x7f) << 16)
+    ctrl = raw24 >> 1
+    return (ctrl >> 10) & 0x1f
+
+
+def _get_wdep(raw: bytes) -> int:
+    """Extract the 6-bit wdep field (ctrl bits [9:4]) from a raw
+    128-bit SASS instruction.  Used by the FG-3.1 memory proof model
+    to determine which scoreboard slot the producer is tracked in.
+    """
+    raw24 = raw[13] | (raw[14] << 8) | ((raw[15] & 0x7f) << 16)
+    ctrl = raw24 >> 1
+    return (ctrl >> 4) & 0x3f
+
+
+def _is_memory_gpr_producer(opc: int) -> bool:
+    """Return True if `opc` is a memory-loading opcode with a GPR dest
+    (i.e. eligible for the FG-3.1 scoreboard proof model).
+    """
+    return opc in _OPCODES_MEMORY_GPR
+
+
 def _get_dest_regs(raw: bytes) -> set[int]:
     """Get destination register indices this instruction writes."""
     opcode = _get_opcode(raw)

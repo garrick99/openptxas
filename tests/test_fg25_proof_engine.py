@@ -160,28 +160,31 @@ def test_inv_i_safe_kernels_have_zero_violations():
 # printed by probe_work/fg25_prove_corpus.py.
 
 _EXPECTED_COUNTS = {
-    # (kernel-label, (total, inert, fwd, ctrl, gap, msb, mviol, viol))
-    # FG-3.1 8-tuple: total, LATENCY_INERT, FORWARDING_SAFE, CTRLWORD_SAFE,
-    # GAP_SAFE, MEMORY_SCOREBOARD_SAFE, MEMORY_VIOLATION, VIOLATION.
+    # FG-3.2 11-tuple: (total, LATENCY_INERT, FORWARDING_SAFE,
+    # CTRLWORD_SAFE, GAP_SAFE, MEMORY_SCOREBOARD_SAFE, MEMORY_INERT,
+    # MEMORY_VIOLATION, UR_MEMORY_SCOREBOARD_SAFE, UR_MEMORY_VIOLATION,
+    # VIOLATION).
     #
-    # Memory-producing opcodes (LDG / LDS / LDC / ATOMG) that used to
-    # classify as LATENCY_INERT under FG-2.5 now classify as
-    # MEMORY_SCOREBOARD_SAFE (or MEMORY_VIOLATION if no rbar evidence)
-    # under FG-3.1.  Baselines regenerated 2026-04-11 after the wdep-
-    # based scoreboard proof model was wired in.
-    "diag":                  (1, 0, 0, 0, 0, 1, 0, 0),
-    "diag3":                 (1, 0, 0, 0, 0, 1, 0, 0),
-    "min_store_guarded":     (2, 0, 0, 0, 1, 1, 0, 0),
-    "probe_fresh":           (2, 0, 0, 0, 1, 1, 0, 0),
-    "reduce_sum":            (13, 4, 6, 1, 1, 1, 0, 0),
-    "conv2d_looped":         (105, 10, 0, 31, 1, 63, 0, 0),
-    "conv2d_unrolled":       (87, 1, 8, 30, 1, 47, 0, 0),
-    "fg21:k_ge":             (2, 0, 0, 0, 1, 1, 0, 0),
-    "fg21:k_lt":             (2, 0, 0, 0, 1, 1, 0, 0),
-    "fg21:k_gt":             (2, 0, 0, 0, 1, 1, 0, 0),
-    "fg21:k_le":             (2, 0, 0, 0, 1, 1, 0, 0),
-    "fg21:k_eq":             (2, 0, 0, 0, 1, 1, 0, 0),
-    "fg21:k_ne":             (2, 0, 0, 0, 1, 1, 0, 0),
+    # Baselines regenerated 2026-04-11 for FG-3.2:
+    #   - Added MEMORY_INERT column (producer wdep=0x3f explicit class).
+    #   - Added UR_MEMORY_SCOREBOARD_SAFE column (rule R10 for S2UR,
+    #     REDUX, ULDC.64).  Every kernel gains +1 UR_SB edge from
+    #     the S2UR → consumer chain introduced by the preamble.
+    #   - reduce_sum gains +2 MSB edges because wdep=0x3b (rotating
+    #     LDG slot) is now explicitly classified as LDG-class.
+    "diag":                  (2, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0),
+    "diag3":                 (2, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0),
+    "min_store_guarded":     (3, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0),
+    "probe_fresh":           (3, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0),
+    "reduce_sum":            (16, 4, 6, 1, 1, 3, 0, 0, 1, 0, 0),
+    "conv2d_looped":         (107, 10, 0, 31, 1, 63, 0, 0, 2, 0, 0),
+    "conv2d_unrolled":       (89, 1, 8, 30, 1, 47, 0, 0, 2, 0, 0),
+    "fg21:k_ge":             (3, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0),
+    "fg21:k_lt":             (3, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0),
+    "fg21:k_gt":             (3, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0),
+    "fg21:k_le":             (3, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0),
+    "fg21:k_eq":             (3, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0),
+    "fg21:k_ne":             (3, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0),
 }
 
 
@@ -207,7 +210,10 @@ def test_inv_j_class_counts_stable(label, expected):
         c[ProofClass.CTRLWORD_SAFE],
         c[ProofClass.GAP_SAFE],
         c[ProofClass.MEMORY_SCOREBOARD_SAFE],
+        c[ProofClass.MEMORY_INERT],
         c[ProofClass.MEMORY_VIOLATION],
+        c[ProofClass.UR_MEMORY_SCOREBOARD_SAFE],
+        c[ProofClass.UR_MEMORY_VIOLATION],
         c[ProofClass.VIOLATION],
     )
     assert actual == expected, (
@@ -879,4 +885,298 @@ def test_inv_w_corpus_safe_under_memory_model():
     assert mem_safe > 0, (
         "INV W: zero MEMORY_SCOREBOARD_SAFE edges means the memory "
         "rule never fired — regression in the FG-3.1 classifier"
+    )
+
+
+# ===========================================================================
+# FG-3.2 INVARIANTS (X, Y, Z, AA, AB, AC) — memory-class completion
+# ===========================================================================
+#
+# FG-3.2 closes the boundaries FG-3.1 left deferred:
+#   - explicit classification of wdep=0x3b (LDG rotating variant)
+#     and wdep=0x3f (no-track descriptor loads)
+#   - UR-destination producer modeling (S2UR, REDUX, ULDC.64) via
+#     new rule R10, in parallel with the existing LDCU.64 rule R1
+#   - empirical answer on whether MEMORY_GAP_SAFE and
+#     MEMORY_FORWARD_SAFE classes have any corpus or synthetic
+#     evidence (answer: no, so no classes added)
+#   - fail-loudly behavior for unknown memory wdep values
+
+
+# ---------------------------------------------------------------------------
+# INV X — every observed memory-producer wdep is explicitly classified
+# ---------------------------------------------------------------------------
+
+def test_inv_x_observed_memory_wdeps_classified():
+    """INV X: across the entire real corpus, every observed GPR-dest
+    memory producer must have a wdep that is EXPLICITLY classified —
+    either in _WDEP_TO_RBAR_MASK (tracked scoreboard) or in
+    _LATENCY_INERT_WDEPS (no-track).  An observed wdep outside both
+    sets would be a silent "falls through as inert" gap, which is
+    exactly what FG-3.2 eliminates.
+    """
+    from sass.scoreboard import (_OPCODES_MEMORY_GPR, _WDEP_TO_RBAR_MASK,
+                                 _LATENCY_INERT_WDEPS, _get_opcode,
+                                 _get_wdep)
+    corpus = _workbench_kernels() + _probe_kernels() + _fg21_predicate_kernels()
+    unclassified = set()  # (opc, wdep, sample_kernel)
+    for label, ptx in corpus:
+        try:
+            cubin, _ = compile_openptxas(ptx)
+        except Exception:
+            continue
+        for _sym, off, sz in _iter_text_sections(cubin):
+            for k in range(sz // 16):
+                raw = cubin[off + k*16 : off + k*16 + 16]
+                opc = _get_opcode(raw)
+                if opc not in _OPCODES_MEMORY_GPR:
+                    continue
+                wd = _get_wdep(raw)
+                if wd not in _WDEP_TO_RBAR_MASK and wd not in _LATENCY_INERT_WDEPS:
+                    unclassified.add((opc, wd, label))
+    assert not unclassified, (
+        f"INV X failed: {len(unclassified)} (opcode, wdep, kernel) "
+        f"tuples with unclassified memory wdeps: "
+        f"{sorted(unclassified)[:10]}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# INV Y — UR-destination producer chains are constructively classified
+# ---------------------------------------------------------------------------
+
+def test_inv_y_ur_producer_chains_classified():
+    """INV Y: every UR-destination producer observed in the corpus
+    (S2UR / REDUX / ULDC.64) must either produce a
+    UR_MEMORY_SCOREBOARD_SAFE edge or have no live UR consumer.  No
+    UR_MEMORY_VIOLATION and no silent skips.
+    LDCU is excluded here because it still routes through rule R1.
+    """
+    from sass.scoreboard import _get_opcode
+    corpus = _workbench_kernels() + _probe_kernels() + _fg21_predicate_kernels()
+    ur_viols = 0
+    ur_safe = 0
+    problem = []
+    for label, ptx in corpus:
+        try:
+            report = _proof_for(ptx)
+        except Exception:
+            continue
+        c = report.counts
+        ur_viols += c[ProofClass.UR_MEMORY_VIOLATION]
+        ur_safe += c[ProofClass.UR_MEMORY_SCOREBOARD_SAFE]
+        if c[ProofClass.UR_MEMORY_VIOLATION]:
+            problem.append(label)
+    assert ur_viols == 0, (
+        f"INV Y failed: {ur_viols} UR_MEMORY_VIOLATION edges in "
+        f"{problem[:10]}"
+    )
+    # Must actually fire at least once — otherwise R10 never ran.
+    assert ur_safe > 0, (
+        "INV Y: rule R10 never emitted a UR_MEMORY_SCOREBOARD_SAFE "
+        "edge — regression in the UR producer enumeration."
+    )
+
+
+# ---------------------------------------------------------------------------
+# INV Z — no memory edge in the corpus relies on instruction-stream
+#          gap alone (no MEMORY_GAP_SAFE class needed)
+# ---------------------------------------------------------------------------
+
+def test_inv_z_no_memory_gap_safe_evidence():
+    """INV Z: empirical check that MEMORY_GAP_SAFE is not a real
+    class in the current corpus.  For every memory writer edge in the
+    proof report (MEMORY_SCOREBOARD_SAFE or UR_MEMORY_SCOREBOARD_SAFE),
+    verify the window [writer+1, reader] actually has rbar wait
+    evidence — i.e. the classification is not just "reader far enough
+    away".  This locks in the FG-3.2 empirical finding: if a future
+    memory edge appears that relies on gap alone, the invariant fires
+    and the user is forced to add an explicit MEMORY_GAP_SAFE class
+    backed by evidence.
+    """
+    from sass.scoreboard import (_get_wdep, _get_rbar,
+                                 _WDEP_TO_RBAR_MASK, _get_opcode)
+    corpus = _workbench_kernels() + _probe_kernels() + _fg21_predicate_kernels()
+    gap_only = []
+    for label, ptx in corpus:
+        try:
+            cubin, _ = compile_openptxas(ptx)
+        except Exception:
+            continue
+        for _sym, off, sz in _iter_text_sections(cubin):
+            instrs = [SassInstr(cubin[off + o:off + o + 16], "")
+                      for o in range(0, sz, 16)
+                      if off + o + 16 <= off + sz]
+            report = verify_proof(instrs)
+            for e in report.edges:
+                if e.classification not in (
+                        ProofClass.MEMORY_SCOREBOARD_SAFE,
+                        ProofClass.UR_MEMORY_SCOREBOARD_SAFE):
+                    continue
+                wd = _get_wdep(instrs[e.writer_idx].raw)
+                if wd not in _WDEP_TO_RBAR_MASK:
+                    continue
+                cb = _WDEP_TO_RBAR_MASK[wd] & ~0x01
+                has_wait = any(
+                    _get_rbar(instrs[m].raw) & cb
+                    for m in range(e.writer_idx + 1, e.reader_idx + 1)
+                )
+                if not has_wait:
+                    gap_only.append((label, e.writer_idx, e.reader_idx,
+                                     hex(wd), e.classification))
+    assert not gap_only, (
+        f"INV Z failed: {len(gap_only)} memory edge(s) claim "
+        f"SCOREBOARD_SAFE without rbar wait evidence in the window. "
+        f"Either the classifier is wrong or there is genuine "
+        f"MEMORY_GAP_SAFE evidence to add an explicit class for: "
+        f"{gap_only[:5]}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# INV AA — no corpus or synthetic evidence for MEMORY_FORWARD_SAFE
+# ---------------------------------------------------------------------------
+
+def test_inv_aa_no_memory_forward_safe_evidence():
+    """INV AA: there is no memory producer→consumer pair in the
+    corpus at gap=0 without a direct rbar wait on the consumer.  That
+    would be the only pattern consistent with a "memory operand
+    forwarding" story, and there is no such evidence.  Like INV Z,
+    this locks the empirical finding so that a future edge matching
+    the pattern cannot slip in silently.
+    """
+    from sass.scoreboard import _get_wdep, _get_rbar, _WDEP_TO_RBAR_MASK
+    corpus = _workbench_kernels() + _probe_kernels() + _fg21_predicate_kernels()
+    candidates = []
+    for label, ptx in corpus:
+        try:
+            cubin, _ = compile_openptxas(ptx)
+        except Exception:
+            continue
+        for _sym, off, sz in _iter_text_sections(cubin):
+            instrs = [SassInstr(cubin[off + o:off + o + 16], "")
+                      for o in range(0, sz, 16)
+                      if off + o + 16 <= off + sz]
+            report = verify_proof(instrs)
+            for e in report.edges:
+                if e.classification not in (
+                        ProofClass.MEMORY_SCOREBOARD_SAFE,
+                        ProofClass.UR_MEMORY_SCOREBOARD_SAFE):
+                    continue
+                if e.gap != 0:
+                    continue
+                wd = _get_wdep(instrs[e.writer_idx].raw)
+                if wd not in _WDEP_TO_RBAR_MASK:
+                    continue
+                cb = _WDEP_TO_RBAR_MASK[wd] & ~0x01
+                # Gap=0 means reader is at i+1.  Check the reader's
+                # own rbar — if it does not have the class bit, the
+                # edge would be a forwarding candidate.
+                rdr_rbar = _get_rbar(instrs[e.reader_idx].raw)
+                if not (rdr_rbar & cb):
+                    candidates.append((label, e.writer_idx, e.reader_idx))
+    assert not candidates, (
+        f"INV AA failed: {len(candidates)} memory edge(s) at gap=0 "
+        f"classified SAFE without rbar wait on the reader itself. "
+        f"This would be the signature of a MEMORY_FORWARD_SAFE "
+        f"class; if real, add it with evidence: {candidates[:5]}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# INV AB — all real kernels remain SAFE under FG-3.2
+# ---------------------------------------------------------------------------
+
+def test_inv_ab_corpus_safe_under_fg32():
+    """INV AB: the full corpus remains SAFE with zero VIOLATION,
+    MEMORY_VIOLATION, and UR_MEMORY_VIOLATION edges in aggregate.
+    Distinct from INV H/I/S/W as an FG-3.2 anchor so regressions in
+    the new UR rule or the extended wdep table fail here first.
+    """
+    corpus = _workbench_kernels() + _probe_kernels() + _fg21_predicate_kernels()
+    totals = {cls: 0 for cls in ProofClass}
+    problem = []
+    for label, ptx in corpus:
+        try:
+            report = _proof_for(ptx)
+        except Exception:
+            continue
+        for cls, n in report.counts.items():
+            totals[cls] += n
+        if report.violations:
+            problem.append(label)
+    assert totals[ProofClass.VIOLATION] == 0
+    assert totals[ProofClass.MEMORY_VIOLATION] == 0
+    assert totals[ProofClass.UR_MEMORY_VIOLATION] == 0
+    assert not problem, f"INV AB: violations in {problem[:10]}"
+    # Sanity: FG-3.2 rules actually produce edges in the corpus.
+    assert totals[ProofClass.UR_MEMORY_SCOREBOARD_SAFE] > 0, (
+        "INV AB: UR rule R10 never fired"
+    )
+
+
+# ---------------------------------------------------------------------------
+# INV AC — unknown memory wdep on a synthetic stream fails loudly
+# ---------------------------------------------------------------------------
+
+def test_inv_ac_unknown_wdep_fails_loudly():
+    """INV AC: if a memory producer is emitted with a wdep value that
+    is neither in _WDEP_TO_RBAR_MASK nor in _LATENCY_INERT_WDEPS, the
+    proof engine must NOT silently skip the edge — it must classify
+    it as MEMORY_VIOLATION with an "unknown wdep" rationale so the
+    mis-modeled slot is surfaced immediately.
+
+    Build a synthetic LDG with a deliberately unknown wdep=0x3c and
+    verify the proof report contains a MEMORY_VIOLATION whose
+    rationale names the unknown slot.
+    """
+    # Synthetic LDG.E with a weird (unknown) wdep slot 0x3c.
+    bad_ctrl = _mk_ctrl(rbar=0x01, wdep=0x3c)
+    mov_ctrl = _mk_ctrl(rbar=0x09, wdep=0x3e)  # would cover 0x35/0x3b
+    instrs = _stream(
+        encode_ldg_e(dest=4, ur_desc=0, src_addr=2, width=32, ctrl=bad_ctrl),
+        encode_mov(dest=5, src=4, ctrl=mov_ctrl),
+    )
+    report = verify_proof(instrs)
+    assert not report.safe, (
+        f"INV AC failed: unknown wdep=0x3c did not produce a "
+        f"VIOLATION. Report: {report.summary_line()}"
+    )
+    assert any(
+        v.classification == ProofClass.MEMORY_VIOLATION and "UNKNOWN" in v.rationale
+        for v in report.violations
+    ), (
+        f"INV AC failed: expected MEMORY_VIOLATION with 'UNKNOWN' "
+        f"rationale, got: "
+        f"{[(v.classification, v.rationale[:60]) for v in report.violations]}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# INV AC' — MEMORY_INERT is emitted for wdep=0x3f
+# ---------------------------------------------------------------------------
+
+def test_inv_ac_prime_memory_inert_classified():
+    """INV AC': a memory producer with wdep=0x3f (explicit no-track)
+    must produce a MEMORY_INERT edge for its first reader rather than
+    being silently skipped.  This is the "every candidate edge is
+    constructively classified" rule from FG-3.2.
+    """
+    ldc_ctrl = _mk_ctrl(rbar=0x01, wdep=0x3f)
+    mov_ctrl = _mk_ctrl(rbar=0x01, wdep=0x3e)
+    instrs = _stream(
+        encode_ldc(dest=4, const_bank=0, const_offset_bytes=0x10,
+                   ctrl=ldc_ctrl),
+        encode_mov(dest=5, src=4, ctrl=mov_ctrl),
+    )
+    report = verify_proof(instrs)
+    inerts = [e for e in report.edges
+              if e.classification == ProofClass.MEMORY_INERT]
+    assert len(inerts) == 1, (
+        f"INV AC': expected one MEMORY_INERT edge for wdep=0x3f LDC, "
+        f"got {[(e.classification, e.rationale[:60]) for e in report.edges]}"
+    )
+    assert report.safe, (
+        f"INV AC': LDC wdep=0x3f → MOV must be SAFE; report="
+        f"{report.summary_line()}"
     )

@@ -659,7 +659,7 @@ _LDCU_GAP_EXEMPT_CONSUMERS: set[int] = {
 # are not considered memory producers.
 
 # Memory-producing opcodes with GPR dest (excluding LDCU/ULDC/S2UR
-# which write the UR bank and are handled by the FG-2.4 R1 rule).
+# which write the UR bank and are handled by rules R1 / R10).
 _OPCODES_MEMORY_GPR: set[int] = (
     _OPCODES_LDG
     | _OPCODES_ATOMG
@@ -669,16 +669,51 @@ _OPCODES_MEMORY_GPR: set[int] = (
 )
 
 
+# FG-3.2: UR-destination memory / system producers.
+# These opcodes write the UR register bank (not GPR).  Consumers read
+# the UR via byte 4 on UR-consuming opcodes.  LDCU.64 is handled by
+# the older LDCU-specific rule R1; all others go through R10.
+_OPCODES_MEMORY_UR: set[int] = {
+    0x7ac,   # LDCU / LDCU.64 — handled by R1 (.64 variant) and R10 (.32)
+    0x9c3,   # S2UR (special register → UR)
+    0x3c4,   # REDUX.SUM (warp reduction → UR)
+    0xab9,   # ULDC.64 (SM_89 uniform const load)
+}
+
+
+# UR-consumer opcodes: opcodes whose byte 4 (b4) is a UR index
+# reference.  Used to find UR consumers during rule R1 / R10.
+_UR_CONSUMER_OPCODES: set[int] = {
+    0xc35,   # IADD.64-UR
+    0xc0c,   # ISETP.R-UR
+    0xc24,   # IMAD.R-UR
+    0xc25,   # IMAD.WIDE.R-UR
+    0xc11,   # LEA.R-UR
+    0xc12,   # IADD3X.R-UR
+    0xc0b,   # FSETP.R-UR
+    0xc02,   # MOV R, UR
+    0x981,   # LDG.E (UR descriptor)
+    0x984,   # LDS (UR base)
+    0xb82,   # LDC (UR base)
+    0x7ac,   # LDCU (UR base)
+    0x986,   # STG.E (UR descriptor at b8, not b4 — see _get_ur_src)
+}
+
+
 # Module-level version of the scheduler's _WDEP_TO_RBAR table.
 # Maps producer wdep slot → required consumer rbar bit mask (the value
 # the scheduler sets when a consumer reads a register produced in that
-# slot).  Used by the FG-3.1 memory proof model; kept in sync with the
-# duplicate inside `assign_ctrl` below.
+# slot).  Used by the FG-3.1/3.2 memory proof model; kept in sync
+# with the duplicate inside `assign_ctrl` below.
 #
-#   0x31 → 0x03 : LDC/LDCU slot      (class bit 0x02)
-#   0x33 → 0x05 : LDS/LDCU.32 slot   (class bit 0x04)
-#   0x35 → 0x09 : LDG/ATOMG slot     (class bit 0x08)
-#   0x3e → 0x03 : ALU slot           (class bit 0x02)
+#   0x31 → 0x03 : LDC/LDCU slot         (class bit 0x02)
+#   0x33 → 0x05 : LDS/LDCU.32 slot      (class bit 0x04)
+#   0x35 → 0x09 : LDG/ATOMG slot        (class bit 0x08)
+#   0x3b → 0x09 : LDG rotating variant  (class bit 0x08) — FG-3.2
+#                   Evidence: reduce_sum LDG [15] emits wdep=0x3b and
+#                   the following BSYNC at [16] has rbar=0x09
+#                   (LDG-class wait bit 3).  Same class as 0x35.
+#   0x3e → 0x03 : ALU slot              (class bit 0x02)
 #
 # `class_bit = required_rbar & ~0x01` — rbar bit 0 (0x01) is the
 # "always-present" base bit and does not encode a class.
@@ -686,8 +721,18 @@ _WDEP_TO_RBAR_MASK: dict[int, int] = {
     0x31: 0x03,
     0x33: 0x05,
     0x35: 0x09,
+    0x3b: 0x09,  # FG-3.2: LDG rotating variant (reduce_sum)
     0x3e: 0x03,
 }
+
+
+# FG-3.2: explicitly-declared no-track wdep slots.
+# A producer with wdep=0x3f is "not scoreboard-tracked" — the hardware
+# treats its result as immediately available.  This is the legitimate
+# "latency-inert" case, distinct from "not yet classified in the
+# model".  Observed on LDC descriptor loads (0xb82) and rare LDS
+# (0x984) in cp_async.
+_LATENCY_INERT_WDEPS: set[int] = {0x3f}
 
 
 def _get_rbar(raw: bytes) -> int:
@@ -715,6 +760,39 @@ def _is_memory_gpr_producer(opc: int) -> bool:
     (i.e. eligible for the FG-3.1 scoreboard proof model).
     """
     return opc in _OPCODES_MEMORY_GPR
+
+
+def _is_memory_ur_producer(opc: int) -> bool:
+    """Return True if `opc` writes the UR register bank and is
+    eligible for the FG-3.2 UR memory proof model (rule R10).
+    LDCU.64 still routes through the older rule R1.
+    """
+    return opc in _OPCODES_MEMORY_UR
+
+
+def _get_ur_dest(raw: bytes) -> int:
+    """Extract the UR destination register index for a UR-writing
+    opcode (LDCU / ULDC / S2UR / REDUX).  Returns -1 if not a
+    UR producer.  The UR dest is at byte 2 for all modeled opcodes.
+    """
+    opc = _get_opcode(raw)
+    if opc not in _OPCODES_MEMORY_UR:
+        return -1
+    return raw[2]
+
+
+def _get_ur_src(raw: bytes) -> int:
+    """Extract the UR source register index for a UR-consuming opcode.
+    Most UR-consuming opcodes place the UR index at byte 4; STG.E
+    (0x986) uses byte 8 for its UR descriptor.  Returns -1 if the
+    opcode does not consume UR at a known byte position.
+    """
+    opc = _get_opcode(raw)
+    if opc not in _UR_CONSUMER_OPCODES:
+        return -1
+    if opc == 0x986:  # STG.E: UR descriptor at b8
+        return raw[8]
+    return raw[4]
 
 
 def _get_dest_regs(raw: bytes) -> set[int]:
@@ -954,6 +1032,7 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
         0x31: 0x03,   # LDC/LDCU slot → rbar=0x03
         0x33: 0x05,   # LDS/LDCU.32 slot → rbar=0x05
         0x35: 0x09,   # LDG slot → rbar=0x09 (all LDGs share this slot, ptxas-verified)
+        0x3b: 0x09,   # FG-3.2: LDG rotating variant, same class as 0x35
         0x3e: 0x03,   # ALU → rbar=0x03
     }
 

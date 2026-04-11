@@ -45,9 +45,13 @@ class ProofClass(str, Enum):
     FORWARDING_SAFE        = "FORWARDING_SAFE"        # pair on _FORWARDING_SAFE_PAIRS list
     CTRLWORD_SAFE          = "CTRLWORD_SAFE"          # LDCU.64 R1 ctrl-word rule
     GAP_SAFE               = "GAP_SAFE"               # instruction-stream gap ≥ min_gpr_gap
-    # FG-3.1 memory latency classes
+    # FG-3.1 memory latency classes (GPR memory producers)
     MEMORY_SCOREBOARD_SAFE = "MEMORY_SCOREBOARD_SAFE"  # rbar wait bit proven in window
+    MEMORY_INERT           = "MEMORY_INERT"            # producer wdep=0x3f, no-track (FG-3.2)
     MEMORY_VIOLATION       = "MEMORY_VIOLATION"        # memory read with no rbar wait
+    # FG-3.2 UR-destination memory / system producers (rule R10)
+    UR_MEMORY_SCOREBOARD_SAFE = "UR_MEMORY_SCOREBOARD_SAFE"
+    UR_MEMORY_VIOLATION       = "UR_MEMORY_VIOLATION"
     VIOLATION              = "VIOLATION"               # ALU / general violation
 
 
@@ -123,7 +127,8 @@ class ProofReport:
     def violations(self) -> list[ProofEdge]:
         return [e for e in self.edges
                 if e.classification in (ProofClass.VIOLATION,
-                                        ProofClass.MEMORY_VIOLATION)]
+                                        ProofClass.MEMORY_VIOLATION,
+                                        ProofClass.UR_MEMORY_VIOLATION)]
 
     @property
     def safe(self) -> bool:
@@ -145,7 +150,10 @@ class ProofReport:
             f"CTRL={c[ProofClass.CTRLWORD_SAFE]}  "
             f"GAP={c[ProofClass.GAP_SAFE]}  "
             f"MSB={c[ProofClass.MEMORY_SCOREBOARD_SAFE]}  "
+            f"MIN={c[ProofClass.MEMORY_INERT]}  "
             f"MVIOL={c[ProofClass.MEMORY_VIOLATION]}  "
+            f"URSB={c[ProofClass.UR_MEMORY_SCOREBOARD_SAFE]}  "
+            f"URVIOL={c[ProofClass.UR_MEMORY_VIOLATION]}  "
             f"VIOL={c[ProofClass.VIOLATION]}"
         )
         prefix = f"{label}: " if label else ""
@@ -533,9 +541,14 @@ def verify_proof(instrs: list[SassInstr]) -> ProofReport:
         _is_forwarding_safe_pair,
         _LDCU_GAP_EXEMPT_CONSUMERS,
         _WDEP_TO_RBAR_MASK,
+        _LATENCY_INERT_WDEPS,
         _get_rbar,
         _get_wdep,
         _is_memory_gpr_producer,
+        _is_memory_ur_producer,
+        _get_ur_dest,
+        _get_ur_src,
+        _UR_CONSUMER_OPCODES,
     )
 
     _UR_CONSUMER_OPCODES = {0xc35, 0xc0c, 0xc24, 0x981}
@@ -641,12 +654,23 @@ def verify_proof(instrs: list[SassInstr]) -> ProofReport:
         if not dest_i:
             continue
         wdep_i = _get_wdep(instrs[i].raw)
-        if wdep_i not in _WDEP_TO_RBAR_MASK:
-            continue  # not scoreboard-tracked (e.g. wdep=0x3f) — inert
-        required_rbar = _WDEP_TO_RBAR_MASK[wdep_i]
-        class_bit = required_rbar & ~0x01
-        if class_bit == 0:
-            continue  # shouldn't happen for memory wdeps
+
+        # FG-3.2: explicit classification of memory wdeps.  Every
+        # observed wdep is constructively classified:
+        #   - tracked in _WDEP_TO_RBAR_MASK → scoreboard proof below
+        #   - in _LATENCY_INERT_WDEPS (0x3f) → MEMORY_INERT edge
+        #   - otherwise → MEMORY_VIOLATION with "unknown wdep" rationale
+        #     (fails loudly so new wdep values in future emissions
+        #     cannot silently slip through as inert)
+        mode_inert = wdep_i in _LATENCY_INERT_WDEPS
+        mode_scoreboard = wdep_i in _WDEP_TO_RBAR_MASK
+        mode_unknown = not (mode_inert or mode_scoreboard)
+
+        if mode_scoreboard:
+            required_rbar = _WDEP_TO_RBAR_MASK[wdep_i]
+            class_bit = required_rbar & ~0x01
+        else:
+            class_bit = 0
 
         live_dest = set(dest_i)
         for j in range(i + 1, len(instrs)):
@@ -657,31 +681,53 @@ def verify_proof(instrs: list[SassInstr]) -> ProofReport:
             if overlap:
                 opc_j = _sc_opc(instrs[j].raw)
                 gap = j - i - 1
-                safe_by_rbar = False
-                wait_idx = -1
-                for m in range(i + 1, j + 1):
-                    if _get_rbar(instrs[m].raw) & class_bit:
-                        safe_by_rbar = True
-                        wait_idx = m
-                        break
-                if safe_by_rbar:
-                    cls = ProofClass.MEMORY_SCOREBOARD_SAFE
+
+                if mode_inert:
+                    cls = ProofClass.MEMORY_INERT
                     rat = (
                         f"memory writer opc=0x{opc_i:03x} "
                         f"(wdep=0x{wdep_i:02x}) → reader "
-                        f"opc=0x{opc_j:03x} at gap={gap}: ctrl rbar "
-                        f"class bit 0x{class_bit:02x} set on instr "
-                        f"[{wait_idx}] proves the scoreboard wait"
+                        f"opc=0x{opc_j:03x} at gap={gap}: producer "
+                        f"wdep=0x3f is explicitly no-track; hardware "
+                        f"makes the result immediately available"
                     )
-                else:
+                elif mode_unknown:
                     cls = ProofClass.MEMORY_VIOLATION
                     rat = (
                         f"memory writer opc=0x{opc_i:03x} "
                         f"(wdep=0x{wdep_i:02x}) → reader "
-                        f"opc=0x{opc_j:03x} at gap={gap}: no rbar "
-                        f"class-bit 0x{class_bit:02x} wait evidence "
-                        f"in [{i + 1}, {j}]"
+                        f"opc=0x{opc_j:03x} at gap={gap}: UNKNOWN "
+                        f"wdep — not in _WDEP_TO_RBAR_MASK and not "
+                        f"in _LATENCY_INERT_WDEPS (FG-3.2 INV AC: "
+                        f"fails loudly until explicitly classified)"
                     )
+                else:
+                    safe_by_rbar = False
+                    wait_idx = -1
+                    for m in range(i + 1, j + 1):
+                        if _get_rbar(instrs[m].raw) & class_bit:
+                            safe_by_rbar = True
+                            wait_idx = m
+                            break
+                    if safe_by_rbar:
+                        cls = ProofClass.MEMORY_SCOREBOARD_SAFE
+                        rat = (
+                            f"memory writer opc=0x{opc_i:03x} "
+                            f"(wdep=0x{wdep_i:02x}) → reader "
+                            f"opc=0x{opc_j:03x} at gap={gap}: "
+                            f"ctrl rbar class bit 0x{class_bit:02x} "
+                            f"set on instr [{wait_idx}] proves the "
+                            f"scoreboard wait"
+                        )
+                    else:
+                        cls = ProofClass.MEMORY_VIOLATION
+                        rat = (
+                            f"memory writer opc=0x{opc_i:03x} "
+                            f"(wdep=0x{wdep_i:02x}) → reader "
+                            f"opc=0x{opc_j:03x} at gap={gap}: no "
+                            f"rbar class-bit 0x{class_bit:02x} wait "
+                            f"evidence in [{i + 1}, {j}]"
+                        )
                 report.edges.append(ProofEdge(
                     writer_idx=i,
                     reader_idx=j,
@@ -696,6 +742,106 @@ def verify_proof(instrs: list[SassInstr]) -> ProofReport:
             dest_j = _sc_dest(instrs[j].raw)
             if dest_j:
                 live_dest -= dest_j
+
+    # ---- FG-3.2 UR-memory producer → UR consumer (rule R10) --------------
+    # Parallel to R9 but for producers that write the UR register bank
+    # instead of GPR: S2UR (0x9c3), REDUX (0x3c4), ULDC.64 (0xab9).
+    # LDCU (0x7ac) is still handled by rule R1 above to preserve the
+    # existing FG-2.4 CTRLWORD_SAFE / GAP_SAFE classification shape.
+    #
+    # The proof mechanism is identical to R9: the producer's emitted
+    # wdep slot determines the class bit, and any instruction in
+    # [i+1, j] whose rbar has that bit set proves the scoreboard wait.
+    # The lookup table _UR_CONSUMER_OPCODES + _get_ur_src are used
+    # instead of GPR source decoding.
+    for i in range(len(instrs)):
+        opc_i = _sc_opc(instrs[i].raw)
+        if not _is_memory_ur_producer(opc_i):
+            continue
+        if opc_i == 0x7ac:
+            continue  # LDCU handled by R1 above
+        ur_dest = _get_ur_dest(instrs[i].raw)
+        if ur_dest < 0 or ur_dest >= 0xff:
+            continue
+        wdep_i = _get_wdep(instrs[i].raw)
+        mode_inert = wdep_i in _LATENCY_INERT_WDEPS
+        mode_scoreboard = wdep_i in _WDEP_TO_RBAR_MASK
+        mode_unknown = not (mode_inert or mode_scoreboard)
+
+        if mode_scoreboard:
+            required_rbar = _WDEP_TO_RBAR_MASK[wdep_i]
+            class_bit = required_rbar & ~0x01
+        else:
+            class_bit = 0
+
+        # Find first UR consumer of ur_dest, stopping on UR shadow.
+        for j in range(i + 1, len(instrs)):
+            opc_j = _sc_opc(instrs[j].raw)
+            # Shadow: another producer overwrites this UR index.
+            if _is_memory_ur_producer(opc_j):
+                other_dest = _get_ur_dest(instrs[j].raw)
+                if other_dest == ur_dest:
+                    break
+            if opc_j not in _UR_CONSUMER_OPCODES:
+                continue
+            if _get_ur_src(instrs[j].raw) != ur_dest:
+                continue
+
+            gap = j - i - 1
+            if mode_inert:
+                cls = ProofClass.UR_MEMORY_SCOREBOARD_SAFE
+                rat = (
+                    f"UR memory writer opc=0x{opc_i:03x} "
+                    f"(wdep=0x{wdep_i:02x}) → UR consumer "
+                    f"opc=0x{opc_j:03x} at gap={gap}: producer "
+                    f"wdep=0x3f is no-track, result immediately "
+                    f"available"
+                )
+            elif mode_unknown:
+                cls = ProofClass.UR_MEMORY_VIOLATION
+                rat = (
+                    f"UR memory writer opc=0x{opc_i:03x} "
+                    f"(wdep=0x{wdep_i:02x}) → UR consumer "
+                    f"opc=0x{opc_j:03x} at gap={gap}: UNKNOWN wdep "
+                    f"(FG-3.2 INV AC)"
+                )
+            else:
+                safe_by_rbar = False
+                wait_idx = -1
+                for m in range(i + 1, j + 1):
+                    if _get_rbar(instrs[m].raw) & class_bit:
+                        safe_by_rbar = True
+                        wait_idx = m
+                        break
+                if safe_by_rbar:
+                    cls = ProofClass.UR_MEMORY_SCOREBOARD_SAFE
+                    rat = (
+                        f"UR memory writer opc=0x{opc_i:03x} "
+                        f"(wdep=0x{wdep_i:02x}) → UR consumer "
+                        f"opc=0x{opc_j:03x} at gap={gap}: ctrl rbar "
+                        f"class bit 0x{class_bit:02x} set on instr "
+                        f"[{wait_idx}] proves the scoreboard wait"
+                    )
+                else:
+                    cls = ProofClass.UR_MEMORY_VIOLATION
+                    rat = (
+                        f"UR memory writer opc=0x{opc_i:03x} "
+                        f"(wdep=0x{wdep_i:02x}) → UR consumer "
+                        f"opc=0x{opc_j:03x} at gap={gap}: no rbar "
+                        f"class-bit 0x{class_bit:02x} wait evidence "
+                        f"in [{i + 1}, {j}]"
+                    )
+            report.edges.append(ProofEdge(
+                writer_idx=i,
+                reader_idx=j,
+                writer_opc=opc_i,
+                reader_opc=opc_j,
+                regs=frozenset({ur_dest}),  # UR index tagged
+                gap=gap,
+                classification=cls,
+                rationale=rat,
+            ))
+            break  # at most one edge per UR producer
 
     # ---- ALU GPR writer → reader (rule R8, FG-3.0 bounded lookahead) -------
     # For every writer at index i with a non-empty GPR dest, enumerate

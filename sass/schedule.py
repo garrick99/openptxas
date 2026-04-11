@@ -363,14 +363,19 @@ def verify_schedule(instrs: list[SassInstr]) -> list[str]:
     Returns a list of human-readable violation strings.  Empty list = no violations.
 
     Checks:
-      • LDCU.64 minimum consumer gap ≥3 (R1)
-      • ALU GPR 0-gap RAW (R8) — for opcodes with min_gpr_gap > 0 in _OPCODE_META
+      • LDCU.64 minimum consumer gap ≥3 (R1) — excludes FG-2.4
+        whitelisted consumer opcodes whose ctrl word covers the gap
+      • ALU GPR 0-gap RAW (R8) — for opcodes with min_gpr_gap > 0 in
+        _OPCODE_META, excluding FG-2.4 forwarding-safe producer-consumer
+        pairs where hardware forwarding handles the RAW
     """
     from sass.scoreboard import (
         _OPCODE_META,
         _get_dest_regs as _sc_dest,
         _get_src_regs  as _sc_src,
         _get_opcode    as _sc_opc,
+        _is_forwarding_safe_pair,
+        _LDCU_GAP_EXEMPT_CONSUMERS,
     )
 
     _UR_CONSUMER_OPCODES = {0xc35, 0xc0c, 0xc24, 0x981}
@@ -388,7 +393,9 @@ def verify_schedule(instrs: list[SassInstr]) -> list[str]:
             break
 
     # R1: LDCU.64 must have ≥3 instructions before its first UR consumer.
-    # Only enforced for pre-boundary LDCU.64s (preamble section).
+    # Only enforced for pre-boundary LDCU.64s (preamble section) AND
+    # only when the consumer is not on the FG-2.4 ctrl-word-handled
+    # exemption list.
     for i, si in enumerate(instrs):
         if i >= boundary_idx:
             break
@@ -398,6 +405,9 @@ def verify_schedule(instrs: list[SassInstr]) -> list[str]:
         for j in range(i + 1, len(instrs)):
             opc_j = _get_opcode(instrs[j].raw)
             if opc_j in _UR_CONSUMER_OPCODES and instrs[j].raw[4] == ur_dest:
+                # FG-2.4: ctrl-word-handled consumers exempt
+                if opc_j in _LDCU_GAP_EXEMPT_CONSUMERS:
+                    break
                 gap = j - i - 1
                 if gap < 3:
                     violations.append(
@@ -405,7 +415,10 @@ def verify_schedule(instrs: list[SassInstr]) -> list[str]:
                         f"at [{j}]: gap={gap} (need ≥3)")
                 break
 
-    # R8: ALU GPR 0-gap RAW
+    # R8: ALU GPR 0-gap RAW.  A writer with min_gpr_gap > 0 followed
+    # by a reader that touches the writer's dest is flagged UNLESS the
+    # pair is on the FG-2.4 forwarding-safe whitelist (see
+    # sass.scoreboard._FORWARDING_SAFE_PAIRS).
     for i in range(len(instrs) - 1):
         opc_i = _sc_opc(instrs[i].raw)
         meta_i = _OPCODE_META.get(opc_i)
@@ -418,6 +431,9 @@ def verify_schedule(instrs: list[SassInstr]) -> list[str]:
         overlap = dest_i & src_j
         if overlap:
             opc_j = _sc_opc(instrs[i + 1].raw)
+            # FG-2.4: skip known hardware-forwarded pairs
+            if _is_forwarding_safe_pair(opc_i, opc_j):
+                continue
             violations.append(
                 f"{meta_i.name} at [{i}] writes {overlap} → "
                 f"opc=0x{opc_j:03x} at [{i+1}] reads immediately (0-gap RAW)")

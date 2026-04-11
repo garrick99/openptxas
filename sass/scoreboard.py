@@ -51,6 +51,13 @@ _OPCODE_META: dict[int, _OpMeta] = {
     0x824: _OpMeta('IMAD',       1, 0x3e, 1),
     0x825: _OpMeta('IMAD.WIDE',  1, 0x3e, 1),   # IMAD.WIDE R-imm (64-bit result)
     0x225: _OpMeta('IMAD.WIDE.RR', 1, 0x3e, 1),  # IMAD.WIDE R-R
+    0xc24: _OpMeta('IMAD.RU',    1, 0x3e, 1),  # IMAD R-UR (FG-1 closeout): same ALU class
+                                                # as the other IMAD variants; 1-instruction
+                                                # GPR latency is required before any reader
+                                                # of the dest.  Previously absent from the
+                                                # scoreboard model → _enforce_gpr_latency
+                                                # did not insert a NOP after fused mul+add,
+                                                # producing the FG-1.14A/B/C anomalies.
     0x819: _OpMeta('SHF',        1, 0x3e, 1),
     0x219: _OpMeta('SHF.R.VAR', 1, 0x3e, 1),  # SHF.R (variable shift: U64/S64/U32.HI/S32.HI)
     0xa19: _OpMeta('SHF.89',     1, 0x3e, 1),  # SM_89 SHF
@@ -308,6 +315,39 @@ def _get_src_regs(raw: bytes) -> set[int]:
     opcode = _get_opcode(raw)
     regs = set()
 
+    # FG-2.4: explicit per-opcode cases for opcodes that are emitted by
+    # OpenPTXas but not in any of the opcode-class sets below.  These
+    # are dispatched first so the generic set-based chain cannot
+    # silently route them through a fallback that returns the wrong
+    # source set.
+    if opcode == 0x812:
+        # IADD3 R-imm: b3 = src0 GPR, b4..b7 = 32-bit imm, b8 = src2 GPR.
+        if raw[3] < 255: regs.add(raw[3])
+        if raw[8] < 255: regs.add(raw[8])
+        return regs
+    if opcode == 0x835:
+        # IADD.64 R-imm: b3:b3+1 = src0 pair, b4..b7 = 32-bit imm.
+        # Unlike IADD3.IMM the 64-bit form has no src2 at b8 — empirical
+        # evidence from smem_exchange/bar_ldc_xor PARITY kernels shows
+        # b8 is a reserved/padding byte (typically 0x00) that the
+        # hardware does not treat as a source register.
+        if raw[3] < 255: regs |= {raw[3], raw[3]+1}
+        return regs
+    if opcode == 0xc11:
+        # LEA R-UR: b3 = base GPR, b4 = UR (not a GPR source), b9 = shift.
+        if raw[3] < 255: regs.add(raw[3])
+        return regs
+    if opcode == 0xc12:
+        # IADD3X R-UR: b3 = src0 GPR, b4 = UR (not a GPR), b8 = src2 GPR.
+        if raw[3] < 255: regs.add(raw[3])
+        if raw[8] < 255: regs.add(raw[8])
+        return regs
+    if opcode == 0xc25:
+        # IMAD.WIDE R-UR: b3 = src0 GPR, b4 = UR, b8:b8+1 = src2 pair.
+        if raw[3] < 255: regs.add(raw[3])
+        if raw[8] < 255: regs |= {raw[8], raw[8]+1}
+        return regs
+
     if opcode in _OPCODES_LDG:
         # LDG: src_addr at b3
         if raw[3] < 255: regs |= {raw[3], raw[3]+1}
@@ -412,8 +452,59 @@ def _get_src_regs(raw: bytes) -> set[int]:
             if raw[3] < 255: regs.add(raw[3])
             if raw[4] < 255: regs.add(raw[4])
             if raw[8] < 255: regs.add(raw[8])
+        # FG-2.4: precise per-opcode cases added to replace the generic
+        # fallback below for every opcode OpenPTXas is known to emit.
+        # Each entry documents the actual GPR source layout per the
+        # encoder in sass.encoding.sm_120_opcodes.
+        elif opcode == 0xf89:
+            # SHFL reg-imm (SHFL.DOWN / SHFL.BFLY form).  Encoder:
+            #   raw[3] = src (GPR to shuffle)
+            #   raw[4..7] = immediate lane + clamp + mode, NO GPR
+            #   raw[10] = predicate dest (PT encoded), not a GPR source
+            # Only b3 is a real GPR source.
+            if raw[3] < 255: regs.add(raw[3])
+        elif opcode == 0x589:
+            # SHFL reg-reg form (shuffle lane in a GPR).  Encoder uses
+            # b3 for data source and b4 for lane source.
+            if raw[3] < 255: regs.add(raw[3])
+            if raw[4] < 255: regs.add(raw[4])
+        elif opcode == 0x989:
+            # SHFL imm-imm form.  Same as 0xf89 — b3 is the single GPR
+            # source; remaining fields are immediates.
+            if raw[3] < 255: regs.add(raw[3])
+        elif opcode == 0x209:
+            # FMNMX float min/max (R-R).  src0=b3, src1=b4.
+            if raw[3] < 255: regs.add(raw[3])
+            if raw[4] < 255: regs.add(raw[4])
+        elif opcode == 0x812:
+            # IADD3-family R-imm variant.  src0=b3; b4..b7 are the
+            # 32-bit immediate; b8 is the third source (usually RZ).
+            if raw[3] < 255: regs.add(raw[3])
+            if raw[8] < 255: regs.add(raw[8])
+        elif opcode == 0x835:
+            # IADD.64 R-imm variant.  src0 pair at b3:b3+1; b4..b7 imm;
+            # b8 is an additional operand (often RZ).
+            if raw[3] < 255: regs |= {raw[3], raw[3]+1}
+            if raw[8] < 255: regs.add(raw[8])
+        elif opcode == 0xc11:
+            # LEA R-UR form (dest = base + (index << scale)).
+            # b3 = base GPR, b4 = UR index (NOT a GPR), b9 = shift imm.
+            if raw[3] < 255: regs.add(raw[3])
+        elif opcode == 0xc12:
+            # IADD3X R-UR variant.  b3 = src0 GPR, b4 = UR (not GPR),
+            # b8 = src2 GPR.
+            if raw[3] < 255: regs.add(raw[3])
+            if raw[8] < 255: regs.add(raw[8])
+        elif opcode == 0xc25:
+            # IMAD.WIDE R-UR variant.  Like encode_imad_ur but writes
+            # a GPR pair.  Source layout: b3 = src0 GPR, b4 = UR,
+            # b8 = src2 (pair, like 0x825/0x225).
+            if raw[3] < 255: regs.add(raw[3])
+            if raw[8] < 255: regs |= {raw[8], raw[8]+1}
         else:
-            # Default: src0 at b3 (generic ALU)
+            # Default: src0 at b3 (generic ALU).
+            # FG-2.4 kept as safety net; every opcode currently emitted
+            # by OpenPTXas has an explicit case above.
             if raw[3] < 255: regs.add(raw[3])
     elif opcode in _OPCODES_F2F:
         # F2F: src at b4. F2F.F32.F64 (b9=0x10, narrowing) reads f64 pair;
@@ -423,6 +514,97 @@ def _get_src_regs(raw: bytes) -> set[int]:
             if raw[9] == 0x10:  # F2F.F32.F64: src is f64 pair
                 regs.add(raw[4] + 1)
     return regs
+
+
+# ---------------------------------------------------------------------------
+# FG-2.4: forwarding-safe reader / producer-consumer pair model
+# ---------------------------------------------------------------------------
+#
+# The _OPCODE_META.min_gpr_gap rule is a coarse "any reader of the
+# writer's dest needs ≥1 instruction of gap" policy.  It is correct
+# in the worst case but conservative for many producer-consumer
+# pairs where hardware operand-forwarding handles the RAW without
+# a NOP.  PTXAS ground truth across the 21-kernel workbench shows
+# it emitting certain 0-gap ALU→ALU and ALU→consumer patterns
+# repeatedly in byte-for-byte PARITY with OpenPTXas, proving those
+# patterns are hardware-safe.
+#
+# Rather than making the decoder return incomplete source sets
+# (which would introduce false negatives in novel kernels), we
+# keep `_get_src_regs` faithful and model the forwarding-safe
+# pairs here as a separate policy consulted by `verify_schedule`.
+#
+# Each entry is a (writer_opc, reader_opc) tuple where:
+#  * The hardware 1-cycle ALU result latency is covered by
+#    operand forwarding into the reader's read stage, OR
+#  * The reader's ctrl-word (rbar/wdep) scoreboard slot covers the
+#    RAW, OR
+#  * The reader is a SHFL/STG family instruction whose pipeline
+#    reads the source operand in a stage that naturally sees the
+#    preceding ALU writer's forwarded value.
+#
+# Pairs NOT on this list are still subject to the standard
+# min_gpr_gap rule, so this list is strictly a "permission to
+# skip the 0-gap check for these specific pairs" — false
+# negatives require a producer opcode whose hardware truly needs
+# a wait-state AND a corresponding entry here that exempts it.
+#
+# Evidence: every pair in this set is found in a PARITY workbench
+# kernel that byte-matches PTXAS.  Removing an entry loses nothing
+# but conservatism; adding an entry without PTXAS evidence is
+# forbidden (see tests/test_fg23_model_complete.py::INV F).
+_FORWARDING_SAFE_PAIRS: set[tuple[int, int]] = {
+    # Integer ALU → integer ALU (most common path).
+    # IMAD.32 / IMAD.RR writing its accumulator (dest == src2) feeds
+    # directly into IADD.64 / IADD3 / next IMAD.  Observed in
+    # conv2d_looped, conv2d_unrolled, reduce_sum, etc.
+    (0x224, 0x235),   # IMAD.32 → IADD.64
+    (0x2a4, 0x235),   # IMAD.RR → IADD.64
+    (0x210, 0x235),   # IADD3   → IADD.64
+    (0x212, 0x235),   # IADD3X  → IADD.64
+    (0x224, 0x210),   # IMAD.32 → IADD3
+    (0x235, 0x210),   # IADD.64 → IADD3
+    # ALU → SHFL (warp shuffle): SHFL's reg-imm form reads the source
+    # GPR in its shuffle pipeline stage, which sees the forwarded
+    # value from the previous cycle.
+    (0x235, 0xf89),   # IADD.64 → SHFL
+    (0x221, 0xf89),   # FADD    → SHFL
+    (0xf89, 0xf89),   # SHFL    → SHFL (chained shuffles in reduce_sum)
+    # ALU → STG: store addr/data pair read covered by STG's own
+    # read barrier, not instruction-stream gap.
+    (0xc35, 0x986),   # IADD.64-UR → STG.E
+    (0xc02, 0x986),   # MOV.UR     → STG.E
+    (0x221, 0x986),   # FADD       → STG.E
+    (0x235, 0x986),   # IADD.64    → STG.E
+    # SHF → ISETP R-R: SHF's output forwarded into ISETP compare stage.
+    (0x819, 0x20c),   # SHF (R-imm) → ISETP R-R
+}
+
+
+def _is_forwarding_safe_pair(writer_opc: int, reader_opc: int) -> bool:
+    """Return True if a 0-gap RAW between the producer and consumer
+    is covered by hardware operand forwarding / ctrl-word scoreboard,
+    per the FG-2.4 forwarding-safe pair table.
+    """
+    return (writer_opc, reader_opc) in _FORWARDING_SAFE_PAIRS
+
+
+# ---------------------------------------------------------------------------
+# FG-2.4: LDCU.64 consumer whitelist for verify_schedule
+# ---------------------------------------------------------------------------
+#
+# The LDCU.64 "≥3 instructions before consumer" rule was designed for
+# the fp64 preamble path where LDCU.64 is followed by a DMMA or similar
+# heavy consumer.  For simple kernels (fmax, cp_async, atom_or,
+# atomg_add, multi_block_atomic) the consumer is an IADD.64-UR (0xc35)
+# or LDG.E (0x981) that PTXAS freely emits at gap=0/1/2 and which is
+# safe because the ctrl word of the consumer (wdep / rbar) handles the
+# wait directly.  The gap rule is therefore skipped when the consumer
+# is on this whitelist.
+_LDCU_GAP_EXEMPT_CONSUMERS: set[int] = {
+    0xc35,  # IADD.64-UR: wdep/rbar on the add covers the LDCU latency
+    0x981,  # LDG.E.64: LDG's own read barrier covers the addr pair
+}
 
 
 def _get_dest_regs(raw: bytes) -> set[int]:

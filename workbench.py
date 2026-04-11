@@ -1,13 +1,15 @@
 """
-WB-0: Kernel Workbench MVP
+WB-0: Kernel Workbench MVP  (subcommand CLI as of WB-12.0)
 
 CLI cockpit for the openptxas → forge → ptxas stack.
 
 Examples
 --------
-  python workbench.py --kernel reduce_sum
-  python workbench.py --kernel conv2d_looped --compare ptxas
-  python workbench.py --kernel hmma_zero --compare ptxas --mode bench
+  python workbench.py run --kernel reduce_sum
+  python workbench.py run --kernel conv2d_looped --compare ptxas
+  python workbench.py run --kernel hmma_zero --compare ptxas --mode bench
+  python workbench.py run --suite all --compare ptxas --mode bench
+  python workbench.py list
 
 The workbench:
   • compiles a known PTX through openptxas
@@ -16,6 +18,16 @@ The workbench:
   • collects regs / sass_total / sass_non_nop / time_ms for both
   • prints a canonical block
   • writes a JSON artifact to results/<ts>_<kernel>.json
+
+Subcommands
+-----------
+  run       run a kernel or suite (current behavior)
+  list      list catalog and suites
+  show      kernel detail (stub — WB-12.2)
+  status    current leaderboard (stub — WB-12.1)
+  dump      side-by-side SASS dump (stub — WB-12.3)
+  history   metric history walk (stub — WB-12.4)
+  diff      diff two artifacts (stub — WB-12.5)
 
 WB-0 is intentionally narrow: hardcoded catalog, no kernel editor, no
 GUI, no AI, no plugin system.  Each catalog entry just points at a PTX
@@ -1954,43 +1966,18 @@ def run_suite(suite_name: str, mode: str, do_compare: bool, repeat: int,
     return 0 if bad == 0 else 1
 
 
-def main():
-    p = argparse.ArgumentParser(
-        prog="workbench",
-        description="WB-1: kernel workbench (multi-run + suite + leaderboard)",
-    )
-    p.add_argument("--kernel", default=None,
-                   help=f"one of: {', '.join(sorted(KERNELS))}")
-    p.add_argument("--suite", default=None,
-                   help=f"one of: {', '.join(sorted(SUITES))}")
-    p.add_argument("--mode", choices=["correct", "bench"], default="correct",
-                   help="correct = build+correctness, bench = +benchmark")
-    p.add_argument("--compare", choices=["ptxas"], default=None,
-                   help="if set, also compile via ptxas and report deltas")
-    p.add_argument("--repeat", type=int, default=1,
-                   help="number of measurement repeats (default: 1)")
-    p.add_argument("--results-dir", default=str(ROOT / "results"),
-                   help="directory for JSON artifacts")
-    p.add_argument("--list", action="store_true",
-                   help="list catalog and exit")
-    args = p.parse_args()
-
-    if args.list:
-        print("Available kernels:")
-        for k, v in KERNELS.items():
-            print(f"  {k:20s} {v['display']}")
-        print()
-        print("Available suites:")
-        for s, ks in SUITES.items():
-            print(f"  {s:20s} ({len(ks)}) {', '.join(ks)}")
-        return 0
-
+def _cmd_run(args, parser):
+    """Dispatch the `run` subcommand — body unchanged from the pre-WB-12.0
+    flat-flag version.  Validation, dispatch, and return value all match
+    the original `main()` exactly so the JSON artifact and stdout layout
+    are byte-for-byte identical (modulo non-deterministic timing fields).
+    """
     if args.repeat < 1:
-        p.error("--repeat must be >= 1")
+        parser.error("--repeat must be >= 1")
     if args.kernel and args.suite:
-        p.error("--kernel and --suite are mutually exclusive")
+        parser.error("--kernel and --suite are mutually exclusive")
     if not args.kernel and not args.suite:
-        p.error("one of --kernel / --suite is required (use --list)")
+        parser.error("one of --kernel / --suite is required (use `workbench list`)")
 
     do_compare = (args.compare == "ptxas")
     if args.suite:
@@ -2008,6 +1995,2053 @@ def main():
         repeat=args.repeat,
         results_dir=Path(args.results_dir),
     )
+
+
+def _cmd_list(args):
+    """Dispatch the `list` subcommand — body unchanged from the pre-WB-12.0
+    `--list` flag handler.  Output is byte-for-byte identical.
+    """
+    print("Available kernels:")
+    for k, v in KERNELS.items():
+        print(f"  {k:20s} {v['display']}")
+    print()
+    print("Available suites:")
+    for s, ks in SUITES.items():
+        print(f"  {s:20s} ({len(ks)}) {', '.join(ks)}")
+    return 0
+
+
+def _cmd_stub(name: str, sub_id: str):
+    """Stub for WB-12.1–12.5 subcommands.  Prints a not-yet-implemented
+    notice and returns exit code 2 so callers can detect the unimplemented
+    state without it being confused with a normal failure (exit 1).
+    """
+    print(f"workbench {name}: not yet implemented (WB-{sub_id} pending)")
+    return 2
+
+
+# ---------------------------------------------------------------------------
+# WB-12.1: workbench status
+# ---------------------------------------------------------------------------
+# Snapshot of the latest (or --from-specified) suite_all artifact.  Pure
+# replay — does not recompute deltas, does not classify kernels, does not
+# call run/bench.  Bucket order, kernel order, and counts come straight
+# from the artifact's `ranking` and `aggregate` fields.
+
+# Display order for buckets in the status output.  NO_COMPARE is
+# intentionally excluded — see WB-12.1 spec.
+#
+# Each tuple is (ranking_key, summary_label, leaderboard_label).
+_STATUS_BUCKETS = [
+    ("PARITY",     "PARITY",  "PARITY"),
+    ("NATIVE_WIN", "WINS",    "NATIVE WIN"),
+    ("GAP",        "GAPS",    "GAP"),
+    ("MIXED",      "MIXED",   "MIXED"),
+]
+
+# Map ranking key → aggregate field name for the count.
+_STATUS_AGG_KEY = {
+    "PARITY":     "parity",
+    "NATIVE_WIN": "native_wins",
+    "GAP":        "gaps",
+    "MIXED":      "mixed",
+}
+
+
+def _format_human_date(ts: str) -> str:
+    """YYYYMMDD_HHMMSS → 'YYYY-MM-DD HH:MM:SS' for table output."""
+    if len(ts) != 15 or ts[8] != "_":
+        return ts
+    return f"{ts[0:4]}-{ts[4:6]}-{ts[6:8]} {ts[9:11]}:{ts[11:13]}:{ts[13:15]}"
+
+
+def _format_iso_timestamp(ts: str) -> str:
+    """YYYYMMDD_HHMMSS → 'YYYY-MM-DDTHH:MM:SS' (ISO 8601) for JSON."""
+    if len(ts) != 15 or ts[8] != "_":
+        return ts
+    return f"{ts[0:4]}-{ts[4:6]}-{ts[6:8]}T{ts[9:11]}:{ts[11:13]}:{ts[13:15]}"
+
+
+def _resolve_suite_artifact(args, cmd_name: str) -> Path | None:
+    """Find a suite_all artifact to read.  Returns Path on success,
+    prints to stderr and returns None on any failure.
+
+    Shared by `status` (WB-12.1), `show` (WB-12.2), and any future
+    subcommand that needs to point at the latest (or --from-specified)
+    suite_all artifact.  `cmd_name` is the user-facing subcommand name
+    so error messages get prefixed correctly.
+    """
+    if args.from_path:
+        path = Path(args.from_path)
+        if not path.exists():
+            print(f"workbench {cmd_name}: artifact not found: {path}",
+                  file=sys.stderr)
+            return None
+        return path
+
+    results_dir = Path(args.results_dir)
+    if not results_dir.is_dir():
+        print(
+            f"workbench {cmd_name}: results dir not found: {results_dir}",
+            file=sys.stderr,
+        )
+        return None
+    candidates = sorted(results_dir.glob("*_suite_all.json"))
+    if not candidates:
+        print(
+            f"workbench {cmd_name}: no suite_all artifact in {results_dir}",
+            file=sys.stderr,
+        )
+        return None
+    # Filenames are prefixed with YYYYMMDD_HHMMSS so lexical sort is chronological.
+    return candidates[-1]
+
+
+def _load_suite_artifact(path: Path, cmd_name: str) -> dict | None:
+    """Load + schema-check a suite_all artifact.  Returns dict on success,
+    None on any failure (with the error already printed to stderr).
+    """
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError as e:
+        print(f"workbench {cmd_name}: malformed JSON in {path}: {e}",
+              file=sys.stderr)
+        return None
+    if data.get("schema") != "workbench.suite/v1":
+        print(
+            f"workbench {cmd_name}: unexpected schema in {path}: "
+            f"{data.get('schema')!r}",
+            file=sys.stderr,
+        )
+        return None
+    return data
+
+
+def _cmd_status(args):
+    """WB-12.1: snapshot the latest (or --from) suite_all artifact.
+
+    Pure replay of the saved leaderboard.  No recomputation.
+    """
+    path = _resolve_suite_artifact(args, "status")
+    if path is None:
+        return 2
+    data = _load_suite_artifact(path, "status")
+    if data is None:
+        return 2
+
+    commit       = data.get("commits", {}).get("openptxas", "?")
+    timestamp_raw = data.get("timestamp", "")
+    aggregate    = data.get("aggregate", {})
+    ranking      = data.get("ranking", {})
+
+    if args.format == "json":
+        out = {
+            "commit":       commit,
+            "timestamp":    _format_iso_timestamp(timestamp_raw),
+            "kernel_count": aggregate.get("kernels", 0),
+            "buckets": {
+                rank_key: list(ranking.get(rank_key, []))
+                for rank_key, _summary, _label in _STATUS_BUCKETS
+            },
+        }
+        print(json.dumps(out, indent=2))
+        return 0
+
+    # Table mode
+    print(f"{'commit:':<10s}{commit}")
+    print(f"{'date:':<10s}{_format_human_date(timestamp_raw)}")
+    print(f"{'kernels:':<10s}{aggregate.get('kernels', 0)}")
+    print()
+    for rank_key, summary_label, _disp_label in _STATUS_BUCKETS:
+        count = aggregate.get(_STATUS_AGG_KEY[rank_key], 0)
+        print(f"{summary_label + ':':<7s}{count:>5d}")
+    print()
+    print("leaderboard:")
+    for rank_key, _summary, disp_label in _STATUS_BUCKETS:
+        members = ranking.get(rank_key, [])
+        if not members:
+            continue
+        print(f"  {disp_label}:")
+        for k in members:
+            print(f"    {k}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# WB-12.2: workbench show
+# ---------------------------------------------------------------------------
+# Drill-down into a single kernel record from a suite_all artifact.  Pure
+# replay — pulls regs / sass_total / sass_non_nop / time_ms_stats.mean /
+# deltas straight from the saved record.  Bucket label comes from the
+# artifact's `ranking` field (cross-checks with `workbench status`).
+
+# Bucket lookup order — matches WB-12.1's _STATUS_BUCKETS plus NO_COMPARE
+# at the end so a kernel that ran without a ptxas compare is still
+# locatable.
+_SHOW_BUCKET_LOOKUP = ("PARITY", "NATIVE_WIN", "GAP", "MIXED", "NO_COMPARE")
+
+
+def _show_metric_line(label: str, value) -> None:
+    """Print a `  label:           value` line with the value column at
+    column 18 (matching the WB-12.2 spec layout).
+    """
+    if value is None:
+        return
+    print(f"  {label + ':':<16s}{value}")
+
+
+def _show_signed_int(label: str, value) -> None:
+    if value is None:
+        return
+    print(f"  {label + ':':<16s}{value:+d}")
+
+
+def _show_signed_float(label: str, value) -> None:
+    if value is None:
+        return
+    print(f"  {label + ':':<16s}{value:+.4f}")
+
+
+def _cmd_show(args):
+    """WB-12.2: print a single-kernel record from the latest (or --from)
+    suite_all artifact.  Pure replay; numbers come straight from the
+    record's stored fields.
+    """
+    path = _resolve_suite_artifact(args, "show")
+    if path is None:
+        return 2
+    data = _load_suite_artifact(path, "show")
+    if data is None:
+        return 2
+
+    kernel_name = args.kernel
+    record = None
+    for r in data.get("kernels", []):
+        if r.get("kernel") == kernel_name:
+            record = r
+            break
+    if record is None:
+        print(
+            f"workbench show: kernel '{kernel_name}' not found in {path}",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Bucket lookup — find which ranking list contains this kernel.
+    ranking = data.get("ranking", {})
+    bucket = None
+    for b in _SHOW_BUCKET_LOOKUP:
+        if kernel_name in ranking.get(b, []):
+            bucket = b
+            break
+    if bucket is None:
+        bucket = "?"
+
+    ours    = record.get("ours") or {}
+    ptxas   = record.get("ptxas") or {}
+    deltas  = record.get("deltas") or {}
+
+    if args.format == "json":
+        out = {
+            "kernel": kernel_name,
+            "bucket": bucket,
+            "ours":   ours,
+            "ptxas":  ptxas if ptxas else None,
+            "delta":  deltas if deltas else None,
+        }
+        print(json.dumps(out, indent=2))
+        return 0
+
+    # Table mode
+    print(f"{'kernel:':<10s}{kernel_name}")
+    print(f"{'bucket:':<10s}{bucket}")
+    print()
+    print("ours:")
+    _show_metric_line("regs",         ours.get("regs"))
+    _show_metric_line("sass_total",   ours.get("sass_total"))
+    _show_metric_line("sass_non_nop", ours.get("sass_non_nop"))
+    ours_mean = (ours.get("time_ms_stats") or {}).get("mean")
+    if ours_mean is not None:
+        print(f"  {'time_ms:':<16s}{ours_mean:.4f} (mean)")
+    if ptxas:
+        print()
+        print("ptxas:")
+        _show_metric_line("regs",         ptxas.get("regs"))
+        _show_metric_line("sass_total",   ptxas.get("sass_total"))
+        _show_metric_line("sass_non_nop", ptxas.get("sass_non_nop"))
+        ptxas_mean = (ptxas.get("time_ms_stats") or {}).get("mean")
+        if ptxas_mean is not None:
+            print(f"  {'time_ms:':<16s}{ptxas_mean:.4f} (mean)")
+    if deltas:
+        print()
+        print("delta:")
+        _show_signed_int  ("regs",         deltas.get("regs"))
+        _show_signed_int  ("sass_total",   deltas.get("sass_total"))
+        _show_signed_int  ("sass_non_nop", deltas.get("sass_non_nop"))
+        _show_signed_float("time_ms",      deltas.get("time_ms_mean"))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# WB-12.3: workbench dump
+# ---------------------------------------------------------------------------
+# Raw passthrough of suite_all artifacts.  No parsing, no validation, no
+# schema checks.  This is the "no interpretation" layer — anything that
+# wants the original JSON bytes can pipe `workbench dump` and get them.
+#
+# Critical: byte-for-byte equality with the source file.  On Windows the
+# artifacts are written with CRLF line endings (Path.write_text default),
+# so the dump path uses Path.read_bytes + sys.stdout.buffer.write to bypass
+# Python's text-mode CRLF translation entirely.
+
+def _cmd_dump(args):
+    """WB-12.3: raw passthrough of a suite_all artifact, or list mode."""
+    # ---- --list mode ---------------------------------------------------
+    if args.list:
+        results_dir = Path(args.results_dir)
+        if not results_dir.is_dir():
+            print(f"workbench dump: results dir not found: {results_dir}",
+                  file=sys.stderr)
+            return 2
+        candidates = sorted(results_dir.glob("*_suite_all.json"))
+        if not candidates:
+            print(
+                f"workbench dump: no suite_all artifact in {results_dir}",
+                file=sys.stderr,
+            )
+            return 2
+        # Header is the basename of the results dir + "/" so the default
+        # default-results-dir prints as "results/" per the WB-12.3 spec
+        # example, regardless of whether the user passed an absolute path.
+        print(f"{Path(args.results_dir).name}/")
+        for c in candidates:
+            print(f"  {c.name}")
+        return 0
+
+    # ---- dump (default / --latest / --from) ----------------------------
+    # _resolve_suite_artifact handles both --from <path> and the
+    # latest-in-results-dir fallback.  --latest is just an explicit no-op
+    # selector for the same behavior — argparse already accepts it.
+    path = _resolve_suite_artifact(args, "dump")
+    if path is None:
+        return 2
+
+    try:
+        data = Path(path).read_bytes()
+    except OSError as e:
+        print(f"workbench dump: cannot read {path}: {e}", file=sys.stderr)
+        return 2
+
+    # Binary write — bypass Windows text-mode CRLF translation so the
+    # output bytes match the file bytes exactly.
+    sys.stdout.buffer.write(data)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# WB-12.4: workbench history
+# ---------------------------------------------------------------------------
+# Trend display across multiple suite_all artifacts.  Pure replay — every
+# field comes from the artifacts as-is.  No smoothing, no averaging, no
+# inference, no "best/worst" labels.
+
+# Buckets we look at when locating a kernel in an artifact's `ranking`.
+_HISTORY_BUCKETS = ("PARITY", "NATIVE_WIN", "GAP", "MIXED", "NO_COMPARE")
+
+
+def _load_history_entries(results_dir: Path) -> list[dict] | None:
+    """Scan results_dir for suite_all artifacts and load minimal fields
+    from each one.  Returns the list (chronological), or None on a fatal
+    error (already printed to stderr).
+
+    Individual unreadable / wrong-schema artifacts are skipped silently
+    so a single bad file doesn't take out the whole history view.
+    """
+    if not results_dir.is_dir():
+        print(f"workbench history: results dir not found: {results_dir}",
+              file=sys.stderr)
+        return None
+    candidates = sorted(results_dir.glob("*_suite_all.json"))
+    if not candidates:
+        print(f"workbench history: no suite_all artifact in {results_dir}",
+              file=sys.stderr)
+        return None
+
+    entries: list[dict] = []
+    for path in candidates:
+        try:
+            data = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        if data.get("schema") != "workbench.suite/v1":
+            continue
+        entries.append({
+            "path":      path,
+            "timestamp": data.get("timestamp", ""),
+            "commit":    data.get("commits", {}).get("openptxas", "?"),
+            "aggregate": data.get("aggregate", {}),
+            "ranking":   data.get("ranking", {}),
+            "kernels":   data.get("kernels", []),
+        })
+    if not entries:
+        print(
+            f"workbench history: no valid suite_all artifacts in {results_dir}",
+            file=sys.stderr,
+        )
+        return None
+    return entries
+
+
+def _history_default_view(entries: list[dict], fmt: str) -> int:
+    """Default history view: one row per artifact with aggregate counts."""
+    if fmt == "json":
+        out = {
+            "history": [
+                {
+                    "timestamp": e["timestamp"],
+                    "commit":    e["commit"],
+                    "aggregate": e["aggregate"],
+                }
+                for e in entries
+            ]
+        }
+        print(json.dumps(out, indent=2))
+        return 0
+
+    print("history (latest last)")
+    print()
+    header = (
+        f"{'timestamp':<18s}{'commit':<10s}{'kernels':<9s}"
+        f"{'parity':<8s}{'wins':<6s}{'gaps':<6s}{'mixed':<5s}"
+    )
+    print(header)
+    print("-" * len(header))
+    for e in entries:
+        agg = e["aggregate"]
+        row = (
+            f"{e['timestamp']:<18s}"
+            f"{e['commit']:<10s}"
+            f"{agg.get('kernels',     0):<9d}"
+            f"{agg.get('parity',      0):<8d}"
+            f"{agg.get('native_wins', 0):<6d}"
+            f"{agg.get('gaps',        0):<6d}"
+            f"{agg.get('mixed',       0):<5d}"
+        )
+        print(row.rstrip())
+    return 0
+
+
+def _history_kernel_view(entries: list[dict], kernel: str, fmt: str) -> int:
+    """--kernel view: per-entry trend for one kernel.  Skip artifacts
+    where the kernel isn't present (catalog grew over time).
+    """
+    rows: list[dict] = []
+    for e in entries:
+        record = None
+        for r in e["kernels"]:
+            if r.get("kernel") == kernel:
+                record = r
+                break
+        if record is None:
+            continue  # kernel not present in this artifact — skip silently
+        bucket = "?"
+        for b in _HISTORY_BUCKETS:
+            if kernel in e["ranking"].get(b, []):
+                bucket = b
+                break
+        deltas = record.get("deltas") or {}
+        rows.append({
+            "timestamp":     e["timestamp"],
+            "commit":        e["commit"],
+            "aggregate":     e["aggregate"],
+            "bucket":        bucket,
+            "non_nop_delta": deltas.get("sass_non_nop", 0),
+            "record":        record,
+        })
+
+    if not rows:
+        print(
+            f"workbench history: kernel '{kernel}' not found in any artifact",
+            file=sys.stderr,
+        )
+        return 2
+
+    if fmt == "json":
+        out = {
+            "kernel": kernel,
+            "history": [
+                {
+                    "timestamp": r["timestamp"],
+                    "commit":    r["commit"],
+                    "aggregate": r["aggregate"],
+                    "kernel": {
+                        "name":   kernel,
+                        "bucket": r["bucket"],
+                        "ours":   r["record"].get("ours"),
+                        "ptxas":  r["record"].get("ptxas"),
+                        "delta":  r["record"].get("deltas"),
+                    },
+                }
+                for r in rows
+            ]
+        }
+        print(json.dumps(out, indent=2))
+        return 0
+
+    print(f"kernel: {kernel}")
+    print()
+    header = f"{'timestamp':<18s}{'bucket':<11s}{'non_nop_delta':<13s}"
+    print(header)
+    print("-" * len(header))
+    for r in rows:
+        line = (
+            f"{r['timestamp']:<18s}"
+            f"{r['bucket']:<11s}"
+            f"{r['non_nop_delta']:+d}"
+        )
+        print(line)
+    return 0
+
+
+def _cmd_history(args):
+    """WB-12.4: trend display across all suite_all artifacts."""
+    if args.limit is not None and args.limit < 1:
+        print("workbench history: --limit must be >= 1", file=sys.stderr)
+        return 2
+
+    entries = _load_history_entries(Path(args.results_dir))
+    if entries is None:
+        return 2
+
+    # --limit applies as a tail (most recent N).
+    if args.limit is not None:
+        entries = entries[-args.limit:]
+
+    if args.kernel:
+        return _history_kernel_view(entries, args.kernel, args.format)
+    return _history_default_view(entries, args.format)
+
+
+# ---------------------------------------------------------------------------
+# WB-12.5: workbench diff
+# ---------------------------------------------------------------------------
+# Compare two suite_all artifacts (default: latest vs previous).  Pure
+# field-level diff.  No inference, no scoring, no labels.
+
+# Aggregate fields shown in the diff table.  (key, display_label).
+_DIFF_AGG_FIELDS = [
+    ("kernels",     "kernels"),
+    ("parity",      "parity"),
+    ("native_wins", "wins"),
+    ("gaps",        "gaps"),
+    ("mixed",       "mixed"),
+]
+
+# Kernel fields tracked for the per-kernel diff.  Order matters — it's
+# the display order in the table when multiple fields differ.
+_DIFF_KERNEL_FIELDS = ["bucket", "build", "correctness",
+                       "regs", "sass_total", "sass_non_nop"]
+
+
+def _kernel_fields_at(art: dict, kernel_name: str) -> dict | None:
+    """Extract diffable fields for a kernel from a suite artifact.
+
+    Returns dict {field: value} or None if the kernel isn't in the
+    artifact at all.  `bucket` comes from `ranking`; numeric fields come
+    from `deltas`; `build`/`correctness` from the kernel record itself.
+    """
+    rec = None
+    for r in art.get("kernels", []):
+        if r.get("kernel") == kernel_name:
+            rec = r
+            break
+    if rec is None:
+        return None
+    bucket = "?"
+    for b in _HISTORY_BUCKETS:
+        if kernel_name in art.get("ranking", {}).get(b, []):
+            bucket = b
+            break
+    deltas = rec.get("deltas") or {}
+    return {
+        "bucket":       bucket,
+        "build":        rec.get("build"),
+        "correctness":  rec.get("correctness"),
+        "regs":         deltas.get("regs"),
+        "sass_total":   deltas.get("sass_total"),
+        "sass_non_nop": deltas.get("sass_non_nop"),
+    }
+
+
+def _fmt_diff_value(field: str, value) -> str:
+    """Format a kernel-field value for the diff display.
+
+    Numeric delta fields print signed (`+1`, `-1`, `+0`).  Strings
+    print as-is.  None becomes `<none>` (used when a kernel was added
+    or removed between artifacts).
+    """
+    if value is None:
+        return "<none>"
+    if field in ("regs", "sass_total", "sass_non_nop"):
+        return f"{value:+d}"
+    return str(value)
+
+
+def _diff_resolve_artifacts(args) -> tuple[Path, Path] | None:
+    """Resolve the (from, to) pair for diff.
+
+    Either both --from and --to are given (explicit), or neither is
+    (default to latest two artifacts in chronological order).
+    """
+    if args.from_path or args.to_path:
+        if not (args.from_path and args.to_path):
+            print(
+                "workbench diff: --from and --to must be specified together",
+                file=sys.stderr,
+            )
+            return None
+        from_path = Path(args.from_path)
+        to_path   = Path(args.to_path)
+        if not from_path.exists():
+            print(f"workbench diff: artifact not found: {from_path}",
+                  file=sys.stderr)
+            return None
+        if not to_path.exists():
+            print(f"workbench diff: artifact not found: {to_path}",
+                  file=sys.stderr)
+            return None
+        return from_path, to_path
+
+    results_dir = Path(args.results_dir)
+    if not results_dir.is_dir():
+        print(f"workbench diff: results dir not found: {results_dir}",
+              file=sys.stderr)
+        return None
+    candidates = sorted(results_dir.glob("*_suite_all.json"))
+    if len(candidates) < 2:
+        print(
+            f"workbench diff: need at least 2 suite_all artifacts, "
+            f"got {len(candidates)} in {results_dir}",
+            file=sys.stderr,
+        )
+        return None
+    return candidates[-2], candidates[-1]
+
+
+def _diff_default_view(from_data: dict, to_data: dict, fmt: str) -> int:
+    """Default diff view: aggregate diff + per-kernel field changes."""
+    from_ts  = from_data.get("timestamp", "")
+    to_ts    = to_data.get("timestamp", "")
+    from_agg = from_data.get("aggregate", {})
+    to_agg   = to_data.get("aggregate", {})
+
+    # Walk both kernel sets to compute changes / added / removed.
+    from_names = {r["kernel"] for r in from_data.get("kernels", [])}
+    to_names   = {r["kernel"] for r in to_data.get("kernels", [])}
+    common     = from_names & to_names
+    added      = sorted(to_names - from_names)
+    removed    = sorted(from_names - to_names)
+
+    # Walk in the to-artifact's stored order so changed kernels appear
+    # in run order, not set/dict order.
+    kernel_changes: list[dict] = []
+    for r in to_data.get("kernels", []):
+        name = r.get("kernel")
+        if name not in common:
+            continue
+        ff = _kernel_fields_at(from_data, name)
+        tf = _kernel_fields_at(to_data, name)
+        diffs: dict = {}
+        for field in _DIFF_KERNEL_FIELDS:
+            if ff.get(field) != tf.get(field):
+                diffs[field] = [ff.get(field), tf.get(field)]
+        if diffs:
+            kernel_changes.append({"kernel": name, "fields": diffs})
+
+    if fmt == "json":
+        out = {
+            "from": from_ts,
+            "to":   to_ts,
+            "aggregate": {
+                key: [from_agg.get(key, 0), to_agg.get(key, 0)]
+                for key, _ in _DIFF_AGG_FIELDS
+            },
+            "kernel_changes": kernel_changes,
+        }
+        if added:
+            out["added"] = added
+        if removed:
+            out["removed"] = removed
+        print(json.dumps(out, indent=2))
+        return 0
+
+    # Table mode
+    print(f"diff: {from_ts} → {to_ts}")
+    print()
+    print("aggregate:")
+    for key, label in _DIFF_AGG_FIELDS:
+        from_v = from_agg.get(key, 0)
+        to_v   = to_agg.get(key, 0)
+        delta  = to_v - from_v
+        print(f"  {label + ':':<10s}{from_v:>2d} → {to_v:>2d}     ({delta:+d})")
+    print()
+    print("kernel changes:")
+    if not kernel_changes:
+        print("  (none)")
+    else:
+        for i, change in enumerate(kernel_changes):
+            if i > 0:
+                print()
+            print(f"  {change['kernel']}:")
+            for field, (old, new) in change["fields"].items():
+                print(
+                    f"    {field}: "
+                    f"{_fmt_diff_value(field, old)} → "
+                    f"{_fmt_diff_value(field, new)}"
+                )
+    if added:
+        print()
+        print("added kernels:")
+        for n in added:
+            print(f"  {n}")
+    if removed:
+        print()
+        print("removed kernels:")
+        for n in removed:
+            print(f"  {n}")
+    return 0
+
+
+def _diff_kernel_view(from_data: dict, to_data: dict,
+                      kernel: str, fmt: str) -> int:
+    """--kernel view: focused per-kernel diff."""
+    from_ts = from_data.get("timestamp", "")
+    to_ts   = to_data.get("timestamp", "")
+
+    from_fields = _kernel_fields_at(from_data, kernel)
+    to_fields   = _kernel_fields_at(to_data, kernel)
+
+    if from_fields is None and to_fields is None:
+        print(
+            f"workbench diff: kernel '{kernel}' not in either artifact",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Build the field-by-field diff.  If the kernel was added or removed,
+    # all fields contribute (with the missing side as None).
+    diffs: dict = {}
+    if from_fields is None:
+        for k in _DIFF_KERNEL_FIELDS:
+            diffs[k] = [None, to_fields.get(k)]
+    elif to_fields is None:
+        for k in _DIFF_KERNEL_FIELDS:
+            diffs[k] = [from_fields.get(k), None]
+    else:
+        for k in _DIFF_KERNEL_FIELDS:
+            if from_fields.get(k) != to_fields.get(k):
+                diffs[k] = [from_fields.get(k), to_fields.get(k)]
+
+    if fmt == "json":
+        out = {
+            "kernel": kernel,
+            "from":   from_ts,
+            "to":     to_ts,
+            "fields": diffs,
+        }
+        print(json.dumps(out, indent=2))
+        return 0
+
+    print(f"kernel: {kernel}")
+    print(f"{'from:':<6s}{from_ts}")
+    print(f"{'to:':<6s}{to_ts}")
+    print()
+    if not diffs:
+        print("(no changes)")
+        return 0
+    for field, (old, new) in diffs.items():
+        print(
+            f"{field}: "
+            f"{_fmt_diff_value(field, old)} → "
+            f"{_fmt_diff_value(field, new)}"
+        )
+    return 0
+
+
+def _cmd_diff(args):
+    """WB-12.5: compare two suite_all artifacts."""
+    paths = _diff_resolve_artifacts(args)
+    if paths is None:
+        return 2
+    from_path, to_path = paths
+
+    from_data = _load_suite_artifact(from_path, "diff")
+    if from_data is None:
+        return 2
+    to_data = _load_suite_artifact(to_path, "diff")
+    if to_data is None:
+        return 2
+
+    if args.kernel:
+        return _diff_kernel_view(from_data, to_data, args.kernel, args.format)
+    return _diff_default_view(from_data, to_data, args.format)
+
+
+# ===========================================================================
+# FG-1: Forge integration
+# ===========================================================================
+#
+# Pipeline (decided in FG-1 design phase, all 5 questions locked):
+#
+#     Forge .fg  →  Forge PTX backend  →  OpenPTXas  →  cubin  →  GPU
+#
+# - Forge already has its own PTX backend (lib/codegen/codegen_ptx.ml).
+#   We do NOT route through OpenCUDA — Forge → PTX is direct.  OpenCUDA
+#   commit hash is still recorded in artifacts for traceability but is
+#   not part of the kernel execution path.
+# - Each Forge target has its own per-target Python harness because
+#   Forge param shapes differ from the hand-crafted reference kernels
+#   (e.g. forge `reduce_sum` is 4 args + single global atomic result;
+#   the hand-crafted reference is 5 args + per-block output array).
+# - Forge runs in WSL (the binary is a Linux ELF).  Each `forge run`
+#   shells out to `wsl.exe -- bash -c '...'`.
+# - Forge writes its .ptx in-place inside the Forge tree.  We copy it
+#   into results/<ts>_forge_<target>.ptx so workbench owns its inputs
+#   and runs are reproducible.
+# - Hard rule: NO silent fallback to the hand-crafted PTX path.  If
+#   Forge fails, openptxas fails to assemble forge PTX, or the GPU
+#   refuses to run the forge-emitted kernel — STOP and report.
+#
+# ---------------------------------------------------------------------
+# FG-1.0: artifact schema (workbench.forge_run/v1)
+# ---------------------------------------------------------------------
+#
+# Locked schema:
+#
+# {
+#   "schema":      "workbench.forge_run/v1",
+#   "timestamp":   "YYYYMMDD_HHMMSS",
+#   "source_mode": "forge",
+#   "ptx_source":  "forge",
+#   "target":      "<logical name>",
+#   "source": {
+#     "fg_path":       "<relative to forge repo>",
+#     "kernel_symbol": "<.entry name in PTX>",
+#     "language":      "forge"
+#   },
+#   "commits": {
+#     "forge":     "<short>",
+#     "opencuda":  "<short>",   # recorded but not in execution path
+#     "openptxas": "<short>"
+#   },
+#   "stages": [
+#     {"name": "forge_compile",       "status": "PASS|FAIL", "duration_ms": ..., "exit_code": ..., "stdout_tail": [], "stderr_tail": []},
+#     {"name": "openptxas_assemble",  "status": "PASS|FAIL", "duration_ms": ..., "error": ...},
+#     {"name": "ptxas_compile",       "status": "PASS|FAIL", "duration_ms": ..., "error": ...},  # only if --compare ptxas
+#     {"name": "gpu_correctness",     "status": "PASS|FAIL", "duration_ms": ..., "error": ...}
+#   ],
+#   "artifacts": {
+#     "forge_cu_path":      "<absolute, may be null>",
+#     "forge_ptx_source":   "<absolute path inside forge tree>",
+#     "forge_ptx_cached":   "<absolute path inside results/>",
+#     "ours_cubin_size":    int,
+#     "ptxas_cubin_size":   int  # null if no compare
+#   },
+#   "build":       "PASS|FAIL",
+#   "correctness": "PASS|FAIL",
+#   "ours":        { ... same shape as workbench.kernel/v1 ours ... },
+#   "ptxas":       { ... same shape as workbench.kernel/v1 ptxas ... }  | null,
+#   "deltas":      { ... same shape as workbench.kernel/v1 deltas ... } | null,
+#   "bucket":      "PARITY|NATIVE_WIN|GAP|MIXED|NO_COMPARE"
+# }
+#
+# Distinct schema name from `workbench.kernel/v1` so consumers (status,
+# show, history, diff) can reliably tell PTX-backed and Forge-backed
+# runs apart.
+
+_FORGE_SCHEMA_VERSION = "workbench.forge_run/v1"
+
+
+# ---------------------------------------------------------------------
+# FG-1.1: Forge target catalog
+# ---------------------------------------------------------------------
+# First-target choice: `reduce_step` from demos/205_gpu_reduce.fg.
+#
+# This is the simplest verified GPU kernel Forge has — pure global-memory
+# dataflow loop with no warp shuffles, no special registers beyond the
+# four supported (tid/ntid/ctaid/nctaid), no device function calls, and
+# no atomics.  It exists specifically to validate the Forge → OpenPTXas
+# → GPU pipeline plumbing without tripping any of the missing-feature
+# bugs found during the FG-1.1 first attempt against `1017_gpu_warp_reduce.fg`.
+#
+# History:
+#   - FG-1.1 first attempt used `reduce_sum` from 1017_gpu_warp_reduce.fg
+#     and surfaced two real bugs:
+#       (A) OpenPTXas missing `%laneid` in _SPECIAL_REGS (sass/isel.py)
+#       (B) Forge PTX backend stubs device function calls
+#           (warp_reduce_sum compiles to `mov 0` placeholder)
+#   - Both findings are explicitly OUT OF SCOPE for FG-1.1 — see the
+#     FG-1.1 stop report.  They become FG-1.5 (laneid) and FG-1.6
+#     (Forge PTX backend) when their time comes.
+#   - This catalog deliberately avoids any Forge target that uses warp
+#     shuffles, device function calls, or %laneid until FG-1.5 / FG-1.6
+#     resolve those gaps.
+
+_FORGE_KERNELS: dict[str, dict] = {
+    "reduce_step": {
+        "display":       "reduce_step (forge-backed, single-threaded "
+                         "in-place pair reduction, u64)",
+        "fg_path":       "demos/205_gpu_reduce.fg",
+        "kernel_symbol": "reduce_step",
+        "harness":       None,  # set below after harness fn is defined
+    },
+    # FG-1.13A — TEMPORARY diagnostic target for %laneid isel coverage.
+    # Minimal Forge kernel that reads lane_id() and stores it into
+    # output[tid].  Forced by FG-1.13 to surface FG-1-A (OpenPTXas isel
+    # missing %laneid in _SPECIAL_REGS).  The .fg source is a temp file
+    # in forge/demos/ that should be removed after FG-1.14 completes.
+    "laneid_trigger": {
+        "display":       "laneid_trigger (FG-1.13A: minimal %laneid)",
+        "fg_path":       "demos/1099_laneid_trigger.fg",
+        "kernel_symbol": "laneid_trigger",
+        "harness":       None,
+    },
+    # FG-1.13B — TEMPORARY diagnostic target for device function call
+    # lowering.  Minimal Forge kernel that calls a user-defined helper
+    # `double_it(x) = x + x` and writes the result.  Forced by FG-1.13
+    # to surface FG-1-B (Forge PTX backend stubs device function calls
+    # to `mov 0`).  The .fg source is a temp file in forge/demos/ that
+    # should be removed after FG-1.14 completes.
+    "devfn_trigger": {
+        "display":       "devfn_trigger (FG-1.13B: minimal device fn call)",
+        "fg_path":       "demos/1098_devfn_trigger.fg",
+        "kernel_symbol": "devfn_trigger",
+        "harness":       None,
+    },
+}
+
+
+def _wsl_path(p: Path) -> str:
+    """Convert a Windows path (C:\\Users\\...) to a WSL /mnt/c/users/... path."""
+    s = str(p).replace("\\", "/")
+    if len(s) >= 2 and s[1] == ":":
+        return f"/mnt/{s[0].lower()}{s[2:]}"
+    return s
+
+
+def _invoke_forge(fg_path: Path) -> dict:
+    """FG-1.1: invoke the Forge compiler on a single .fg file via WSL.
+
+    The Forge binary is a Linux ELF (`forge/_build/default/bin/main.exe`)
+    so we shell out via `wsl.exe -- bash -c`.  No opam env needed — the
+    prebuilt binary is self-contained.
+
+    Returns a stage record matching the FG-1.0 schema:
+        {
+            "name":         "forge_compile",
+            "status":       "PASS" | "FAIL",
+            "duration_ms":  float,
+            "exit_code":    int,
+            "stdout_tail":  list[str],
+            "stderr_tail":  list[str],
+        }
+    """
+    forge_root_wsl = _wsl_path(REPO_FORGE)
+    fg_rel = fg_path.relative_to(REPO_FORGE) if fg_path.is_absolute() else fg_path
+    fg_rel_str = str(fg_rel).replace("\\", "/")
+
+    cmd_str = (
+        f"cd {forge_root_wsl} && "
+        f"./_build/default/bin/main.exe build {fg_rel_str}"
+    )
+
+    t0 = time.perf_counter()
+    try:
+        result = subprocess.run(
+            ["wsl.exe", "--", "bash", "-c", cmd_str],
+            capture_output=True,
+            timeout=180,
+        )
+        duration_ms = (time.perf_counter() - t0) * 1000.0
+    except subprocess.TimeoutExpired:
+        return {
+            "name":        "forge_compile",
+            "status":      "FAIL",
+            "duration_ms": (time.perf_counter() - t0) * 1000.0,
+            "exit_code":   -1,
+            "stdout_tail": [],
+            "stderr_tail": ["timeout (180s)"],
+        }
+    except FileNotFoundError as e:
+        return {
+            "name":        "forge_compile",
+            "status":      "FAIL",
+            "duration_ms": (time.perf_counter() - t0) * 1000.0,
+            "exit_code":   -1,
+            "stdout_tail": [],
+            "stderr_tail": [f"wsl.exe not found: {e}"],
+        }
+
+    stdout_lines = result.stdout.decode("utf-8", errors="replace").splitlines()
+    stderr_lines = result.stderr.decode("utf-8", errors="replace").splitlines()
+
+    return {
+        "name":        "forge_compile",
+        "status":      "PASS" if result.returncode == 0 else "FAIL",
+        "duration_ms": duration_ms,
+        "exit_code":   result.returncode,
+        "stdout_tail": stdout_lines[-12:],
+        "stderr_tail": stderr_lines[-12:],
+    }
+
+
+# ---------------------------------------------------------------------
+# FG-1.1: per-target harnesses for Forge-backed kernels
+# ---------------------------------------------------------------------
+
+def harness_forge_reduce_step(ctx: CUDAContext, func, mode: str) -> dict:
+    """Forge-emitted reduce_step (demos/205_gpu_reduce.fg).
+
+    Forge param shape (4 args, span<u64> flattened to ptr+len):
+        .param .u64 reduce_step_param_s_data
+        .param .u64 reduce_step_param_s_len
+        .param .u64 reduce_step_param_n
+        .param .u64 reduce_step_param_stride
+
+    Semantics — sequential single-pair reduction step:
+
+        let mut i = 0
+        while i + stride < n:
+            s[i] = s[i] + s[i + stride]
+            i += stride * 2
+
+    With stride=1, n=N this writes pair sums into the even indices:
+        s[0] = s[0]+s[1], s[2] = s[2]+s[3], ...
+
+    *Crucial:* this is a single-threaded sequential algorithm.  Every
+    thread runs the same loop on the same memory.  Launching with more
+    than one thread/block would cause data races.  We launch (1,1,1) ×
+    (1,1,1) — the kernel exists to validate the pipeline plumbing, not
+    to demonstrate parallelism.
+    """
+    n = 16
+    stride = 1
+
+    # Input: 1..N
+    host_in = (ctypes.c_uint64 * n)(*[i + 1 for i in range(n)])
+
+    # Expected output: even indices hold s[i]+s[i+1], odd indices unchanged.
+    expected = list(range(1, n + 1))
+    i = 0
+    while i + stride < n:
+        expected[i] = expected[i] + expected[i + stride]
+        i += stride * 2
+
+    d_s = ctx.alloc(n * 8)
+    try:
+        ctx.copy_to(d_s, bytes(host_in))
+
+        a_s_data = ctypes.c_uint64(d_s)
+        a_s_len  = ctypes.c_uint64(n)
+        a_n      = ctypes.c_uint64(n)
+        a_stride = ctypes.c_uint64(stride)
+        args, _hold = _make_args(a_s_data, a_s_len, a_n, a_stride)
+
+        # Single thread, single block — no race over the shared loop state.
+        ctx.cuda.cuLaunchKernel(
+            func, 1, 1, 1, 1, 1, 1, 0, None, args, None
+        )
+        sync_rc = ctx.sync()
+        if sync_rc != 0:
+            return {"correct": False, "time_ms": None,
+                    "error": f"sync failed: {sync_rc}"}
+
+        out_bytes = ctx.copy_from(d_s, n * 8)
+        actual = list(struct.unpack(f"<{n}Q", out_bytes))
+        correct = (actual == expected)
+
+        time_ms = None
+        if mode == "bench":
+            # Reset buffer between bench iterations so each launch sees
+            # the same input and we measure the kernel, not accumulated
+            # state from previous calls.
+            ctx.copy_to(d_s, bytes(host_in))
+            time_ms = _bench_launch(
+                ctx, func, (1, 1, 1), (1, 1, 1), args
+            )
+    finally:
+        ctx.free(d_s)
+
+    return {"correct": correct, "time_ms": time_ms,
+            "expected": expected, "actual": actual}
+
+
+def harness_forge_laneid_trigger(ctx: CUDAContext, func, mode: str) -> dict:
+    """FG-1.13A: read lane_id() into output[tid], verify against expected
+    pattern [0, 1, 2, ..., block_size-1] for a single warp-shaped block.
+
+    Param shape (3 args):
+        .param .u64 laneid_trigger_param_output_data
+        .param .u64 laneid_trigger_param_output_len
+        .param .u64 laneid_trigger_param_n
+    """
+    n = 32  # one warp
+    host_out = (ctypes.c_uint64 * n)(*([0] * n))
+    expected = list(range(n))  # lane 0..31
+
+    d_out = ctx.alloc(n * 8)
+    try:
+        ctx.copy_to(d_out, bytes(host_out))
+        a_out_data = ctypes.c_uint64(d_out)
+        a_out_len  = ctypes.c_uint64(n)
+        a_n        = ctypes.c_uint64(n)
+        args, _hold = _make_args(a_out_data, a_out_len, a_n)
+        # Launch 1 block of n threads (one warp)
+        ctx.cuda.cuLaunchKernel(func, 1, 1, 1, n, 1, 1, 0, None, args, None)
+        sr = ctx.sync()
+        if sr != 0:
+            return {"correct": False, "time_ms": None,
+                    "error": f"sync failed: {sr}"}
+        out = ctx.copy_from(d_out, n * 8)
+        actual = list(struct.unpack(f"<{n}Q", out))
+        correct = (actual == expected)
+        time_ms = None
+        if mode == "bench":
+            ctx.copy_to(d_out, bytes(host_out))
+            time_ms = _bench_launch(ctx, func, (1, 1, 1), (n, 1, 1), args)
+    finally:
+        ctx.free(d_out)
+    return {"correct": correct, "time_ms": time_ms,
+            "expected": expected, "actual": actual}
+
+
+def harness_forge_devfn_trigger(ctx: CUDAContext, func, mode: str) -> dict:
+    """FG-1.13B: call double_it(tid) and store result.  Expected output is
+    [2*tid for tid in 0..n).  If Forge PTX backend stubs the device call
+    to `mov 0`, actual output will be all zeros.
+
+    Param shape (3 args):
+        .param .u64 devfn_trigger_param_output_data
+        .param .u64 devfn_trigger_param_output_len
+        .param .u64 devfn_trigger_param_n
+    """
+    n = 16
+    host_out = (ctypes.c_uint64 * n)(*([0xDEADBEEF] * n))  # sentinel
+    expected = [2 * i for i in range(n)]
+
+    d_out = ctx.alloc(n * 8)
+    try:
+        ctx.copy_to(d_out, bytes(host_out))
+        a_out_data = ctypes.c_uint64(d_out)
+        a_out_len  = ctypes.c_uint64(n)
+        a_n        = ctypes.c_uint64(n)
+        args, _hold = _make_args(a_out_data, a_out_len, a_n)
+        ctx.cuda.cuLaunchKernel(func, 1, 1, 1, n, 1, 1, 0, None, args, None)
+        sr = ctx.sync()
+        if sr != 0:
+            return {"correct": False, "time_ms": None,
+                    "error": f"sync failed: {sr}"}
+        out = ctx.copy_from(d_out, n * 8)
+        actual = list(struct.unpack(f"<{n}Q", out))
+        correct = (actual == expected)
+        time_ms = None
+        if mode == "bench":
+            ctx.copy_to(d_out, bytes(host_out))
+            time_ms = _bench_launch(ctx, func, (1, 1, 1), (n, 1, 1), args)
+    finally:
+        ctx.free(d_out)
+    return {"correct": correct, "time_ms": time_ms,
+            "expected": expected, "actual": actual}
+
+
+# Bind harnesses to catalog entries now that the functions exist.
+_FORGE_KERNELS["reduce_step"]["harness"] = harness_forge_reduce_step
+_FORGE_KERNELS["laneid_trigger"]["harness"] = harness_forge_laneid_trigger
+_FORGE_KERNELS["devfn_trigger"]["harness"] = harness_forge_devfn_trigger
+
+
+# ---------------------------------------------------------------------
+# FG-1.1: forge measurement + dispatch
+# ---------------------------------------------------------------------
+
+def _classify_forge_result(result: dict) -> str:
+    """Classify a Forge run into PARITY / NATIVE_WIN / GAP / MIXED / NO_COMPARE.
+
+    Same rules as classify_kernel for hand-crafted runs — uses regs +
+    sass_total + sass_non_nop deltas.  Centralized here so the Forge
+    artifact's `bucket` field is computed at write-time, not at view-time.
+    """
+    if result.get("error") or result.get("ptxas") is None:
+        return "NO_COMPARE"
+    d = result.get("deltas") or {}
+    fields = [d.get("regs", 0), d.get("sass_total", 0), d.get("sass_non_nop", 0)]
+    if all(f == 0 for f in fields):
+        return "PARITY"
+    if all(f <= 0 for f in fields) and any(f < 0 for f in fields):
+        return "NATIVE_WIN"
+    if all(f >= 0 for f in fields) and any(f > 0 for f in fields):
+        return "GAP"
+    return "MIXED"
+
+
+def measure_forge_kernel(target: str, mode: str, do_compare: bool,
+                         repeat: int, results_dir: Path) -> dict:
+    """FG-1.1: full Forge → OpenPTXas → GPU pipeline for a single target.
+
+    Mirrors `measure_kernel` but:
+    - Stage 1 invokes Forge via WSL to compile .fg → .ptx
+    - The Forge-emitted .ptx is copied into results/<ts>_forge_<target>.ptx
+    - Each pipeline stage is recorded in `result["stages"]` with status,
+      duration, and (on failure) error/stdout/stderr tail
+    - On any stage failure, the function STOPS and returns a partial
+      result so the caller can write a failure artifact
+    """
+    if target not in _FORGE_KERNELS:
+        return {"target": target, "error": f"unknown forge target '{target}'",
+                "stages": []}
+
+    entry = _FORGE_KERNELS[target]
+    fg_path = REPO_FORGE / entry["fg_path"]
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    result: dict = {
+        "schema":       _FORGE_SCHEMA_VERSION,
+        "timestamp":    ts,
+        "source_mode":  "forge",
+        "ptx_source":   "forge",
+        "target":       target,
+        "display":      entry["display"],
+        "mode":         mode,
+        "repeat":       repeat,
+        "source": {
+            "fg_path":       entry["fg_path"],
+            "kernel_symbol": entry["kernel_symbol"],
+            "language":      "forge",
+        },
+        "stages":       [],
+        "artifacts":    {
+            "forge_cu_path":     None,
+            "forge_ptx_source":  None,
+            "forge_ptx_cached":  None,
+            "ours_cubin_size":   None,
+            "ptxas_cubin_size":  None,
+        },
+        "build":        "FAIL",
+        "correctness":  "FAIL",
+        "ours":         None,
+        "ptxas":        None,
+        "deltas":       None,
+        "bucket":       "NO_COMPARE",
+    }
+
+    if not fg_path.exists():
+        result["error"] = f"forge source not found: {fg_path}"
+        return result
+
+    # ----- Stage 1: forge compile via WSL -----
+    print(f"[forge] compiling {entry['fg_path']} ...", flush=True)
+    forge_stage = _invoke_forge(fg_path)
+    result["stages"].append(forge_stage)
+    if forge_stage["status"] != "PASS":
+        result["error"] = (
+            f"forge compile failed (exit {forge_stage['exit_code']})"
+        )
+        return result
+
+    # Capture forge outputs and copy ptx into results/.
+    forge_cu_src  = fg_path.with_suffix(".cu")
+    forge_ptx_src = fg_path.with_suffix(".ptx")
+    if not forge_ptx_src.exists():
+        result["error"] = (
+            f"forge succeeded but no .ptx output at {forge_ptx_src}"
+        )
+        return result
+
+    results_dir.mkdir(parents=True, exist_ok=True)
+    cached_ptx = results_dir / f"{ts}_forge_{target}.ptx"
+    cached_ptx.write_bytes(forge_ptx_src.read_bytes())
+    result["artifacts"]["forge_cu_path"]    = str(forge_cu_src) if forge_cu_src.exists() else None
+    result["artifacts"]["forge_ptx_source"] = str(forge_ptx_src)
+    result["artifacts"]["forge_ptx_cached"] = str(cached_ptx)
+
+    ptx_text = cached_ptx.read_text(encoding="utf-8")
+
+    # ----- Stage 2: openptxas assemble -----
+    print(f"[forge] assembling via openptxas ...", flush=True)
+    t0 = time.perf_counter()
+    cubin_ours: bytes | None = None
+    report = None
+    try:
+        cubin_ours, t_compile_ours, report = compile_with_report(ptx_text)
+        result["stages"].append({
+            "name":        "openptxas_assemble",
+            "status":      "PASS",
+            "duration_ms": (time.perf_counter() - t0) * 1000.0,
+        })
+    except Exception as e:
+        result["stages"].append({
+            "name":        "openptxas_assemble",
+            "status":      "FAIL",
+            "duration_ms": (time.perf_counter() - t0) * 1000.0,
+            "error":       f"{type(e).__name__}: {e}",
+        })
+        result["error"] = (
+            f"openptxas refused forge PTX: {type(e).__name__}: {e}"
+        )
+        return result
+
+    ours = metrics_from_cubin(cubin_ours)
+    ours["compile_ms"] = t_compile_ours * 1000.0
+    ours["time_ms_runs"] = []
+    result["ours"] = ours
+    result["build"] = "PASS"
+    result["artifacts"]["ours_cubin_size"] = len(cubin_ours)
+
+    # ----- Stage 2b (optional): ptxas compile for compare -----
+    cubin_ptxas: bytes | None = None
+    if do_compare:
+        t0 = time.perf_counter()
+        try:
+            cubin_ptxas, t_compile_ptxas = compile_ptxas(ptx_text)
+            result["stages"].append({
+                "name":        "ptxas_compile",
+                "status":      "PASS",
+                "duration_ms": (time.perf_counter() - t0) * 1000.0,
+            })
+            theirs = metrics_from_cubin(cubin_ptxas)
+            theirs["compile_ms"] = t_compile_ptxas * 1000.0
+            theirs["time_ms_runs"] = []
+            result["ptxas"] = theirs
+            result["artifacts"]["ptxas_cubin_size"] = len(cubin_ptxas)
+        except Exception as e:
+            result["stages"].append({
+                "name":        "ptxas_compile",
+                "status":      "FAIL",
+                "duration_ms": (time.perf_counter() - t0) * 1000.0,
+                "error":       f"{type(e).__name__}: {e}",
+            })
+            result["ptxas_error"] = f"{type(e).__name__}: {e}"
+
+    # ----- Stage 3: GPU correctness + benchmarking -----
+    print(f"[forge] launching kernel on GPU ...", flush=True)
+    ctx = CUDAContext()
+    correct = True
+    gpu_t0 = time.perf_counter()
+    gpu_error: str | None = None
+    try:
+        if not ctx.load(cubin_ours):
+            gpu_error = "cuModuleLoadData failed for openptxas cubin"
+        else:
+            try:
+                func = ctx.get_func(entry["kernel_symbol"])
+            except AssertionError as e:
+                gpu_error = f"cuModuleGetFunction failed: {e}"
+
+            if gpu_error is None:
+                for _ in range(repeat):
+                    r = entry["harness"](ctx, func, mode)
+                    if not r.get("correct", False):
+                        correct = False
+                        if "error" in r:
+                            gpu_error = r["error"]
+                    if r.get("time_ms") is not None:
+                        ours["time_ms_runs"].append(r["time_ms"])
+
+                if (result["ptxas"] is not None and cubin_ptxas is not None
+                        and gpu_error is None):
+                    if ctx.load(cubin_ptxas):
+                        func_p = ctx.get_func(entry["kernel_symbol"])
+                        for _ in range(repeat):
+                            rp = entry["harness"](ctx, func_p, mode)
+                            if rp.get("time_ms") is not None:
+                                result["ptxas"]["time_ms_runs"].append(
+                                    rp["time_ms"]
+                                )
+                    else:
+                        result["ptxas_error"] = (
+                            "cuModuleLoadData failed for ptxas cubin"
+                        )
+    finally:
+        ctx.close()
+
+    result["stages"].append({
+        "name":        "gpu_correctness",
+        "status":      "PASS" if correct and gpu_error is None else "FAIL",
+        "duration_ms": (time.perf_counter() - gpu_t0) * 1000.0,
+        **({"error": gpu_error} if gpu_error else {}),
+    })
+
+    if gpu_error and not correct:
+        result["error"] = gpu_error
+        return result
+
+    result["correctness"] = "PASS" if correct else "FAIL"
+
+    # ----- Stats + deltas -----
+    ours["time_ms_stats"] = _stats(ours["time_ms_runs"])
+    if result["ptxas"] is not None:
+        result["ptxas"]["time_ms_stats"] = _stats(result["ptxas"]["time_ms_runs"])
+        theirs = result["ptxas"]
+        deltas = {
+            "regs":         ours["regs"]         - theirs["regs"],
+            "sass_total":   ours["sass_total"]   - theirs["sass_total"],
+            "sass_non_nop": ours["sass_non_nop"] - theirs["sass_non_nop"],
+        }
+        if (ours["time_ms_stats"] is not None
+                and theirs["time_ms_stats"] is not None):
+            deltas["time_ms_mean"] = (
+                ours["time_ms_stats"]["mean"]
+                - theirs["time_ms_stats"]["mean"]
+            )
+        result["deltas"] = deltas
+
+    result["bucket"] = _classify_forge_result(result)
+
+    if report is not None:
+        result["metadata"] = {
+            "compaction_attempted": report.attempted,
+            "compaction_covered":   report.covered,
+            "compacted":            report.gpr_fields_rewritten > 0,
+            "compact_regs_before":  report.regs_before,
+            "compact_regs_after":   report.regs_after,
+            "compacted_insts":      report.compacted_insts,
+            "gpr_fields_rewritten": report.gpr_fields_rewritten,
+        }
+
+    return result
+
+
+def _print_forge_block(result: dict, commits: dict) -> None:
+    """Print a human-readable summary of a Forge run."""
+    print(f"[forge] target={result['target']}  ({result['display']})")
+    for s in result.get("stages", []):
+        marker = "PASS" if s["status"] == "PASS" else "FAIL"
+        ms = s.get("duration_ms", 0.0)
+        print(f"  {s['name']:22s} {marker}  ({ms:.1f} ms)")
+        if s["status"] != "PASS":
+            for line in s.get("stderr_tail", []):
+                print(f"    ! {line}")
+            for line in s.get("stdout_tail", []):
+                print(f"    | {line}")
+            if "error" in s:
+                print(f"    error: {s['error']}")
+
+    print(f"  build:       {result.get('build', 'FAIL')}")
+    print(f"  correctness: {result.get('correctness', 'FAIL')}")
+    print(f"  bucket:      {result.get('bucket', 'NO_COMPARE')}")
+    print(f"  forge:     {commits.get('forge', '?')}")
+    print(f"  opencuda:  {commits.get('opencuda', '?')}")
+    print(f"  openptxas: {commits.get('openptxas', '?')}")
+
+    if result.get("error"):
+        print(f"  error: {result['error']}")
+        return
+
+    ours = result.get("ours") or {}
+    if ours:
+        print()
+        print("  ours:")
+        print(f"    regs:         {ours.get('regs', '?')}")
+        print(f"    sass_total:   {ours.get('sass_total', '?')}")
+        print(f"    sass_non_nop: {ours.get('sass_non_nop', '?')}")
+        print(f"    compile_ms:   {ours.get('compile_ms', 0.0):.1f}")
+        stats = ours.get("time_ms_stats")
+        if stats:
+            print(f"    time_ms:      {stats['mean']:.4f}")
+
+    ptxas = result.get("ptxas") or {}
+    if ptxas:
+        print()
+        print("  ptxas:")
+        print(f"    regs:         {ptxas.get('regs', '?')}")
+        print(f"    sass_total:   {ptxas.get('sass_total', '?')}")
+        print(f"    sass_non_nop: {ptxas.get('sass_non_nop', '?')}")
+        print(f"    compile_ms:   {ptxas.get('compile_ms', 0.0):.1f}")
+        stats = ptxas.get("time_ms_stats")
+        if stats:
+            print(f"    time_ms:      {stats['mean']:.4f}")
+
+    deltas = result.get("deltas") or {}
+    if deltas:
+        print()
+        print("  delta:")
+        print(f"    regs:         {deltas.get('regs', 0):+d}")
+        print(f"    sass_total:   {deltas.get('sass_total', 0):+d}")
+        print(f"    sass_non_nop: {deltas.get('sass_non_nop', 0):+d}")
+        if "time_ms_mean" in deltas:
+            print(f"    time_ms_mean: {deltas['time_ms_mean']:+.4f}")
+
+
+def write_forge_kernel_json(result: dict, commits: dict,
+                            results_dir: Path) -> Path:
+    """Write a forge_run/v1 artifact next to the cached PTX."""
+    results_dir.mkdir(parents=True, exist_ok=True)
+    ts = result["timestamp"]
+    target = result["target"]
+    artifact = dict(result)  # shallow copy — preserves field order
+    artifact["commits"] = commits
+    out_path = results_dir / f"{ts}_forge_{target}.json"
+    out_path.write_text(json.dumps(artifact, indent=2, default=str))
+    return out_path
+
+
+def _cmd_forge_run(args):
+    """FG-1.1: workbench forge run --target <name> [--compare ptxas] ..."""
+    if args.repeat < 1:
+        print("workbench forge run: --repeat must be >= 1", file=sys.stderr)
+        return 2
+    if args.target not in _FORGE_KERNELS:
+        print(
+            f"workbench forge run: unknown target '{args.target}'. "
+            f"Try `workbench forge list`.",
+            file=sys.stderr,
+        )
+        return 2
+
+    do_compare = (args.compare == "ptxas")
+    commits = collect_commits()
+    results_dir = Path(args.results_dir)
+
+    result = measure_forge_kernel(
+        target=args.target,
+        mode=args.mode,
+        do_compare=do_compare,
+        repeat=args.repeat,
+        results_dir=results_dir,
+    )
+
+    _print_forge_block(result, commits)
+    artifact = write_forge_kernel_json(result, commits, results_dir)
+    print()
+    print(f"[workbench] forge artifact: {artifact}")
+
+    if "error" in result:
+        return 1
+    return 0 if result.get("correctness") == "PASS" else 1
+
+
+def _cmd_forge_list(args):
+    """FG-1.1: list available Forge-backed targets."""
+    print("Available forge targets:")
+    for k, v in _FORGE_KERNELS.items():
+        print(f"  {k:20s} {v['display']}")
+        print(f"  {'':20s}   source: {v['fg_path']}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# FG-2 B1: workbench explore
+# ---------------------------------------------------------------------------
+# One-shot summary of every catalogued kernel: name, class, last bucket,
+# and headline metrics.  Pure replay from the most recent suite_all
+# artifact plus the most recent per-kernel artifact, with a fallback to
+# forge_* artifacts for Forge-backed kernels.
+
+def _find_latest_kernel_record(results_dir: Path, kernel: str) -> dict | None:
+    """Find the most recent artifact that contains metrics for `kernel`.
+
+    Search order (newest first):
+      1) per-kernel *_<kernel>.json single-kernel artifacts
+      2) *_suite_all.json artifacts whose kernels[] list includes the name
+    Returns a dict with fields {'bucket','regs','sass_total','sass_non_nop',
+    'source','timestamp'} or None.
+    """
+    if not results_dir.exists():
+        return None
+    # Gather candidate files sorted by filename timestamp (newest first).
+    candidates = sorted(results_dir.glob("*.json"), reverse=True)
+    for p in candidates:
+        name = p.name
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        # Case 1: single-kernel artifact (schema WB-0)
+        if data.get("kernel") == kernel:
+            ours = data.get("ours") or {}
+            deltas = data.get("deltas") or {}
+            return {
+                "bucket":       data.get("bucket", "?"),
+                "regs":         ours.get("regs"),
+                "sass_total":   ours.get("sass_total"),
+                "sass_non_nop": ours.get("sass_non_nop"),
+                "source":       name,
+                "timestamp":    data.get("timestamp", ""),
+            }
+        # Case 2: suite_all artifact
+        if "kernels" in data and "ranking" in data:
+            for rec in data.get("kernels", []):
+                if rec.get("kernel") != kernel:
+                    continue
+                # Find bucket from ranking
+                bucket = "?"
+                for b, members in data.get("ranking", {}).items():
+                    if kernel in members:
+                        bucket = b
+                        break
+                ours = rec.get("ours") or {}
+                return {
+                    "bucket":       bucket,
+                    "regs":         ours.get("regs"),
+                    "sass_total":   ours.get("sass_total"),
+                    "sass_non_nop": ours.get("sass_non_nop"),
+                    "source":       name,
+                    "timestamp":    data.get("timestamp", ""),
+                }
+        # Case 3: forge_run artifact
+        if data.get("schema") == _FORGE_SCHEMA_VERSION and data.get("target") == kernel:
+            ours = data.get("ours") or {}
+            return {
+                "bucket":       data.get("bucket", "NO_COMPARE"),
+                "regs":         ours.get("regs"),
+                "sass_total":   ours.get("sass_total"),
+                "sass_non_nop": ours.get("sass_non_nop"),
+                "source":       name,
+                "timestamp":    data.get("timestamp", ""),
+            }
+    return None
+
+
+def _cmd_explore(args):
+    """FG-2 B1: enumerate every catalogued kernel with its last known
+    bucket + headline metrics.  Includes both hand-crafted workbench
+    kernels and Forge-backed kernels.
+    """
+    results_dir = Path(args.results_dir)
+
+    rows = []
+    for name in sorted(KERNELS.keys()):
+        rec = _find_latest_kernel_record(results_dir, name)
+        rows.append(("hand", name, rec))
+    for name in sorted(_FORGE_KERNELS.keys()):
+        rec = _find_latest_kernel_record(results_dir, name)
+        rows.append(("forge", name, rec))
+
+    def _fmt(v):
+        return "-" if v is None else str(v)
+
+    print(f"{'name':<22s} {'class':<6s} {'last bucket':<13s} "
+          f"{'regs':>5s} {'sass':>5s} {'nop':>5s}  source")
+    print("-" * 78)
+    for kind, name, rec in rows:
+        if rec is None:
+            print(f"{name:<22s} {kind:<6s} {'(no runs)':<13s} "
+                  f"{'-':>5s} {'-':>5s} {'-':>5s}  -")
+            continue
+        print(f"{name:<22s} {kind:<6s} {rec['bucket']:<13s} "
+              f"{_fmt(rec['regs']):>5s} {_fmt(rec['sass_total']):>5s} "
+              f"{_fmt(rec['sass_non_nop']):>5s}  {rec['source']}")
+    print()
+    print(f"Total: {len(rows)} kernels  "
+          f"({sum(1 for _, _, r in rows if r)} with runs, "
+          f"{sum(1 for _, _, r in rows if not r)} without)")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# FG-2 B2: workbench kdiff (one-shot compile + SASS side-by-side)
+# ---------------------------------------------------------------------------
+def _decode_sass_line(raw: bytes) -> str:
+    """Return a short text label for a 16-byte SASS instruction.
+
+    Uses the scoreboard's opcode map for recognized opcodes and falls
+    back to `OP_<hex>` for unknown ones.  Follows the convention used
+    throughout the codebase (comment strings after each SassInstr).
+    """
+    if len(raw) < 16:
+        return "<short>"
+    opc = (raw[0] | (raw[1] << 8)) & 0xFFF
+    labels = {
+        0x918: 'NOP',     0x947: 'BRA',     0x94d: 'EXIT',
+        0x919: 'S2R',     0x9c3: 'S2UR',    0x7b8: 'LDC',
+        0xb82: 'LDC.alt', 0x7ac: 'LDCU',
+        0x210: 'IADD3',   0x212: 'IADD3X',  0x810: 'IADD3.IMM',
+        0x224: 'IMAD',    0x2a4: 'IMAD.RR', 0xc24: 'IMAD.RU',
+        0x824: 'IMAD.I',  0x825: 'IMAD.WIDE.I', 0x225: 'IMAD.WIDE',
+        0x235: 'IADD.64', 0xc35: 'IADD.64-UR',
+        0x20c: 'ISETP',   0xc0c: 'ISETP.RU', 0x80c: 'ISETP.IMM',
+        0x202: 'MOV',     0xc02: 'MOV.UR',
+        0x986: 'STG',     0x981: 'LDG',
+        0x308: 'MUFU',    0x221: 'FADD',    0x223: 'FFMA',
+    }
+    name = labels.get(opc, f'OP_{opc:03x}')
+    return f"{raw.hex()}  {name}"
+
+
+def _extract_sass_text(cubin: bytes, symbol: str) -> list[str]:
+    """Walk .text.<symbol> and return a list of decoded 16-byte rows."""
+    e_shoff = struct.unpack_from('<Q', cubin, 40)[0]
+    e_shnum = struct.unpack_from('<H', cubin, 60)[0]
+    e_shstrndx = struct.unpack_from('<H', cubin, 62)[0]
+    stoff = struct.unpack_from('<Q', cubin, e_shoff + e_shstrndx * 64 + 24)[0]
+    target = b".text." + symbol.encode()
+    for i in range(e_shnum):
+        base = e_shoff + i * 64
+        nm = struct.unpack_from('<I', cubin, base)[0]
+        name_end = cubin.index(0, stoff + nm)
+        if cubin[stoff + nm:name_end] != target:
+            continue
+        off = struct.unpack_from('<Q', cubin, base + 24)[0]
+        sz = struct.unpack_from('<Q', cubin, base + 32)[0]
+        out = []
+        for o in range(0, sz, 16):
+            out.append(_decode_sass_line(cubin[off + o:off + o + 16]))
+        return out
+    return []
+
+
+def _cmd_kdiff(args):
+    """FG-2 B2: one-shot compile of a catalogued kernel through both
+    OpenPTXas and PTXAS, then print a side-by-side SASS diff plus the
+    delta block.
+    """
+    name = args.kernel
+    if name not in KERNELS:
+        print(f"workbench kdiff: unknown kernel '{name}'. "
+              f"Try `workbench list`.",
+              file=sys.stderr)
+        return 2
+    entry = KERNELS[name]
+    symbol = entry["kernel_name"]
+    ptx = entry.get("ptx_inline")
+    if ptx is None:
+        path = entry.get("ptx_path")
+        if path is None:
+            print(f"workbench kdiff: no PTX source for '{name}'", file=sys.stderr)
+            return 2
+        ptx = Path(path).read_text(encoding="utf-8")
+
+    try:
+        cubin_o, _ = compile_openptxas(ptx)
+    except Exception as exc:
+        print(f"workbench kdiff: openptxas failed: {exc}", file=sys.stderr)
+        return 1
+    try:
+        cubin_p, _ = compile_ptxas(ptx)
+    except Exception as exc:
+        print(f"workbench kdiff: ptxas failed: {exc}", file=sys.stderr)
+        return 1
+
+    info_o = analyze_cubin(cubin_o, kernel_name=symbol)
+    info_p = analyze_cubin(cubin_p, kernel_name=symbol)
+    regs_o = _num_gprs(cubin_o, symbol)
+    regs_p = _num_gprs(cubin_p, symbol)
+
+    print(f"kernel: {name}")
+    print(f"symbol: {symbol}")
+    print()
+    print(f"{'metric':<14s} {'ours':>8s}  {'ptxas':>8s}  {'delta':>8s}")
+    print("-" * 44)
+    def _row(label, ov, pv):
+        if ov is None or pv is None:
+            print(f"{label:<14s} {str(ov):>8s}  {str(pv):>8s}  {'-':>8s}")
+            return
+        delta = ov - pv
+        print(f"{label:<14s} {ov:>8d}  {pv:>8d}  {delta:>+8d}")
+    _row("regs",         regs_o, regs_p)
+    _row("sass_total",   info_o["n_instrs"], info_p["n_instrs"])
+    _row("sass_non_nop", info_o["n_real"],   info_p["n_real"])
+    print()
+
+    sass_o = _extract_sass_text(cubin_o, symbol)
+    sass_p = _extract_sass_text(cubin_p, symbol)
+
+    print("side-by-side SASS  (! marks lines that differ):")
+    print("=" * 92)
+    width = 42
+    max_len = max(len(sass_o), len(sass_p))
+    for i in range(max_len):
+        lo = sass_o[i] if i < len(sass_o) else ""
+        lp = sass_p[i] if i < len(sass_p) else ""
+        # Compare by opcode label (last token after hex)
+        lo_op = lo.split("  ")[-1] if lo else ""
+        lp_op = lp.split("  ")[-1] if lp else ""
+        marker = "!" if lo_op != lp_op else " "
+        # Show hex + opcode label, truncate to width
+        def _cell(s):
+            # Take everything after first double-space once
+            if not s: return ""
+            return s[:width]
+        print(f"{marker} {_cell(lo):<{width}s} | {_cell(lp):<{width}s}")
+    return 0
+
+
+def _num_gprs(cubin: bytes, symbol: str) -> int | None:
+    """Best-effort GPR count for a kernel in a cubin via the pipeline's
+    helper (`analyze_cubin` returns it for OpenPTXas cubins but not for
+    PTXAS ones — in which case we fall back to scanning the text).
+    """
+    try:
+        info = analyze_cubin(cubin, kernel_name=symbol)
+    except Exception:
+        return None
+    return info.get("num_gprs")
+
+
+def main():
+    # Force stdout to UTF-8 so non-ASCII characters in subcommand output
+    # (e.g. WB-12.5 diff's `→` arrows) work on the Windows cp1252 console.
+    # Safe for ASCII output (cp1252 and UTF-8 agree on ASCII bytes), so
+    # WB-12.0's byte-equality lock for `run` is unaffected.  WB-12.3's
+    # `dump` writes via sys.stdout.buffer and bypasses text mode entirely
+    # so this reconfigure has no effect on it either.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except (AttributeError, OSError):
+        pass
+
+    p = argparse.ArgumentParser(
+        prog="workbench",
+        description="WB-12.0: kernel workbench (subcommand CLI dashboard)",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True, metavar="<command>")
+
+    # ---- run ----
+    p_run = sub.add_parser(
+        "run",
+        help="run a kernel or suite",
+        description="Run a kernel or suite through openptxas + optional ptxas compare.",
+    )
+    p_run.add_argument("--kernel", default=None,
+                       help=f"one of: {', '.join(sorted(KERNELS))}")
+    p_run.add_argument("--suite", default=None,
+                       help=f"one of: {', '.join(sorted(SUITES))}")
+    p_run.add_argument("--mode", choices=["correct", "bench"], default="correct",
+                       help="correct = build+correctness, bench = +benchmark")
+    p_run.add_argument("--compare", choices=["ptxas"], default=None,
+                       help="if set, also compile via ptxas and report deltas")
+    p_run.add_argument("--repeat", type=int, default=1,
+                       help="number of measurement repeats (default: 1)")
+    p_run.add_argument("--results-dir", default=str(ROOT / "results"),
+                       help="directory for JSON artifacts")
+
+    # ---- list ----
+    sub.add_parser(
+        "list",
+        help="list catalog and suites",
+        description="List available kernels and suites.",
+    )
+
+    # ---- status (WB-12.1) ----
+    p_status = sub.add_parser(
+        "status",
+        help="snapshot the latest suite_all artifact",
+        description="Print a snapshot of the most recent suite_all artifact "
+                    "(or the artifact specified via --from).  Pure replay — "
+                    "does not recompute or rerun anything.",
+    )
+    p_status.add_argument("--from", dest="from_path", default=None,
+                          metavar="ARTIFACT",
+                          help="path to a specific suite_all.json (default: latest)")
+    p_status.add_argument("--format", choices=["table", "json"], default="table",
+                          help="output format (default: table)")
+    p_status.add_argument("--results-dir", default=str(ROOT / "results"),
+                          help="directory to scan for the latest suite_all.json")
+
+    # ---- show (WB-12.2) ----
+    p_show = sub.add_parser(
+        "show",
+        help="drill down into a single kernel record",
+        description="Print the regs / sass / time / delta block for a "
+                    "single kernel from the most recent suite_all artifact "
+                    "(or the artifact specified via --from).  Pure replay.",
+    )
+    p_show.add_argument("--kernel", required=True,
+                        help=f"one of: {', '.join(sorted(KERNELS))}")
+    p_show.add_argument("--from", dest="from_path", default=None,
+                        metavar="ARTIFACT",
+                        help="path to a specific suite_all.json (default: latest)")
+    p_show.add_argument("--format", choices=["table", "json"], default="table",
+                        help="output format (default: table)")
+    p_show.add_argument("--results-dir", default=str(ROOT / "results"),
+                        help="directory to scan for the latest suite_all.json")
+
+    # ---- dump (WB-12.3) ----
+    p_dump = sub.add_parser(
+        "dump",
+        help="raw passthrough of a suite_all artifact",
+        description="Print the bytes of a suite_all artifact verbatim. "
+                    "No parsing, no validation, no schema checks. "
+                    "Use --list to see available artifacts.",
+    )
+    _dump_mode = p_dump.add_mutually_exclusive_group()
+    _dump_mode.add_argument("--latest", action="store_true",
+                            help="print the most recent suite_all artifact (default)")
+    _dump_mode.add_argument("--from", dest="from_path", default=None,
+                            metavar="ARTIFACT",
+                            help="print the bytes of a specific artifact")
+    _dump_mode.add_argument("--list", action="store_true",
+                            help="list available suite_all artifacts")
+    p_dump.add_argument("--results-dir", default=str(ROOT / "results"),
+                        help="directory to scan for suite_all.json files")
+
+    # ---- history (WB-12.4) ----
+    p_hist = sub.add_parser(
+        "history",
+        help="trend display across all suite_all artifacts",
+        description="Walk results/*_suite_all.json in chronological order "
+                    "and display aggregate counts per artifact (default), "
+                    "or per-kernel trend (--kernel).  Pure replay — every "
+                    "value comes straight from the saved artifacts.",
+    )
+    p_hist.add_argument("--limit", type=int, default=None,
+                        help="show only the most recent N entries (default: all)")
+    p_hist.add_argument("--kernel", default=None,
+                        help="show per-kernel trend instead of aggregate counts")
+    p_hist.add_argument("--format", choices=["table", "json"], default="table",
+                        help="output format (default: table)")
+    p_hist.add_argument("--results-dir", default=str(ROOT / "results"),
+                        help="directory to scan for suite_all.json files")
+
+    # ---- diff (WB-12.5) ----
+    p_diff = sub.add_parser(
+        "diff",
+        help="compare two suite_all artifacts",
+        description="Compare two suite_all artifacts (default: latest vs "
+                    "previous).  Shows aggregate diff and per-kernel "
+                    "field-level changes.  Pure replay.",
+    )
+    p_diff.add_argument("--from", dest="from_path", default=None,
+                        metavar="ARTIFACT",
+                        help="explicit `from` artifact (default: previous)")
+    p_diff.add_argument("--to", dest="to_path", default=None,
+                        metavar="ARTIFACT",
+                        help="explicit `to` artifact (default: latest)")
+    p_diff.add_argument("--kernel", default=None,
+                        help="focus on a single kernel")
+    p_diff.add_argument("--format", choices=["table", "json"], default="table",
+                        help="output format (default: table)")
+    p_diff.add_argument("--results-dir", default=str(ROOT / "results"),
+                        help="directory to scan for suite_all.json files")
+
+    # ---- forge (FG-1) ----
+    p_forge = sub.add_parser(
+        "forge",
+        help="forge-backed kernel runs (Forge → OpenPTXas → GPU)",
+        description="Run kernels through the live Forge → OpenPTXas → GPU "
+                    "pipeline.  Forge is invoked via WSL on the .fg source; "
+                    "the resulting PTX is cached into results/ and assembled "
+                    "by OpenPTXas.",
+    )
+    forge_sub = p_forge.add_subparsers(dest="forge_cmd", required=True,
+                                       metavar="<forge-command>")
+
+    pf_run = forge_sub.add_parser(
+        "run",
+        help="run a forge-backed kernel through the full pipeline",
+    )
+    pf_run.add_argument("--target", required=True,
+                        help=f"one of: {', '.join(sorted(_FORGE_KERNELS))}")
+    pf_run.add_argument("--mode", choices=["correct", "bench"], default="correct",
+                        help="correct = build+correctness, bench = +benchmark")
+    pf_run.add_argument("--compare", choices=["ptxas"], default=None,
+                        help="if set, also compile via ptxas and report deltas")
+    pf_run.add_argument("--repeat", type=int, default=1,
+                        help="number of measurement repeats (default: 1)")
+    pf_run.add_argument("--results-dir", default=str(ROOT / "results"),
+                        help="directory for forge artifacts")
+
+    forge_sub.add_parser(
+        "list",
+        help="list available forge targets",
+    )
+
+    # ---- FG-2 B1: explore ----
+    p_explore = sub.add_parser(
+        "explore",
+        help="enumerate every kernel with last-known bucket + metrics",
+        description="FG-2 B1.  List every catalogued kernel (hand-crafted "
+                    "and Forge-backed) with the most recent known bucket "
+                    "and headline metrics (regs / sass_total / sass_non_nop).  "
+                    "Pure replay from results/*.json.",
+    )
+    p_explore.add_argument("--results-dir", default=str(ROOT / "results"),
+                           help="directory to scan for artifacts")
+
+    # ---- FG-2 B2: kdiff ----
+    p_kdiff = sub.add_parser(
+        "kdiff",
+        help="one-shot compile + side-by-side SASS diff OURS vs PTXAS",
+        description="FG-2 B2.  Compile a single catalogued kernel through "
+                    "both OpenPTXas and PTXAS, print the metric deltas, "
+                    "and print a side-by-side SASS diff. Marks lines that "
+                    "differ with a leading `!`.",
+    )
+    p_kdiff.add_argument("--kernel", required=True,
+                         help=f"one of: {', '.join(sorted(KERNELS))}")
+
+    # ---- FG-2 B3: leaderboard (alias for status) ----
+    p_lb = sub.add_parser(
+        "leaderboard",
+        help="alias for `status` — bucket summary + per-bucket kernel list",
+        description="FG-2 B3.  Print the PARITY / NATIVE WIN / GAP / MIXED "
+                    "buckets with counts and kernel names from the most "
+                    "recent suite_all artifact.  Pure replay.",
+    )
+    p_lb.add_argument("--from", dest="from_path", default=None,
+                      metavar="ARTIFACT",
+                      help="path to a specific suite_all.json (default: latest)")
+    p_lb.add_argument("--format", choices=["table", "json"], default="table",
+                      help="output format (default: table)")
+    p_lb.add_argument("--results-dir", default=str(ROOT / "results"),
+                      help="directory to scan for the latest suite_all.json")
+
+    # ---- FG-2 top-level flag layer --------------------------------------
+    # The task spec asks for four top-level flag forms that aren't native
+    # argparse shapes (e.g. `python workbench.py --explore`).  Translate
+    # them into the equivalent subcommand invocations before parse_args.
+    # Valid rewrites:
+    #   --explore            → explore
+    #   --leaderboard        → leaderboard
+    #   --history <kernel>   → history --kernel <kernel>
+    #   --kernel <k> --diff ptxas → kdiff --kernel <k>
+    argv = sys.argv[1:]
+    if argv and argv[0] == "--explore":
+        argv = ["explore"] + argv[1:]
+    elif argv and argv[0] == "--leaderboard":
+        argv = ["leaderboard"] + argv[1:]
+    elif argv and argv[0] == "--history":
+        if len(argv) >= 2 and not argv[1].startswith("-"):
+            argv = ["history", "--kernel", argv[1]] + argv[2:]
+        else:
+            argv = ["history"] + argv[1:]
+    elif (len(argv) >= 4
+          and argv[0] == "--kernel"
+          and argv[2] == "--diff"
+          and argv[3] == "ptxas"):
+        argv = ["kdiff", "--kernel", argv[1]] + argv[4:]
+
+    args = p.parse_args(argv)
+
+    if args.cmd == "run":
+        return _cmd_run(args, p_run)
+    if args.cmd == "list":
+        return _cmd_list(args)
+    if args.cmd == "status":
+        return _cmd_status(args)
+    if args.cmd == "show":
+        return _cmd_show(args)
+    if args.cmd == "dump":
+        return _cmd_dump(args)
+    if args.cmd == "history":
+        return _cmd_history(args)
+    if args.cmd == "diff":
+        return _cmd_diff(args)
+    if args.cmd == "forge":
+        if args.forge_cmd == "run":
+            return _cmd_forge_run(args)
+        if args.forge_cmd == "list":
+            return _cmd_forge_list(args)
+        p.error(f"unknown forge subcommand: {args.forge_cmd}")
+    if args.cmd == "explore":
+        return _cmd_explore(args)
+    if args.cmd == "kdiff":
+        return _cmd_kdiff(args)
+    if args.cmd == "leaderboard":
+        # FG-2 B3: leaderboard is a thin alias over status, so it
+        # replays the same saved suite_all artifact.
+        return _cmd_status(args)
+    p.error(f"unknown subcommand: {args.cmd}")
 
 
 if __name__ == "__main__":

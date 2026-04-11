@@ -841,26 +841,32 @@ def encode_isetp_ur(pred_dest: int, src_reg: int, ur_src: int,
     SM_120 only: uses opcode 0xc0c (R-UR). The R-R variant (0x20c) silently
     produces P=FALSE on SM_120 hardware.
 
-    b9 parity: bit 1 of b9 reflects src_reg index parity (odd→0x62, even→0x60).
-    This is a hardware encoding artefact; it does NOT flip the comparison direction.
+    Field layout (FG-2.1, verified against ptxas ground truth for GE/GT):
+      b8 = 0x70                       fixed for R-UR ISETP
+      b9 = (cmp << 4) | parity_bit    cmp goes in b9 high nibble
+                                       (NOT in b8 — that was the FG-2.1 bug)
+      parity_bit = 0x2 if src_reg is odd else 0x0
 
-    The ctrl misc field must be 0 or ≥13 for this instruction to produce correct
-    results on SM_120. The scoreboard forces misc=0 for all ISETP R-UR instructions.
+    Comparison codes that PTXAS actually emits for the R-UR path:
+      cmp=6 (GE)  — direct
+      cmp=4 (GT)  — direct
+      cmp=1 (LT)  — never (PTXAS lowers setp.lt as ISETP.GE + negate)
+      cmp=3 (LE)  — never (PTXAS lowers setp.le as ISETP.GT + negate)
+      cmp=2 (EQ), cmp=5 (NE) — fall through to other paths in isel
 
-    Ground truth (GE, ctrl=0x17ed):
+    Ground truth (GE, R-odd, ctrl=0x17ed):
         encode_isetp_ur(0, 13, 5) -> bytes.fromhex('0c7c000d050000007062f00b00da2f00')
         encode_isetp_ur(0, 9, 5)  -> bytes.fromhex('0c7c0009050000007062f00b00da2f00')
+    Ground truth (GT, R-even, ctrl=0x17ed):
+        encode_isetp_ur(0, 2, 6, cmp=4) ->
+            bytes.fromhex('0c7c0002060000007040f10b00dc2f00')
+            (matches PTXAS for setp.gt.u64 R2, UR6)
     """
     if ctrl == 0:
         ctrl = _CTRL_DEFAULT
-    # b9 encoding depends on src_reg parity AND comparison code.
-    # GE (cmp=6): b9 = 0x62 (odd) or 0x60 (even)  [original ground truth]
-    # GT (cmp=4): b9 = 0x62 (odd) or 0x42 (even)  [ptxas ballot kernel]
-    # Other codes: use GE-style as default (verified for GE/LE bounds checks)
-    # b9 parity: even=0x42, odd=0x62 (all comparison codes)
-    # ptxas ground truth: R2(even) → 0x42 for both GE and GT
-    b9_val = 0x62  # always 0x62 per ptxas ground truth
-    b8_val = (cmp << 4) | 0x10  # same cmp encoding as R-R variant
+    parity_bit = 0x02 if (src_reg & 1) else 0x00
+    b9_val = ((cmp & 0xF) << 4) | parity_bit
+    b8_val = 0x70
     return _build(0x0c, 0x7c,
                   b2=pred_dest & 0xFF, b3=src_reg, b4=ur_src & 0xFF,
                   b8=b8_val,

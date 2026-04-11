@@ -2396,22 +2396,78 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             # Check if mul_a or mul_b is in UR (ctaid.x)
                             a_ur = ctx._ur_for_param.get(mul_a)
                             b_ur = ctx._ur_for_param.get(mul_b)
+                            # Determine the GPR source (the mul operand that is NOT
+                            # in a uniform register).
+                            a_gpr = None
                             if a_ur is not None:
                                 a_gpr = ctx.ra.r32(mul_b)
-                                output.append(SassInstr(encode_imad_ur(fused_dest, a_gpr, a_ur, c_reg),
-                                    f'IMAD R{fused_dest}, R{a_gpr}, UR{a_ur}, R{c_reg}  // fused mul+add'))
                             elif b_ur is not None:
                                 a_gpr = ctx.ra.r32(mul_a)
-                                output.append(SassInstr(encode_imad_ur(fused_dest, a_gpr, b_ur, c_reg),
-                                    f'IMAD R{fused_dest}, R{a_gpr}, UR{b_ur}, R{c_reg}  // fused mul+add'))
-                            else:
-                                # Both in GPR — can't fuse with R-UR IMAD
-                                # Fall through to normal mul handling
-                                pass
-                            if a_ur is not None or b_ur is not None:
-                                # Alias mul dest to fused dest
-                                ctx.ra.int_regs[mul_dest_name] = fused_dest
-                                ctx.ra.int_regs[_next.dest.name] = fused_dest
+                            # Both in GPR → can't fuse with R-UR IMAD, fall through
+                            if a_gpr is not None:
+                                # FG-1.14C / FG-2.2: NARROW defensive check at
+                                # this specific fusion site, not a global rule.
+                                #
+                                # FG-2.2 verified across the 21-kernel suite +
+                                # FG-1 reproducers + FG-2.1 repros that PTXAS
+                                # itself emits aliased IMADs (dest ∈ {srcs})
+                                # aggressively — 67 of its 106 IMADs alias a
+                                # source, and it matches OURS byte-for-byte on
+                                # 11 PARITY kernels that contain 65 such
+                                # aliased IMADs.  The STRICT invariant dest ∉
+                                # {src0,src1,src2} is therefore NOT a
+                                # correctness requirement; it is empirically
+                                # violated by the reference compiler.
+                                #
+                                # The REAL hardware requirement — enforced by
+                                # sass.schedule._enforce_gpr_latency reading
+                                # sass.scoreboard._OPCODE_META — is that the
+                                # dest must not be read with 0 instructions of
+                                # gap by a non-latency-aware consumer.  Since
+                                # FG-1 closeout registered IMAD.R-UR (0xc24)
+                                # in _OPCODE_META with min_gpr_gap=1, the
+                                # scheduler now inserts the required NOP and
+                                # the raw aliasing at this very site is safe
+                                # even when dest == src0.
+                                #
+                                # We keep the fresh-GPR rebind here anyway
+                                # because this particular fusion path creates
+                                # a quirky ownership pattern: the mul-operand
+                                # vreg and the add-dest vreg collapse into the
+                                # same physical register AFTER the linear-scan
+                                # allocator already made its decisions.  Having
+                                # the isel pick a scratch register keeps that
+                                # collapse local to the fusion site and avoids
+                                # surprising downstream consumers that were
+                                # expecting separate registers.  This is
+                                # defense-in-depth, not structural correctness.
+                                if fused_dest == a_gpr or fused_dest == c_reg:
+                                    fresh = _alloc_gpr(ctx)
+                                    ctx.ra.int_regs[_next.dest.name] = fresh
+                                    ctx.ra.int_regs[mul_dest_name] = fresh
+                                    fused_dest = fresh
+                                else:
+                                    # Still alias mul's dest to the add's dest,
+                                    # as before.
+                                    ctx.ra.int_regs[mul_dest_name] = fused_dest
+                                    ctx.ra.int_regs[_next.dest.name] = fused_dest
+                                # Emit the IMAD (source ordering preserved from
+                                # the original branches).  The ALU-latency NOP
+                                # that used to follow this instruction (FG-1.14C)
+                                # was removed in the FG-1 closeout after opcode
+                                # 0xc24 was registered in
+                                # sass.scoreboard._OPCODE_META with
+                                # min_gpr_gap=1, so the global scheduler now
+                                # enforces the 1-instruction reader gap from
+                                # the model rather than via a local hack.
+                                if a_ur is not None:
+                                    output.append(SassInstr(
+                                        encode_imad_ur(fused_dest, a_gpr, a_ur, c_reg),
+                                        f'IMAD R{fused_dest}, R{a_gpr}, UR{a_ur}, R{c_reg}  // fused mul+add'))
+                                else:
+                                    output.append(SassInstr(
+                                        encode_imad_ur(fused_dest, a_gpr, b_ur, c_reg),
+                                        f'IMAD R{fused_dest}, R{a_gpr}, UR{b_ur}, R{c_reg}  // fused mul+add'))
                                 # Mark the add instruction to skip
                                 if not hasattr(ctx, '_skip_instrs'):
                                     ctx._skip_instrs = set()
@@ -2549,9 +2605,71 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     #   IMAD.WIDE d_lo, a_lo, b_lo, RZ  → d_lo:d_hi = a_lo × b_lo
                     #   IMAD.RR   d_hi, a_lo, b_hi, d_hi → d_hi += a_lo × b_hi (lo bits only)
                     #   IMAD.RR   d_hi, a_hi, b_lo, d_hi → d_hi += a_hi × b_lo
+                    #
+                    # FG-1.12 — UR→GPR residency enforcement.
+                    #
+                    # IMAD.WIDE R-R (opcode 0x225) reads its source operands as
+                    # GPR pairs.  But a u64 source value may currently live
+                    # only in UR space — e.g., a u64 parameter loaded via
+                    # LDCU into UR8..UR9 in the preamble and never copied to
+                    # a GPR pair.  `ctx.ra.lo(name)` returns a GPR index for
+                    # the vreg, but that GPR may have never been written if
+                    # the value was only UR-resident.
+                    #
+                    # Root cause of FG-1-D (diagnosed in FG-1.11): Forge
+                    # reduce_step loaded `stride` into UR8..UR9, then the
+                    # mul.lo.u64 lowering emitted `IMAD.WIDE R12, R2, R10`
+                    # reading R2 — which was never written.  Loop counter
+                    # update `i += stride*2` produced garbage, loop exited
+                    # after 1 iteration.
+                    #
+                    # Fix: enforce the residency invariant locally.  If a
+                    # source vreg is UR-resident and has not been copied
+                    # to a GPR yet (`not in _gpr_written`), emit two MOV
+                    # R,UR instructions (one per half) to materialize the
+                    # u64 value into a fresh GPR pair, update the
+                    # allocator's mapping, and mark the vreg as GPR-written.
+                    # Then proceed with the standard IMAD.WIDE R-R lowering.
+                    #
+                    # Narrowness: this block only fires when at least one
+                    # source is in `_ur_params` and not already in
+                    # `_gpr_written`.  Kernels whose u64 operands are
+                    # already GPR-resident (the existing 21 hand-crafted
+                    # kernels) never hit this path and are unaffected.
+                    _gpr_written = getattr(ctx, '_gpr_written', set())
+                    _ur_params   = getattr(ctx, '_ur_params', {})
+
+                    def _ensure_u64_gpr(src):
+                        """Return the GPR lo index for a u64 source, materializing
+                        from UR via MOV R,UR if the vreg is UR-resident and has
+                        not yet been copied to a GPR pair.
+                        """
+                        if not isinstance(src, RegOp):
+                            return ctx.ra.lo(src.name)
+                        if (src.name in _ur_params
+                                and src.name not in _gpr_written):
+                            ur_base = _ur_params[src.name]
+                            tmp_lo = _alloc_gpr_pair(ctx)
+                            output.append(SassInstr(
+                                encode_mov_gpr_from_ur(tmp_lo, ur_base),
+                                f'MOV R{tmp_lo}, UR{ur_base}  '
+                                f'// FG-1.12: materialize {src.name}.lo for mul.lo.{typ}'))
+                            output.append(SassInstr(
+                                encode_mov_gpr_from_ur(tmp_lo + 1, ur_base + 1),
+                                f'MOV R{tmp_lo+1}, UR{ur_base+1}  '
+                                f'// FG-1.12: materialize {src.name}.hi for mul.lo.{typ}'))
+                            # Rebind allocator so subsequent consumers see the
+                            # GPR pair, and flag as GPR-written so UR-path
+                            # checks (e.g. add.u64 R-UR) don't fire again.
+                            ctx.ra.int_regs[src.name] = tmp_lo
+                            if hasattr(ctx, '_gpr_written'):
+                                ctx._gpr_written.add(src.name)
+                            return tmp_lo
+                        return ctx.ra.lo(src.name)
+
                     d_lo = ctx.ra.lo(instr.dest.name)
-                    a_lo = ctx.ra.lo(instr.srcs[0].name)
-                    b_lo = ctx.ra.lo(instr.srcs[1].name)
+                    a_lo = _ensure_u64_gpr(instr.srcs[0])
+                    b_lo = _ensure_u64_gpr(instr.srcs[1])
                     output.append(SassInstr(encode_imad_wide_rr(d_lo, a_lo, b_lo, RZ),
                         f'IMAD.WIDE R{d_lo}, R{a_lo}, R{b_lo}, RZ  // mul.lo.{typ} wide'))
                     # IMAD R-R (0x2a4) is broken on SM_120. Use IMAD.WIDE for cross terms:
@@ -3652,15 +3770,27 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                         ctx._negated_preds.discard(pd)
                         else:
                             # Integer comparison
-                            # SM_120: ISETP.LT encoding (b8=0x10) doesn't work on hardware.
-                            # Invert LT→GE and GT→LE, negate the predicate on branches.
-                            # EXCEPTION: if src1 is from a param (has UR), use ISETP.UR
-                            # with direct GT/LT instead of inverting. ISETP.UR works with
-                            # GT on SM_120 (ptxas-verified). This avoids the negated-pred
-                            # path that creates ISETP+VOTE+ISETP hazards (rule #23).
-                            _INVERT = {'lt': 'ge', 'gt': 'le'}
-                            # GT/LT always invert to GE/LE for ISETP.UR (ptxas-verified).
-                            # ptxas uses GE (not GT) even for vote-feeding compares.
+                            # SM_120 R-UR ISETP only emits cmp=GE (6) or cmp=GT (4)
+                            # in ptxas ground truth.  Direct LT/LE encodings are
+                            # never used by ptxas — both produce wrong results on
+                            # hardware (FG-2.1: setp.le emitted as ISETP.LE direct
+                            # silently computes GE; setp.gt -> ISETP.LE+neg likewise
+                            # silently computes LT).  We therefore canonicalize
+                            # away from LT/LE the same way ptxas does:
+                            #   setp.lt → ISETP.GE + negate predicate
+                            #   setp.le → ISETP.GT + negate predicate
+                            #   setp.eq → ISETP.NE + negate predicate  (FG-2.3)
+                            # GE, GT, and NE are emitted directly.  IMM path
+                            # supports the full comparison set so it's exempt.
+                            #
+                            # FG-2.3 addition: EQ falls through to NE + neg so
+                            # the R-UR path can be used for equality compares
+                            # against UR-bound params.  Without this, EQ/NE
+                            # would fall to the ISETP R-R path, which cannot
+                            # read a UR-bound operand — the isel ended up
+                            # reading an uninitialised GPR slot and silently
+                            # produced a constant predicate.
+                            _INVERT = {'lt': 'ge', 'le': 'gt', 'eq': 'ne'}
                             _can_use_ur_direct = False
                             _can_use_imm_direct = False
                             # ISETP.IMM (0x80c) supports all comparison codes directly.
@@ -3695,7 +3825,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             elif isinstance(b, RegOp):
                                 b_param_off = ctx._reg_param_off.get(b.name) if ctx else None
                                 b_ur_idx = (ctx._ur_params.get(b.name) if ctx else None)
-                                if b_ur_idx is not None and isetp_cmp in (ISETP_GE, ISETP_GT, ISETP_LE, ISETP_LT):
+                                if b_ur_idx is not None and isetp_cmp in (ISETP_GE, ISETP_GT, ISETP_LE, ISETP_LT, ISETP_NE):
                                     # SM_120 rule #25: ISETP.UR + VOTE causes ERR715 when
                                     # LDG is present. Use GPR path for vote kernels.
                                     _vote_safe = getattr(ctx, '_has_vote', False)
@@ -3729,7 +3859,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                         output.append(SassInstr(
                                             encode_isetp_ur(emit_pd, ar, b_ur_idx, cmp=isetp_cmp),
                                             f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, UR{b_ur_idx}, PT'))
-                                elif b_param_off is not None and isetp_cmp in (ISETP_GE, ISETP_GT, ISETP_LE, ISETP_LT):
+                                elif b_param_off is not None and isetp_cmp in (ISETP_GE, ISETP_GT, ISETP_LE, ISETP_LT, ISETP_NE):
                                     # SM_120 rule: LDCU.32 in the body poisons IADD.64-UR.
                                     # Always use GPR R-R path. The param value was loaded
                                     # into a GPR by ld.param → LDC at the regular u32 path.

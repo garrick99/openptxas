@@ -119,7 +119,43 @@ def _patch_cuinfo_sm(sm_version: int) -> bytes:
 def _build_nv_info_global(num_gprs: int = 16, num_uniform: int = 14):
     # EIATTR_REGCOUNT (0x2f): GPR count at offset 4, UR count at offset 8.
     # Both must be at least the actual usage to avoid ILLEGAL_INSTRUCTION.
-    rc = max(num_gprs, 16)  # minimum 16 per SM_120 hardware requirement
+    #
+    # FG-1.10 — register count slack correction.
+    #
+    # Diagnosed in FG-1.9 via cubin-byte bisection on Forge reduce_step:
+    # SM_120 / RTX 5090 requires the declared regcount to EXCEED the
+    # actual max GPR usage by at least 2.  When the declared count
+    # exactly matches max_GPR_used + 1, the first instruction that
+    # writes to a register at the boundary traps with sync 715
+    # (CUDA_ERROR_ILLEGAL_INSTRUCTION) — even though the SASS itself
+    # is correct and the register is within the declared range.
+    #
+    # Empirical evidence (FG-1.9 cubin-patch sweep on reduce_step):
+    #   declared regs   = 16 (= num_gprs, max usage R15) → SYNC 715
+    #   declared regs   = 17                              → SYNC 715
+    #   declared regs   = 18 (= num_gprs + 2)            → SYNC 0 (no trap)
+    #   declared regs >= 18                              → SYNC 0
+    #
+    # PTXAS for the same kernel declares regs = 24.  PTXAS appears to
+    # follow `max_used + slack` with slack ≥ 2 in our observed cases.
+    #
+    # We use slack = 4 (instead of the minimum 2) for headroom:
+    #   - covers pair/quad-write ops (IMAD.WIDE, HMMA, IMMA, DMMA, QMMA)
+    #     where the boundary register may matter for the high half/quad
+    #   - avoids edge-case oscillation if hardware tolerance varies
+    #     across drivers / Blackwell revisions
+    #   - cost is negligible: 2 extra registers declared per kernel,
+    #     no SASS impact, no allocator impact, no metric drift
+    #
+    # The 16-register floor is preserved for kernels with low GPR
+    # usage (where the slack is naturally absorbed by the floor).
+    #
+    # Note: this only changes the metadata declaration, not the SASS.
+    # `cubin_metrics()` in workbench scans the SASS for max GPR — so
+    # the JSON artifact's `regs` field is unaffected, and WB-12.0
+    # byte-equality on the metric hashes is preserved.
+    _REGCOUNT_SLACK = 4
+    rc = max(num_gprs + _REGCOUNT_SLACK, 16)
     buf = bytearray(bytes.fromhex(
         '042f08000800000010000000'
         '041108000800000000000000'

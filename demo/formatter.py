@@ -153,11 +153,16 @@ def fmt_suite_summary(results: list[dict]) -> str:
     return '\n'.join(lines)
 
 
-def fmt_proof_footer(adversarial: tuple[int, int]) -> str:
+def fmt_proof_footer(adversarial: tuple[int, int],
+                     corpus: tuple[int, int] | None = None) -> str:
     """Format proof footer for suite output."""
     a_pass, a_total = adversarial
+    parts = [f'{a_pass}/{a_total} adversarial CONFIRMED']
+    if corpus and corpus[0] > 0:
+        c_pass, c_total = corpus
+        parts.append(f'{c_pass}/{c_total} corpus SAFE')
     lines = []
-    lines.append(f'  Proof: {a_pass}/{a_total} adversarial CONFIRMED')
+    lines.append(f'  Proof: {" | ".join(parts)}')
     lines.append('')
     return '\n'.join(lines)
 

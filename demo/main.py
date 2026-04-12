@@ -45,15 +45,17 @@ SUITES = {
 }
 
 
-def _get_proof_counts() -> tuple[int, int]:
-    """Run adversarial harness, return (confirmed, total)."""
+def _get_proof_counts() -> dict:
+    """Run adversarial harness + corpus proof, return counts."""
     import subprocess
+
+    # Adversarial harness
     r = subprocess.run(
         [sys.executable, str(ROOT / 'probe_work' / 'fg40_adversarial_harness.py')],
         capture_output=True, text=True, cwd=str(ROOT),
     )
-    confirmed = 0
-    total = 0
+    adv_confirmed = 0
+    adv_total = 0
     for line in r.stdout.splitlines():
         line = line.strip()
         if 'MODEL_CONFIRMED' in line and '=' in line:
@@ -61,8 +63,8 @@ def _get_proof_counts() -> tuple[int, int]:
             if len(parts) == 2:
                 try:
                     n = int(parts[1].strip())
-                    confirmed += n
-                    total += n
+                    adv_confirmed += n
+                    adv_total += n
                 except ValueError:
                     pass
         for tag in ('MODEL_FALSE_POSITIVE', 'MODEL_FALSE_NEGATIVE'):
@@ -71,10 +73,32 @@ def _get_proof_counts() -> tuple[int, int]:
                 if len(parts) == 2:
                     try:
                         n = int(parts[1].strip())
-                        total += n
+                        adv_total += n
                     except ValueError:
                         pass
-    return confirmed, total
+
+    # Corpus proof (run via pytest in subprocess for isolation)
+    r2 = subprocess.run(
+        [sys.executable, '-m', 'pytest',
+         'tests/test_fg25_proof_engine.py', '-k', 'inv_h',
+         '-q', '--tb=no'],
+        capture_output=True, text=True, cwd=str(ROOT),
+    )
+    corpus_passed = 0
+    corpus_total = 0
+    for line in r2.stdout.splitlines():
+        # pytest summary: "37 passed, 61 deselected in 0.88s"
+        if 'passed' in line:
+            for part in line.split():
+                if part.isdigit():
+                    corpus_passed = int(part)
+                    corpus_total = corpus_passed
+                    break
+
+    return {
+        'adversarial': (adv_confirmed, adv_total),
+        'corpus': (corpus_passed, corpus_total),
+    }
 
 
 def run_one_kernel(name: str, show_diff: bool = False,
@@ -186,8 +210,8 @@ def main():
 
     # Auto proof footer for suites (or standalone --proof)
     if args.suite or args.proof:
-        confirmed, total = _get_proof_counts()
-        print(fmt_proof_footer((confirmed, total)))
+        proof = _get_proof_counts()
+        print(fmt_proof_footer(proof['adversarial'], proof['corpus']))
 
     if any(not r['gpu']['ours_pass'] for r in results):
         return 1

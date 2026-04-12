@@ -178,6 +178,16 @@ _ALIAS_SLACK = {
         "k100_atom_add", "k100_atom_min",
         "k100_atom_max", "k100_atom_cas32", "k100_add64_chain",
     ]},
+    # KERNEL-100.2 sprint 2 corpus
+    **{k: 3 for k in [
+        "k200_deep_alu", "k200_alt_32_64", "k200_triple_acc", "k200_quad_acc",
+        "k200_nested_pred", "k200_pred_chain", "k200_pred_mul",
+        "k200_branch_store", "k200_double_guard", "k200_load_pred_store",
+        "k200_indep_load_merge", "k200_fadd_chain", "k200_fmul_add",
+        "k200_ilp3_chain", "k200_ilp_load_compute", "k200_ilp_dual_addr",
+        "k200_shl_chain", "k200_and_or_chain", "k200_mul_add_long",
+        "k200_xor_reduce", "k200_wide_imm", "k200_shfl_reduce2",
+    ]},
 }
 
 

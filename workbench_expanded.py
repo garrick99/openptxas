@@ -866,6 +866,514 @@ EXPANDED_KERNELS = {
     "k100_redux_and":        {"display": "redux.sync.and (warp AND reduce)", "ptx_inline": _K100_REDUX_AND, "kernel_name": "k100_redux_and", "harness": _harness_redux_and},
 }
 
+# ===================================================================
+# SPRINT 2 — KERNEL-100.2: 25 kernels (structural diversity)
+# ===================================================================
+
+def _ptx_simple(name, body_regs, body_ptx, extra_params=""):
+    """Template for simple out[tid] = f(tid) kernels."""
+    return f"""
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry {name}(.param .u64 p_out, .param .u32 n{extra_params}) {{
+    .reg .u32 %r<{body_regs}>; .reg .u64 %rd<4>; .reg .pred %p0, %p1, %p2;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+{body_ptx}
+    cvt.u64.u32 %rd1, %r0; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r2;
+    ret;
+}}
+"""
+
+# 1. Longer dependency chains
+_K200_DEEP_ALU = _ptx_simple("k200_deep_alu", 12, """
+    mul.lo.u32 %r2, %r0, 3;
+    add.u32 %r3, %r2, 7;
+    xor.b32 %r4, %r3, 0xFF;
+    and.b32 %r5, %r4, 0x3FF;
+    mul.lo.u32 %r6, %r5, 5;
+    add.u32 %r7, %r6, 13;
+    xor.b32 %r8, %r7, 0xAB;
+    and.b32 %r2, %r8, 0x7FF;""")
+
+_K200_ALT_32_64 = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry k200_alt_32_64(.param .u64 p_out, .param .u32 n) {
+    .reg .u32 %r<8>; .reg .u64 %rd<6>; .reg .pred %p0;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    mul.lo.u32 %r2, %r0, 7;
+    cvt.u64.u32 %rd1, %r2;
+    add.u64 %rd2, %rd1, 100;
+    cvt.u32.u64 %r3, %rd2;
+    add.u32 %r4, %r3, 50;
+    cvt.u64.u32 %rd3, %r4;
+    add.u64 %rd4, %rd3, 25;
+    cvt.u32.u64 %r2, %rd4;
+    cvt.u64.u32 %rd5, %r0; shl.b64 %rd5, %rd5, 2;
+    add.u64 %rd5, %rd0, %rd5;
+    st.global.u32 [%rd5], %r2;
+    ret;
+}
+"""
+
+_K200_TRIPLE_ACC = _ptx_simple("k200_triple_acc", 12, """
+    mul.lo.u32 %r2, %r0, 3;
+    mul.lo.u32 %r3, %r0, 5;
+    mul.lo.u32 %r4, %r0, 7;
+    add.u32 %r2, %r2, %r3;
+    add.u32 %r2, %r2, %r4;""")
+
+_K200_QUAD_ACC = _ptx_simple("k200_quad_acc", 12, """
+    mul.lo.u32 %r3, %r0, 2;
+    mul.lo.u32 %r4, %r0, 3;
+    mul.lo.u32 %r5, %r0, 5;
+    mul.lo.u32 %r6, %r0, 7;
+    add.u32 %r2, %r3, %r4;
+    add.u32 %r7, %r5, %r6;
+    add.u32 %r2, %r2, %r7;""")
+
+# 2. Divergence-lite control flow
+_K200_NESTED_PRED = _ptx_simple("k200_nested_pred", 10, """
+    mov.u32 %r2, %r0;
+    setp.gt.u32 %p1, %r0, 8;
+    @%p1 add.u32 %r2, %r2, 10;
+    @%p1 setp.gt.u32 %p2, %r0, 24;
+    @%p2 add.u32 %r2, %r2, 20;""")
+
+_K200_PRED_CHAIN = _ptx_simple("k200_pred_chain", 10, """
+    mov.u32 %r2, 0;
+    setp.gt.u32 %p1, %r0, 4;
+    @%p1 add.u32 %r2, %r2, 1;
+    setp.gt.u32 %p1, %r0, 8;
+    @%p1 add.u32 %r2, %r2, 2;
+    setp.gt.u32 %p1, %r0, 16;
+    @%p1 add.u32 %r2, %r2, 4;
+    setp.gt.u32 %p1, %r0, 32;
+    @%p1 add.u32 %r2, %r2, 8;""")
+
+_K200_PRED_MUL = _ptx_simple("k200_pred_mul", 10, """
+    mul.lo.u32 %r2, %r0, 3;
+    setp.lt.u32 %p1, %r0, 32;
+    @%p1 mul.lo.u32 %r2, %r0, 7;
+    add.u32 %r2, %r2, 1;""")
+
+_K200_BRANCH_STORE = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry k200_branch_store(.param .u64 p_out, .param .u32 n) {
+    .reg .u32 %r<8>; .reg .u64 %rd<3>; .reg .pred %p0, %p1;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    cvt.u64.u32 %rd1, %r0; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    mul.lo.u32 %r2, %r0, 11;
+    setp.lt.u32 %p1, %r0, 32;
+    @%p1 add.u32 %r2, %r2, 100;
+    st.global.u32 [%rd2], %r2;
+    ret;
+}
+"""
+
+_K200_DOUBLE_GUARD = _ptx_simple("k200_double_guard", 10, """
+    mul.lo.u32 %r2, %r0, 3;
+    setp.gt.u32 %p1, %r0, 16;
+    @%p1 add.u32 %r2, %r2, 50;
+    setp.lt.u32 %p2, %r0, 48;
+    @%p2 add.u32 %r2, %r2, 25;""")
+
+# 3. Memory / control interaction
+_K200_LOAD_PRED_STORE = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry k200_load_pred_store(.param .u64 p_out, .param .u64 p_in, .param .u32 n) {
+    .reg .u32 %r<6>; .reg .u64 %rd<5>; .reg .pred %p0, %p1;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    ld.param.u64 %rd1, [p_in];
+    cvt.u64.u32 %rd2, %r0; shl.b64 %rd2, %rd2, 2;
+    add.u64 %rd3, %rd1, %rd2;
+    ld.global.u32 %r2, [%rd3];
+    setp.gt.u32 %p1, %r2, 32;
+    @%p1 add.u32 %r2, %r2, 1000;
+    add.u64 %rd4, %rd0, %rd2;
+    st.global.u32 [%rd4], %r2;
+    ret;
+}
+"""
+
+_K200_INDEP_LOAD_MERGE = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry k200_indep_load_merge(.param .u64 p_out, .param .u64 p_in, .param .u32 n) {
+    .reg .u32 %r<6>; .reg .u64 %rd<6>; .reg .pred %p0;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out]; ld.param.u64 %rd1, [p_in];
+    cvt.u64.u32 %rd2, %r0; shl.b64 %rd2, %rd2, 2;
+    // load from p_in[tid]
+    add.u64 %rd3, %rd1, %rd2; ld.global.u32 %r2, [%rd3];
+    // independent compute
+    mul.lo.u32 %r3, %r0, 3;
+    add.u32 %r4, %r2, %r3;
+    and.b32 %r4, %r4, 0xFFFF;
+    add.u64 %rd4, %rd0, %rd2;
+    st.global.u32 [%rd4], %r4;
+    ret;
+}
+"""
+
+# 4. FP32 / mixed compute
+_K200_FADD_CHAIN = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry k200_fadd_chain(.param .u64 p_out, .param .u64 p_in, .param .u32 n) {
+    .reg .u32 %r<4>; .reg .u64 %rd<5>; .reg .f32 %f<6>; .reg .pred %p0;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out]; ld.param.u64 %rd1, [p_in];
+    cvt.u64.u32 %rd2, %r0; shl.b64 %rd2, %rd2, 2;
+    add.u64 %rd3, %rd1, %rd2;
+    ld.global.f32 %f0, [%rd3];
+    add.f32 %f1, %f0, %f0;
+    add.f32 %f2, %f1, %f0;
+    mov.b32 %r2, %f2;
+    add.u64 %rd4, %rd0, %rd2;
+    st.global.u32 [%rd4], %r2;
+    ret;
+}
+"""
+
+_K200_FMUL_ADD = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry k200_fmul_add(.param .u64 p_out, .param .u64 p_in, .param .u32 n) {
+    .reg .u32 %r<4>; .reg .u64 %rd<5>; .reg .f32 %f<6>; .reg .pred %p0;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out]; ld.param.u64 %rd1, [p_in];
+    cvt.u64.u32 %rd2, %r0; shl.b64 %rd2, %rd2, 2;
+    add.u64 %rd3, %rd1, %rd2;
+    ld.global.f32 %f0, [%rd3];
+    mul.f32 %f1, %f0, %f0;
+    add.f32 %f2, %f1, %f0;
+    mov.b32 %r2, %f2;
+    add.u64 %rd4, %rd0, %rd2;
+    st.global.u32 [%rd4], %r2;
+    ret;
+}
+"""
+
+# 5. ILP-heavy synthetics
+_K200_ILP3_CHAIN = _ptx_simple("k200_ilp3_chain", 16, """
+    mul.lo.u32 %r2, %r0, 3;
+    mul.lo.u32 %r3, %r0, 5;
+    mul.lo.u32 %r4, %r0, 7;
+    add.u32 %r5, %r2, 10;
+    add.u32 %r6, %r3, 20;
+    add.u32 %r7, %r4, 30;
+    xor.b32 %r8, %r5, 0xFF;
+    xor.b32 %r9, %r6, 0xAA;
+    xor.b32 %r10, %r7, 0x55;
+    add.u32 %r2, %r8, %r9;
+    add.u32 %r2, %r2, %r10;""")
+
+_K200_ILP_LOAD_COMPUTE = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry k200_ilp_load_compute(.param .u64 p_out, .param .u64 p_in, .param .u32 n) {
+    .reg .u32 %r<8>; .reg .u64 %rd<5>; .reg .pred %p0;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out]; ld.param.u64 %rd1, [p_in];
+    cvt.u64.u32 %rd2, %r0; shl.b64 %rd2, %rd2, 2;
+    add.u64 %rd3, %rd1, %rd2;
+    ld.global.u32 %r2, [%rd3];
+    // independent compute while load is in-flight
+    mul.lo.u32 %r3, %r0, 17;
+    add.u32 %r4, %r3, 42;
+    // merge
+    add.u32 %r5, %r2, %r4;
+    add.u64 %rd4, %rd0, %rd2;
+    st.global.u32 [%rd4], %r5;
+    ret;
+}
+"""
+
+_K200_ILP_DUAL_ADDR = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry k200_ilp_dual_addr(.param .u64 p_out, .param .u64 p_a, .param .u64 p_b, .param .u32 n) {
+    .reg .u32 %r<8>; .reg .u64 %rd<8>; .reg .pred %p0;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out]; ld.param.u64 %rd1, [p_a]; ld.param.u64 %rd2, [p_b];
+    cvt.u64.u32 %rd3, %r0; shl.b64 %rd3, %rd3, 2;
+    // chain A: address + load
+    add.u64 %rd4, %rd1, %rd3; ld.global.u32 %r2, [%rd4];
+    // chain B: address + load (independent)
+    add.u64 %rd5, %rd2, %rd3; ld.global.u32 %r3, [%rd5];
+    // chain C: independent ALU
+    mul.lo.u32 %r4, %r0, 11;
+    // merge all three
+    add.u32 %r5, %r2, %r3;
+    add.u32 %r5, %r5, %r4;
+    add.u64 %rd6, %rd0, %rd3;
+    st.global.u32 [%rd6], %r5;
+    ret;
+}
+"""
+
+# 6. More integer patterns
+_K200_SHL_CHAIN = _ptx_simple("k200_shl_chain", 10, """
+    add.u32 %r2, %r0, 1;
+    shl.b32 %r3, %r2, 1;
+    shl.b32 %r4, %r3, 2;
+    xor.b32 %r2, %r4, %r2;""")
+
+_K200_AND_OR_CHAIN = _ptx_simple("k200_and_or_chain", 10, """
+    or.b32  %r2, %r0, 0xF0;
+    and.b32 %r3, %r2, 0xFF;
+    or.b32  %r4, %r3, 0x100;
+    and.b32 %r2, %r4, 0x1FF;""")
+
+_K200_MUL_ADD_LONG = _ptx_simple("k200_mul_add_long", 14, """
+    mul.lo.u32 %r2, %r0, 3;
+    add.u32 %r3, %r2, 1;
+    mul.lo.u32 %r4, %r3, 5;
+    add.u32 %r5, %r4, 2;
+    mul.lo.u32 %r6, %r5, 7;
+    add.u32 %r2, %r6, 3;""")
+
+_K200_XOR_REDUCE = _ptx_simple("k200_xor_reduce", 10, """
+    xor.b32 %r2, %r0, 0x1;
+    xor.b32 %r3, %r2, 0x2;
+    xor.b32 %r4, %r3, 0x4;
+    xor.b32 %r2, %r4, 0x8;""")
+
+_K200_WIDE_IMM = _ptx_simple("k200_wide_imm", 10, """
+    add.u32 %r2, %r0, 0x12345;
+    and.b32 %r3, %r2, 0xFFFFF;
+    xor.b32 %r2, %r3, 0xABCDE;""")
+
+# 7. Shuffle + compute
+_K200_SHFL_REDUCE2 = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry k200_shfl_reduce2(.param .u64 p_out, .param .u32 n) {
+    .reg .u32 %r<8>; .reg .u64 %rd<3>; .reg .pred %p0;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    add.u32 %r2, %r0, 1;
+    shfl.sync.bfly.b32 %r3, %r2, 1, 31, 0xFFFFFFFF;
+    add.u32 %r2, %r2, %r3;
+    shfl.sync.bfly.b32 %r3, %r2, 2, 31, 0xFFFFFFFF;
+    add.u32 %r2, %r2, %r3;
+    cvt.u64.u32 %rd1, %r0; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r2;
+    ret;
+}
+"""
+
+# --- Sprint 2 harnesses ---
+
+def _verify_simple(fn):
+    def verify(buf, N):
+        for t in range(N):
+            exp = fn(t) & 0xFFFFFFFF
+            if struct.unpack_from('<I', buf, t*4)[0] != exp: return False
+        return True
+    return verify
+
+def _harness_s2(name, fn, N=64):
+    def harness(ctx, func, mode):
+        return _h(ctx, func, N, _simple_args, _verify_simple(fn))
+    return harness
+
+def _harness_s2_load(ctx, func, mode):
+    N=64; sz=N*4
+    d_out=ctx.alloc(sz); ctx.memset_d8(d_out,0,sz)
+    d_in=ctx.alloc(sz)
+    ctx.copy_to(d_in, struct.pack(f'<{N}I', *range(N)))
+    args,h=_make_args(ctypes.c_uint64(d_out), ctypes.c_uint64(d_in), ctypes.c_uint32(N))
+    try:
+        err=ctx.launch(func,(1,1,1),(N,1,1),args); assert err==0 and ctx.sync()==0
+        buf=ctx.copy_from(d_out,sz)
+        correct=all(struct.unpack_from('<I',buf,t*4)[0]==(t+1000 if t>32 else t)&0xFFFFFFFF for t in range(N))
+    finally:
+        ctx.free(d_out); ctx.free(d_in)
+    return {"correct": correct, "time_ms": None}
+
+def _harness_s2_dual_load(ctx, func, mode):
+    N=64; sz=N*4
+    d_out=ctx.alloc(sz); ctx.memset_d8(d_out,0,sz)
+    d_in=ctx.alloc(sz)
+    ctx.copy_to(d_in, struct.pack(f'<{N}I', *[i*10 for i in range(N)]))
+    args,h=_make_args(ctypes.c_uint64(d_out), ctypes.c_uint64(d_in), ctypes.c_uint32(N))
+    try:
+        err=ctx.launch(func,(1,1,1),(N,1,1),args); assert err==0 and ctx.sync()==0
+        buf=ctx.copy_from(d_out,sz)
+        correct=all(struct.unpack_from('<I',buf,t*4)[0]==((t*10+t*3)&0xFFFF)&0xFFFFFFFF for t in range(N))
+    finally:
+        ctx.free(d_out); ctx.free(d_in)
+    return {"correct": correct, "time_ms": None}
+
+def _harness_s2_fadd(ctx, func, mode):
+    N=64; sz=N*4
+    d_out=ctx.alloc(sz); ctx.memset_d8(d_out,0,sz)
+    d_in=ctx.alloc(sz)
+    # Input: float(tid+1)
+    data = struct.pack(f'<{N}f', *[float(i+1) for i in range(N)])
+    ctx.copy_to(d_in, data)
+    args,h=_make_args(ctypes.c_uint64(d_out), ctypes.c_uint64(d_in), ctypes.c_uint32(N))
+    try:
+        err=ctx.launch(func,(1,1,1),(N,1,1),args); assert err==0 and ctx.sync()==0
+        buf=ctx.copy_from(d_out,sz)
+        correct = True
+        for t in range(N):
+            inp = float(t+1)
+            exp = inp + inp + inp  # f0+f0+f0 = 3*f0
+            got = struct.unpack_from('<f', buf, t*4)[0]
+            if abs(got - exp) > 0.01: correct = False; break
+    finally:
+        ctx.free(d_out); ctx.free(d_in)
+    return {"correct": correct, "time_ms": None}
+
+def _harness_s2_fmul(ctx, func, mode):
+    N=64; sz=N*4
+    d_out=ctx.alloc(sz); ctx.memset_d8(d_out,0,sz)
+    d_in=ctx.alloc(sz)
+    data = struct.pack(f'<{N}f', *[float(i+1) for i in range(N)])
+    ctx.copy_to(d_in, data)
+    args,h=_make_args(ctypes.c_uint64(d_out), ctypes.c_uint64(d_in), ctypes.c_uint32(N))
+    try:
+        err=ctx.launch(func,(1,1,1),(N,1,1),args); assert err==0 and ctx.sync()==0
+        buf=ctx.copy_from(d_out,sz)
+        correct = True
+        for t in range(N):
+            inp = float(t+1)
+            exp = inp * inp + inp  # f0*f0 + f0
+            got = struct.unpack_from('<f', buf, t*4)[0]
+            if abs(got - exp) > max(0.01, abs(exp)*1e-6): correct = False; break
+    finally:
+        ctx.free(d_out); ctx.free(d_in)
+    return {"correct": correct, "time_ms": None}
+
+def _harness_s2_ilp_load_compute(ctx, func, mode):
+    N=64; sz=N*4
+    d_out=ctx.alloc(sz); ctx.memset_d8(d_out,0,sz)
+    d_in=ctx.alloc(sz)
+    ctx.copy_to(d_in, struct.pack(f'<{N}I', *[i*10 for i in range(N)]))
+    args,h=_make_args(ctypes.c_uint64(d_out), ctypes.c_uint64(d_in), ctypes.c_uint32(N))
+    try:
+        err=ctx.launch(func,(1,1,1),(N,1,1),args); assert err==0 and ctx.sync()==0
+        buf=ctx.copy_from(d_out,sz)
+        correct=all(struct.unpack_from('<I',buf,t*4)[0]==(t*10+t*17+42)&0xFFFFFFFF for t in range(N))
+    finally:
+        ctx.free(d_out); ctx.free(d_in)
+    return {"correct": correct, "time_ms": None}
+
+def _harness_s2_ilp_dual_addr(ctx, func, mode):
+    N=64; sz=N*4
+    d_out=ctx.alloc(sz); ctx.memset_d8(d_out,0,sz)
+    d_a=ctx.alloc(sz); d_b=ctx.alloc(sz)
+    ctx.copy_to(d_a, struct.pack(f'<{N}I', *[i for i in range(N)]))
+    ctx.copy_to(d_b, struct.pack(f'<{N}I', *[i*2 for i in range(N)]))
+    args,h=_make_args(ctypes.c_uint64(d_out), ctypes.c_uint64(d_a), ctypes.c_uint64(d_b), ctypes.c_uint32(N))
+    try:
+        err=ctx.launch(func,(1,1,1),(N,1,1),args); assert err==0 and ctx.sync()==0
+        buf=ctx.copy_from(d_out,sz)
+        correct=all(struct.unpack_from('<I',buf,t*4)[0]==(t+t*2+t*11)&0xFFFFFFFF for t in range(N))
+    finally:
+        ctx.free(d_out); ctx.free(d_a); ctx.free(d_b)
+    return {"correct": correct, "time_ms": None}
+
+def _harness_s2_shfl_reduce2(ctx, func, mode):
+    def verify(buf, N):
+        # Two rounds of butterfly: pairs of 1,2 then pairs of 4
+        vals = [t+1 for t in range(N)]
+        # Round 1: each lane adds partner^1
+        r1 = [vals[t] + vals[t^1] for t in range(N)]
+        # Round 2: each lane adds partner^2
+        r2 = [r1[t] + r1[t^2] for t in range(N)]
+        for t in range(min(N,32)):
+            if struct.unpack_from('<I', buf, t*4)[0] != r2[t] & 0xFFFFFFFF: return False
+        return True
+    return _h(ctx, func, 32, _simple_args, verify)
+
+
+SPRINT2_KERNELS = {
+    "k200_deep_alu":          {"display": "8-stage deep ALU chain", "ptx_inline": _K200_DEEP_ALU, "kernel_name": "k200_deep_alu",
+                               "harness": _harness_s2("k200_deep_alu", lambda t: ((((t*3+7)^0xFF)&0x3FF)*5+13)^0xAB & 0x7FF)},
+    "k200_alt_32_64":         {"display": "alternating 32/64-bit chain", "ptx_inline": _K200_ALT_32_64, "kernel_name": "k200_alt_32_64",
+                               "harness": _harness_s2("k200_alt_32_64", lambda t: (t*7+100+50+25)&0xFFFFFFFF)},
+    "k200_triple_acc":        {"display": "3 independent accumulators merge", "ptx_inline": _K200_TRIPLE_ACC, "kernel_name": "k200_triple_acc",
+                               "harness": _harness_s2("k200_triple_acc", lambda t: t*3+t*5+t*7)},
+    "k200_quad_acc":          {"display": "4 independent accumulators merge", "ptx_inline": _K200_QUAD_ACC, "kernel_name": "k200_quad_acc",
+                               "harness": _harness_s2("k200_quad_acc", lambda t: t*2+t*3+t*5+t*7)},
+    "k200_nested_pred":       {"display": "nested predicated adds", "ptx_inline": _K200_NESTED_PRED, "kernel_name": "k200_nested_pred",
+                               "harness": _harness_s2("k200_nested_pred", lambda t: t+(10 if t>8 else 0)+(20 if t>24 else 0))},
+    "k200_pred_chain":        {"display": "4-stage predicate chain (bucket count)", "ptx_inline": _K200_PRED_CHAIN, "kernel_name": "k200_pred_chain",
+                               "harness": _harness_s2("k200_pred_chain", lambda t: (1 if t>4 else 0)+(2 if t>8 else 0)+(4 if t>16 else 0)+(8 if t>32 else 0))},
+    "k200_pred_mul":          {"display": "predicated mul override", "ptx_inline": _K200_PRED_MUL, "kernel_name": "k200_pred_mul",
+                               "harness": _harness_s2("k200_pred_mul", lambda t: (t*7 if t<32 else t*3)+1)},
+    "k200_branch_store":      {"display": "branch + guarded add + store", "ptx_inline": _K200_BRANCH_STORE, "kernel_name": "k200_branch_store",
+                               "harness": _harness_s2("k200_branch_store", lambda t: t*11+(100 if t<32 else 0))},
+    "k200_double_guard":      {"display": "two independent guards on same value", "ptx_inline": _K200_DOUBLE_GUARD, "kernel_name": "k200_double_guard",
+                               "harness": _harness_s2("k200_double_guard", lambda t: t*3+(50 if t>16 else 0)+(25 if t<48 else 0))},
+    "k200_load_pred_store":   {"display": "load + predicated transform + store", "ptx_inline": _K200_LOAD_PRED_STORE, "kernel_name": "k200_load_pred_store",
+                               "harness": _harness_s2_load},
+    "k200_indep_load_merge":  {"display": "load + independent ALU + mask merge", "ptx_inline": _K200_INDEP_LOAD_MERGE, "kernel_name": "k200_indep_load_merge",
+                               "harness": _harness_s2_dual_load},
+    "k200_fadd_chain":        {"display": "FP32 add chain (3 stages)", "ptx_inline": _K200_FADD_CHAIN, "kernel_name": "k200_fadd_chain",
+                               "harness": _harness_s2_fadd},
+    "k200_fmul_add":          {"display": "FP32 mul + add + mul chain", "ptx_inline": _K200_FMUL_ADD, "kernel_name": "k200_fmul_add",
+                               "harness": _harness_s2_fmul},
+    "k200_ilp3_chain":        {"display": "3 independent ALU chains + merge", "ptx_inline": _K200_ILP3_CHAIN, "kernel_name": "k200_ilp3_chain",
+                               "harness": _harness_s2("k200_ilp3_chain", lambda t: ((t*3+10)^0xFF)+((t*5+20)^0xAA)+((t*7+30)^0x55))},
+    "k200_ilp_load_compute":  {"display": "ILP: load + independent ALU + merge", "ptx_inline": _K200_ILP_LOAD_COMPUTE, "kernel_name": "k200_ilp_load_compute",
+                               "harness": _harness_s2_ilp_load_compute},
+    "k200_ilp_dual_addr":     {"display": "ILP: 2 addr chains + ALU + merge", "ptx_inline": _K200_ILP_DUAL_ADDR, "kernel_name": "k200_ilp_dual_addr",
+                               "harness": _harness_s2_ilp_dual_addr},
+    "k200_shl_chain":         {"display": "shift-left chain + xor", "ptx_inline": _K200_SHL_CHAIN, "kernel_name": "k200_shl_chain",
+                               "harness": _harness_s2("k200_shl_chain", lambda t: ((t+1)<<3)^(t+1))},
+    "k200_and_or_chain":      {"display": "and/or alternating chain", "ptx_inline": _K200_AND_OR_CHAIN, "kernel_name": "k200_and_or_chain",
+                               "harness": _harness_s2("k200_and_or_chain", lambda t: (((t|0xF0)&0xFF)|0x100)&0x1FF)},
+    "k200_mul_add_long":      {"display": "mul+add x3 deep chain", "ptx_inline": _K200_MUL_ADD_LONG, "kernel_name": "k200_mul_add_long",
+                               "harness": _harness_s2("k200_mul_add_long", lambda t: ((t*3+1)*5+2)*7+3)},
+    "k200_xor_reduce":        {"display": "4-stage xor with constants", "ptx_inline": _K200_XOR_REDUCE, "kernel_name": "k200_xor_reduce",
+                               "harness": _harness_s2("k200_xor_reduce", lambda t: t^0x1^0x2^0x4^0x8)},
+    "k200_wide_imm":          {"display": "wide immediate constants (>16-bit)", "ptx_inline": _K200_WIDE_IMM, "kernel_name": "k200_wide_imm",
+                               "harness": _harness_s2("k200_wide_imm", lambda t: ((t+0x12345)&0xFFFFF)^0xABCDE)},
+    "k200_shfl_reduce2":      {"display": "2-round butterfly shuffle reduce", "ptx_inline": _K200_SHFL_REDUCE2, "kernel_name": "k200_shfl_reduce2",
+                               "harness": _harness_s2_shfl_reduce2},
+}
+
+for v in SPRINT2_KERNELS.values():
+    v.setdefault("ptx_path", None)
+
+EXPANDED_KERNELS.update(SPRINT2_KERNELS)
+
+
 # Add ptx_path=None to all entries
 for v in EXPANDED_KERNELS.values():
     v.setdefault("ptx_path", None)
@@ -876,7 +1384,11 @@ def register(kernels_dict, suites_dict, make_args_fn):
     global _make_args
     _make_args = make_args_fn
     kernels_dict.update(EXPANDED_KERNELS)
-    # Add expanded suite
-    suites_dict["expanded"] = list(EXPANDED_KERNELS.keys())
+    # Add suite groupings
+    s1_keys = [k for k in EXPANDED_KERNELS if k.startswith("k100_")]
+    s2_keys = [k for k in EXPANDED_KERNELS if k.startswith("k200_")]
+    suites_dict["expanded"] = s1_keys + s2_keys
+    suites_dict["sprint1"] = s1_keys
+    suites_dict["sprint2"] = s2_keys
     # Update 'all' suite
-    suites_dict["all"] = list(suites_dict.get("all", [])) + list(EXPANDED_KERNELS.keys())
+    suites_dict["all"] = list(suites_dict.get("all", [])) + s1_keys + s2_keys

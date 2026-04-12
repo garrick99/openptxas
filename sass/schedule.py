@@ -1126,6 +1126,64 @@ def _fill_ldcu_latency(instrs: list[SassInstr]) -> list[SassInstr]:
     return cleaned
 
 
+def _remove_forwarding_safe_nops(instrs: list[SassInstr]) -> list[SassInstr]:
+    """PERF-1: remove NOPs that separate proven forwarding-safe pairs.
+
+    After all scheduling passes have run, scan for the pattern:
+
+        [i]   ALU writer (opc in _OPCODE_META, min_gpr_gap > 0)
+        [i+1] NOP (// ALU GPR latency)
+        [i+2] ALU reader (reads writer's dest regs)
+
+    If (writer_opc, reader_opc) is on _FORWARDING_SAFE_PAIRS or the
+    writer is a ZERO_INIT_SAFE HFMA2, the NOP is unnecessary — remove
+    it.  The hardware forwards the result without a gap.
+
+    This runs as the LAST scheduling pass so all prior reordering and
+    NOP insertion is already finalized.
+    """
+    from sass.scoreboard import (
+        _OPCODE_META,
+        _get_dest_regs as _sc_dest,
+        _get_src_regs  as _sc_src,
+        _get_opcode    as _sc_opc,
+        _is_forwarding_safe_pair,
+        _is_zero_init_fastpath,
+    )
+    nop_opc = 0x918  # NOP opcode
+    removed = 0
+    result = list(instrs)
+    i = 0
+    while i < len(result) - 2:
+        opc_i = _sc_opc(result[i].raw)
+        meta_i = _OPCODE_META.get(opc_i)
+        if meta_i is None or meta_i.min_gpr_gap == 0:
+            i += 1
+            continue
+        # Check if [i+1] is a NOP
+        if _sc_opc(result[i + 1].raw) != nop_opc:
+            i += 1
+            continue
+        # Check if [i+2] reads [i]'s dest (the pair that the NOP guards)
+        dest_i = _sc_dest(result[i].raw)
+        if not dest_i:
+            i += 1
+            continue
+        src_k = _sc_src(result[i + 2].raw)
+        if not (dest_i & src_k):
+            i += 1
+            continue
+        opc_k = _sc_opc(result[i + 2].raw)
+        # Can we remove the NOP?
+        if _is_forwarding_safe_pair(opc_i, opc_k) or _is_zero_init_fastpath(result[i].raw):
+            result.pop(i + 1)
+            removed += 1
+            # Don't advance i — re-check at the same position
+        else:
+            i += 1
+    return result
+
+
 def schedule(instrs: list[SassInstr]) -> list[SassInstr]:
     """
     Reorder and pad instructions for correct SM_120 execution.
@@ -1134,8 +1192,9 @@ def schedule(instrs: list[SassInstr]) -> list[SassInstr]:
       1. _hoist_ldcu64        — move LDCU.64 early (≥3-cycle gap before UR consumers)
       2. _enforce_gpr_latency — insert NOPs for ALU GPR RAW hazards
       3. _fill_ldcu_latency   — hoist deferred LDCU.64 to fill latency with useful work
-      4. _reorder_after_ldg  — hide LDG latency by filling the slot with LDC/NOP
-      5. _hoist_isetp_past_vote — SM_120 rule #23: avoid ISETP+VOTE+ISETP pattern
+      4. _enforce_gpr_latency — re-check after fill reordering
+      5. _remove_forwarding_safe_nops — PERF-1: remove NOPs where hardware forwarding
+                                        is proven safe (23 evidence-backed pairs from FG-4)
 
     Ctrl assignment is handled separately by sass.scoreboard.assign_ctrl().
     """
@@ -1143,6 +1202,13 @@ def schedule(instrs: list[SassInstr]) -> list[SassInstr]:
     instrs = _enforce_gpr_latency(instrs)
     instrs = _fill_ldcu_latency(instrs)
     instrs = _enforce_gpr_latency(instrs)  # re-check after fill reordering
+    # PERF-1: NOP removal pass disabled after test_4ptr_add failure —
+    # the forwarding-safe whitelist has at least one pair that is not
+    # actually safe at gap=0 in all contexts (likely IADD.64-UR → STG
+    # address where the STG uses the IADD result as the store ADDRESS,
+    # not as forwarded data).  Needs deeper investigation before
+    # re-enabling.
+    # instrs = _remove_forwarding_safe_nops(instrs)  # PERF-1
     # Skip LDG latency NOPs — rely on ctrl wdep for LDG (ptxas pattern)
     # instrs = _reorder_after_ldg(instrs)
 

@@ -24,6 +24,7 @@ __pycache__/
 # tracked exception files below are reachable)
 probe_work/*
 !probe_work/fg40_adversarial_harness.py
+!probe_work/fg42_evidence_harness.py
 
 # Local machine-specific junction (points to ptxas repro files)
 ptxas_bug/

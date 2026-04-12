@@ -585,8 +585,32 @@ _FORWARDING_SAFE_PAIRS: set[tuple[int, int]] = {
     (0xc02, 0x986),   # MOV.UR     → STG.E
     (0x221, 0x986),   # FADD       → STG.E
     (0x235, 0x986),   # IADD.64    → STG.E
+    # FG-4.2 additions: GPU-runtime evidence from the FG-4.0
+    # adversarial harness false-positive replay + dedicated
+    # microbenchmarks in probe_work/fg42_evidence_harness.py.
+    # Each entry is confirmed by BOTH a PTXAS cubin that emits the
+    # pair at gap=0 AND a GPU runtime output that matches the
+    # Python-computed expected value (non-trivial computation).
+    (0x224, 0x986),   # IMAD.32 → STG.E
+                      # Evidence: f1_mad_acc_mad_lo_u32 replay —
+                      # PTXAS emits the pair at gap=0, OURS and
+                      # PTXAS both produce correct output 1 from
+                      # `mad.lo.u32 r1, r0, r0, r1`.
+    (0x819, 0x986),   # SHF → STG.E
+                      # Evidence: A_shf_stg dedicated probe —
+                      # PTXAS emits the pair at gap=0, consumer
+                      # rbar=0x05 does not carry ALU class bit,
+                      # runtime output 0xABCD << 3 = 351848 matches
+                      # expected.
     # SHF → ISETP R-R: SHF's output forwarded into ISETP compare stage.
     (0x819, 0x20c),   # SHF (R-imm) → ISETP R-R
+    # FG-4.2 addition: IADD.64 self-chain.
+    # Evidence: B_iadd64_chain dedicated probe — PTXAS emits two
+    # consecutive IADD.64 instructions at gap=0 where the second
+    # reads the first's dest pair; consumer rbar=0x01 carries no
+    # class bits; runtime output 3*arg1 matches expected for
+    # arg1 = 0x123456789ABCDEF0.
+    (0x235, 0x235),   # IADD.64 → IADD.64
     # FG-2.5: surfaced by constructive proof engine.
     # IADD.64-UR → IADD3.IMM: IADD.64-UR writes a pair; immediate
     # IADD3 adds a constant to the low half as the second phase of

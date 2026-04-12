@@ -1526,6 +1526,104 @@ def test_inv_adj3_no_false_negatives_introduced():
     )
 
 
+# ===========================================================================
+# FG-4.2 INVARIANTS (AE1, AE2, AE3) — hardware-evidence forwarding pairs
+# ===========================================================================
+#
+# FG-4.2 adds three new entries to _FORWARDING_SAFE_PAIRS backed by
+# GPU-runtime evidence from probe_work/fg42_evidence_harness.py:
+#
+#   (0x224, 0x986)  IMAD.32 → STG.E
+#   (0x819, 0x986)  SHF     → STG.E
+#   (0x235, 0x235)  IADD.64 → IADD.64
+#
+# Each is confirmed by a kernel where PTXAS emits the pair at gap=0
+# AND the GPU runtime output matches a Python-computed expected
+# value (non-trivial computation).  Other FG-4.0 false-positive pairs
+# (LEA→IADD3X, LEA→STG, IMAD.32→IADD3X, SHF→IADD.64) remain
+# conservative because their replay evidence was trivially zero and
+# no dedicated probe could exercise them with a non-zero computation.
+
+
+def test_inv_ae1_fg42_pairs_are_forwarding_safe():
+    """INV AE1: each FG-4.2 evidence-backed pair must be on
+    _FORWARDING_SAFE_PAIRS so the proof engine classifies them as
+    FORWARDING_SAFE instead of VIOLATION.
+    """
+    from sass.scoreboard import _FORWARDING_SAFE_PAIRS
+    confirmed = {
+        (0x224, 0x986),  # IMAD.32 → STG.E
+        (0x819, 0x986),  # SHF     → STG.E
+        (0x235, 0x235),  # IADD.64 → IADD.64
+    }
+    missing = confirmed - _FORWARDING_SAFE_PAIRS
+    assert not missing, (
+        f"INV AE1: FG-4.2 evidence-backed pairs missing from "
+        f"_FORWARDING_SAFE_PAIRS: {missing}"
+    )
+
+
+def test_inv_ae2_nearby_pair_still_conservative():
+    """INV AE2: pairs NOT covered by FG-4.2 evidence must still be
+    flagged as VIOLATION.  We check two adjacent pairs that the
+    harness could NOT validate with non-trivial runtime output:
+
+        (0x211, 0x212)  LEA → IADD3X
+        (0x224, 0x212)  IMAD.32 → IADD3X
+
+    These must NOT be on _FORWARDING_SAFE_PAIRS — adding them
+    without evidence is exactly what FG-4.2 forbids.
+    """
+    from sass.scoreboard import _FORWARDING_SAFE_PAIRS
+    unsupported = {
+        (0x211, 0x212),  # LEA → IADD3X
+        (0x224, 0x212),  # IMAD.32 → IADD3X
+        (0x211, 0x986),  # LEA → STG (replay evidence too weak)
+        (0x819, 0x235),  # SHF → IADD.64 (replay evidence too weak)
+    }
+    leaked = unsupported & _FORWARDING_SAFE_PAIRS
+    assert not leaked, (
+        f"INV AE2: unsupported pairs leaked into _FORWARDING_SAFE_PAIRS "
+        f"without evidence: {leaked}"
+    )
+
+
+def test_inv_ae3_no_false_negatives_from_fg42():
+    """INV AE3: the FG-4.2 additions must not turn any FG-2.5
+    negative-control VIOLATION into SAFE.  Specifically:
+
+      - INV L (IMAD.R-UR → MOV): must still be UNSAFE because
+        the pair is (0xc24, 0x202), not (0x224, 0x986).
+      - INV N (IMAD.WIDE.RR → IADD3): must still be UNSAFE
+        because the pair is (0x225, 0x210).
+
+    Regenerating these as live verify_proof calls guards against
+    any accidental overlap between FG-4.2 entries and existing
+    negative test patterns.
+    """
+    # Re-run INV L hazard
+    instrs_l = _stream(
+        encode_imad_ur(dest=4, src0=3, ur_src=6, src2=2),
+        encode_mov(dest=5, src=4),
+    )
+    report_l = verify_proof(instrs_l)
+    assert not report_l.safe, (
+        "INV AE3: INV L hazard (IMAD.R-UR → MOV) no longer flagged — "
+        "FG-4.2 refinement leaked into an adjacent pair"
+    )
+
+    # Re-run INV N hazard
+    instrs_n = _stream(
+        encode_imad_wide_rr(dest=8, src0=2, src1=3, src2=0xff),
+        encode_iadd3(dest=10, src0=8, src1=11, src2=0xff),
+    )
+    report_n = verify_proof(instrs_n)
+    assert not report_n.safe, (
+        "INV AE3: INV N hazard (IMAD.WIDE.RR → IADD3) no longer "
+        "flagged — FG-4.2 refinement leaked"
+    )
+
+
 def test_inv_adj4_corpus_safe_after_refinement():
     """INV ADJ4: the full corpus remains SAFE after the FG-4.1
     precision refinement — zero VIOLATION / MEMORY_VIOLATION /

@@ -210,6 +210,12 @@ _ALIAS_SLACK = {
         "w1_div_if_else", "w1_div_multi_guard",
         "w1_div_pred_store", "w1_div_load_paths",
     ]},
+    # WEIRD-2 corpus
+    **{k: 3 for k in [
+        "w2_atom_and_reduce", "w2_loop_atom_add",
+        "w2_div_loop", "w2_nested_loop",
+        "w2_pred_load", "w2_multi_store", "w2_deep_pred", "w2_loop_mul",
+    ]},
 }
 
 

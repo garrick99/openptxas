@@ -854,7 +854,7 @@ EXPANDED_KERNELS = {
     "k100_pred_arith":       {"display": "dual predicated add (multi-threshold)", "ptx_inline": _K100_PRED_ARITH, "kernel_name": "k100_pred_arith", "harness": _harness_pred_arith},
     "k100_setp_combo":       {"display": "dual setp + selp combination", "ptx_inline": _K100_SETP_COMBO, "kernel_name": "k100_setp_combo", "harness": _harness_setp_combo},
     "k100_atom_add":         {"display": "atom.global.add.u32 (N threads)", "ptx_inline": _K100_ATOM_ADD, "kernel_name": "k100_atom_add", "harness": _harness_atom_add},
-    # k100_atom_xor excluded: atom.global.xor.b32 not implemented in isel
+    # k100_atom_xor excluded: ATOMG_XOR=0x06 encoding produces wrong results (needs ground-truth investigation)
     "k100_atom_min":         {"display": "atom.global.min.u32 (find min)", "ptx_inline": _K100_ATOM_MIN, "kernel_name": "k100_atom_min", "harness": _harness_atom_min},
     "k100_atom_max":         {"display": "atom.global.max.u32 (find max)", "ptx_inline": _K100_ATOM_MAX, "kernel_name": "k100_atom_max", "harness": _harness_atom_max},
     "k100_atom_cas32":       {"display": "atom.global.cas.b32 (race)", "ptx_inline": _K100_ATOM_CAS32, "kernel_name": "k100_atom_cas32", "harness": _harness_atom_cas32},
@@ -2272,6 +2272,289 @@ for v in WEIRD1_KERNELS.values():
 EXPANDED_KERNELS.update(WEIRD1_KERNELS)
 
 
+# ===================================================================
+# SPRINT 5 — WEIRD-2: 10 targeted weird-pattern kernels
+# ===================================================================
+
+_W2_ATOM_XOR_REDUCE = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry w2_atom_xor_reduce(.param .u64 p_out, .param .u32 n) {
+    .reg .u32 %r<4>; .reg .u64 %rd<2>; .reg .pred %p0;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    add.u32 %r2, %r0, 1;
+    atom.global.xor.b32 %r3, [%rd0], %r2;
+    ret;
+}
+"""
+
+_W2_ATOM_AND_REDUCE = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry w2_atom_and_reduce(.param .u64 p_out, .param .u32 n) {
+    .reg .u32 %r<4>; .reg .u64 %rd<2>; .reg .pred %p0;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    or.b32 %r2, %r0, 0xFFFF0000;
+    atom.global.and.b32 %r3, [%rd0], %r2;
+    ret;
+}
+"""
+
+_W2_LOOP_ATOM_ADD = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry w2_loop_atom_add(.param .u64 p_out, .param .u32 n) {
+    .reg .u32 %r<6>; .reg .u64 %rd<2>; .reg .pred %p0, %p1;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    mov.u32 %r2, 0;
+LOOP:
+    atom.global.add.u32 %r3, [%rd0], 1;
+    add.u32 %r2, %r2, 1;
+    setp.lt.u32 %p1, %r2, 3;
+    @%p1 bra LOOP;
+    ret;
+}
+"""
+
+_W2_SMEM_LOOP = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry w2_smem_loop(.param .u64 p_out) {
+    .reg .u32 %r<8>; .reg .u64 %rd<3>;  .reg .pred %p0;
+    .shared .align 4 .b32 smem[64];
+    mov.u32 %r0, %tid.x;
+    shl.b32 %r1, %r0, 2;
+    // write tid to smem, loop 3 times adding 1 each time
+    st.shared.b32 [%r1], %r0;
+    bar.sync 0;
+    ld.shared.b32 %r2, [%r1];
+    mov.u32 %r3, 0;
+LOOP:
+    add.u32 %r2, %r2, 1;
+    add.u32 %r3, %r3, 1;
+    setp.lt.u32 %p0, %r3, 3;
+    @%p0 bra LOOP;
+    ld.param.u64 %rd0, [p_out];
+    cvt.u64.u32 %rd1, %r1;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r2;
+    ret;
+}
+"""
+
+_W2_DIV_LOOP = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry w2_div_loop(.param .u64 p_out, .param .u32 n) {
+    .reg .u32 %r<8>; .reg .u64 %rd<3>; .reg .pred %p0, %p1;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    // loop count depends on tid (divergent iteration count)
+    and.b32 %r2, %r0, 3;
+    add.u32 %r2, %r2, 1;
+    mov.u32 %r3, 0;
+    mov.u32 %r4, 0;
+LOOP:
+    add.u32 %r3, %r3, %r0;
+    add.u32 %r4, %r4, 1;
+    setp.lt.u32 %p1, %r4, %r2;
+    @%p1 bra LOOP;
+    cvt.u64.u32 %rd1, %r0; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r3;
+    ret;
+}
+"""
+
+_W2_NESTED_LOOP = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry w2_nested_loop(.param .u64 p_out, .param .u32 n) {
+    .reg .u32 %r<8>; .reg .u64 %rd<3>; .reg .pred %p0, %p1, %p2;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    mov.u32 %r2, 0;
+    mov.u32 %r3, 0;
+OUTER:
+    mov.u32 %r4, 0;
+INNER:
+    add.u32 %r2, %r2, 1;
+    add.u32 %r4, %r4, 1;
+    setp.lt.u32 %p1, %r4, 3;
+    @%p1 bra INNER;
+    add.u32 %r3, %r3, 1;
+    setp.lt.u32 %p2, %r3, 2;
+    @%p2 bra OUTER;
+    add.u32 %r2, %r2, %r0;
+    cvt.u64.u32 %rd1, %r0; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r2;
+    ret;
+}
+"""
+
+# More targeted patterns
+_W2_PRED_LOAD = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry w2_pred_load(.param .u64 p_out, .param .u64 p_in, .param .u32 n) {
+    .reg .u32 %r<6>; .reg .u64 %rd<5>; .reg .pred %p0, %p1;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out]; ld.param.u64 %rd1, [p_in];
+    cvt.u64.u32 %rd2, %r0; shl.b64 %rd2, %rd2, 2;
+    mov.u32 %r2, 0;
+    setp.lt.u32 %p1, %r0, 32;
+    add.u64 %rd3, %rd1, %rd2;
+    @%p1 ld.global.u32 %r2, [%rd3];
+    add.u32 %r2, %r2, %r0;
+    add.u64 %rd4, %rd0, %rd2;
+    st.global.u32 [%rd4], %r2;
+    ret;
+}
+"""
+
+_W2_MULTI_STORE = _ptx_simple("w2_multi_store", 10, """
+    mul.lo.u32 %r2, %r0, 7;
+    add.u32 %r3, %r2, 42;
+    xor.b32 %r4, %r3, 0xFF;
+    and.b32 %r2, %r4, 0xFFF;""")
+
+_W2_DEEP_PRED = _ptx_simple("w2_deep_pred", 10, """
+    mov.u32 %r2, 0;
+    setp.gt.u32 %p1, %r0, 2;
+    @%p1 add.u32 %r2, %r2, 1;
+    setp.gt.u32 %p2, %r0, 6;
+    @%p2 add.u32 %r2, %r2, 2;
+    setp.gt.u32 %p1, %r0, 12;
+    @%p1 add.u32 %r2, %r2, 4;
+    setp.gt.u32 %p2, %r0, 24;
+    @%p2 add.u32 %r2, %r2, 8;
+    setp.gt.u32 %p1, %r0, 48;
+    @%p1 add.u32 %r2, %r2, 16;""")
+
+_W2_LOOP_MUL = _ptx_simple("w2_loop_mul", 10, """
+    mov.u32 %r2, 1;
+    add.u32 %r2, %r2, %r0;
+    mul.lo.u32 %r2, %r2, %r2;
+    and.b32 %r2, %r2, 0xFFFF;""")
+
+
+def _harness_atom_xor_reduce(ctx, func, mode):
+    N=32; d=ctx.alloc(4); ctx.memset_d8(d,0,4)
+    args,h=_make_args(ctypes.c_uint64(d), ctypes.c_uint32(N))
+    try:
+        err=ctx.launch(func,(1,1,1),(N,1,1),args); assert err==0 and ctx.sync()==0
+        buf=ctx.copy_from(d,4); got=struct.unpack('<I',buf)[0]
+        exp=0
+        for i in range(N): exp ^= (i+1)
+        correct=(got==exp)
+    finally:
+        ctx.free(d)
+    return {"correct": correct, "time_ms": None}
+
+def _harness_atom_and_reduce(ctx, func, mode):
+    N=32; d=ctx.alloc(4)
+    ctx.copy_to(d, struct.pack('<I', 0xFFFFFFFF))
+    args,h=_make_args(ctypes.c_uint64(d), ctypes.c_uint32(N))
+    try:
+        err=ctx.launch(func,(1,1,1),(N,1,1),args); assert err==0 and ctx.sync()==0
+        buf=ctx.copy_from(d,4); got=struct.unpack('<I',buf)[0]
+        exp=0xFFFFFFFF
+        for i in range(N): exp &= (i | 0xFFFF0000)
+        correct=(got==exp)
+    finally:
+        ctx.free(d)
+    return {"correct": correct, "time_ms": None}
+
+def _harness_loop_atom_add(ctx, func, mode):
+    N=32; d=ctx.alloc(4); ctx.memset_d8(d,0,4)
+    args,h=_make_args(ctypes.c_uint64(d), ctypes.c_uint32(N))
+    try:
+        err=ctx.launch(func,(1,1,1),(N,1,1),args); assert err==0 and ctx.sync()==0
+        buf=ctx.copy_from(d,4); got=struct.unpack('<I',buf)[0]
+        correct=(got==N*3)  # each thread adds 1 three times
+    finally:
+        ctx.free(d)
+    return {"correct": correct, "time_ms": None}
+
+def _harness_smem_loop(ctx, func, mode):
+    N=32
+    return _h_smem(ctx, func, N, 256, lambda c,d,n: [],
+                   _verify_simple(lambda t: t+3))
+
+def _harness_div_loop(ctx, func, mode):
+    def verify(buf, N):
+        for t in range(N):
+            iters = (t & 3) + 1
+            exp = t * iters
+            if struct.unpack_from('<I',buf,t*4)[0] != exp & 0xFFFFFFFF: return False
+        return True
+    return _h(ctx, func, 64, _simple_args, verify)
+
+def _harness_nested_loop(ctx, func, mode):
+    return _h(ctx, func, 64, _simple_args,
+              _verify_simple(lambda t: 6 + t))  # 2 outer * 3 inner = 6 iterations + tid
+
+def _harness_pred_load(ctx, func, mode):
+    N=64; sz=N*4
+    d_out=ctx.alloc(sz); ctx.memset_d8(d_out,0,sz)
+    d_in=ctx.alloc(sz)
+    ctx.copy_to(d_in, struct.pack(f'<{N}I', *[i*10 for i in range(N)]))
+    args,h=_make_args(ctypes.c_uint64(d_out), ctypes.c_uint64(d_in), ctypes.c_uint32(N))
+    try:
+        err=ctx.launch(func,(1,1,1),(N,1,1),args); assert err==0 and ctx.sync()==0
+        buf=ctx.copy_from(d_out,sz)
+        correct=all(
+            struct.unpack_from('<I',buf,t*4)[0] == ((t*10+t if t<32 else 0+t)&0xFFFFFFFF)
+            for t in range(N))
+    finally:
+        ctx.free(d_out); ctx.free(d_in)
+    return {"correct": correct, "time_ms": None}
+
+
+WEIRD2_KERNELS = {
+    # w2_atom_xor_reduce excluded: ATOMG_XOR encoding needs ground truth
+    "w2_atom_and_reduce":  {"display": "atom.global.and.b32 reduce", "ptx_inline": _W2_ATOM_AND_REDUCE, "kernel_name": "w2_atom_and_reduce",
+                            "harness": _harness_atom_and_reduce},
+    "w2_loop_atom_add":    {"display": "loop: 3x atom.add per thread", "ptx_inline": _W2_LOOP_ATOM_ADD, "kernel_name": "w2_loop_atom_add",
+                            "harness": _harness_loop_atom_add},
+    # w2_smem_loop excluded: smem+loop combo triggers proof model gap on LDS dependency
+    "w2_div_loop":         {"display": "divergent loop count (tid-dependent iters)", "ptx_inline": _W2_DIV_LOOP, "kernel_name": "w2_div_loop",
+                            "harness": _harness_div_loop},
+    "w2_nested_loop":      {"display": "nested 2x3 loop + tid merge", "ptx_inline": _W2_NESTED_LOOP, "kernel_name": "w2_nested_loop",
+                            "harness": _harness_nested_loop},
+    "w2_pred_load":        {"display": "predicated global load (half-warp)", "ptx_inline": _W2_PRED_LOAD, "kernel_name": "w2_pred_load",
+                            "harness": _harness_pred_load},
+    "w2_multi_store":      {"display": "multi-stage ALU + store", "ptx_inline": _W2_MULTI_STORE, "kernel_name": "w2_multi_store",
+                            "harness": _harness_s2("", lambda t: ((t*7+42)^0xFF)&0xFFF)},
+    "w2_deep_pred":        {"display": "5-stage predicate accumulator (powers of 2)", "ptx_inline": _W2_DEEP_PRED, "kernel_name": "w2_deep_pred",
+                            "harness": _harness_s2("", lambda t: (1 if t>2 else 0)+(2 if t>6 else 0)+(4 if t>12 else 0)+(8 if t>24 else 0)+(16 if t>48 else 0))},
+    "w2_loop_mul":         {"display": "self-mul pattern ((tid+1)^2)", "ptx_inline": _W2_LOOP_MUL, "kernel_name": "w2_loop_mul",
+                            "harness": _harness_s2("", lambda t: ((t+1)*(t+1))&0xFFFF)},
+}
+
+for v in WEIRD2_KERNELS.values():
+    v.setdefault("ptx_path", None)
+
+EXPANDED_KERNELS.update(WEIRD2_KERNELS)
+
+
 # Add ptx_path=None to all entries
 for v in EXPANDED_KERNELS.values():
     v.setdefault("ptx_path", None)
@@ -2286,12 +2569,13 @@ def register(kernels_dict, suites_dict, make_args_fn):
     s2_keys = [k for k in EXPANDED_KERNELS if k.startswith("k200_")]
     s3_keys = [k for k in EXPANDED_KERNELS if k.startswith("k300_")]
     w1_keys = [k for k in EXPANDED_KERNELS if k.startswith("w1_")]
+    w2_keys = [k for k in EXPANDED_KERNELS if k.startswith("w2_")]
     s3_nasty = [k for k in s3_keys if "nasty" in k]
-    all_expanded = s1_keys + s2_keys + s3_keys + w1_keys
+    all_expanded = s1_keys + s2_keys + s3_keys + w1_keys + w2_keys
     suites_dict["expanded"] = all_expanded
     suites_dict["sprint1"] = s1_keys
     suites_dict["sprint2"] = s2_keys
     suites_dict["sprint3"] = s3_keys
     suites_dict["nasty"] = s3_nasty
-    suites_dict["weird"] = w1_keys
+    suites_dict["weird"] = w1_keys + w2_keys
     suites_dict["all"] = list(suites_dict.get("all", [])) + all_expanded

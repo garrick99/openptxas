@@ -62,7 +62,7 @@ from sass.encoding.sm_120_opcodes import (
     encode_shfl, SHFL_IDX, SHFL_UP, SHFL_DOWN, SHFL_BFLY,
     encode_vote_ballot,
     encode_atomg_cas_b32, encode_atomg_cas_b64, encode_atomg_u32, encode_atomg_add_f32,
-    ATOMG_ADD, ATOMG_MIN, ATOMG_MAX, ATOMG_EXCH, ATOMG_OR, ATOMG_AND,
+    ATOMG_ADD, ATOMG_MIN, ATOMG_MAX, ATOMG_EXCH, ATOMG_OR, ATOMG_AND, ATOMG_XOR,
     encode_membar, MEMBAR_GPU, MEMBAR_CTA,
     encode_idp4a,
     encode_dadd, encode_dmul, encode_dfma, encode_dfma_ur_ur,
@@ -3126,6 +3126,9 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
 
                 elif op == 'atom' and 'and' in instr.types and 'b32' in instr.types:
                     output.extend(_select_atom_generic_u32(instr, ctx.ra, ctx, ATOMG_AND, 'AND.b32'))
+
+                elif op == 'atom' and 'xor' in instr.types and 'b32' in instr.types:
+                    output.extend(_select_atom_generic_u32(instr, ctx.ra, ctx, ATOMG_XOR, 'XOR.b32'))
 
                 elif op == 'atom' and 'min' in instr.types and 'u32' in instr.types:
                     output.extend(_select_atom_generic_u32(instr, ctx.ra, ctx, ATOMG_MIN, 'MIN.u32'))

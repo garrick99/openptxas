@@ -184,17 +184,21 @@ _EXPECTED_COUNTS = {
     #     (STG-consumer edges and LDCU.32 edges).
     "diag":                  (4, 0, 0, 0, 0, 1, 0, 0, 3, 0, 0, 0, 0),
     "diag3":                 (4, 0, 0, 0, 0, 1, 0, 0, 2, 1, 0, 0, 0),
-    "min_store_guarded":     (5, 0, 0, 0, 0, 1, 0, 0, 4, 0, 0, 0, 0),
-    "probe_fresh":           (5, 0, 0, 0, 0, 1, 0, 0, 4, 0, 0, 0, 0),
+    # FG-4.4 drift: the bug-1 fix moves one u64 param from UR to GPR
+    # (LDC.64 direct) on kernels where the param register is redefined
+    # later.  That adds one MEMORY_SCOREBOARD_SAFE edge for the new
+    # LDC.64 → consumer chain and shifts one UR_MEMORY_* edge.
+    "min_store_guarded":     (5, 0, 0, 0, 0, 2, 0, 0, 2, 1, 0, 0, 0),
+    "probe_fresh":           (5, 0, 0, 0, 0, 2, 0, 0, 2, 1, 0, 0, 0),
     "reduce_sum":            (18, 4, 6, 0, 0, 3, 0, 0, 4, 0, 1, 0, 0),
     "conv2d_looped":         (109, 10, 0, 0, 0, 63, 0, 0, 36, 0, 0, 0, 0),
     "conv2d_unrolled":       (91, 1, 8, 0, 0, 47, 0, 0, 35, 0, 0, 0, 0),
-    "fg21:k_ge":             (5, 0, 0, 0, 0, 1, 0, 0, 4, 0, 0, 0, 0),
-    "fg21:k_lt":             (5, 0, 0, 0, 0, 1, 0, 0, 4, 0, 0, 0, 0),
-    "fg21:k_gt":             (5, 0, 0, 0, 0, 1, 0, 0, 4, 0, 0, 0, 0),
-    "fg21:k_le":             (5, 0, 0, 0, 0, 1, 0, 0, 4, 0, 0, 0, 0),
-    "fg21:k_eq":             (5, 0, 0, 0, 0, 1, 0, 0, 4, 0, 0, 0, 0),
-    "fg21:k_ne":             (5, 0, 0, 0, 0, 1, 0, 0, 4, 0, 0, 0, 0),
+    "fg21:k_ge":             (5, 0, 0, 0, 0, 2, 0, 0, 2, 1, 0, 0, 0),
+    "fg21:k_lt":             (5, 0, 0, 0, 0, 2, 0, 0, 2, 1, 0, 0, 0),
+    "fg21:k_gt":             (5, 0, 0, 0, 0, 2, 0, 0, 2, 1, 0, 0, 0),
+    "fg21:k_le":             (5, 0, 0, 0, 0, 2, 0, 0, 2, 1, 0, 0, 0),
+    "fg21:k_eq":             (5, 0, 0, 0, 0, 2, 0, 0, 2, 1, 0, 0, 0),
+    "fg21:k_ne":             (5, 0, 0, 0, 0, 2, 0, 0, 2, 1, 0, 0, 0),
 }
 
 
@@ -1624,6 +1628,94 @@ def test_inv_af2_shf_iadd64_still_conservative():
         "INV AF2: (0x819, 0x235) SHF→IADD.64 leaked into "
         "_FORWARDING_SAFE_PAIRS without evidence"
     )
+
+
+def test_fg44_bug2_mad_lo_immediate():
+    """FG-4.4 Bug 2: mad.lo.u32 with immediate src1 and/or src2 used
+    to drop operands silently.  `mad.lo.u32 %r1, %r0, 3, 7` was the
+    minimal repro — OURS produced 0 instead of r0*3+7.  Root cause:
+    (a) src2 ImmOp was replaced by RZ without materializing the
+    immediate; (b) the literal-pool slot for src1 was placed adjacent
+    to the param area and zeroed by the CUDA driver at launch.  Fix:
+    use encode_imad_r_imm (inline 16-bit immediate) for small imm
+    multipliers, and materialize src2 immediate via _materialize_imm.
+
+    This is a compile-only regression — the runtime correctness check
+    lives in probe_work/ (not runnable under unit tests that avoid
+    GPU launches).  Here we only verify the kernel builds.
+    """
+    from benchmarks.bench_util import compile_openptxas
+    ptx = """
+.version 8.8
+.target sm_120
+.address_size 64
+
+.visible .entry k_fg44_bug2(.param .u64 out, .param .u32 a) {
+    .reg .u32 %r<4>;
+    .reg .u64 %rd<2>;
+    ld.param.u64 %rd0, [out];
+    ld.param.u32 %r0, [a];
+    mad.lo.u32 %r1, %r0, 3, 7;
+    st.global.u32 [%rd0], %r1;
+    ret;
+}
+"""
+    cubin, _ = compile_openptxas(ptx)
+    assert len(cubin) > 0
+    # Sanity check: the cubin should contain an IMAD R-imm (0x824)
+    # rather than LDCU.32 → IMAD R-UR for the mad.lo pattern.
+    import struct as _s
+    e_shoff = _s.unpack_from('<Q', cubin, 40)[0]
+    e_shnum = _s.unpack_from('<H', cubin, 60)[0]
+    e_shstrndx = _s.unpack_from('<H', cubin, 62)[0]
+    stoff = _s.unpack_from('<Q', cubin, e_shoff + e_shstrndx * 64 + 24)[0]
+    found_imad_r_imm = False
+    for i in range(e_shnum):
+        base = e_shoff + i * 64
+        nm = _s.unpack_from('<I', cubin, base)[0]
+        end = cubin.index(0, stoff + nm)
+        name = cubin[stoff + nm:end]
+        if name.startswith(b'.text.'):
+            off = _s.unpack_from('<Q', cubin, base + 24)[0]
+            sz = _s.unpack_from('<Q', cubin, base + 32)[0]
+            for k in range(sz // 16):
+                raw = cubin[off + k*16 : off + k*16 + 16]
+                opc = raw[0] | ((raw[1] & 0xF) << 8)
+                if opc == 0x824:
+                    found_imad_r_imm = True
+            break
+    assert found_imad_r_imm, (
+        "FG-4.4 Bug 2 regression: kernel did not emit IMAD R-imm "
+        "(0x824) — the inline-immediate fix was bypassed"
+    )
+
+
+def test_fg44_bug1_duplicate_ldparam_u64():
+    """FG-4.4 Bug 1: a kernel that loads the same u64 param into
+    two different vregs AND redefines one of them via add.u64 used
+    to raise KeyError('%rd2') in the regalloc → isel path.  The
+    fix in _select_ld_param routes a GPR-allocated u64 param
+    through LDC.64 (direct-to-GPR) instead of the UR path, so the
+    subsequent add.u64 can resolve both operands.
+    """
+    from benchmarks.bench_util import compile_openptxas
+    ptx = """
+.version 8.8
+.target sm_120
+.address_size 64
+
+.visible .entry k_fg44_bug1(.param .u64 arg0) {
+    .reg .u64 %rd<4>;
+    ld.param.u64 %rd1, [arg0];
+    ld.param.u64 %rd2, [arg0];
+    add.u64 %rd1, %rd1, %rd2;
+    st.global.u64 [%rd1], %rd1;
+    ret;
+}
+"""
+    # Must not raise.  Produces a valid cubin.
+    cubin, _ = compile_openptxas(ptx)
+    assert len(cubin) > 0
 
 
 def test_inv_af3_no_false_negatives_from_fg43():

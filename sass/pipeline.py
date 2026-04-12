@@ -614,7 +614,17 @@ def compile_function(fn: Function, verbose: bool = False,
         )
     else:
         last_param_end = param_base
-    lit_pool_base = (last_param_end + 3) & ~3  # 4-byte align
+    # FG-4.4 Bug 2 investigation found that the CUDA driver zeroes a
+    # region of cbuf[0] past the last declared param (observed up to
+    # at least 32 bytes past param_base).  Any 32-bit literal placed
+    # adjacent to the params is overwritten at launch and the LDCU.32
+    # that loads it reads 0.  The fix at the isel site is to prefer
+    # encode_imad_r_imm (opcode 0x824, inline 16-bit imm) over the
+    # LDCU.32 + IMAD R-UR path for small immediates — that sidesteps
+    # the literal pool entirely.  Large immediates (> 0xffff) still
+    # need a literal; 32-byte alignment is enough to keep them past
+    # the driver's pad region.
+    lit_pool_base = (last_param_end + 31) & ~31
 
     # Reserve a dedicated even-aligned scratch pair for UR→GPR address
     # materializations (ld.global / st.global with pointer-only params).
@@ -1242,9 +1252,17 @@ def compile_function(fn: Function, verbose: bool = False,
     # Compute constant bank size: param area + literal pool
     total_param_bytes = sum(param_sizes)
     param_area_end = ((param_base + total_param_bytes + 3) // 4) * 4
-    # Add literal pool entries (4 bytes each)
+    # Add literal pool entries (4 bytes each) — the pool starts at
+    # lit_pool_base, which is 16-byte aligned past the params (FG-4.4
+    # Bug 2 fix).  const0_size must therefore extend to lit_pool_base
+    # + lit_pool_bytes, not just param_area_end + lit_pool_bytes,
+    # otherwise the literal slots at the aligned offset overflow the
+    # const section buffer.
     lit_pool_bytes = len(ctx._const_pool) * 4
-    const0_size = ((param_area_end + lit_pool_bytes + 3) // 4) * 4
+    if lit_pool_bytes > 0:
+        const0_size = ((lit_pool_base + lit_pool_bytes + 3) // 4) * 4
+    else:
+        const0_size = param_area_end
 
     # Build const0 init data: zeros throughout, literal values at pool offsets
     const0_init: bytearray | None = None

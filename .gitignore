@@ -25,6 +25,7 @@ __pycache__/
 probe_work/*
 !probe_work/fg40_adversarial_harness.py
 !probe_work/fg42_evidence_harness.py
+!probe_work/fg45_shf_iadd64_probe.py
 
 # Local machine-specific junction (points to ptxas repro files)
 ptxas_bug/

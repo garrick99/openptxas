@@ -1273,12 +1273,20 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
             # The deferred LDCU.64 would execute unconditionally (warp-wide) but
             # the consumer is predicated — UR/GPR conflicts across paths.
             # Fall back to LDC pair for predicated params.
-            if instr.pred:
+            #
+            # FG-4.4 Bug 1 fix: if the allocator has already given this
+            # param register a GPR (dest.name in ra.int_regs), the
+            # register is being redefined later (u64_def_count > 1 path
+            # in regalloc.py) and cannot participate in the UR-bound
+            # code path — later consumers via _select_add_u64 would
+            # see a stale ur_params entry AND a ra.lo() lookup would
+            # KeyError.  Route directly to the GPR via LDC.64.
+            if instr.pred or dest.name in ra.int_regs:
                 dr = ctx.ra.lo(dest.name)
                 ctx._gpr_written.add(dest.name)
                 return [
                     SassInstr(encode_ldc_64(dr, 0, byte_off),
-                              f'LDC.64 R{dr}, c[0][0x{byte_off:x}]  // {param_name} (divergent fallback)'),
+                              f'LDC.64 R{dr}, c[0][0x{byte_off:x}]  // {param_name} (GPR direct)'),
                 ]
             # Preamble preload: assign UR pair, record for preamble emission.
             # The LDCU is emitted by compile_function in the preamble window.
@@ -4158,10 +4166,34 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     d = ctx.ra.r32(instr.dest.name)
                     a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     c_op = instr.srcs[2] if len(instr.srcs) > 2 else None
-                    c = ctx.ra.r32(c_op.name) if isinstance(c_op, RegOp) else RZ
+                    # FG-4.4 Bug 2 fix: if src2 is an immediate, it was
+                    # silently replaced with RZ here and the +src2
+                    # addend was lost.  Materialize the immediate into
+                    # a scratch GPR first and use that as the c operand.
+                    if isinstance(c_op, RegOp):
+                        c = ctx.ra.r32(c_op.name)
+                    elif isinstance(c_op, ImmOp):
+                        if (c_op.value & 0xFFFFFFFF) == 0:
+                            c = RZ
+                        else:
+                            c = _materialize_imm(c_op, ctx, ctx.ra, output)
+                    else:
+                        c = RZ
                     if isinstance(instr.srcs[1], ImmOp):
-                        # Immediate multiplier: IMAD.SHL if power-of-2, else LDCU+IMAD R-UR
+                        # FG-4.4 Bug 2 fix: for 16-bit-fitting immediate
+                        # multipliers, use encode_imad_r_imm (opcode
+                        # 0x824, `IMAD dest, src0, imm16, src2`) which
+                        # encodes the immediate inline in b4:b5.  This
+                        # avoids the literal-pool + LDCU.32 path that
+                        # was broken by the CUDA driver zeroing literals
+                        # placed adjacent to the param area.
+                        #
+                        # Power-of-2 shortcut via IMAD.SHL.U32 is kept
+                        # for its IADD3 fast path; the LDCU literal
+                        # pool path is retired for immediates <= 0xffff
+                        # and only used for imm > 0xffff.
                         imm = instr.srcs[1].value & 0xFFFFFFFF
+                        from sass.encoding.sm_120_opcodes import encode_imad_r_imm as _encode_imad_r_imm
                         if imm > 0 and (imm & (imm - 1)) == 0:
                             shift = imm.bit_length() - 1
                             if shift <= 15:
@@ -4171,14 +4203,21 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 output.append(SassInstr(encode_iadd3(d, t, c, RZ),
                                     f'IADD3 R{d}, R{t}, R{c}, RZ  // mad.lo add'))
                             else:
-                                lit_off = ctx._alloc_literal(imm)
-                                ur_tmp = ctx._next_ur; ctx._next_ur += 1
-                                output.append(SassInstr(encode_ldcu_32(ur_tmp, 0, lit_off),
-                                    f'LDCU.32 UR{ur_tmp}, c[0][0x{lit_off:x}]'))
-                                output.append(_nop('ldcu32->imad gap'))
-                                output.append(SassInstr(encode_imad_ur(d, a, ur_tmp, c),
-                                    f'IMAD R{d}, R{a}, UR{ur_tmp}, R{c}  // mad.lo imm'))
+                                output.append(SassInstr(
+                                    _encode_imad_r_imm(d, a, imm, c),
+                                    f'IMAD R{d}, R{a}, 0x{imm:x}, R{c}  // mad.lo imm (inline)'))
+                        elif imm <= 0xffff:
+                            # Direct inline-immediate IMAD.
+                            output.append(SassInstr(
+                                _encode_imad_r_imm(d, a, imm, c),
+                                f'IMAD R{d}, R{a}, 0x{imm:x}, R{c}  // mad.lo imm (inline)'))
                         else:
+                            # imm > 0xffff: still need the literal-pool
+                            # path.  The lit_pool_base alignment hack in
+                            # pipeline.py ensures the pool is past the
+                            # driver's cbuf-pad region, but for the
+                            # common small-imm case we skip this entirely
+                            # via the inline path above.
                             lit_off = ctx._alloc_literal(imm)
                             ur_tmp = ctx._next_ur; ctx._next_ur += 1
                             output.append(SassInstr(encode_ldcu_32(ur_tmp, 0, lit_off),

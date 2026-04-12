@@ -2208,6 +2208,13 @@ SUITES: dict[str, list[str]] = {
     ],
 }
 
+# KERNEL-100: corpus expansion registration
+try:
+    import workbench_expanded
+    workbench_expanded.register(KERNELS, SUITES, _make_args)
+except ImportError:
+    pass  # expanded kernels not available (optional)
+
 
 def classify_kernel(result: dict) -> str:
     """Bucket a kernel result into PARITY / NATIVE_WIN / GAP / NO_COMPARE."""

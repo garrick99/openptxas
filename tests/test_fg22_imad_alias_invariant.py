@@ -163,6 +163,21 @@ _ALIAS_SLACK = {
     "ilp_unrolled_sum4": 2,
     "ilp_pipeline_load": 2,
     "ilp_pred_alu": 1,
+    # KERNEL-100 expanded corpus: IMAD.WIDE address fusion + mul.lo IMAD
+    # use dest-aliased patterns.  Safe per 32-bit-read / 64-bit-pair-write
+    # semantics (IMAD.WIDE) and FG-2.2 audit (IMAD R-imm).
+    # GPU correctness verified for every kernel.  Slack=2 covers up to
+    # two aliased IMADs (mul+addr fusion).
+    **{k: 2 for k in [
+        "k100_add_sub_chain", "k100_xor_and_or", "k100_imm_heavy",
+        "k100_mul_xor", "k100_mixed_32_64", "k100_ldg_add_stg",
+        "k100_dual_load", "k100_load_shift_store", "k100_addr_independent",
+        "k100_guarded_store", "k100_early_exit", "k100_if_else_merge",
+        "k100_pred_arith", "k100_setp_combo", "k100_shfl_down",
+        "k100_shfl_up", "k100_shfl_xor", "k100_redux_and",
+        "k100_atom_add", "k100_atom_min",
+        "k100_atom_max", "k100_atom_cas32", "k100_add64_chain",
+    ]},
 }
 
 

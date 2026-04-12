@@ -2395,10 +2395,14 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     if isinstance(instr.srcs[1], ImmOp):
                         imm = instr.srcs[1].value & 0xFFFFFFFF
                         lit_off = ctx._alloc_literal(imm)
-                        output.append(SassInstr(encode_ldc(d, 0, lit_off),
-                                                f'LDC R{d}, c[0][0x{lit_off:x}]  // sub imm={imm:#x}'))
-                        output.append(SassInstr(encode_iadd3(d, a, d, RZ, negate_src1=True),
-                                                f'IADD3 R{d}, R{a}, -R{d}, RZ  // sub.{typ} imm'))
+                        # KERNEL-100.1 bugfix: when d==a, loading the literal
+                        # into d clobbers the source before IADD3 reads it.
+                        # Use a scratch register for the literal in that case.
+                        lit_reg = d if d != a else _alloc_gpr(ctx)
+                        output.append(SassInstr(encode_ldc(lit_reg, 0, lit_off),
+                                                f'LDC R{lit_reg}, c[0][0x{lit_off:x}]  // sub imm={imm:#x}'))
+                        output.append(SassInstr(encode_iadd3(d, a, lit_reg, RZ, negate_src1=True),
+                                                f'IADD3 R{d}, R{a}, -R{lit_reg}, RZ  // sub.{typ} imm'))
                     else:
                         b = ctx.ra.r32(instr.srcs[1].name)
                         output.append(SassInstr(encode_iadd3(d, a, b, RZ, negate_src1=True),

@@ -1209,24 +1209,28 @@ def schedule(instrs: list[SassInstr]) -> list[SassInstr]:
     instrs = _enforce_gpr_latency(instrs)
     instrs = _fill_ldcu_latency(instrs)
     instrs = _enforce_gpr_latency(instrs)  # re-check after fill reordering
-    # PERF-2: _remove_forwarding_safe_nops is STRUCTURALLY CORRECT for
-    # its single-edge forwarding model (operand-role-aware, evidence-
-    # backed) but CANNOT be safely enabled because body-NOPs often
-    # serve dual purposes:
-    #   1. Guard the explicit ALU RAW edge they were inserted for
-    #   2. Implicitly buffer preceding memory-load scoreboard waits
-    # Removing the NOP solves (1) via forwarding but exposes (2),
-    # causing LDG results to be read before they commit.
+    # PERF-2/PERF-3: NOP removal and local rescheduling passes are
+    # structurally correct but produce zero safe transformations on
+    # the current 21-kernel workbench.  Root causes:
     #
-    # To safely remove NOPs, a future pass would need to verify that
-    # ALL dependencies at the NOP position — not just the ALU RAW
-    # edge — are satisfied after removal.  That requires full multi-
-    # dependency analysis at each candidate NOP, which is effectively
-    # a complete rescheduling pass.
+    #   1. DUAL-PURPOSE NOPs (PERF-2): body NOPs often guard both an
+    #      explicit ALU RAW edge AND an implicit memory-load
+    #      scoreboard wait.  Single-edge NOP removal is unsafe.
     #
-    # Evidence: FADD→STG data-forwarding is proven safe (FG-2.4) but
-    # removing the NOP in saxpy_multi broke test_4ptr_add because the
-    # NOP was also buffering a preceding LDG→FADD scoreboard wait.
+    #   2. NO FILL CANDIDATES (PERF-3): every body NOP sits
+    #      immediately before a terminal memory op (STG/ATOMG/LDG),
+    #      and every candidate instruction in the [-3,+3] window is
+    #      part of the dependency chain feeding the consumer.  No
+    #      independent instruction exists to fill the NOP slot
+    #      without creating a new RAW/WAW hazard.
+    #
+    #   3. KERNELS TOO LINEAR: the workbench kernels have minimal
+    #      instruction-level parallelism — each body instruction is
+    #      on the critical path.  There are no "free" instructions
+    #      to reorder for latency hiding.
+    #
+    # The infrastructure (_remove_forwarding_safe_nops with operand-
+    # role checks) is preserved for future kernels with more ILP.
     # instrs = _remove_forwarding_safe_nops(instrs)
     # Skip LDG latency NOPs — rely on ctrl wdep for LDG (ptxas pattern)
     # instrs = _reorder_after_ldg(instrs)

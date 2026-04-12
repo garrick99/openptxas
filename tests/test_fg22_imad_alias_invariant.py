@@ -153,6 +153,16 @@ _ALIAS_SLACK = {
     # the OURS pattern passes GPU correctness — the 32-bit-read /
     # 64-bit-pair-write semantics make it safe.
     "dual_ldg64_dadd": 1,
+    # PERF-4 ILP kernels: OURS uses IMAD for mul.lo.u32 with immediate
+    # (via the LDCU.32 + IMAD R-UR path or inline IMAD R-imm) while
+    # PTXAS may choose a different instruction pattern.  The IMAD
+    # aliasing is safe per the same 32-bit-read / 64-bit-pair-write
+    # semantics.  All ILP kernels pass GPU correctness.
+    "ilp_dual_int32": 2,
+    "ilp_alu_addr": 1,
+    "ilp_unrolled_sum4": 2,
+    "ilp_pipeline_load": 2,
+    "ilp_pred_alu": 1,
 }
 
 

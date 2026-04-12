@@ -1383,6 +1383,358 @@ def harness_atom_or(ctx: CUDAContext, func, mode: str) -> dict:
     return {"correct": correct, "time_ms": time_ms}
 
 
+# ===========================================================================
+# PERF-4: ILP benchmark PTX sources + harnesses
+# ===========================================================================
+# Each kernel has TWO or more independent instruction chains so the
+# scheduler has opportunities to fill latency NOPs with useful work
+# from the other chain.  All kernels write out[tid.x] = f(tid.x).
+
+_PTX_ILP_DUAL_INT32 = """
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry ilp_dual_int32(
+    .param .u64 p_out, .param .u32 n)
+{
+    .reg .u32 %r<12>;
+    .reg .u64 %rd<4>;
+    .reg .pred %p0;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    // Chain A: a = ((tid * 3) + 7) ^ 0xABCD
+    mul.lo.u32 %r2, %r0, 3;
+    // Chain B: b = ((tid * 5) + 13) ^ 0x1234  (independent of A)
+    mul.lo.u32 %r5, %r0, 5;
+    add.u32 %r3, %r2, 7;
+    add.u32 %r6, %r5, 13;
+    xor.b32 %r4, %r3, 0xABCD;
+    xor.b32 %r7, %r6, 0x1234;
+    // Merge
+    add.u32 %r8, %r4, %r7;
+    // Store out[tid]
+    cvt.u64.u32 %rd1, %r0; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd1, %rd0, %rd1;
+    st.global.u32 [%rd1], %r8;
+    ret;
+}
+"""
+
+def harness_ilp_dual_int32(ctx, func, _ptxas_func=None):
+    N = 64; sz = N * 4
+    d = ctx.alloc(sz); ctx.memset_d8(d, 0, sz)
+    args, holders = _make_args(ctypes.c_uint64(d), ctypes.c_uint32(N))
+    time_ms = None
+    try:
+        err = ctx.launch(func, (1,1,1), (N,1,1), args)
+        assert err == 0 and ctx.sync() == 0
+        buf = ctx.copy_from(d, sz)
+        correct = True
+        for t in range(N):
+            a = (((t * 3) + 7) ^ 0xABCD) & 0xFFFFFFFF
+            b = (((t * 5) + 13) ^ 0x1234) & 0xFFFFFFFF
+            expected = (a + b) & 0xFFFFFFFF
+            got = struct.unpack_from('<I', buf, t * 4)[0]
+            if got != expected:
+                correct = False; break
+    finally:
+        ctx.free(d)
+    return {"correct": correct, "time_ms": time_ms}
+
+
+_PTX_ILP_DUAL_INT64 = """
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry ilp_dual_int64(
+    .param .u64 p_out, .param .u64 p_a, .param .u64 p_b, .param .u32 n)
+{
+    .reg .u32 %r<4>;
+    .reg .u64 %rd<10>;
+    .reg .pred %p0;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    ld.param.u64 %rd1, [p_a];
+    ld.param.u64 %rd2, [p_b];
+    // Chain A: addr_a = p_a + tid*8, val_a = ld.global.u64 [addr_a]
+    cvt.u64.u32 %rd3, %r0; shl.b64 %rd4, %rd3, 3;
+    add.u64 %rd5, %rd1, %rd4;
+    // Chain B: addr_b = p_b + tid*8 (independent)
+    add.u64 %rd6, %rd2, %rd4;
+    // Both loads independent
+    ld.global.u64 %rd7, [%rd5];
+    ld.global.u64 %rd8, [%rd6];
+    // Merge: result = val_a + val_b
+    add.u64 %rd9, %rd7, %rd8;
+    // Store out[tid]
+    add.u64 %rd5, %rd0, %rd4;
+    st.global.u64 [%rd5], %rd9;
+    ret;
+}
+"""
+
+def harness_ilp_dual_int64(ctx, func, _ptxas_func=None):
+    N = 32; sz8 = N * 8; sz_out = N * 8
+    a_vals = [i * 100 + 7 for i in range(N)]
+    b_vals = [i * 200 + 13 for i in range(N)]
+    d_a = ctx.alloc(sz8); d_b = ctx.alloc(sz8); d_out = ctx.alloc(sz_out)
+    ctx.copy_to(d_a, struct.pack(f'<{N}Q', *a_vals))
+    ctx.copy_to(d_b, struct.pack(f'<{N}Q', *b_vals))
+    ctx.memset_d8(d_out, 0, sz_out)
+    args, holders = _make_args(ctypes.c_uint64(d_out), ctypes.c_uint64(d_a),
+                               ctypes.c_uint64(d_b), ctypes.c_uint32(N))
+    time_ms = None
+    try:
+        err = ctx.launch(func, (1,1,1), (N,1,1), args)
+        assert err == 0 and ctx.sync() == 0
+        buf = ctx.copy_from(d_out, sz_out)
+        correct = True
+        for t in range(N):
+            expected = a_vals[t] + b_vals[t]
+            got = struct.unpack_from('<Q', buf, t * 8)[0]
+            if got != expected:
+                correct = False; break
+    finally:
+        ctx.free(d_a); ctx.free(d_b); ctx.free(d_out)
+    return {"correct": correct, "time_ms": time_ms}
+
+
+_PTX_ILP_ALU_ADDR = """
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry ilp_alu_addr(
+    .param .u64 p_out, .param .u32 n)
+{
+    .reg .u32 %r<8>;
+    .reg .u64 %rd<4>;
+    .reg .pred %p0;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    // Value chain (independent of address chain)
+    mul.lo.u32 %r2, %r0, 7;
+    add.u32 %r3, %r2, 42;
+    xor.b32 %r4, %r3, 0xFF00;
+    and.b32 %r5, %r4, 0xFFFF;
+    // Address chain (independent of value chain)
+    cvt.u64.u32 %rd1, %r0;
+    shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    // Merge: store
+    st.global.u32 [%rd2], %r5;
+    ret;
+}
+"""
+
+def harness_ilp_alu_addr(ctx, func, _ptxas_func=None):
+    N = 64; sz = N * 4
+    d = ctx.alloc(sz); ctx.memset_d8(d, 0, sz)
+    args, holders = _make_args(ctypes.c_uint64(d), ctypes.c_uint32(N))
+    time_ms = None
+    try:
+        err = ctx.launch(func, (1,1,1), (N,1,1), args)
+        assert err == 0 and ctx.sync() == 0
+        buf = ctx.copy_from(d, sz)
+        correct = True
+        for t in range(N):
+            expected = (((t * 7 + 42) ^ 0xFF00) & 0xFFFF) & 0xFFFFFFFF
+            got = struct.unpack_from('<I', buf, t * 4)[0]
+            if got != expected:
+                correct = False; break
+    finally:
+        ctx.free(d)
+    return {"correct": correct, "time_ms": time_ms}
+
+
+_PTX_ILP_UNROLLED_SUM4 = """
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry ilp_unrolled_sum4(
+    .param .u64 p_out, .param .u64 p_data, .param .u32 n)
+{
+    .reg .u32 %r<8>;
+    .reg .u64 %rd<8>;
+    .reg .f32 %f<8>;
+    .reg .pred %p0;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    ld.param.u64 %rd1, [p_data];
+    // 4 independent loads (4 elements per thread, stride = n)
+    cvt.u64.u32 %rd2, %r0; shl.b64 %rd2, %rd2, 2;
+    add.u64 %rd3, %rd1, %rd2;
+    ld.global.f32 %f0, [%rd3];
+    add.u64 %rd4, %rd3, 256;
+    ld.global.f32 %f1, [%rd4];
+    add.u64 %rd5, %rd4, 256;
+    ld.global.f32 %f2, [%rd5];
+    add.u64 %rd6, %rd5, 256;
+    ld.global.f32 %f3, [%rd6];
+    // 4 independent accumulates (each add is independent)
+    add.f32 %f4, %f0, %f1;
+    add.f32 %f5, %f2, %f3;
+    // Final merge
+    add.f32 %f6, %f4, %f5;
+    // Store
+    add.u64 %rd7, %rd0, %rd2;
+    st.global.f32 [%rd7], %f6;
+    ret;
+}
+"""
+
+def harness_ilp_unrolled_sum4(ctx, func, _ptxas_func=None):
+    N = 64; STRIDE = 256 // 4  # 256 bytes = 64 floats
+    total_elems = N + 3 * STRIDE
+    data = [float(i % 100) for i in range(total_elems)]
+    sz_data = total_elems * 4; sz_out = N * 4
+    d_data = ctx.alloc(sz_data); d_out = ctx.alloc(sz_out)
+    ctx.copy_to(d_data, struct.pack(f'<{total_elems}f', *data))
+    ctx.memset_d8(d_out, 0, sz_out)
+    args, holders = _make_args(ctypes.c_uint64(d_out), ctypes.c_uint64(d_data),
+                               ctypes.c_uint32(N))
+    time_ms = None
+    try:
+        err = ctx.launch(func, (1,1,1), (N,1,1), args)
+        assert err == 0 and ctx.sync() == 0
+        buf = ctx.copy_from(d_out, sz_out)
+        correct = True
+        for t in range(N):
+            expected = data[t] + data[t + STRIDE] + data[t + 2*STRIDE] + data[t + 3*STRIDE]
+            got = struct.unpack_from('<f', buf, t * 4)[0]
+            if abs(got - expected) > 0.01:
+                correct = False; break
+    finally:
+        ctx.free(d_data); ctx.free(d_out)
+    return {"correct": correct, "time_ms": time_ms}
+
+
+_PTX_ILP_PIPELINE_LOAD = """
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry ilp_pipeline_load(
+    .param .u64 p_out, .param .u64 p_x, .param .u64 p_y, .param .u32 n)
+{
+    .reg .u32 %r<4>;
+    .reg .u64 %rd<8>;
+    .reg .f32 %f<6>;
+    .reg .pred %p0;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    ld.param.u64 %rd1, [p_x];
+    ld.param.u64 %rd2, [p_y];
+    cvt.u64.u32 %rd3, %r0; shl.b64 %rd3, %rd3, 2;
+    // Pipeline: issue load A, then load B, then compute A, compute B
+    add.u64 %rd4, %rd1, %rd3;
+    ld.global.f32 %f0, [%rd4];     // load x[tid]
+    add.u64 %rd5, %rd2, %rd3;
+    ld.global.f32 %f1, [%rd5];     // load y[tid] (independent)
+    // Compute on x (while y is in flight)
+    mul.f32 %f2, %f0, 0f40400000;     // 3.0
+    add.f32 %f3, %f2, 0f40E00000;     // 7.0
+    // Compute on y (while x-compute runs)
+    mul.f32 %f4, %f1, 0f40A00000;     // 5.0
+    add.f32 %f5, %f4, 0f41500000;     // 13.0
+    // Merge
+    add.f32 %f2, %f3, %f5;
+    // Store
+    add.u64 %rd6, %rd0, %rd3;
+    st.global.f32 [%rd6], %f2;
+    ret;
+}
+"""
+
+def harness_ilp_pipeline_load(ctx, func, _ptxas_func=None):
+    N = 64; sz = N * 4
+    x = [float(i) for i in range(N)]
+    y = [float(i * 10) for i in range(N)]
+    d_x = ctx.alloc(sz); d_y = ctx.alloc(sz); d_out = ctx.alloc(sz)
+    ctx.copy_to(d_x, struct.pack(f'<{N}f', *x))
+    ctx.copy_to(d_y, struct.pack(f'<{N}f', *y))
+    ctx.memset_d8(d_out, 0, sz)
+    args, holders = _make_args(ctypes.c_uint64(d_out), ctypes.c_uint64(d_x),
+                               ctypes.c_uint64(d_y), ctypes.c_uint32(N))
+    time_ms = None
+    try:
+        err = ctx.launch(func, (1,1,1), (N,1,1), args)
+        assert err == 0 and ctx.sync() == 0
+        buf = ctx.copy_from(d_out, sz)
+        correct = True
+        for t in range(N):
+            expected = (x[t] * 3.0 + 7.0) + (y[t] * 5.0 + 13.0)
+            got = struct.unpack_from('<f', buf, t * 4)[0]
+            if abs(got - expected) > 0.1:
+                correct = False; break
+    finally:
+        ctx.free(d_x); ctx.free(d_y); ctx.free(d_out)
+    return {"correct": correct, "time_ms": time_ms}
+
+
+_PTX_ILP_PRED_ALU = """
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry ilp_pred_alu(
+    .param .u64 p_out, .param .u32 n)
+{
+    .reg .u32 %r<10>;
+    .reg .u64 %rd<4>;
+    .reg .pred %p0, %p1;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    // Chain A: val = tid * 7 + 42
+    mul.lo.u32 %r2, %r0, 7;
+    add.u32 %r3, %r2, 42;
+    // Chain B: flag = (tid > 16)  (independent of A)
+    setp.gt.u32 %p1, %r0, 16;
+    // Chain C: bonus = tid * 3   (independent of A and B)
+    mul.lo.u32 %r4, %r0, 3;
+    // Merge: result = flag ? (val + bonus) : val
+    // Use predicated add instead of selp (selp operand order varies)
+    mov.u32 %r5, %r3;
+    @%p1 add.u32 %r5, %r3, %r4;
+    // Store
+    cvt.u64.u32 %rd1, %r0; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r5;
+    ret;
+}
+"""
+
+def harness_ilp_pred_alu(ctx, func, _ptxas_func=None):
+    N = 64; sz = N * 4
+    d = ctx.alloc(sz); ctx.memset_d8(d, 0, sz)
+    args, holders = _make_args(ctypes.c_uint64(d), ctypes.c_uint32(N))
+    time_ms = None
+    try:
+        err = ctx.launch(func, (1,1,1), (N,1,1), args)
+        assert err == 0 and ctx.sync() == 0
+        buf = ctx.copy_from(d, sz)
+        correct = True
+        for t in range(N):
+            val = (t * 7 + 42) & 0xFFFFFFFF
+            bonus = (t * 3) & 0xFFFFFFFF
+            expected = ((val + bonus) & 0xFFFFFFFF) if t > 16 else val
+            got = struct.unpack_from('<I', buf, t * 4)[0]
+            if got != expected:
+                correct = False; break
+    finally:
+        ctx.free(d)
+    return {"correct": correct, "time_ms": time_ms}
+
+
 # ---------------------------------------------------------------------------
 # Catalog
 # ---------------------------------------------------------------------------
@@ -1535,6 +1887,55 @@ KERNELS: dict[str, dict] = {
         "ptx_inline": _PTX_REDUX_SUM,
         "kernel_name": "redux_sum_kernel",
         "harness": harness_redux_sum,
+    },
+    # =================================================================
+    # PERF-4: ILP benchmark suite
+    # =================================================================
+    # Each kernel has multiple independent instruction chains to
+    # create scheduling opportunities (body latency NOPs that a local
+    # rescheduler could fill with independent work from another chain).
+    # =================================================================
+    "ilp_dual_int32": {
+        "display": "ILP: dual independent u32 chains",
+        "ptx_path": None,
+        "ptx_inline": _PTX_ILP_DUAL_INT32,
+        "kernel_name": "ilp_dual_int32",
+        "harness": harness_ilp_dual_int32,
+    },
+    "ilp_dual_int64": {
+        "display": "ILP: dual independent u64 add chains",
+        "ptx_path": None,
+        "ptx_inline": _PTX_ILP_DUAL_INT64,
+        "kernel_name": "ilp_dual_int64",
+        "harness": harness_ilp_dual_int64,
+    },
+    "ilp_alu_addr": {
+        "display": "ILP: independent ALU value + address chains",
+        "ptx_path": None,
+        "ptx_inline": _PTX_ILP_ALU_ADDR,
+        "kernel_name": "ilp_alu_addr",
+        "harness": harness_ilp_alu_addr,
+    },
+    "ilp_unrolled_sum4": {
+        "display": "ILP: 4-accumulator unrolled sum",
+        "ptx_path": None,
+        "ptx_inline": _PTX_ILP_UNROLLED_SUM4,
+        "kernel_name": "ilp_unrolled_sum4",
+        "harness": harness_ilp_unrolled_sum4,
+    },
+    "ilp_pipeline_load": {
+        "display": "ILP: software-pipelined dual load+compute",
+        "ptx_path": None,
+        "ptx_inline": _PTX_ILP_PIPELINE_LOAD,
+        "kernel_name": "ilp_pipeline_load",
+        "harness": harness_ilp_pipeline_load,
+    },
+    "ilp_pred_alu": {
+        "display": "ILP: independent scalar + predicate chains",
+        "ptx_path": None,
+        "ptx_inline": _PTX_ILP_PRED_ALU,
+        "kernel_name": "ilp_pred_alu",
+        "harness": harness_ilp_pred_alu,
     },
 }
 
@@ -1782,6 +2183,10 @@ SUITES: dict[str, list[str]] = {
         "conv2d_unrolled", "vecadd_large", "multi_ldg",
         "smem_exchange", "atomg_add", "fmax",
     ],
+    "ilp": [
+        "ilp_dual_int32", "ilp_dual_int64", "ilp_alu_addr",
+        "ilp_unrolled_sum4", "ilp_pipeline_load", "ilp_pred_alu",
+    ],
     "all": [
         # Whole catalog (everything)
         "reduce_sum", "conv2d_looped", "conv2d_unrolled",
@@ -1792,6 +2197,9 @@ SUITES: dict[str, list[str]] = {
         # WB-9 frontier
         "smem_cycle", "bar_ldc_xor", "dual_ldg64_dadd",
         "multi_block_atomic", "atom_cas64", "redux_sum",
+        # PERF-4 ILP suite
+        "ilp_dual_int32", "ilp_dual_int64", "ilp_alu_addr",
+        "ilp_unrolled_sum4", "ilp_pipeline_load", "ilp_pred_alu",
     ],
     # WB-9: the 6 new kernels in isolation
     "frontier": [

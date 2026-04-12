@@ -1567,24 +1567,17 @@ def test_inv_ae1_fg42_pairs_are_forwarding_safe():
     )
 
 
-def test_inv_ae2_nearby_pair_still_conservative():
-    """INV AE2: pairs NOT covered by any evidence pass (FG-4.2
-    through FG-4.3) must still be flagged as VIOLATION.  FG-4.3
-    confirmed LEA→IADD3X, LEA→STG, IMAD.32→IADD3X, and (transitively)
-    IADD3X→STG via dedicated non-trivial probes.  The only remaining
-    uncovered pair is (0x819, 0x235) SHF→IADD.64 — probes could not
-    force PTXAS to emit 0x819 for that ALU shape while also producing
-    a Python-matching non-zero output.
+def test_inv_ae2_no_unevidenced_pairs():
+    """INV AE2 (updated FG-4.8): all FG-4.0 adversarial false-positive
+    pairs are now covered by evidence (FG-4.2, FG-4.3, FG-4.8).  No
+    unsupported pairs remain.
     """
+    # This test is preserved as a sentinel: if a future pass adds a
+    # new pair without evidence, add it to the unsupported set here.
     from sass.scoreboard import _FORWARDING_SAFE_PAIRS
-    unsupported = {
-        (0x819, 0x235),  # SHF → IADD.64 — inconclusive in FG-4.3
-    }
+    unsupported: set[tuple[int, int]] = set()  # empty as of FG-4.8
     leaked = unsupported & _FORWARDING_SAFE_PAIRS
-    assert not leaked, (
-        f"INV AE2: unsupported pairs leaked into _FORWARDING_SAFE_PAIRS "
-        f"without evidence: {leaked}"
-    )
+    assert not leaked
 
 
 # ===========================================================================
@@ -1616,17 +1609,17 @@ def test_inv_af1_fg43_pairs_are_forwarding_safe():
     )
 
 
-def test_inv_af2_shf_iadd64_still_conservative():
-    """INV AF2: the SHF→IADD.64 pair (0x819, 0x235) was the one
-    FG-4.3 probe that could NOT be confirmed — PTXAS re-routed
-    through opcode 0x899 instead of 0x819 on every clone shape.
-    The pair must remain OFF the whitelist until a future pass
-    produces direct evidence.
+def test_inv_af2_shf_iadd64_confirmed():
+    """INV AF2 (updated FG-4.8): the SHF→IADD.64 pair (0x819, 0x235)
+    is now CONFIRMED as forwarding-safe by in-place cubin-mutation
+    forensics (see probe_work/fg47_raw_sass_probe.py and the FG-4.8
+    commit message for the full evidence chain).  The pair must be on
+    _FORWARDING_SAFE_PAIRS.
     """
     from sass.scoreboard import _FORWARDING_SAFE_PAIRS
-    assert (0x819, 0x235) not in _FORWARDING_SAFE_PAIRS, (
-        "INV AF2: (0x819, 0x235) SHF→IADD.64 leaked into "
-        "_FORWARDING_SAFE_PAIRS without evidence"
+    assert (0x819, 0x235) in _FORWARDING_SAFE_PAIRS, (
+        "INV AF2 (FG-4.8): (0x819, 0x235) SHF→IADD.64 evidence "
+        "confirmed — must be on _FORWARDING_SAFE_PAIRS"
     )
 
 

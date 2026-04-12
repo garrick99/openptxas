@@ -604,6 +604,20 @@ _FORWARDING_SAFE_PAIRS: set[tuple[int, int]] = {
                       # expected.
     # SHF → ISETP R-R: SHF's output forwarded into ISETP compare stage.
     (0x819, 0x20c),   # SHF (R-imm) → ISETP R-R
+    # FG-4.8: SHF → IADD.64.
+    # Evidence: in-place cubin-mutation forensics on the original
+    # f6_random_s45058_l10 PTXAS cubin (which has SHF at [4] and
+    # IADD.64 at [5] at gap=0).  Replaced S2R with MOV R0=0x42,
+    # then compared three variants:
+    #   SHF shift=2 present:  out = -(0x42>>2)  = 0xFFFFFFF0
+    #   SHF shift=5 present:  out = -(0x42>>5)  = 0xFFFFFFFE
+    #   SHF replaced by NOP:  out = -(0x42)     = 0xFFFFFFBE
+    # The first two values differ from the NOP control — proving the
+    # IADD.64 at gap=0 reads the SHF's shifted R0, not the stale
+    # pre-SHF value.  Ctrl words: SHF wdep=0x3e, IADD.64 rbar=0x01
+    # (no class bit covers the dependency).  Hardware forwarding is
+    # the only mechanism.
+    (0x819, 0x235),   # SHF → IADD.64
     # FG-4.2 addition: IADD.64 self-chain.
     # Evidence: B_iadd64_chain dedicated probe — PTXAS emits two
     # consecutive IADD.64 instructions at gap=0 where the second

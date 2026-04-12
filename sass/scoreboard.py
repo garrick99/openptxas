@@ -89,6 +89,7 @@ _OPCODE_META: dict[int, _OpMeta] = {
     0xc0c: _OpMeta('ISETP.RU',   0, 0x3e, 0),  # ISETP R-UR: misc=0 on SM_120
     0x431: _OpMeta('HFMA2',      1, 0x3e, 1),  # HFMA2 (half-precision FMA2, used as zero-init in div.u32)
     0x810: _OpMeta('IADD3.IMM',  1, 0x3e, 1),  # IADD3 with 32-bit immediate operand
+    0x812: _OpMeta('LOP3.IMM',   1, 0x3e, 1),  # LOP3 with 32-bit immediate (IMAD-FUSE-1)
     0x306: _OpMeta('I2F.U32.RP', 1, 0x3e, 1),  # I2F unsigned int to float, round toward +inf
     0x305: _OpMeta('F2I.FTZ.U32',1, 0x3e, 1),  # F2I float to unsigned int, truncate
     0x310: _OpMeta('F2F',        1, 0x33, 1),  # F2F float-to-float precision conversion (F32↔F64), long-latency wdep=0x33
@@ -214,6 +215,7 @@ _OPCODES_ALU = {
     0x305,        # F2I.U32
     # Logic
     0x212,        # LOP3.LUT (SM_120)
+    0x812,        # LOP3.LUT.IMM (SM_120, 32-bit immediate form)
     0xa12,        # LOP3.LUT (SM_89 cbuf form)
     0x819,        # SHF (SM_120, all variants)
     0xa19,        # SHF (SM_89)
@@ -321,7 +323,7 @@ def _get_src_regs(raw: bytes) -> set[int]:
     # silently route them through a fallback that returns the wrong
     # source set.
     if opcode == 0x812:
-        # IADD3 R-imm: b3 = src0 GPR, b4..b7 = 32-bit imm, b8 = src2 GPR.
+        # LOP3.IMM / IADD3 R-imm: b3 = src0 GPR, b4..b7 = 32-bit imm, b8 = src2 GPR.
         if raw[3] < 255: regs.add(raw[3])
         if raw[8] < 255: regs.add(raw[8])
         return regs

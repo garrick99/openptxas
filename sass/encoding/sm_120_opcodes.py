@@ -1507,6 +1507,52 @@ def encode_lop3(dest: int, src0: int, src1: int, src2: int,
     return bytes(raw)
 
 
+# LOP3 immediate-32 form (opcode 0x812): dest = f(src0, imm32, src2) per LUT.
+# Ground truth (ptxas sm_120):
+#   XOR: LOP3.LUT R0, R0, 0xabcd, RZ  → 12780000cdab0000ff3c8e0700e40f00
+#         b9=0x3c (XOR LUT for immediate form)
+#   AND: LOP3.LUT R5, R0, 0xffff, RZ  → 12780500ffff0000ffc08e0700e40f00
+#         b9=0xc0 (AND LUT for immediate form)
+#   OR:  b9=0xfc (derived — src0 | imm32, independent of src2)
+# The XOR LUT (0x3C) differs from the R-R form (0x96) because the
+# immediate form encodes a two-operand truth table (src0 ^ imm, ignoring src2).
+# AND (0xC0) and OR (0xFC) happen to match the R-R values.
+LOP3_IMM_XOR = 0x3C
+LOP3_IMM_AND = 0xC0
+LOP3_IMM_OR  = 0xFC
+
+
+def encode_lop3_imm32(dest: int, src0: int, imm32: int, src2: int,
+                      lut: int, ctrl: int = 0) -> bytes:
+    """Encode LOP3 with 32-bit immediate: dest = f(src0, imm32, src2) per LUT.
+
+    Opcode 0x812 (b0=0x12, b1=0x78).  The 32-bit immediate occupies bytes 4-7.
+    Use LOP3_IMM_XOR/AND/OR for the lut parameter.
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0x12
+    raw[1] = 0x78
+    raw[2] = dest & 0xFF
+    raw[3] = src0 & 0xFF
+    imm32 = imm32 & 0xFFFFFFFF
+    raw[4] = imm32 & 0xFF
+    raw[5] = (imm32 >> 8) & 0xFF
+    raw[6] = (imm32 >> 16) & 0xFF
+    raw[7] = (imm32 >> 24) & 0xFF
+    raw[8] = src2 & 0xFF
+    raw[9] = lut & 0xFF
+    raw[10] = 0x8e
+    raw[11] = 0x07
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
 # ---------------------------------------------------------------------------
 # IMAD.SHL.U32 (multiply-add as shift-left, avoids SHF pipeline conflicts)
 # ---------------------------------------------------------------------------

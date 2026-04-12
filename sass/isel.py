@@ -90,6 +90,7 @@ from sass.encoding.sm_120_opcodes import (
     encode_iadd3_pred_neg_b4, encode_iadd3_pred_small_imm,
     encode_iadd3_pred_neg_b3, encode_lop3_pred,
     encode_lop3, LOP3_AND, LOP3_OR, LOP3_XOR,
+    encode_lop3_imm32, LOP3_IMM_XOR, LOP3_IMM_AND, LOP3_IMM_OR,
     RZ, PT, SR_TID_X, SR_TID_Y, SR_TID_Z,
     SR_CTAID_X, SR_CTAID_Y, SR_CTAID_Z,
     SR_NTID_X, SR_NTID_Y, SR_NTID_Z,
@@ -2335,17 +2336,25 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     lut = {'and': LOP3_AND, 'or': LOP3_OR, 'xor': LOP3_XOR}[op]
                     if isinstance(instr.srcs[1], ImmOp):
-                        # Immediate src1: materialize via IADD3.IMM, then LOP3.LUT R-R.
-                        # When dest aliases src0 (d == a), materializing into d would
-                        # clobber the source before LOP3 reads it — use a scratch register.
+                        # IMAD-FUSE-1: Use LOP3.IMM (opcode 0x812) to encode the
+                        # immediate inline, avoiding the separate materialize step.
+                        # Ground truth: ptxas uses LOP3.IMM for xor/and/or with
+                        # 32-bit immediate on SM_120 (LUT values differ from R-R form).
                         imm = instr.srcs[1].value & 0xFFFFFFFF
-                        if d == a:
-                            imm_reg = _alloc_gpr(ctx)
+                        lut_imm = {'and': LOP3_IMM_AND, 'or': LOP3_IMM_OR, 'xor': LOP3_IMM_XOR}[op]
+                        if d < 14:
+                            output.append(SassInstr(
+                                encode_lop3_imm32(d, a, imm, RZ, lut_imm),
+                                f'LOP3.LUT R{d}, R{a}, 0x{imm:x}, RZ, 0x{lut_imm:02x}  // {op}.{typ} imm'))
                         else:
-                            imm_reg = d
-                        output.append(SassInstr(encode_iadd3_imm32(imm_reg, RZ, imm, RZ),
-                                                f'IADD3 R{imm_reg}, RZ, 0x{imm:x}, RZ  // {op} imm materialize'))
-                        _emit_lop3(output, ctx, d, a, imm_reg, RZ, lut, f'LOP3.LUT R{d}, R{a}, R{imm_reg}, RZ, 0x{lut:02x}  // {op}.{typ} imm')
+                            # LOP3 dest must be < R14 on SM_120 — use scratch + MOV
+                            used = {a, d}
+                            scratch = next((r for r in range(14) if r not in used), 0)
+                            output.append(SassInstr(
+                                encode_lop3_imm32(scratch, a, imm, RZ, lut_imm),
+                                f'LOP3.LUT R{scratch}, R{a}, 0x{imm:x}, RZ, 0x{lut_imm:02x}  // {op}.{typ} imm (via R{scratch})'))
+                            output.append(SassInstr(encode_iadd3(d, scratch, RZ, RZ),
+                                f'MOV R{d}, R{scratch}  // lop3 fixup'))
                     else:
                         b = ctx.ra.r32(instr.srcs[1].name)
                         _emit_lop3(output, ctx, d, a, b, RZ, lut, f'LOP3.LUT R{d}, R{a}, R{b}, RZ, 0x{lut:02x}  // {op}.{typ}')

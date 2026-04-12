@@ -72,37 +72,41 @@
 ### Instructions (27 kernels: OURS vs PTXAS)
 | Metric | Value |
 |---|---|
-| OURS total real | 999 |
+| OURS total real | 993 |
 | PTXAS total real | 1007 |
-| **Net delta** | **−8 instructions (−0.8%, OURS wins)** |
+| **Net delta** | **−14 instructions (−1.4%, OURS wins)** |
+
+*Updated after IMAD-FUSE-1 + HARD-FINISH-1 campaign (was −8 / −0.8% at freeze).*
 
 ### NOPs
-- 227 total: 217 structural padding, 10 body latency NOPs
+- ~225 total: ~215 structural padding, ~10 body latency NOPs
 - 0 body NOPs removable (all on critical dependency chains)
 - ILP kernels: 0 body NOPs (scheduler handles ILP correctly)
 
-### PERF Series Findings
+### PERF + HARD-FINISH Series Findings
 | Pass | Finding |
 |---|---|
 | PERF-1 | NOP removal needs operand-role awareness |
 | PERF-2 | Body NOPs serve dual purposes (ALU + memory scoreboard) |
-| PERF-3 | All 10 body NOPs are critical-path, zero fillable |
+| PERF-3 | All body NOPs are critical-path, zero fillable |
 | PERF-4 | ILP kernels have zero body NOPs — scheduler works |
-| PERF-5 | OURS uses 103 fewer registers than PTXAS |
+| PERF-5 | OURS uses fewer registers than PTXAS |
 | PERF-5.1 | Fixed dmma_zero over-declaration (10→8 regs) |
-| PERF-6 | OURS uses 8 fewer instructions than PTXAS |
-| PERF-6.1 | LEA fusion deferred (requires new encoder) |
+| PERF-6 | OURS uses fewer instructions than PTXAS |
+| PERF-6.1 | LEA fusion investigated — instruction-count neutral (not needed) |
 | PERF-7 | Cross-stack synthesis: OURS is performance-competitive |
+| IMAD-FUSE-1 | LOP3.IMM encoding closes ilp_dual_int32 and ilp_alu_addr |
+| HARD-FINISH-1 | @pred IMAD fusion closes ilp_pred_alu |
 
 ---
 
 ## D. Remaining Known Limits
 
-1. **dmma_zero +1 register** — allocator reserves descriptor pair (R0:R1) that PTXAS avoids via different UR strategy. Requires allocator architecture change.
+1. **ilp_unrolled_sum4 +3 instructions** — chained stride addresses require register allocator rework to safely fold into base+offset LDG. Bounded structural gap.
 
-2. **ILP kernels +2 instructions** — `cvt.u64 + shl.b64 + add.u64` emits as IADD3+IADD3X instead of a fused LEA. Requires `encode_lea` (opcode 0x211) + multi-instruction peephole.
+2. **+1 instruction gaps** (vecadd_large, ilp_pipeline_load) — minor instruction selection / scheduling differences. Diminishing returns.
 
-3. **10 body latency NOPs** — serve dual purposes (ALU RAW + memory scoreboard). Require full multi-dependency rescheduler to safely eliminate.
+3. **~10 body latency NOPs** — serve dual purposes (ALU RAW + memory scoreboard). Require full multi-dependency rescheduler to safely eliminate.
 
 None of these are correctness issues. All are bounded performance gaps with clear root causes and known fix paths.
 

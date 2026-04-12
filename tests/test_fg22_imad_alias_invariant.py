@@ -188,6 +188,18 @@ _ALIAS_SLACK = {
         "k200_shl_chain", "k200_and_or_chain", "k200_mul_add_long",
         "k200_xor_reduce", "k200_wide_imm", "k200_shfl_reduce2",
     ]},
+    # KERNEL-100.3 sprint 3 corpus
+    **{k: 4 for k in [
+        "k300_long_mul_chain", "k300_add_xor_alt", "k300_or_chain",
+        "k300_and_mask", "k300_mul7_add3", "k300_mul11_xor", "k300_triple_xor",
+        "k300_pred3", "k300_pred_mul_add", "k300_shfl_idx", "k300_shl_add",
+        "k300_mul_pair", "k300_add5", "k300_xor_pair", "k300_and_or_xor",
+        "k300_nasty_long_live", "k300_nasty_deep_dep", "k300_nasty_wide_xor",
+        "k300_nasty_imm_heavy", "k300_nasty_pred_nest3", "k300_nasty_mul_chain3",
+        "k300_nasty_add_wrap", "k300_nasty_shfl_chain", "k300_nasty_multi_pred",
+        "k300_nasty_zero_init", "k300_nasty_identity", "k300_nasty_overflow",
+        "k300_nasty_shl_xor", "k300_nasty_accum5", "k300_nasty_pred_xor",
+    ]},
 }
 
 

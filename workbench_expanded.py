@@ -1374,6 +1374,305 @@ for v in SPRINT2_KERNELS.values():
 EXPANDED_KERNELS.update(SPRINT2_KERNELS)
 
 
+# ===================================================================
+# SPRINT 3 — KERNEL-100.3: 30 kernels (push to 100+, nasty patterns)
+# ===================================================================
+
+# --- Normal additions (15 kernels) ---
+
+_K300_LONG_MUL_CHAIN = _ptx_simple("k300_long_mul_chain", 14, """
+    mul.lo.u32 %r2, %r0, 3; mul.lo.u32 %r3, %r2, 5;
+    mul.lo.u32 %r4, %r3, 7; mul.lo.u32 %r2, %r4, 11;
+    and.b32 %r2, %r2, 0xFFFF;""")
+
+_K300_ADD_XOR_ALT = _ptx_simple("k300_add_xor_alt", 10, """
+    add.u32 %r2, %r0, 1; xor.b32 %r3, %r2, 3;
+    add.u32 %r4, %r3, 5; xor.b32 %r2, %r4, 7;""")
+
+_K300_OR_CHAIN = _ptx_simple("k300_or_chain", 10, """
+    or.b32 %r2, %r0, 0x10; or.b32 %r3, %r2, 0x20;
+    or.b32 %r4, %r3, 0x40; or.b32 %r2, %r4, 0x80;""")
+
+_K300_AND_MASK = _ptx_simple("k300_and_mask", 10, """
+    mul.lo.u32 %r2, %r0, 257;
+    and.b32 %r2, %r2, 0xFF;""")
+
+_K300_MUL7_ADD3 = _ptx_simple("k300_mul7_add3", 10, """
+    mul.lo.u32 %r2, %r0, 7; add.u32 %r2, %r2, 3;""")
+
+_K300_MUL11_XOR = _ptx_simple("k300_mul11_xor", 10, """
+    mul.lo.u32 %r2, %r0, 11; xor.b32 %r2, %r2, 0x5555;
+    and.b32 %r2, %r2, 0xFFFF;""")
+
+_K300_TRIPLE_XOR = _ptx_simple("k300_triple_xor", 10, """
+    xor.b32 %r2, %r0, 0xAA; xor.b32 %r3, %r2, 0x55;
+    xor.b32 %r2, %r3, 0xFF;""")
+
+_K300_PRED3 = _ptx_simple("k300_pred3", 10, """
+    mov.u32 %r2, %r0;
+    setp.gt.u32 %p1, %r0, 10;
+    @%p1 add.u32 %r2, %r2, 1;
+    setp.gt.u32 %p1, %r0, 20;
+    @%p1 add.u32 %r2, %r2, 2;
+    setp.gt.u32 %p1, %r0, 40;
+    @%p1 add.u32 %r2, %r2, 4;""")
+
+_K300_PRED_MUL_ADD = _ptx_simple("k300_pred_mul_add", 10, """
+    mul.lo.u32 %r2, %r0, 5;
+    setp.lt.u32 %p1, %r0, 32;
+    @%p1 add.u32 %r2, %r2, 100;""")
+
+_K300_SHFL_IDX = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry k300_shfl_idx(.param .u64 p_out, .param .u32 n) {
+    .reg .u32 %r<6>; .reg .u64 %rd<3>; .reg .pred %p0;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    add.u32 %r2, %r0, 100;
+    shfl.sync.idx.b32 %r3, %r2, 0, 31, 0xFFFFFFFF;
+    add.u32 %r4, %r2, %r3;
+    cvt.u64.u32 %rd1, %r0; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r4;
+    ret;
+}
+"""
+
+_K300_SHL_ADD = _ptx_simple("k300_shl_add", 10, """
+    shl.b32 %r2, %r0, 3; add.u32 %r2, %r2, %r0;""")
+
+_K300_MUL_PAIR = _ptx_simple("k300_mul_pair", 12, """
+    mul.lo.u32 %r2, %r0, 13; mul.lo.u32 %r3, %r0, 17;
+    add.u32 %r2, %r2, %r3;""")
+
+_K300_ADD5 = _ptx_simple("k300_add5", 12, """
+    add.u32 %r2, %r0, 1; add.u32 %r3, %r2, 2;
+    add.u32 %r4, %r3, 3; add.u32 %r5, %r4, 4;
+    add.u32 %r2, %r5, 5;""")
+
+_K300_XOR_PAIR = _ptx_simple("k300_xor_pair", 10, """
+    xor.b32 %r2, %r0, 0x1234; xor.b32 %r2, %r2, 0x5678;""")
+
+_K300_AND_OR_XOR = _ptx_simple("k300_and_or_xor", 10, """
+    and.b32 %r2, %r0, 0xFF; or.b32 %r3, %r2, 0x100;
+    xor.b32 %r2, %r3, 0x55;""")
+
+# --- Nasty additions (15 kernels) ---
+
+_K300_NASTY_LONG_LIVE = _ptx_simple("k300_nasty_long_live", 16, """
+    mul.lo.u32 %r2, %r0, 3;
+    mul.lo.u32 %r3, %r0, 5;
+    mul.lo.u32 %r4, %r0, 7;
+    mul.lo.u32 %r5, %r0, 11;
+    mul.lo.u32 %r6, %r0, 13;
+    add.u32 %r7, %r2, %r3;
+    add.u32 %r8, %r4, %r5;
+    add.u32 %r9, %r7, %r8;
+    add.u32 %r2, %r9, %r6;""")
+
+_K300_NASTY_DEEP_DEP = _ptx_simple("k300_nasty_deep_dep", 16, """
+    add.u32 %r2, %r0, 1; add.u32 %r3, %r2, 1; add.u32 %r4, %r3, 1;
+    add.u32 %r5, %r4, 1; add.u32 %r6, %r5, 1; add.u32 %r7, %r6, 1;
+    add.u32 %r8, %r7, 1; add.u32 %r9, %r8, 1; add.u32 %r2, %r9, 1;""")
+
+_K300_NASTY_WIDE_XOR = _ptx_simple("k300_nasty_wide_xor", 10, """
+    xor.b32 %r2, %r0, 0xDEADBEEF;
+    and.b32 %r2, %r2, 0xFFFFFF;""")
+
+_K300_NASTY_IMM_HEAVY = _ptx_simple("k300_nasty_imm_heavy", 10, """
+    add.u32 %r2, %r0, 0x11111;
+    xor.b32 %r3, %r2, 0x22222;
+    and.b32 %r4, %r3, 0x33333;
+    or.b32 %r2, %r4, 0x44000;""")
+
+_K300_NASTY_PRED_NEST3 = _ptx_simple("k300_nasty_pred_nest3", 10, """
+    mov.u32 %r2, 0;
+    setp.gt.u32 %p1, %r0, 5;
+    @%p1 add.u32 %r2, %r2, 1;
+    @%p1 setp.gt.u32 %p2, %r0, 15;
+    @%p2 add.u32 %r2, %r2, 2;
+    @%p2 setp.gt.u32 %p1, %r0, 30;
+    @%p1 add.u32 %r2, %r2, 4;""")
+
+_K300_NASTY_MUL_CHAIN3 = _ptx_simple("k300_nasty_mul_chain3", 10, """
+    mul.lo.u32 %r2, %r0, 3;
+    mul.lo.u32 %r2, %r2, 5;
+    mul.lo.u32 %r2, %r2, 7;
+    and.b32 %r2, %r2, 0xFFFF;""")
+
+_K300_NASTY_ADD_WRAP = _ptx_simple("k300_nasty_add_wrap", 10, """
+    add.u32 %r2, %r0, 0xFFFFFFF0;
+    add.u32 %r2, %r2, 0x20;""")
+
+_K300_NASTY_SHFL_CHAIN = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry k300_nasty_shfl_chain(.param .u64 p_out, .param .u32 n) {
+    .reg .u32 %r<8>; .reg .u64 %rd<3>; .reg .pred %p0;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    add.u32 %r2, %r0, 1;
+    shfl.sync.bfly.b32 %r3, %r2, 1, 31, 0xFFFFFFFF;
+    add.u32 %r2, %r2, %r3;
+    shfl.sync.bfly.b32 %r3, %r2, 2, 31, 0xFFFFFFFF;
+    add.u32 %r2, %r2, %r3;
+    shfl.sync.bfly.b32 %r3, %r2, 4, 31, 0xFFFFFFFF;
+    add.u32 %r2, %r2, %r3;
+    cvt.u64.u32 %rd1, %r0; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r2;
+    ret;
+}
+"""
+
+_K300_NASTY_MULTI_PRED = _ptx_simple("k300_nasty_multi_pred", 10, """
+    mov.u32 %r2, %r0;
+    setp.gt.u32 %p1, %r0, 4;
+    @%p1 add.u32 %r2, %r2, 10;
+    setp.gt.u32 %p2, %r0, 8;
+    @%p2 add.u32 %r2, %r2, 20;
+    setp.gt.u32 %p1, %r0, 16;
+    @%p1 add.u32 %r2, %r2, 40;
+    setp.gt.u32 %p2, %r0, 32;
+    @%p2 add.u32 %r2, %r2, 80;
+    setp.gt.u32 %p1, %r0, 48;
+    @%p1 add.u32 %r2, %r2, 160;""")
+
+_K300_NASTY_ZERO_INIT = _ptx_simple("k300_nasty_zero_init", 10, """
+    mov.u32 %r2, 0;
+    add.u32 %r2, %r2, %r0;
+    add.u32 %r2, %r2, %r0;""")
+
+_K300_NASTY_IDENTITY = _ptx_simple("k300_nasty_identity", 10, """
+    xor.b32 %r2, %r0, 0;
+    and.b32 %r2, %r2, 0xFFFFFFFF;
+    or.b32 %r2, %r2, 0;""")
+
+_K300_NASTY_OVERFLOW = _ptx_simple("k300_nasty_overflow", 10, """
+    mul.lo.u32 %r2, %r0, 0xFFFF;
+    add.u32 %r2, %r2, 0xFFFF;""")
+
+_K300_NASTY_SHL_XOR = _ptx_simple("k300_nasty_shl_xor", 10, """
+    shl.b32 %r2, %r0, 4;
+    xor.b32 %r3, %r2, %r0;
+    shl.b32 %r4, %r3, 2;
+    xor.b32 %r2, %r4, %r3;""")
+
+_K300_NASTY_ACCUM5 = _ptx_simple("k300_nasty_accum5", 16, """
+    mul.lo.u32 %r2, %r0, 2;
+    mul.lo.u32 %r3, %r0, 3;
+    mul.lo.u32 %r4, %r0, 5;
+    mul.lo.u32 %r5, %r0, 7;
+    mul.lo.u32 %r6, %r0, 11;
+    add.u32 %r7, %r2, %r3;
+    add.u32 %r8, %r4, %r5;
+    add.u32 %r9, %r7, %r8;
+    add.u32 %r2, %r9, %r6;""")
+
+_K300_NASTY_PRED_XOR = _ptx_simple("k300_nasty_pred_xor", 10, """
+    xor.b32 %r2, %r0, 0xAA;
+    setp.gt.u32 %p1, %r0, 16;
+    @%p1 xor.b32 %r2, %r2, 0x55;""")
+
+
+# Sprint 3 harnesses
+def _harness_shfl_idx(ctx, func, mode):
+    def verify(buf, N):
+        for t in range(min(N, 32)):
+            val = t + 100
+            lane0_val = 0 + 100  # shfl.idx src=0 → gets lane 0's value
+            exp = (val + lane0_val) & 0xFFFFFFFF
+            if struct.unpack_from('<I', buf, t*4)[0] != exp: return False
+        return True
+    return _h(ctx, func, 32, _simple_args, verify)
+
+def _harness_nasty_shfl_chain(ctx, func, mode):
+    def verify(buf, N):
+        vals = [t+1 for t in range(N)]
+        for rnd in [1, 2, 4]:
+            vals = [vals[t] + vals[t ^ rnd] for t in range(N)]
+        for t in range(min(N, 32)):
+            if struct.unpack_from('<I', buf, t*4)[0] != vals[t] & 0xFFFFFFFF: return False
+        return True
+    return _h(ctx, func, 32, _simple_args, verify)
+
+
+SPRINT3_KERNELS = {
+    # Normal
+    "k300_long_mul_chain": {"display": "4-stage mul chain", "ptx_inline": _K300_LONG_MUL_CHAIN, "kernel_name": "k300_long_mul_chain",
+                            "harness": _harness_s2("", lambda t: (t*3*5*7*11)&0xFFFF)},
+    "k300_add_xor_alt": {"display": "alternating add+xor chain", "ptx_inline": _K300_ADD_XOR_ALT, "kernel_name": "k300_add_xor_alt",
+                          "harness": _harness_s2("", lambda t: ((t+1)^3)+5^7)},
+    "k300_or_chain": {"display": "4-stage OR chain", "ptx_inline": _K300_OR_CHAIN, "kernel_name": "k300_or_chain",
+                       "harness": _harness_s2("", lambda t: t|0x10|0x20|0x40|0x80)},
+    "k300_and_mask": {"display": "mul + AND mask", "ptx_inline": _K300_AND_MASK, "kernel_name": "k300_and_mask",
+                       "harness": _harness_s2("", lambda t: (t*257)&0xFF)},
+    "k300_mul7_add3": {"display": "mul*7 + add 3", "ptx_inline": _K300_MUL7_ADD3, "kernel_name": "k300_mul7_add3",
+                        "harness": _harness_s2("", lambda t: t*7+3)},
+    "k300_mul11_xor": {"display": "mul*11 + xor + mask", "ptx_inline": _K300_MUL11_XOR, "kernel_name": "k300_mul11_xor",
+                        "harness": _harness_s2("", lambda t: (t*11^0x5555)&0xFFFF)},
+    "k300_triple_xor": {"display": "3-stage xor with constants", "ptx_inline": _K300_TRIPLE_XOR, "kernel_name": "k300_triple_xor",
+                         "harness": _harness_s2("", lambda t: (t^0xAA^0x55^0xFF))},
+    "k300_pred3": {"display": "3-threshold predicate chain", "ptx_inline": _K300_PRED3, "kernel_name": "k300_pred3",
+                    "harness": _harness_s2("", lambda t: t+(1 if t>10 else 0)+(2 if t>20 else 0)+(4 if t>40 else 0))},
+    "k300_pred_mul_add": {"display": "mul + predicated add", "ptx_inline": _K300_PRED_MUL_ADD, "kernel_name": "k300_pred_mul_add",
+                           "harness": _harness_s2("", lambda t: t*5+(100 if t<32 else 0))},
+    "k300_shfl_idx": {"display": "shfl.sync.idx (broadcast lane 0)", "ptx_inline": _K300_SHFL_IDX, "kernel_name": "k300_shfl_idx",
+                       "harness": _harness_shfl_idx},
+    "k300_shl_add": {"display": "shl + self-add", "ptx_inline": _K300_SHL_ADD, "kernel_name": "k300_shl_add",
+                      "harness": _harness_s2("", lambda t: (t<<3)+t)},
+    "k300_mul_pair": {"display": "dual mul merge", "ptx_inline": _K300_MUL_PAIR, "kernel_name": "k300_mul_pair",
+                       "harness": _harness_s2("", lambda t: t*13+t*17)},
+    "k300_add5": {"display": "5-stage add chain", "ptx_inline": _K300_ADD5, "kernel_name": "k300_add5",
+                   "harness": _harness_s2("", lambda t: t+1+2+3+4+5)},
+    "k300_xor_pair": {"display": "double xor with large constants", "ptx_inline": _K300_XOR_PAIR, "kernel_name": "k300_xor_pair",
+                       "harness": _harness_s2("", lambda t: t^0x1234^0x5678)},
+    "k300_and_or_xor": {"display": "and + or + xor combo", "ptx_inline": _K300_AND_OR_XOR, "kernel_name": "k300_and_or_xor",
+                         "harness": _harness_s2("", lambda t: ((t&0xFF)|0x100)^0x55)},
+    # Nasty
+    "k300_nasty_long_live": {"display": "nasty: 5 simultaneous live values", "ptx_inline": _K300_NASTY_LONG_LIVE, "kernel_name": "k300_nasty_long_live",
+                              "harness": _harness_s2("", lambda t: t*3+t*5+t*7+t*11+t*13)},
+    "k300_nasty_deep_dep": {"display": "nasty: 9-deep serial add chain", "ptx_inline": _K300_NASTY_DEEP_DEP, "kernel_name": "k300_nasty_deep_dep",
+                             "harness": _harness_s2("", lambda t: t+9)},
+    "k300_nasty_wide_xor": {"display": "nasty: xor with 0xDEADBEEF", "ptx_inline": _K300_NASTY_WIDE_XOR, "kernel_name": "k300_nasty_wide_xor",
+                             "harness": _harness_s2("", lambda t: (t^0xDEADBEEF)&0xFFFFFF)},
+    "k300_nasty_imm_heavy": {"display": "nasty: 4 wide immediates", "ptx_inline": _K300_NASTY_IMM_HEAVY, "kernel_name": "k300_nasty_imm_heavy",
+                              "harness": _harness_s2("", lambda t: (((t+0x11111)^0x22222)&0x33333)|0x44000)},
+    "k300_nasty_pred_nest3": {"display": "nasty: 3-level nested predication", "ptx_inline": _K300_NASTY_PRED_NEST3, "kernel_name": "k300_nasty_pred_nest3",
+                               "harness": _harness_s2("", lambda t: (1 if t>5 else 0)+(2 if t>15 else 0)+(4 if t>30 else 0))},
+    "k300_nasty_mul_chain3": {"display": "nasty: 3-mul serial chain", "ptx_inline": _K300_NASTY_MUL_CHAIN3, "kernel_name": "k300_nasty_mul_chain3",
+                               "harness": _harness_s2("", lambda t: (t*3*5*7)&0xFFFF)},
+    "k300_nasty_add_wrap": {"display": "nasty: unsigned add wraparound", "ptx_inline": _K300_NASTY_ADD_WRAP, "kernel_name": "k300_nasty_add_wrap",
+                             "harness": _harness_s2("", lambda t: (t+0xFFFFFFF0+0x20)&0xFFFFFFFF)},
+    "k300_nasty_shfl_chain": {"display": "nasty: 3-round butterfly shuffle", "ptx_inline": _K300_NASTY_SHFL_CHAIN, "kernel_name": "k300_nasty_shfl_chain",
+                               "harness": _harness_nasty_shfl_chain},
+    "k300_nasty_multi_pred": {"display": "nasty: 5-stage predicate accumulator", "ptx_inline": _K300_NASTY_MULTI_PRED, "kernel_name": "k300_nasty_multi_pred",
+                               "harness": _harness_s2("", lambda t: t+(10 if t>4 else 0)+(20 if t>8 else 0)+(40 if t>16 else 0)+(80 if t>32 else 0)+(160 if t>48 else 0))},
+    "k300_nasty_zero_init": {"display": "nasty: zero-init + double self-add", "ptx_inline": _K300_NASTY_ZERO_INIT, "kernel_name": "k300_nasty_zero_init",
+                              "harness": _harness_s2("", lambda t: t*2)},
+    "k300_nasty_identity": {"display": "nasty: xor 0 + and ~0 + or 0 (identity)", "ptx_inline": _K300_NASTY_IDENTITY, "kernel_name": "k300_nasty_identity",
+                             "harness": _harness_s2("", lambda t: t)},
+    "k300_nasty_overflow": {"display": "nasty: mul*0xFFFF + add 0xFFFF (overflow)", "ptx_inline": _K300_NASTY_OVERFLOW, "kernel_name": "k300_nasty_overflow",
+                             "harness": _harness_s2("", lambda t: (t*0xFFFF+0xFFFF)&0xFFFFFFFF)},
+    "k300_nasty_shl_xor": {"display": "nasty: shift + xor + shift + xor", "ptx_inline": _K300_NASTY_SHL_XOR, "kernel_name": "k300_nasty_shl_xor",
+                            "harness": _harness_s2("", lambda t: (((t<<4)^t)<<2)^((t<<4)^t))},
+    "k300_nasty_accum5": {"display": "nasty: 5-accumulator tree merge", "ptx_inline": _K300_NASTY_ACCUM5, "kernel_name": "k300_nasty_accum5",
+                           "harness": _harness_s2("", lambda t: t*2+t*3+t*5+t*7+t*11)},
+    "k300_nasty_pred_xor": {"display": "nasty: xor + predicated xor", "ptx_inline": _K300_NASTY_PRED_XOR, "kernel_name": "k300_nasty_pred_xor",
+                             "harness": _harness_s2("", lambda t: (t^0xAA)^(0x55 if t>16 else 0))},
+}
+
+for v in SPRINT3_KERNELS.values():
+    v.setdefault("ptx_path", None)
+
+EXPANDED_KERNELS.update(SPRINT3_KERNELS)
+
+
 # Add ptx_path=None to all entries
 for v in EXPANDED_KERNELS.values():
     v.setdefault("ptx_path", None)
@@ -1384,11 +1683,14 @@ def register(kernels_dict, suites_dict, make_args_fn):
     global _make_args
     _make_args = make_args_fn
     kernels_dict.update(EXPANDED_KERNELS)
-    # Add suite groupings
     s1_keys = [k for k in EXPANDED_KERNELS if k.startswith("k100_")]
     s2_keys = [k for k in EXPANDED_KERNELS if k.startswith("k200_")]
-    suites_dict["expanded"] = s1_keys + s2_keys
+    s3_keys = [k for k in EXPANDED_KERNELS if k.startswith("k300_")]
+    s3_nasty = [k for k in s3_keys if "nasty" in k]
+    s3_normal = [k for k in s3_keys if "nasty" not in k]
+    suites_dict["expanded"] = s1_keys + s2_keys + s3_keys
     suites_dict["sprint1"] = s1_keys
     suites_dict["sprint2"] = s2_keys
-    # Update 'all' suite
-    suites_dict["all"] = list(suites_dict.get("all", [])) + s1_keys + s2_keys
+    suites_dict["sprint3"] = s3_keys
+    suites_dict["nasty"] = s3_nasty
+    suites_dict["all"] = list(suites_dict.get("all", [])) + s1_keys + s2_keys + s3_keys

@@ -1149,9 +1149,9 @@ def _remove_forwarding_safe_nops(instrs: list[SassInstr]) -> list[SassInstr]:
         _get_opcode    as _sc_opc,
         _is_forwarding_safe_pair,
         _is_zero_init_fastpath,
+        _overlap_is_data_only,
     )
     nop_opc = 0x918  # NOP opcode
-    removed = 0
     result = list(instrs)
     i = 0
     while i < len(result) - 2:
@@ -1170,14 +1170,21 @@ def _remove_forwarding_safe_nops(instrs: list[SassInstr]) -> list[SassInstr]:
             i += 1
             continue
         src_k = _sc_src(result[i + 2].raw)
-        if not (dest_i & src_k):
+        overlap = dest_i & src_k
+        if not overlap:
             i += 1
             continue
         opc_k = _sc_opc(result[i + 2].raw)
-        # Can we remove the NOP?
-        if _is_forwarding_safe_pair(opc_i, opc_k) or _is_zero_init_fastpath(result[i].raw):
+        # PERF-2: can we remove the NOP?  Three conditions required:
+        #   1. (writer_opc, reader_opc) is forwarding-safe OR writer
+        #      is a zero-init fastpath
+        #   2. The overlap feeds only the reader's DATA operand, NOT
+        #      its ADDRESS operand (operand-role check)
+        pair_safe = (_is_forwarding_safe_pair(opc_i, opc_k)
+                     or _is_zero_init_fastpath(result[i].raw))
+        role_safe = _overlap_is_data_only(result[i + 2].raw, overlap)
+        if pair_safe and role_safe:
             result.pop(i + 1)
-            removed += 1
             # Don't advance i — re-check at the same position
         else:
             i += 1
@@ -1202,13 +1209,25 @@ def schedule(instrs: list[SassInstr]) -> list[SassInstr]:
     instrs = _enforce_gpr_latency(instrs)
     instrs = _fill_ldcu_latency(instrs)
     instrs = _enforce_gpr_latency(instrs)  # re-check after fill reordering
-    # PERF-1: NOP removal pass disabled after test_4ptr_add failure —
-    # the forwarding-safe whitelist has at least one pair that is not
-    # actually safe at gap=0 in all contexts (likely IADD.64-UR → STG
-    # address where the STG uses the IADD result as the store ADDRESS,
-    # not as forwarded data).  Needs deeper investigation before
-    # re-enabling.
-    # instrs = _remove_forwarding_safe_nops(instrs)  # PERF-1
+    # PERF-2: _remove_forwarding_safe_nops is STRUCTURALLY CORRECT for
+    # its single-edge forwarding model (operand-role-aware, evidence-
+    # backed) but CANNOT be safely enabled because body-NOPs often
+    # serve dual purposes:
+    #   1. Guard the explicit ALU RAW edge they were inserted for
+    #   2. Implicitly buffer preceding memory-load scoreboard waits
+    # Removing the NOP solves (1) via forwarding but exposes (2),
+    # causing LDG results to be read before they commit.
+    #
+    # To safely remove NOPs, a future pass would need to verify that
+    # ALL dependencies at the NOP position — not just the ALU RAW
+    # edge — are satisfied after removal.  That requires full multi-
+    # dependency analysis at each candidate NOP, which is effectively
+    # a complete rescheduling pass.
+    #
+    # Evidence: FADD→STG data-forwarding is proven safe (FG-2.4) but
+    # removing the NOP in saxpy_multi broke test_4ptr_add because the
+    # NOP was also buffering a preceding LDG→FADD scoreboard wait.
+    # instrs = _remove_forwarding_safe_nops(instrs)
     # Skip LDG latency NOPs — rely on ctrl wdep for LDG (ptxas pattern)
     # instrs = _reorder_after_ldg(instrs)
 

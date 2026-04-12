@@ -871,6 +871,74 @@ def _is_memory_gpr_producer(opc: int) -> bool:
     return opc in _OPCODES_MEMORY_GPR
 
 
+# ---------------------------------------------------------------------------
+# PERF-2: operand-role-aware forwarding
+# ---------------------------------------------------------------------------
+#
+# The flat _FORWARDING_SAFE_PAIRS set proves that a (writer, reader)
+# opcode pair is safe at gap=0 when the overlap feeds the reader's
+# DATA operand.  However, the SAME opcode pair is NOT safe when the
+# overlap feeds the reader's ADDRESS operand — the address pipeline
+# has a different timing requirement from the data pipeline.
+#
+# Evidence: PERF-1 found that removing the NOP between IADD.64-UR
+# and STG.E is safe when STG's DATA register (b4) overlaps the
+# writer's dest, but BREAKS when STG's ADDRESS pair (b3) overlaps
+# (test_4ptr_add: produced stale-address store, got 1.0 instead of
+# 111.0).
+#
+# The operand-role check extracts which bytes of the reader
+# instruction carry the overlapping register index, then classifies
+# the overlap as DATA (b4 for STG/ATOMG, b3 for ALU consumers) or
+# ADDRESS (b3 for STG/LDG/ATOMG when the reader is a memory op).
+#
+# A forwarding-safe pair is only safe to elide the NOP if EVERY
+# overlapping register lands in a DATA role — never in an ADDRESS
+# role.
+
+# Opcodes where b3 is a memory ADDRESS pair (not a generic ALU src).
+_MEMORY_ADDR_OPCODES: set[int] = (
+    _OPCODES_STG          # STG: b3 = store address pair
+    | _OPCODES_LDG        # LDG: b3 = load address pair
+    | _OPCODES_ATOMG      # ATOMG: b3 = atomic address pair
+    | _OPCODES_LDS        # LDS: b3 = shared-memory address (when GPR-addressed)
+    | _OPCODES_STS        # STS: b3 = shared-memory address
+)
+
+
+def _overlap_is_data_only(reader_raw: bytes, overlap_regs: set[int]) -> bool:
+    """PERF-2: return True iff EVERY overlapping register feeds only
+    a DATA operand of the reader, never an ADDRESS operand.
+
+    For memory instructions (STG, LDG, ATOMG, LDS, STS):
+      b3 = address pair base (b3, b3+1)  → ADDRESS role
+      b4 = data register                 → DATA role
+      b8 = UR descriptor (not a GPR)     → ignored
+
+    For ALU instructions:
+      all operand bytes are ALU sources — DATA role by definition.
+
+    Conservative: if the reader opcode is unrecognized, return False.
+    """
+    opc = _get_opcode(reader_raw)
+    if opc not in _MEMORY_ADDR_OPCODES:
+        # ALU consumer — all GPR sources are data. Safe.
+        return True
+
+    # Memory consumer: check if any overlap reg is in the address pair.
+    addr_base = reader_raw[3]
+    if addr_base >= 0xff:
+        # RZ as address — no real address dependency.
+        return True
+    addr_regs = {addr_base, addr_base + 1}
+    if overlap_regs & addr_regs:
+        # At least one overlapping register is in the address pair.
+        return False
+
+    # Overlap is in data (b4) or src2 (b8) or something else — DATA role.
+    return True
+
+
 def _is_zero_init_fastpath(raw: bytes) -> bool:
     """FG-4.1: semantic predicate for the HFMA2 zero-init trick.
 

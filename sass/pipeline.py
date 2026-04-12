@@ -1526,7 +1526,11 @@ def _patch_ptxas_capmerc_gprs(capmerc: bytes | None, num_gprs: int) -> bytes | N
     if capmerc is None:
         return None
     cm = bytearray(capmerc)
-    cm[8] = max(num_gprs, 8)  # byte[8] = GPR count, minimum 8
+    # ALLOC-1: the previous floor of 8 was conservative — PTXAS
+    # declares as few as 7 for small tensor kernels (dmma_zero).
+    # Use the actual num_gprs without an artificial floor.  SM_120
+    # hardware has no documented minimum GPR declaration beyond 2.
+    cm[8] = max(num_gprs, 2)
     return bytes(cm)
 
 

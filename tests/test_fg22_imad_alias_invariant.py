@@ -216,6 +216,13 @@ _ALIAS_SLACK = {
         "w2_div_loop", "w2_nested_loop",
         "w2_pred_load", "w2_multi_store", "w2_deep_pred", "w2_loop_mul",
     ]},
+    # REAL-1 corpus
+    **{k: 3 for k in [
+        "r1_warp_sum", "r1_dot4", "r1_histogram8", "r1_scan_warp",
+        "r1_scale_add", "r1_minmax", "r1_bitcount",
+        "r1_running_xor", "r1_multi_stage", "r1_accumulator",
+        "r1_gather", "r1_scatter_add",
+    ]},
 }
 
 

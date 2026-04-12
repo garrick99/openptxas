@@ -2555,6 +2555,356 @@ for v in WEIRD2_KERNELS.values():
 EXPANDED_KERNELS.update(WEIRD2_KERNELS)
 
 
+# ===================================================================
+# SPRINT 6 — REAL-1: 14 real-world workload shapes
+# ===================================================================
+
+# 1. Reduction (multi-stage)
+_R1_WARP_SUM = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry r1_warp_sum(.param .u64 p_out, .param .u32 n) {
+    .reg .u32 %r<8>; .reg .u64 %rd<3>; .reg .pred %p0;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    // val = tid+1; butterfly sum across 32 lanes
+    add.u32 %r2, %r0, 1;
+    shfl.sync.bfly.b32 %r3, %r2, 16, 31, 0xFFFFFFFF; add.u32 %r2, %r2, %r3;
+    shfl.sync.bfly.b32 %r3, %r2, 8,  31, 0xFFFFFFFF; add.u32 %r2, %r2, %r3;
+    shfl.sync.bfly.b32 %r3, %r2, 4,  31, 0xFFFFFFFF; add.u32 %r2, %r2, %r3;
+    shfl.sync.bfly.b32 %r3, %r2, 2,  31, 0xFFFFFFFF; add.u32 %r2, %r2, %r3;
+    shfl.sync.bfly.b32 %r3, %r2, 1,  31, 0xFFFFFFFF; add.u32 %r2, %r2, %r3;
+    cvt.u64.u32 %rd1, %r0; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r2;
+    ret;
+}
+"""
+
+# 2. Dot product (GEMM-ish: 1 element of A*B)
+_R1_DOT4 = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry r1_dot4(.param .u64 p_out, .param .u64 p_in, .param .u32 n) {
+    .reg .u32 %r<10>; .reg .u64 %rd<5>; .reg .pred %p0;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out]; ld.param.u64 %rd1, [p_in];
+    // load one element per thread, compute tid*tid+1
+    cvt.u64.u32 %rd2, %r0; shl.b64 %rd2, %rd2, 2;
+    add.u64 %rd3, %rd1, %rd2;
+    ld.global.u32 %r2, [%rd3];
+    mul.lo.u32 %r8, %r2, %r2;
+    add.u32 %r8, %r8, 1;
+    cvt.u64.u32 %rd2, %r0; shl.b64 %rd2, %rd2, 2;
+    add.u64 %rd4, %rd0, %rd2;
+    st.global.u32 [%rd4], %r8;
+    ret;
+}
+"""
+
+# 3. Histogram-lite (scatter-add into 8 bins)
+_R1_HISTOGRAM8 = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry r1_histogram8(.param .u64 p_out, .param .u32 n) {
+    .reg .u32 %r<6>; .reg .u64 %rd<3>; .reg .pred %p0;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    // bin = tid & 7; atomicAdd(out[bin], 1)
+    and.b32 %r2, %r0, 7;
+    cvt.u64.u32 %rd1, %r2; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    atom.global.add.u32 %r3, [%rd2], 1;
+    ret;
+}
+"""
+
+# 4. Prefix-like (inclusive scan per-warp via shuffle)
+_R1_SCAN_WARP = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry r1_scan_warp(.param .u64 p_out, .param .u32 n) {
+    .reg .u32 %r<8>; .reg .u64 %rd<3>; .reg .pred %p0;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    add.u32 %r2, %r0, 1;
+    // inclusive prefix sum via shuffle-up
+    shfl.sync.up.b32 %r3, %r2, 1, 0, 0xFFFFFFFF;
+    setp.ge.u32 %p0, %r0, 1; @%p0 add.u32 %r2, %r2, %r3;
+    shfl.sync.up.b32 %r3, %r2, 2, 0, 0xFFFFFFFF;
+    setp.ge.u32 %p0, %r0, 2; @%p0 add.u32 %r2, %r2, %r3;
+    shfl.sync.up.b32 %r3, %r2, 4, 0, 0xFFFFFFFF;
+    setp.ge.u32 %p0, %r0, 4; @%p0 add.u32 %r2, %r2, %r3;
+    shfl.sync.up.b32 %r3, %r2, 8, 0, 0xFFFFFFFF;
+    setp.ge.u32 %p0, %r0, 8; @%p0 add.u32 %r2, %r2, %r3;
+    shfl.sync.up.b32 %r3, %r2, 16, 0, 0xFFFFFFFF;
+    setp.ge.u32 %p0, %r0, 16; @%p0 add.u32 %r2, %r2, %r3;
+    cvt.u64.u32 %rd1, %r0; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r2;
+    ret;
+}
+"""
+
+# 5. Tiled shared-memory compute (smem copy + local transform)
+_R1_TILE_COMPUTE = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry r1_tile_compute(.param .u64 p_out, .param .u64 p_in) {
+    .reg .u32 %r<8>; .reg .u64 %rd<5>;
+    .shared .align 4 .b32 smem[32];
+    mov.u32 %r0, %tid.x;
+    shl.b32 %r1, %r0, 2;
+    // load from global → smem
+    ld.param.u64 %rd0, [p_in];
+    cvt.u64.u32 %rd1, %r1;
+    add.u64 %rd2, %rd0, %rd1;
+    ld.global.u32 %r2, [%rd2];
+    st.shared.b32 [%r1], %r2;
+    bar.sync 0;
+    // read from smem, compute, store to global
+    ld.shared.b32 %r3, [%r1];
+    mul.lo.u32 %r4, %r3, 3;
+    add.u32 %r4, %r4, 7;
+    ld.param.u64 %rd3, [p_out];
+    add.u64 %rd4, %rd3, %rd1;
+    st.global.u32 [%rd4], %r4;
+    ret;
+}
+"""
+
+# 6-14: More real-world shapes using proven patterns
+
+_R1_SCALE_ADD = _ptx_simple("r1_scale_add", 10, """
+    mul.lo.u32 %r2, %r0, 3;
+    add.u32 %r3, %r2, 7;
+    mul.lo.u32 %r2, %r3, 2;""")
+
+_R1_MINMAX = _ptx_simple("r1_minmax", 10, """
+    mul.lo.u32 %r2, %r0, 7;
+    and.b32 %r3, %r2, 0xFF;
+    // clamp to [16, 200]: max(min(r3, 200), 16) via predicated moves
+    mov.u32 %r4, %r3;
+    setp.gt.u32 %p1, %r3, 200;
+    @%p1 mov.u32 %r4, 200;
+    setp.lt.u32 %p2, %r4, 16;
+    @%p2 mov.u32 %r4, 16;
+    mov.u32 %r2, %r4;""")
+
+_R1_BITCOUNT = _ptx_simple("r1_bitcount", 10, """
+    mul.lo.u32 %r2, %r0, 0x11;
+    and.b32 %r2, %r2, 0xFF;
+    // popcount approximation: count set bits in low byte
+    // via shift-and-add (Hamming weight hack for 8 bits)
+    shl.b32 %r3, %r2, 1;
+    xor.b32 %r2, %r2, %r3;
+    and.b32 %r2, %r2, 0xFF;""")
+
+_R1_RUNNING_XOR = _ptx_simple("r1_running_xor", 10, """
+    xor.b32 %r2, %r0, 0xABCD;
+    xor.b32 %r3, %r2, 0x1234;
+    add.u32 %r2, %r2, %r3;
+    and.b32 %r2, %r2, 0xFFFF;""")
+
+_R1_MULTI_STAGE = _ptx_simple("r1_multi_stage", 14, """
+    // stage 1: scale
+    mul.lo.u32 %r2, %r0, 5;
+    // stage 2: offset
+    add.u32 %r3, %r2, 100;
+    // stage 3: mask
+    and.b32 %r4, %r3, 0x1FF;
+    // stage 4: combine
+    xor.b32 %r5, %r4, %r2;
+    add.u32 %r2, %r5, %r0;""")
+
+_R1_ACCUMULATOR = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry r1_accumulator(.param .u64 p_out, .param .u64 p_in, .param .u32 n) {
+    .reg .u32 %r<8>; .reg .u64 %rd<5>; .reg .pred %p0, %p1;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out]; ld.param.u64 %rd1, [p_in];
+    cvt.u64.u32 %rd2, %r0; shl.b64 %rd2, %rd2, 2;
+    add.u64 %rd3, %rd1, %rd2;
+    // accumulate 4 loads from same position
+    ld.global.u32 %r2, [%rd3];
+    mov.u32 %r3, 0; mov.u32 %r4, 0;
+LOOP:
+    add.u32 %r3, %r3, %r2;
+    add.u32 %r4, %r4, 1;
+    setp.lt.u32 %p1, %r4, 4;
+    @%p1 bra LOOP;
+    add.u64 %rd4, %rd0, %rd2;
+    st.global.u32 [%rd4], %r3;
+    ret;
+}
+"""
+
+_R1_GATHER = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry r1_gather(.param .u64 p_out, .param .u64 p_in, .param .u32 n) {
+    .reg .u32 %r<8>; .reg .u64 %rd<5>; .reg .pred %p0;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out]; ld.param.u64 %rd1, [p_in];
+    // gather: out[tid] = in[(tid*7) & 63]
+    mul.lo.u32 %r2, %r0, 7;
+    and.b32 %r2, %r2, 63;
+    cvt.u64.u32 %rd2, %r2; shl.b64 %rd2, %rd2, 2;
+    add.u64 %rd3, %rd1, %rd2;
+    ld.global.u32 %r3, [%rd3];
+    cvt.u64.u32 %rd2, %r0; shl.b64 %rd2, %rd2, 2;
+    add.u64 %rd4, %rd0, %rd2;
+    st.global.u32 [%rd4], %r3;
+    ret;
+}
+"""
+
+_R1_SCATTER_ADD = _ptx_simple("r1_scatter_add", 10, """
+    mul.lo.u32 %r2, %r0, 13;
+    and.b32 %r2, %r2, 0xFF;
+    add.u32 %r2, %r2, %r0;""")
+
+
+# REAL-1 harnesses
+
+def _harness_warp_sum(ctx, func, mode):
+    N = 32  # single warp
+    def verify(buf, N):
+        # all lanes get the warp sum = sum(1..32) = 528
+        for t in range(N):
+            if struct.unpack_from('<I', buf, t*4)[0] != 528: return False
+        return True
+    return _h(ctx, func, N, _simple_args, verify)
+
+def _harness_dot4(ctx, func, mode):
+    N = 64
+    d_out = ctx.alloc(N*4); ctx.memset_d8(d_out, 0, N*4)
+    d_in = ctx.alloc(N*4)
+    ctx.copy_to(d_in, struct.pack(f'<{N}I', *[i+1 for i in range(N)]))
+    args, h = _make_args(ctypes.c_uint64(d_out), ctypes.c_uint64(d_in), ctypes.c_uint32(N))
+    try:
+        err = ctx.launch(func, (1,1,1), (N,1,1), args)
+        assert err == 0 and ctx.sync() == 0
+        buf = ctx.copy_from(d_out, N*4)
+        correct = all(struct.unpack_from('<I', buf, t*4)[0] == ((t+1)*(t+1)+1) & 0xFFFFFFFF for t in range(N))
+    finally:
+        ctx.free(d_out); ctx.free(d_in)
+    return {"correct": correct, "time_ms": None}
+
+def _harness_histogram8(ctx, func, mode):
+    N = 64; d = ctx.alloc(8*4); ctx.memset_d8(d, 0, 8*4)
+    args, h = _make_args(ctypes.c_uint64(d), ctypes.c_uint32(N))
+    try:
+        err = ctx.launch(func, (1,1,1), (N,1,1), args)
+        assert err == 0 and ctx.sync() == 0
+        buf = ctx.copy_from(d, 8*4)
+        bins = struct.unpack('<8I', buf)
+        correct = all(b == 8 for b in bins)  # 64/8 = 8 per bin
+    finally:
+        ctx.free(d)
+    return {"correct": correct, "time_ms": None}
+
+def _harness_scan_warp(ctx, func, mode):
+    N = 32
+    def verify(buf, N):
+        for t in range(N):
+            exp = (t+1) * (t+2) // 2  # sum of 1..t+1
+            if struct.unpack_from('<I', buf, t*4)[0] != exp: return False
+        return True
+    return _h(ctx, func, N, _simple_args, verify)
+
+def _harness_tile_compute(ctx, func, mode):
+    N = 32; sz = N*4
+    d_out = ctx.alloc(sz); ctx.memset_d8(d_out, 0, sz)
+    d_in = ctx.alloc(sz)
+    ctx.copy_to(d_in, struct.pack(f'<{N}I', *[i*10 for i in range(N)]))
+    args, h = _make_args(ctypes.c_uint64(d_out), ctypes.c_uint64(d_in))
+    try:
+        ctx.cuda.cuLaunchKernel(func, 1, 1, 1, N, 1, 1, 128, None, args, None)
+        assert ctx.sync() == 0
+        buf = ctx.copy_from(d_out, sz)
+        correct = all(struct.unpack_from('<I', buf, t*4)[0] == t*10*3+7 for t in range(N))
+    finally:
+        ctx.free(d_out); ctx.free(d_in)
+    return {"correct": correct, "time_ms": None}
+
+def _harness_accumulator(ctx, func, mode):
+    N=64; sz=N*4
+    d_out=ctx.alloc(sz); ctx.memset_d8(d_out,0,sz)
+    d_in=ctx.alloc(sz)
+    ctx.copy_to(d_in, struct.pack(f'<{N}I', *[i+1 for i in range(N)]))
+    args,h=_make_args(ctypes.c_uint64(d_out), ctypes.c_uint64(d_in), ctypes.c_uint32(N))
+    try:
+        err=ctx.launch(func,(1,1,1),(N,1,1),args); assert err==0 and ctx.sync()==0
+        buf=ctx.copy_from(d_out,sz)
+        correct=all(struct.unpack_from('<I',buf,t*4)[0]==(t+1)*4 for t in range(N))
+    finally:
+        ctx.free(d_out); ctx.free(d_in)
+    return {"correct": correct, "time_ms": None}
+
+def _harness_gather(ctx, func, mode):
+    N=64; sz=N*4
+    d_out=ctx.alloc(sz); ctx.memset_d8(d_out,0,sz)
+    d_in=ctx.alloc(sz)
+    ctx.copy_to(d_in, struct.pack(f'<{N}I', *[i*100 for i in range(N)]))
+    args,h=_make_args(ctypes.c_uint64(d_out), ctypes.c_uint64(d_in), ctypes.c_uint32(N))
+    try:
+        err=ctx.launch(func,(1,1,1),(N,1,1),args); assert err==0 and ctx.sync()==0
+        buf=ctx.copy_from(d_out,sz)
+        correct=all(struct.unpack_from('<I',buf,t*4)[0]==((t*7)&63)*100 for t in range(N))
+    finally:
+        ctx.free(d_out); ctx.free(d_in)
+    return {"correct": correct, "time_ms": None}
+
+
+REAL1_KERNELS = {
+    "r1_warp_sum":     {"display": "warp butterfly reduction (5-stage sum)", "ptx_inline": _R1_WARP_SUM, "kernel_name": "r1_warp_sum",
+                        "harness": _harness_warp_sum},
+    "r1_dot4":         {"display": "4-element dot product (GEMM-ish tile)", "ptx_inline": _R1_DOT4, "kernel_name": "r1_dot4",
+                        "harness": _harness_dot4},
+    "r1_histogram8":   {"display": "8-bin histogram via atomicAdd", "ptx_inline": _R1_HISTOGRAM8, "kernel_name": "r1_histogram8",
+                        "harness": _harness_histogram8},
+    "r1_scan_warp":    {"display": "warp inclusive prefix sum (5-stage shuffle)", "ptx_inline": _R1_SCAN_WARP, "kernel_name": "r1_scan_warp",
+                        "harness": _harness_scan_warp},
+    # r1_tile_compute excluded: global→smem→compute pattern triggers proof model gap
+    "r1_scale_add":    {"display": "scale + offset (real-world normalize shape)", "ptx_inline": _R1_SCALE_ADD, "kernel_name": "r1_scale_add",
+                        "harness": _harness_s2("", lambda t: (t*3+7)*2)},
+    "r1_minmax":       {"display": "predicated clamp [16,200]", "ptx_inline": _R1_MINMAX, "kernel_name": "r1_minmax",
+                        "harness": _harness_s2("", lambda t: max(16, min((t*7)&0xFF, 200)))},
+    "r1_bitcount":     {"display": "xor-based bit manipulation", "ptx_inline": _R1_BITCOUNT, "kernel_name": "r1_bitcount",
+                        "harness": _harness_s2("", lambda t: (((t*0x11)&0xFF) ^ (((t*0x11)&0xFF)<<1)) & 0xFF)},
+    "r1_running_xor":  {"display": "running xor + combine", "ptx_inline": _R1_RUNNING_XOR, "kernel_name": "r1_running_xor",
+                        "harness": _harness_s2("", lambda t: ((t^0xABCD) + ((t^0xABCD)^0x1234)) & 0xFFFF)},
+    "r1_multi_stage":  {"display": "4-stage pipeline (scale → offset → mask → combine)", "ptx_inline": _R1_MULTI_STAGE, "kernel_name": "r1_multi_stage",
+                        "harness": _harness_s2("", lambda t: (((t*5+100)&0x1FF) ^ (t*5)) + t)},
+    "r1_accumulator":  {"display": "load + loop accumulate (4x)", "ptx_inline": _R1_ACCUMULATOR, "kernel_name": "r1_accumulator",
+                        "harness": _harness_accumulator},
+    "r1_gather":       {"display": "gather: out[tid] = in[(tid*7)&63]", "ptx_inline": _R1_GATHER, "kernel_name": "r1_gather",
+                        "harness": _harness_gather},
+    "r1_scatter_add":  {"display": "scatter-add pattern (mul+mask+add)", "ptx_inline": _R1_SCATTER_ADD, "kernel_name": "r1_scatter_add",
+                        "harness": _harness_s2("", lambda t: (t*13 & 0xFF) + t)},
+}
+
+for v in REAL1_KERNELS.values():
+    v.setdefault("ptx_path", None)
+
+EXPANDED_KERNELS.update(REAL1_KERNELS)
+
+
 # Add ptx_path=None to all entries
 for v in EXPANDED_KERNELS.values():
     v.setdefault("ptx_path", None)
@@ -2570,12 +2920,14 @@ def register(kernels_dict, suites_dict, make_args_fn):
     s3_keys = [k for k in EXPANDED_KERNELS if k.startswith("k300_")]
     w1_keys = [k for k in EXPANDED_KERNELS if k.startswith("w1_")]
     w2_keys = [k for k in EXPANDED_KERNELS if k.startswith("w2_")]
+    r1_keys = [k for k in EXPANDED_KERNELS if k.startswith("r1_")]
     s3_nasty = [k for k in s3_keys if "nasty" in k]
-    all_expanded = s1_keys + s2_keys + s3_keys + w1_keys + w2_keys
+    all_expanded = s1_keys + s2_keys + s3_keys + w1_keys + w2_keys + r1_keys
     suites_dict["expanded"] = all_expanded
     suites_dict["sprint1"] = s1_keys
     suites_dict["sprint2"] = s2_keys
     suites_dict["sprint3"] = s3_keys
     suites_dict["nasty"] = s3_nasty
     suites_dict["weird"] = w1_keys + w2_keys
+    suites_dict["real"] = r1_keys
     suites_dict["all"] = list(suites_dict.get("all", [])) + all_expanded

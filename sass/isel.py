@@ -2223,7 +2223,80 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 # (fewer pipeline slots than normal allocation).
                                 pass  # no S2UR NOPs
                                 continue
-                    output.extend(_select_mov(instr, ctx.ra, ctx))
+                    # HARD-FINISH-1: mov+@pred add → @pred IMAD coalescing.
+                    # Pattern:
+                    #   mul.lo.u32 %tmp, %a, K        (already emitted)
+                    #   mov.u32 %dest, %val            (this instruction)
+                    #   @%pred add.u32 %dest, %val, %tmp  (next instruction)
+                    # Fused into: @pred IMAD R_dest, R_a, K, R_dest
+                    # where R_dest = R_val (coalesced).  Saves MOV + separate mul.
+                    _did_pred_fuse = False
+                    if (typ in ('u32', 's32') and isinstance(instr.dest, RegOp)
+                            and isinstance(instr.srcs[0], RegOp)
+                            and not instr.pred
+                            and _instr_idx + 1 < len(bb.instructions)):
+                        _nxt = bb.instructions[_instr_idx + 1]
+                        if (_nxt.op == 'add' and _nxt.pred
+                                and _nxt.types and _nxt.types[-1] in ('u32', 's32')
+                                and isinstance(_nxt.dest, RegOp)
+                                and _nxt.dest.name == instr.dest.name
+                                and isinstance(_nxt.srcs[0], RegOp)
+                                and isinstance(_nxt.srcs[1], RegOp)):
+                            val_name = instr.srcs[0].name
+                            dest_name = instr.dest.name
+                            # Identify which add source is val and which is tmp
+                            if _nxt.srcs[0].name == val_name:
+                                tmp_name = _nxt.srcs[1].name
+                            elif _nxt.srcs[1].name == val_name:
+                                tmp_name = _nxt.srcs[0].name
+                            else:
+                                tmp_name = None
+                            if tmp_name is not None:
+                                # Look backward for mul.lo.u32 producing tmp with imm K
+                                _mul_i = None
+                                for _la in range(max(0, _instr_idx - 4), _instr_idx):
+                                    _c = bb.instructions[_la]
+                                    if (_c.op == 'mul' and 'lo' in _c.types
+                                            and _c.types[-1] in ('u32', 's32')
+                                            and isinstance(_c.dest, RegOp)
+                                            and _c.dest.name == tmp_name
+                                            and isinstance(_c.srcs[1], ImmOp)
+                                            and isinstance(_c.srcs[0], RegOp)):
+                                        _mul_i = _c
+                                        break
+                                if (_mul_i is not None
+                                        and (_mul_i.srcs[1].value & 0xFFFFFFFF) <= 0xFFFF):
+                                    from sass.encoding.sm_120_opcodes import encode_imad_r_imm
+                                    mul_k = _mul_i.srcs[1].value & 0xFFFFFFFF
+                                    mul_a = ctx.ra.r32(_mul_i.srcs[0].name)
+                                    val_r = ctx.ra.r32(val_name)
+                                    # Coalesce dest with val
+                                    ctx.ra.int_regs[dest_name] = val_r
+                                    # Remove the mul's SASS from output (last IMAD for this tmp)
+                                    tmp_r = ctx.ra.r32(tmp_name)
+                                    for _ri in range(len(output) - 1, max(len(output) - 6, -1), -1):
+                                        if _ri >= 0 and f'R{tmp_r},' in output[_ri].comment and 'mul.lo' in output[_ri].comment:
+                                            output.pop(_ri)
+                                            break
+                                    # Emit @pred IMAD (predication applied manually since
+                                    # the fusion is emitted at the mov's slot, not the add's)
+                                    pd = ctx.ra.pred(_nxt.pred) if _nxt.pred in ctx.ra.pred_regs else 0
+                                    neg = _nxt.neg
+                                    if hasattr(ctx, '_negated_preds') and pd in ctx._negated_preds:
+                                        neg = not neg
+                                    imad_raw = patch_pred(
+                                        encode_imad_r_imm(val_r, mul_a, mul_k, val_r),
+                                        pred=pd, neg=neg)
+                                    pred_str = f'@{"!" if neg else ""}P{pd} '
+                                    output.append(SassInstr(imad_raw,
+                                        f'{pred_str}IMAD R{val_r}, R{mul_a}, 0x{mul_k:x}, R{val_r}  // fused mov+@pred mul+add'))
+                                    # Skip the @pred add
+                                    if not hasattr(ctx, '_skip_instrs'):
+                                        ctx._skip_instrs = set()
+                                    ctx._skip_instrs.add(id(_nxt))
+                                    _did_pred_fuse = True
+                    if not _did_pred_fuse:
+                        output.extend(_select_mov(instr, ctx.ra, ctx))
 
                 elif op == 'shl' and typ in ('b64', 'u64', 's64'):
                     output.extend(_select_shl_b64(instr, ctx.ra, ctx, output))

@@ -1503,15 +1503,12 @@ def _select_atom_add_u32(instr: Instruction, ra: RegAlloc,
         raise ISelError("atom.add addr must be MemOp")
     d    = ra.r32(dest_op.name)
 
+    # OC-4 fix: materialize the ADDRESS first, then the DATA.
+    # Previously data was allocated a scratch GPR via _alloc_gpr()
+    # before the address materialization, but _emit_ur_to_gpr could
+    # allocate an overlapping pair (e.g., data=R6 then addr=R6:R7),
+    # clobbering the data before the ATOMG reads it.
     prefix = []
-    # Materialize data operand: may be register or immediate (e.g., atomicAdd(p, 1))
-    if isinstance(data_op, ImmOp):
-        data = _alloc_gpr(ctx)
-        prefix.append(SassInstr(encode_iadd3_imm32(data, RZ, data_op.value & 0xFFFFFFFF, RZ),
-                                f'MOV R{data}, {data_op.value:#x}  // atom data imm'))
-    else:
-        data = ra.r32(data_op.name)
-
     base_name = addr_op.base if addr_op.base.startswith('%') else f'%{addr_op.base}'
     ur_params = getattr(ctx, '_ur_params', {}) if ctx else {}
     deferred = getattr(ctx, '_deferred_ur_params', {}) if ctx else {}
@@ -1535,6 +1532,20 @@ def _select_atom_add_u32(instr: Instruction, ra: RegAlloc,
         prefix.extend(_emit_ur_to_gpr(addr, ur_idx, "UR->GPR addr"))
     else:
         addr = RZ
+
+    # Materialize data AFTER address so _alloc_gpr returns a register
+    # that doesn't overlap with the address pair.  Explicitly bump
+    # _next_gpr past the address pair (which is allocated via the
+    # fixed _addr_scratch_lo, outside _alloc_gpr's knowledge).
+    if isinstance(data_op, ImmOp):
+        if ctx and addr != RZ and hasattr(ctx, '_next_gpr'):
+            if ctx._next_gpr <= addr + 1:
+                ctx._next_gpr = addr + 2
+        data = _alloc_gpr(ctx)
+        prefix.append(SassInstr(encode_iadd3_imm32(data, RZ, data_op.value & 0xFFFFFFFF, RZ),
+                                f'MOV R{data}, {data_op.value:#x}  // atom data imm'))
+    else:
+        data = ra.r32(data_op.name)
 
     ur_d = ctx.ur_desc if ctx else 4
     return prefix + [SassInstr(encode_atomg_u32(d, addr, 0, data, ATOMG_ADD, ur_desc=ur_d),

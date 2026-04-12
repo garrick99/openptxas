@@ -353,6 +353,312 @@ DEDICATED_PROBES = [
 
 
 # ---------------------------------------------------------------------------
+# FG-4.3 — non-trivial clones of the 4 remaining FG-4.0 FP kernels
+# ---------------------------------------------------------------------------
+#
+# The four FG-4.0 false-positive F6 random kernels all start with
+# `mov.u32 %r0, %tid.x`, which drives the whole computation to zero
+# when launched with a single thread (tid.x=0).  The FG-4.3 probes
+# clone those kernel bodies exactly BUT replace the tid.x source with
+# `ld.param.u32 %r0, [arg1]`, forcing the computation to flow through
+# a non-trivial constant.  The expected output is computed by a
+# Python model of the same PTX body.
+#
+# If PTXAS still emits the target (producer, reader) SASS pair at
+# gap=0 in the non-trivial clone, AND the runtime output matches the
+# Python expected value, the pair is genuinely forwarding-safe.
+
+def _f43_mask32(x: int) -> int:
+    return x & 0xFFFFFFFF
+
+
+# --- f6_random_s13107_l9 clone: flagged (0x211, 0x212) LEA → IADD3X ---
+PROBE_F43_LEA_IADD3X = {
+    "id": "F43_lea_iadd3x",
+    "cluster": "C",
+    "description": "Clone of f6_random_s13107_l9 with ld.param initializer "
+                   "(flagged LEA→IADD3X in FG-4.0)",
+    "ptx": """
+.version 8.8
+.target sm_120
+.address_size 64
+
+.visible .entry F43_lea_iadd3x(
+    .param .u64 arg0,
+    .param .u32 arg1)
+{
+    .reg .u32 %r<8>;
+    .reg .u64 %rd<8>;
+
+    ld.param.u64 %rd0, [arg0];
+    ld.param.u32 %r0, [arg1];
+
+    add.u32 %r3, %r0, %r0;
+    shr.b32 %r7, %r0, 3;
+    sub.u32 %r3, %r7, %r0;
+    xor.b32 %r2, %r3, %r0;
+    sub.u32 %r1, %r7, %r0;
+    xor.b32 %r7, %r3, %r0;
+    sub.u32 %r3, %r7, %r0;
+    xor.b32 %r4, %r3, %r0;
+    sub.u32 %r3, %r7, %r4;
+    st.global.u32 [%rd0], %r7;
+
+    ret;
+}
+""",
+    "inputs": {"arg1": 0x12345678},
+    "expected": lambda i: (lambda r0:
+        (lambda r3, r7:
+            (lambda r3:
+                (lambda r2:
+                    (lambda r1:
+                        (lambda r7:
+                            _f43_mask32(r7)  # stored value = r7 after the second xor
+                        )(_f43_mask32(r3 ^ r0))
+                    )(_f43_mask32(r7 - r0))
+                )(_f43_mask32(r3 ^ r0))
+            )(_f43_mask32(r7 - r0))
+        )(_f43_mask32(r0 + r0), r0 >> 3)
+    )(i["arg1"]),
+}
+
+
+# --- f6_random_s45058_l10 clone: flagged (0x819, 0x235) SHF → IADD.64 ---
+PROBE_F43_SHF_IADD64 = {
+    "id": "F43_shf_iadd64",
+    "cluster": "B",
+    "description": "Clone of f6_random_s45058_l10 with ld.param initializer "
+                   "(flagged SHF→IADD.64 in FG-4.0)",
+    "ptx": """
+.version 8.8
+.target sm_120
+.address_size 64
+
+.visible .entry F43_shf_iadd64(
+    .param .u64 arg0,
+    .param .u32 arg1)
+{
+    .reg .u32 %r<8>;
+    .reg .u64 %rd<8>;
+
+    ld.param.u64 %rd0, [arg0];
+    ld.param.u32 %r0, [arg1];
+
+    shl.b32 %r5, %r0, 4;
+    shr.b32 %r4, %r0, 2;
+    sub.u32 %r2, %r0, %r4;
+    xor.b32 %r7, %r0, %r0;
+    sub.u32 %r3, %r7, %r4;
+    xor.b32 %r1, %r3, %r0;
+    sub.u32 %r3, %r7, %r4;
+    xor.b32 %r2, %r3, %r0;
+    sub.u32 %r7, %r7, %r4;
+    xor.b32 %r5, %r3, %r0;
+    st.global.u32 [%rd0], %r7;
+
+    ret;
+}
+""",
+    "inputs": {"arg1": 0x12345678},
+    "expected": lambda i: _f43_mask32(
+        _f43_mask32(_f43_mask32(i["arg1"] ^ i["arg1"]) - (i["arg1"] >> 2))
+        - (i["arg1"] >> 2)
+    ),
+}
+
+
+# --- f6_random_s45059_l14 clone: flagged (0x211, 0x986) LEA → STG ---
+PROBE_F43_LEA_STG = {
+    "id": "F43_lea_stg",
+    "cluster": "C",
+    "description": "Clone of f6_random_s45059_l14 with ld.param initializer "
+                   "(flagged LEA→STG in FG-4.0)",
+    "ptx": None,   # populated below
+    "inputs": {"arg1": 0x12345678},
+    "expected": lambda i: 0,   # populated below
+}
+
+
+# --- f6_random_s49153_l16 clone: flagged (0x224, 0x212) IMAD.32 → IADD3X ---
+PROBE_F43_IMAD_IADD3X = {
+    "id": "F43_imad_iadd3x",
+    "cluster": "A",
+    "description": "Clone of f6_random_s49153_l16 with ld.param initializer "
+                   "(flagged IMAD.32→IADD3X in FG-4.0)",
+    "ptx": None,   # populated below
+    "inputs": {"arg1": 0x12345678},
+    "expected": lambda i: 0,   # populated below
+}
+
+
+def _populate_f43_lea_stg_probe():
+    """Populate PROBE_F43_LEA_STG body from the original f6_random_s45059_l14
+    kernel body with tid → ld.param substitution, and compute expected."""
+    import importlib
+    from probe_work.fg40_adversarial_harness import enumerate_corpus
+    for fam, kid, _rec, ptx in enumerate_corpus():
+        if kid == "f6_random_s45059_l14":
+            # Strip the .shared decl and rename, swap tid source.
+            new_ptx = ptx.replace(
+                "mov.u32 %r0, %tid.x;",
+                "ld.param.u32 %r0, [arg1];"
+            ).replace(kid, "F43_lea_stg")
+            PROBE_F43_LEA_STG["ptx"] = new_ptx
+            # Execute the body symbolically to compute expected:
+            expected = _simulate_f6_kernel_body(ptx, 0x12345678)
+            PROBE_F43_LEA_STG["expected"] = lambda i, e=expected: e
+            return
+    raise RuntimeError("f6_random_s45059_l14 not found in corpus")
+
+
+def _populate_f43_imad_iadd3x_probe():
+    """Same idea for f6_random_s49153_l16."""
+    from probe_work.fg40_adversarial_harness import enumerate_corpus
+    for fam, kid, _rec, ptx in enumerate_corpus():
+        if kid == "f6_random_s49153_l16":
+            new_ptx = ptx.replace(
+                "mov.u32 %r0, %tid.x;",
+                "ld.param.u32 %r0, [arg1];"
+            ).replace(kid, "F43_imad_iadd3x")
+            PROBE_F43_IMAD_IADD3X["ptx"] = new_ptx
+            expected = _simulate_f6_kernel_body(ptx, 0x12345678)
+            PROBE_F43_IMAD_IADD3X["expected"] = lambda i, e=expected: e
+            return
+    raise RuntimeError("f6_random_s49153_l16 not found in corpus")
+
+
+def _simulate_f6_kernel_body(ptx: str, arg1: int) -> int:
+    """Minimal PTX body simulator for F6 random kernels.  Supports
+    add/sub/mul/xor/and/or/shl/shr with u32 operands.  Returns the
+    final value stored to [%rd0] via `st.global.u32`.
+    """
+    import re
+    regs: dict[int, int] = {0: arg1 & 0xFFFFFFFF}
+    MASK = 0xFFFFFFFF
+    def get(name):
+        # %r7 → regs[7], 0x5 → literal
+        if name.startswith("%r"):
+            return regs.get(int(name[2:]), 0)
+        return int(name, 0)
+    # Isolate the kernel body (everything between { and } after the .entry).
+    body = ptx.split("{", 1)[1].rsplit("}", 1)[0]
+    last_stored = 0
+    for line in body.splitlines():
+        line = line.strip().rstrip(";")
+        if not line:
+            continue
+        if line.startswith("st.global.u32"):
+            # st.global.u32 [%rd0], %rN
+            m = re.search(r"%r(\d+)", line.split(",")[-1])
+            if m:
+                last_stored = regs.get(int(m.group(1)), 0) & MASK
+            continue
+        # ALU ops: OPCODE dest, src0, src1
+        parts = line.split()
+        if not parts:
+            continue
+        op = parts[0]
+        rest = " ".join(parts[1:])
+        if op.startswith(("add.u32", "sub.u32", "mul.lo.u32",
+                          "xor.b32", "and.b32", "or.b32",
+                          "shl.b32", "shr.b32")):
+            operands = [x.strip() for x in rest.split(",")]
+            if len(operands) != 3:
+                continue
+            d_name, a_name, b_name = operands
+            if not d_name.startswith("%r"):
+                continue
+            d = int(d_name[2:])
+            a = get(a_name)
+            b = get(b_name)
+            if op.startswith("add"):
+                regs[d] = (a + b) & MASK
+            elif op.startswith("sub"):
+                regs[d] = (a - b) & MASK
+            elif op.startswith("mul.lo"):
+                regs[d] = (a * b) & MASK
+            elif op.startswith("xor"):
+                regs[d] = (a ^ b) & MASK
+            elif op.startswith("and"):
+                regs[d] = (a & b) & MASK
+            elif op.startswith("or"):
+                regs[d] = (a | b) & MASK
+            elif op.startswith("shl"):
+                regs[d] = (a << (b & 31)) & MASK
+            elif op.startswith("shr"):
+                regs[d] = (a >> (b & 31)) & MASK
+    return last_stored
+
+
+# Populate the two probes whose bodies come from existing F6 kernels.
+_populate_f43_lea_stg_probe()
+_populate_f43_imad_iadd3x_probe()
+
+
+# Override the hand-coded symbolic expected with the simulator so the
+# expressions for PROBE_F43_LEA_IADD3X and PROBE_F43_SHF_IADD64 are
+# definitely consistent with their PTX bodies.
+def _probe_expected_from_sim(probe: dict) -> int:
+    return _simulate_f6_kernel_body(probe["ptx"],
+                                    probe["inputs"]["arg1"])
+
+_F43_LEA_IADD3X_EXPECTED = _probe_expected_from_sim(PROBE_F43_LEA_IADD3X)
+_F43_SHF_IADD64_EXPECTED = _probe_expected_from_sim(PROBE_F43_SHF_IADD64)
+PROBE_F43_LEA_IADD3X["expected"] = lambda i, e=_F43_LEA_IADD3X_EXPECTED: e
+PROBE_F43_SHF_IADD64["expected"] = lambda i, e=_F43_SHF_IADD64_EXPECTED: e
+
+
+F43_PROBES = [
+    PROBE_F43_LEA_IADD3X,
+    PROBE_F43_SHF_IADD64,
+    PROBE_F43_LEA_STG,
+    PROBE_F43_IMAD_IADD3X,
+]
+
+
+# FG-4.3 second-attempt probe for SHF → IADD.64.  The previous clone
+# (F43_shf_iadd64) had PTXAS route through opcode 0x899 instead of
+# 0x819 because ld.param.u32 source behaves differently from tid.x
+# in the register allocator.  This probe forces a 64-bit shift
+# feeding a register-register 64-bit add, which is the classic SHF
+# → IADD.64 shape.
+PROBE_F43_SHF_IADD64_V2 = {
+    "id": "F43_shf_iadd64_v2",
+    "cluster": "B",
+    "description": "64-bit shr + reg-reg add: forces SHF → IADD.64 "
+                   "in PTXAS SASS",
+    "ptx": """
+.version 8.8
+.target sm_120
+.address_size 64
+
+.visible .entry F43_shf_iadd64_v2(
+    .param .u64 arg0,
+    .param .u64 arg1,
+    .param .u64 arg2)
+{
+    .reg .u64 %rd<6>;
+
+    ld.param.u64 %rd0, [arg0];
+    ld.param.u64 %rd1, [arg1];
+    ld.param.u64 %rd2, [arg2];
+    shr.u64 %rd3, %rd1, 5;
+    add.u64 %rd4, %rd3, %rd2;
+    st.global.u64 [%rd0], %rd4;
+    ret;
+}
+""",
+    "inputs": {"arg1": 0x0123456789ABCDEF,
+               "arg2": 0xFEDCBA9876543210},
+    "expected": lambda i: ((i["arg1"] >> 5) + i["arg2"]) & 0xFFFFFFFFFFFFFFFF,
+}
+F43_PROBES.append(PROBE_F43_SHF_IADD64_V2)
+
+DEDICATED_PROBES = DEDICATED_PROBES + F43_PROBES
+
+
+# ---------------------------------------------------------------------------
 # Direct FG-4.0 kernel replay: run each false-positive kernel on GPU
 # using BOTH OURS and PTXAS cubins, compare outputs.  If both produce
 # the same output for the same input, the PTXAS gap=0 schedule is
@@ -592,6 +898,12 @@ PRODUCER_CONSUMER_HINT = {
     "P_imad_stg_nd":  (0x224, 0x986),   # IMAD.32 → STG
     "P_lea_index":    (0x211, 0x986),   # LEA → STG
     "P_shf_iadd64":   (0x819, 0x235),   # SHF → IADD.64
+    # FG-4.3 clones of FG-4.0 false-positive kernels with ld.param flow
+    "F43_lea_iadd3x":   (0x211, 0x212),  # LEA → IADD3X
+    "F43_shf_iadd64":   (0x819, 0x235),  # SHF → IADD.64
+    "F43_lea_stg":      (0x211, 0x986),  # LEA → STG
+    "F43_imad_iadd3x":  (0x224, 0x212),  # IMAD.32 → IADD3X
+    "F43_shf_iadd64_v2": (0x819, 0x235), # 64-bit shift + reg-reg add
 }
 
 

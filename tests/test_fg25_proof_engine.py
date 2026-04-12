@@ -1564,27 +1564,92 @@ def test_inv_ae1_fg42_pairs_are_forwarding_safe():
 
 
 def test_inv_ae2_nearby_pair_still_conservative():
-    """INV AE2: pairs NOT covered by FG-4.2 evidence must still be
-    flagged as VIOLATION.  We check two adjacent pairs that the
-    harness could NOT validate with non-trivial runtime output:
-
-        (0x211, 0x212)  LEA → IADD3X
-        (0x224, 0x212)  IMAD.32 → IADD3X
-
-    These must NOT be on _FORWARDING_SAFE_PAIRS — adding them
-    without evidence is exactly what FG-4.2 forbids.
+    """INV AE2: pairs NOT covered by any evidence pass (FG-4.2
+    through FG-4.3) must still be flagged as VIOLATION.  FG-4.3
+    confirmed LEA→IADD3X, LEA→STG, IMAD.32→IADD3X, and (transitively)
+    IADD3X→STG via dedicated non-trivial probes.  The only remaining
+    uncovered pair is (0x819, 0x235) SHF→IADD.64 — probes could not
+    force PTXAS to emit 0x819 for that ALU shape while also producing
+    a Python-matching non-zero output.
     """
     from sass.scoreboard import _FORWARDING_SAFE_PAIRS
     unsupported = {
-        (0x211, 0x212),  # LEA → IADD3X
-        (0x224, 0x212),  # IMAD.32 → IADD3X
-        (0x211, 0x986),  # LEA → STG (replay evidence too weak)
-        (0x819, 0x235),  # SHF → IADD.64 (replay evidence too weak)
+        (0x819, 0x235),  # SHF → IADD.64 — inconclusive in FG-4.3
     }
     leaked = unsupported & _FORWARDING_SAFE_PAIRS
     assert not leaked, (
         f"INV AE2: unsupported pairs leaked into _FORWARDING_SAFE_PAIRS "
         f"without evidence: {leaked}"
+    )
+
+
+# ===========================================================================
+# FG-4.3 INVARIANTS — evidence-backed forwarding pairs for F6 patterns
+# ===========================================================================
+#
+# FG-4.3 added four more _FORWARDING_SAFE_PAIRS entries after running
+# non-trivial clones of four FG-4.0 false-positive kernels on GPU and
+# comparing PTXAS outputs against a small PTX-body simulator.  The
+# four pairs below are each backed by at least one probe whose runtime
+# output matched the simulator bit-for-bit with arg1=0x12345678.
+
+
+def test_inv_af1_fg43_pairs_are_forwarding_safe():
+    """INV AF1: each FG-4.3 evidence-backed pair must be on
+    _FORWARDING_SAFE_PAIRS.
+    """
+    from sass.scoreboard import _FORWARDING_SAFE_PAIRS
+    confirmed = {
+        (0x211, 0x212),  # LEA → IADD3X
+        (0x211, 0x986),  # LEA → STG.E
+        (0x224, 0x212),  # IMAD.32 → IADD3X
+        (0x212, 0x986),  # IADD3X → STG.E (transitive)
+    }
+    missing = confirmed - _FORWARDING_SAFE_PAIRS
+    assert not missing, (
+        f"INV AF1: FG-4.3 pairs missing from _FORWARDING_SAFE_PAIRS: "
+        f"{missing}"
+    )
+
+
+def test_inv_af2_shf_iadd64_still_conservative():
+    """INV AF2: the SHF→IADD.64 pair (0x819, 0x235) was the one
+    FG-4.3 probe that could NOT be confirmed — PTXAS re-routed
+    through opcode 0x899 instead of 0x819 on every clone shape.
+    The pair must remain OFF the whitelist until a future pass
+    produces direct evidence.
+    """
+    from sass.scoreboard import _FORWARDING_SAFE_PAIRS
+    assert (0x819, 0x235) not in _FORWARDING_SAFE_PAIRS, (
+        "INV AF2: (0x819, 0x235) SHF→IADD.64 leaked into "
+        "_FORWARDING_SAFE_PAIRS without evidence"
+    )
+
+
+def test_inv_af3_no_false_negatives_from_fg43():
+    """INV AF3: FG-4.3 additions must not turn any FG-2.5
+    negative-control VIOLATION into SAFE.  Re-runs INV L (IMAD.R-UR
+    → MOV) and INV N (IMAD.WIDE.RR → IADD3) as live verify_proof
+    calls.
+    """
+    from sass.encoding.sm_120_opcodes import encode_imad_ur
+    instrs_l = _stream(
+        encode_imad_ur(dest=4, src0=3, ur_src=6, src2=2),
+        encode_mov(dest=5, src=4),
+    )
+    report_l = verify_proof(instrs_l)
+    assert not report_l.safe, (
+        "INV AF3: INV L (IMAD.R-UR → MOV) hazard no longer flagged "
+        "— FG-4.3 refinement leaked"
+    )
+    instrs_n = _stream(
+        encode_imad_wide_rr(dest=8, src0=2, src1=3, src2=0xff),
+        encode_iadd3(dest=10, src0=8, src1=11, src2=0xff),
+    )
+    report_n = verify_proof(instrs_n)
+    assert not report_n.safe, (
+        "INV AF3: INV N (IMAD.WIDE.RR → IADD3) hazard no longer "
+        "flagged — FG-4.3 refinement leaked"
     )
 
 

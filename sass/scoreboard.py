@@ -611,6 +611,50 @@ _FORWARDING_SAFE_PAIRS: set[tuple[int, int]] = {
     # class bits; runtime output 3*arg1 matches expected for
     # arg1 = 0x123456789ABCDEF0.
     (0x235, 0x235),   # IADD.64 → IADD.64
+    # FG-4.3 additions: clones of three of the four remaining FG-4.0
+    # false-positive F6 random kernels were built by substituting
+    # `mov.u32 %r0, %tid.x` → `ld.param.u32 %r0, [arg1]` so the
+    # computation flows through a non-trivial constant
+    # (arg1=0x12345678).  Expected outputs were computed by a
+    # small PTX-body simulator in probe_work/fg42_evidence_harness.py
+    # and compared to the GPU runtime output of the PTXAS cubin.
+    # Three of the four probes passed with bit-exact matches.  The
+    # fourth probe (F43_shf_iadd64) did NOT confirm its pair
+    # because the ld.param version caused PTXAS to pick a different
+    # shift opcode (0x899 instead of 0x819).  Each entry below
+    # carries its own probe + evidence citation.
+    (0x211, 0x212),   # LEA → IADD3X
+                      # Evidence: F43_lea_iadd3x probe — clone of
+                      # f6_random_s13107_l9 with ld.param arg1=
+                      # 0x12345678; PTXAS SASS has 0x211→0x212 at
+                      # gap=0, consumer rbar=0x01, runtime output
+                      # 3794166319 (0xe226622f) matches PTX-body
+                      # simulator.
+    (0x211, 0x986),   # LEA → STG.E
+                      # Evidence: F43_lea_stg probe — clone of
+                      # f6_random_s45059_l14 with ld.param arg1=
+                      # 0x12345678; PTXAS SASS has 0x211→0x986 at
+                      # gap=0, consumer rbar=0x05 (LDS class, NOT
+                      # the producer's ALU class bit), runtime
+                      # output 3684127504 (0xdb975310) matches
+                      # simulator.
+    (0x224, 0x212),   # IMAD.32 → IADD3X
+                      # Evidence: F43_imad_iadd3x probe — clone of
+                      # f6_random_s49153_l16 with ld.param arg1=
+                      # 0x12345678; PTXAS SASS has 0x224→0x212 at
+                      # gap=0, consumer rbar=0x01, runtime output
+                      # 271863872 (0x10345040) matches simulator.
+    (0x212, 0x986),   # IADD3X → STG.E
+                      # Evidence: transitively proven by F43_lea_iadd3x
+                      # and F43_imad_iadd3x probes.  Both probe cubins
+                      # have a SASS chain of ALU producer → IADD3X →
+                      # STG.E at gap=0 at every step.  The LEA→IADD3X
+                      # and IMAD.32→IADD3X links are already confirmed
+                      # above.  If IADD3X→STG.E were broken, the
+                      # runtime outputs (0xe226622f and 0x10345040)
+                      # would not match their Python-simulated values;
+                      # since they do, every link in the chain —
+                      # including IADD3X→STG.E — is forwarding-safe.
     # FG-2.5: surfaced by constructive proof engine.
     # IADD.64-UR → IADD3.IMM: IADD.64-UR writes a pair; immediate
     # IADD3 adds a constant to the low half as the second phase of

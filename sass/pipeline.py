@@ -1295,17 +1295,32 @@ def compile_function(fn: Function, verbose: bool = False,
                 s2r_offset = i
                 break
 
-    # FB-4.4: post-SASS register accounting. Use the MAX of compaction count
-    # and allocator high-water — never report fewer registers than the
-    # allocator allocated, even if compaction's view is lower (some scratch
-    # may be allocated but not visible in our field metadata).
+    # FB-4.4 + PERF-5.1: post-SASS register accounting.
+    # First compute the allocator's estimate (high-water from allocation).
     _allocator_count = max(alloc.num_gprs, ctx._next_gpr,
                            getattr(ctx, '_scratch_highwater', 0))
     if _compact_count > 0:
-        # Compaction succeeded with rewrite — its count IS the truth
         _final_gprs = max(_compact_count, 2)
     else:
         _final_gprs = max(_allocator_count, 2)
+    # PERF-5.1: scan the actual emitted SASS to find the highest GPR
+    # index that appears in any instruction's dest or src fields.  The
+    # allocator can over-estimate when isel folds virtual regs to RZ
+    # (e.g., DMMA zero-init patterns where %fd inputs are allocated
+    # real pairs but the encoder uses RZ operands).  Declaring fewer
+    # registers improves occupancy without affecting correctness.
+    from sass.scoreboard import _get_dest_regs, _get_src_regs
+    _sass_max_gpr = 0
+    for _si in range(0, len(sass_bytes), 16):
+        _raw = sass_bytes[_si:_si + 16]
+        if len(_raw) < 16:
+            break
+        for _r in _get_dest_regs(_raw) | _get_src_regs(_raw):
+            if _r < 255 and _r > _sass_max_gpr:
+                _sass_max_gpr = _r
+    _sass_gpr_count = _sass_max_gpr + 2  # +1 for index→count, +1 for pair safety
+    if _sass_gpr_count < _final_gprs:
+        _final_gprs = max(_sass_gpr_count, 2)
     if verbose and _final_gprs != _allocator_count:
         print(f"[pipeline] FB-4.4: final regs={_final_gprs} "
               f"(allocator reported {_allocator_count})")

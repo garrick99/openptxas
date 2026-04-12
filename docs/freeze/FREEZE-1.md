@@ -42,7 +42,11 @@
 | OpenPTXas pytest | 585 | 585 | 0 |
 | OpenPTXas proof corpus | 54 | 54 SAFE | 0 |
 | OpenPTXas adversarial | 51 | 51 | 0 |
-| **Cross-stack total** | **~33,489** | **~33,434** | **0** |
+| OpenPTXas skipped | 0 | — | — |
+| OpenCUDA skipped | 55 | — | — |
+| **Cross-stack total** | **33,489** | **33,384 passed** | **0 failed** |
+
+*The 55 skipped OpenCUDA tests are runtime GPU-availability checks (no GPU in headless CI). 0 xfail markers in any repo.*
 
 ### Proof Model (FG-2.4 → FG-4.8)
 - 13 proof classes (LATENCY_INERT through UR_MEMORY_VIOLATION)

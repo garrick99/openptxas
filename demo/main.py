@@ -7,10 +7,10 @@ OpenPTXas against NVIDIA's ptxas on real GPU hardware.
 
 Usage:
     python demo/main.py --kernel ilp_dual_int32
-    python demo/main.py --suite ilp
     python demo/main.py --suite demo
     python demo/main.py --suite full
-    python demo/main.py --kernel vecadd_large --diff
+    python demo/main.py --kernel ilp_dual_int32 --diff
+    python demo/main.py --suite demo --explain
     python demo/main.py --proof
 """
 from __future__ import annotations
@@ -22,11 +22,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from benchmarks.bench_util import compile_openptxas, compile_ptxas
 from demo.compare import compile_both, opcode_name
 from demo.runner import run_full, get_ptx
 from demo.diff import diff_streams, summarize_transforms
-from demo.formatter import fmt_kernel_report, fmt_suite_summary, fmt_proof_status
+from demo.formatter import (fmt_kernel_report, fmt_suite_summary,
+                             fmt_proof_footer, fmt_structured_diff)
 import workbench
 
 
@@ -45,14 +45,46 @@ SUITES = {
 }
 
 
-def run_one_kernel(name: str, show_diff: bool = False) -> dict | None:
+def _get_proof_counts() -> tuple[int, int]:
+    """Run adversarial harness, return (confirmed, total)."""
+    import subprocess
+    r = subprocess.run(
+        [sys.executable, str(ROOT / 'probe_work' / 'fg40_adversarial_harness.py')],
+        capture_output=True, text=True, cwd=str(ROOT),
+    )
+    confirmed = 0
+    total = 0
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if 'MODEL_CONFIRMED' in line and '=' in line:
+            parts = line.split('=')
+            if len(parts) == 2:
+                try:
+                    n = int(parts[1].strip())
+                    confirmed += n
+                    total += n
+                except ValueError:
+                    pass
+        for tag in ('MODEL_FALSE_POSITIVE', 'MODEL_FALSE_NEGATIVE'):
+            if tag in line and ':' in line:
+                parts = line.split(':')
+                if len(parts) == 2:
+                    try:
+                        n = int(parts[1].strip())
+                        total += n
+                    except ValueError:
+                        pass
+    return confirmed, total
+
+
+def run_one_kernel(name: str, show_diff: bool = False,
+                   explain: bool = False) -> dict | None:
     """Run full comparison pipeline for one kernel."""
     ptx = get_ptx(name)
     if ptx is None:
         print(f'ERROR: no PTX source for kernel "{name}"', file=sys.stderr)
         return None
 
-    # Run workbench: compile both, GPU correctness, metrics
     wb = run_full(name)
     if wb is None or wb.get('error'):
         print(f'ERROR: {name}: {wb.get("error") if wb else "unknown"}', file=sys.stderr)
@@ -62,10 +94,8 @@ def run_one_kernel(name: str, show_diff: bool = False) -> dict | None:
     ours_wb = wb['ours']
     ptxas_wb = wb['ptxas']
 
-    # Compile both for SASS disassembly (cheap -- already cached in memory)
     sass = compile_both(ptx)
 
-    # Build unified metrics dict from workbench (authoritative source)
     metrics = {
         'ours': {
             'non_nop': ours_wb['sass_non_nop'],
@@ -90,29 +120,15 @@ def run_one_kernel(name: str, show_diff: bool = False) -> dict | None:
         'ptxas_pass': ptxas_wb is not None,
     }
 
-    # Diff analysis
     diff_records = diff_streams(metrics['ours']['ops'], metrics['ptxas']['ops'])
     highlights = summarize_transforms(diff_records)
 
-    # Print report
-    report = fmt_kernel_report(name, metrics, gpu, diff_records, highlights)
+    report = fmt_kernel_report(name, metrics, gpu, diff_records, highlights,
+                               explain=explain)
     print(report)
 
-    # Optional detailed diff
     if show_diff:
-        print('[DETAILED INSTRUCTION DIFF]')
-        for r in diff_records:
-            if r['type'] == 'match':
-                opc = opcode_name(r['ours']['opcode'])
-                print(f'    [{r["ours"]["idx"]:3d}]  {opc:<16s}  =  [{r["ptxas"]["idx"]:3d}] {opc}')
-            elif r['type'] == 'ours_only':
-                opc = opcode_name(r['ours']['opcode'])
-                tag = '  <<< ' + r['explanation'] if r['explanation'] else ''
-                print(f'  + [{r["ours"]["idx"]:3d}]  {opc:<16s}     {"---":>5s} ---{tag}')
-            elif r['type'] == 'ptxas_only':
-                opc = opcode_name(r['ptxas']['opcode'])
-                print(f'  - {"---":>5s}  {"---":<16s}     [{r["ptxas"]["idx"]:3d}] {opc}')
-        print()
+        print(fmt_structured_diff(diff_records))
 
     return {
         'name': name,
@@ -121,40 +137,6 @@ def run_one_kernel(name: str, show_diff: bool = False) -> dict | None:
         'diff': diff_records,
         'highlights': highlights,
     }
-
-
-def run_proof_summary():
-    """Run adversarial harness and print proof status."""
-    import subprocess
-    r = subprocess.run(
-        [sys.executable, str(ROOT / 'probe_work' / 'fg40_adversarial_harness.py')],
-        capture_output=True, text=True, cwd=str(ROOT),
-    )
-    confirmed = 0
-    total_checked = 0
-    for line in r.stdout.splitlines():
-        line = line.strip()
-        if 'MODEL_CONFIRMED' in line and '=' in line:
-            parts = line.split('=')
-            if len(parts) == 2:
-                try:
-                    n = int(parts[1].strip())
-                    confirmed += n
-                    total_checked += n
-                except ValueError:
-                    pass
-        for tag in ('MODEL_FALSE_POSITIVE', 'MODEL_FALSE_NEGATIVE'):
-            if tag in line and ':' in line:
-                parts = line.split(':')
-                if len(parts) == 2:
-                    try:
-                        n = int(parts[1].strip())
-                        total_checked += n
-                    except ValueError:
-                        pass
-    print()
-    print(fmt_proof_status((confirmed, total_checked)))
-    print()
 
 
 def main():
@@ -166,9 +148,11 @@ def main():
     parser.add_argument('--suite', '-s', choices=list(SUITES.keys()),
                         help='Run a kernel suite (demo, ilp, full)')
     parser.add_argument('--diff', '-d', action='store_true',
-                        help='Show detailed instruction-level diff')
+                        help='Show structured transformation diff')
+    parser.add_argument('--explain', '-e', action='store_true',
+                        help='Show detailed WHY explanations for differences')
     parser.add_argument('--proof', '-p', action='store_true',
-                        help='Run proof model verification')
+                        help='Run proof model verification (standalone)')
     args = parser.parse_args()
 
     if not args.kernel and not args.suite and not args.proof:
@@ -184,22 +168,26 @@ def main():
     results = []
 
     if args.kernel:
-        r = run_one_kernel(args.kernel, show_diff=args.diff)
+        r = run_one_kernel(args.kernel, show_diff=args.diff,
+                           explain=args.explain)
         if r:
             results.append(r)
 
     if args.suite:
         kernels = SUITES.get(args.suite, [])
         for name in kernels:
-            r = run_one_kernel(name, show_diff=args.diff)
+            r = run_one_kernel(name, show_diff=args.diff,
+                               explain=args.explain)
             if r:
                 results.append(r)
 
     if results and len(results) > 1:
         print(fmt_suite_summary(results))
 
-    if args.proof:
-        run_proof_summary()
+    # Auto proof footer for suites (or standalone --proof)
+    if args.suite or args.proof:
+        confirmed, total = _get_proof_counts()
+        print(fmt_proof_footer((confirmed, total)))
 
     if any(not r['gpu']['ours_pass'] for r in results):
         return 1

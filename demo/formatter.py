@@ -4,8 +4,17 @@ from __future__ import annotations
 from demo.compare import opcode_name
 
 
+# Bounded gap explanations — why a specific kernel has a residual
+_GAP_CATEGORY = {
+    'ilp_unrolled_sum4': ('struct', 'chained stride addresses require allocator rework'),
+    'ilp_pipeline_load': ('minor', 'scheduling style difference, diminishing returns'),
+    'vecadd_large':      ('sched', 'address generation style difference'),
+}
+
+
 def fmt_kernel_report(name: str, metrics: dict, gpu: dict,
-                      diff_records: list[dict], highlights: list[str]) -> str:
+                      diff_records: list[dict], highlights: list[str],
+                      explain: bool = False) -> str:
     """Format a complete kernel comparison report."""
     ours = metrics['ours']
     ptxas = metrics['ptxas']
@@ -37,7 +46,7 @@ def fmt_kernel_report(name: str, metrics: dict, gpu: dict,
     _row('Total (incl NOPs)', ptxas['total'], ours['total'])
     lines.append('')
 
-    # -- Highlights --
+    # -- Highlights (shown when --explain or always if concise) --
     if highlights:
         lines.append('[HIGHLIGHTS]')
         for h in highlights:
@@ -58,7 +67,7 @@ def fmt_kernel_report(name: str, metrics: dict, gpu: dict,
         # WHY section for explained differences
         explained = [r for r in diff_records
                      if r['type'] == 'ours_only' and r['explanation']]
-        if explained:
+        if explained and explain:
             lines.append('')
             lines.append('  WHY:')
             seen = set()
@@ -80,7 +89,11 @@ def fmt_kernel_report(name: str, metrics: dict, gpu: dict,
     elif instr_delta == 0:
         lines.append(f'  PARITY on instructions (+{reg_delta} registers)')
     else:
-        lines.append(f'  PTXAS leads by {instr_delta} instruction(s) (bounded residual)')
+        cat, reason = _GAP_CATEGORY.get(name, ('', ''))
+        tag = f' ({cat})' if cat else ''
+        lines.append(f'  PTXAS leads by {instr_delta} instruction(s){tag}')
+        if reason and explain:
+            lines.append(f'  Reason: {reason}')
     lines.append('')
 
     return '\n'.join(lines)
@@ -120,7 +133,9 @@ def fmt_suite_summary(results: list[dict]) -> str:
             verdict = 'PARITY'
             parity += 1
         else:
-            verdict = f'+{di} gap'
+            cat, _ = _GAP_CATEGORY.get(name, ('', ''))
+            tag = f' ({cat})' if cat else ''
+            verdict = f'+{di} gap{tag}'
             gaps += 1
 
         di_s = f'{di:+d}' if di != 0 else '0'
@@ -138,12 +153,109 @@ def fmt_suite_summary(results: list[dict]) -> str:
     return '\n'.join(lines)
 
 
-def fmt_proof_status(adversarial: tuple[int, int],
-                     corpus: tuple[int, int] | None = None) -> str:
-    """Format proof model status line."""
+def fmt_proof_footer(adversarial: tuple[int, int]) -> str:
+    """Format proof footer for suite output."""
     a_pass, a_total = adversarial
-    parts = [f'Proof: {a_pass}/{a_total} adversarial CONFIRMED']
-    if corpus:
-        c_pass, c_total = corpus
-        parts.append(f'{c_pass}/{c_total} corpus SAFE')
-    return '  '.join(parts)
+    lines = []
+    lines.append(f'  Proof: {a_pass}/{a_total} adversarial CONFIRMED')
+    lines.append('')
+    return '\n'.join(lines)
+
+
+def fmt_structured_diff(diff_records: list[dict]) -> str:
+    """Format transformation-grouped diff output."""
+    lines = []
+    lines.append('[STRUCTURED DIFF]')
+    lines.append('')
+
+    # Group contiguous ours_only / ptxas_only into transformation blocks
+    transforms = []
+    current_block = {'ours': [], 'ptxas': []}
+
+    for r in diff_records:
+        if r['type'] == 'match':
+            # Flush current block if non-empty
+            if current_block['ours'] or current_block['ptxas']:
+                transforms.append(current_block)
+                current_block = {'ours': [], 'ptxas': []}
+        elif r['type'] == 'ours_only':
+            current_block['ours'].append(r)
+        elif r['type'] == 'ptxas_only':
+            current_block['ptxas'].append(r)
+
+    if current_block['ours'] or current_block['ptxas']:
+        transforms.append(current_block)
+
+    if not transforms:
+        lines.append('  Instruction streams are identical.')
+        lines.append('')
+        return '\n'.join(lines)
+
+    for idx, block in enumerate(transforms, 1):
+        # Determine transformation name
+        name = _classify_transform(block)
+        lines.append(f'  [TRANSFORMATION {idx}: {name}]')
+
+        if block['ptxas']:
+            ops = [opcode_name(r['ptxas']['opcode']) for r in block['ptxas']]
+            idxs = [f'[{r["ptxas"]["idx"]:d}]' for r in block['ptxas']]
+            lines.append(f'  PTXAS ({len(ops)}): {" ".join(f"{i} {o}" for i, o in zip(idxs, ops))}')
+
+        if block['ours']:
+            ops = [opcode_name(r['ours']['opcode']) for r in block['ours']]
+            idxs = [f'[{r["ours"]["idx"]:d}]' for r in block['ours']]
+            lines.append(f'  OURS  ({len(ops)}): {" ".join(f"{i} {o}" for i, o in zip(idxs, ops))}')
+
+        # Effect
+        delta = len(block['ours']) - len(block['ptxas'])
+        if delta < 0:
+            lines.append(f'  Effect: {len(block["ptxas"])} -> {len(block["ours"])} (saved {-delta})')
+        elif delta > 0:
+            lines.append(f'  Effect: {len(block["ptxas"])} -> {len(block["ours"])} (+{delta})')
+        else:
+            lines.append(f'  Effect: {len(block["ptxas"])} -> {len(block["ours"])} (neutral)')
+
+        # Explanation from any annotated record
+        for r in block['ours']:
+            if r.get('explanation'):
+                lines.append(f'  Why: {r["explanation"]}')
+                break
+
+        lines.append('')
+
+    return '\n'.join(lines)
+
+
+def _classify_transform(block: dict) -> str:
+    """Classify a diff block into a named transformation."""
+    ours_ops = [opcode_name(r['ours']['opcode']) for r in block['ours']]
+    ptxas_ops = [opcode_name(r['ptxas']['opcode']) for r in block['ptxas']]
+    all_ops = ours_ops + ptxas_ops
+
+    # Check for explained records first
+    for r in block['ours']:
+        if r.get('explanation'):
+            if 'LOP3' in r['explanation']:
+                return 'LOP3 inline immediate'
+            if 'IMAD.WIDE' in r['explanation']:
+                return 'IMAD.WIDE address fusion'
+            if 'IADD.64' in r['explanation']:
+                return 'IADD.64 R-UR address add'
+            if 'predicated' in r['explanation']:
+                return 'predicated IMAD fusion'
+
+    # Pattern-based classification
+    if any('LEA' in o for o in ptxas_ops):
+        return 'address generation (LEA vs IMAD.WIDE+IADD.64)'
+    if any('IMAD.424' in o for o in ptxas_ops):
+        return 'IMAD mul+add form (PTXAS 0x424 vs OURS IMAD.Ri+IADD3)'
+    if any('HFMA2' in o for o in ptxas_ops):
+        return 'constant materialization (HFMA2 vs LDCU/S2R)'
+    if any('SHF' in o for o in ptxas_ops):
+        return 'stride address calc (SHF vs IADD3 chain)'
+    if any('ISETP.RUR' in o for o in ptxas_ops) or any('ISETP' in o for o in ours_ops):
+        return 'setup / bounds check style'
+    if any('LDCU' in o for o in all_ops):
+        return 'parameter loading'
+
+    return 'instruction selection difference'

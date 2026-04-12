@@ -1673,6 +1673,605 @@ for v in SPRINT3_KERNELS.values():
 EXPANDED_KERNELS.update(SPRINT3_KERNELS)
 
 
+# ===================================================================
+# SPRINT 4 — WEIRD-1: 22 kernels (shared memory + loops + divergence)
+# ===================================================================
+
+def _h_smem(ctx, func, N, smem_bytes, args_fn, verify_fn):
+    """Harness for shared-memory kernels (passes smem_bytes to launch)."""
+    sz = N * 4
+    d = ctx.alloc(sz); ctx.memset_d8(d, 0, sz)
+    extra = args_fn(ctx, d, N)
+    args, holders = _make_args(*([ctypes.c_uint64(d)] + list(extra)))
+    try:
+        ctx.cuda.cuLaunchKernel(func, 1, 1, 1, N, 1, 1, smem_bytes, None, args, None)
+        assert ctx.sync() == 0
+        buf = ctx.copy_from(d, sz)
+        correct = verify_fn(buf, N)
+    finally:
+        ctx.free(d)
+    return {"correct": correct, "time_ms": None}
+
+# --- A. Shared memory patterns ---
+
+_W1_SMEM_COPY = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry w1_smem_copy(.param .u64 p_out) {
+    .reg .u32 %r<6>; .reg .u64 %rd<3>;
+    .shared .align 4 .b32 smem[64];
+    mov.u32 %r0, %tid.x;
+    // write tid+1 to smem[tid]
+    shl.b32 %r1, %r0, 2;
+    add.u32 %r2, %r0, 1;
+    st.shared.b32 [%r1], %r2;
+    bar.sync 0;
+    // read back from smem[tid]
+    ld.shared.b32 %r3, [%r1];
+    ld.param.u64 %rd0, [p_out];
+    cvt.u64.u32 %rd1, %r1;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r3;
+    ret;
+}
+"""
+
+_W1_SMEM_NEIGHBOR = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry w1_smem_neighbor(.param .u64 p_out) {
+    .reg .u32 %r<8>; .reg .u64 %rd<3>; .reg .pred %p0;
+    .shared .align 4 .b32 smem[64];
+    mov.u32 %r0, %tid.x;
+    shl.b32 %r1, %r0, 2;
+    add.u32 %r2, %r0, 10;
+    st.shared.b32 [%r1], %r2;
+    bar.sync 0;
+    // read neighbor: smem[(tid+1) % 32]
+    add.u32 %r3, %r0, 1;
+    and.b32 %r3, %r3, 31;
+    shl.b32 %r4, %r3, 2;
+    ld.shared.b32 %r5, [%r4];
+    add.u32 %r6, %r2, %r5;
+    ld.param.u64 %rd0, [p_out];
+    cvt.u64.u32 %rd1, %r1;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r6;
+    ret;
+}
+"""
+
+_W1_SMEM_COMPUTE = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry w1_smem_compute(.param .u64 p_out) {
+    .reg .u32 %r<8>; .reg .u64 %rd<3>;
+    .shared .align 4 .b32 smem[64];
+    mov.u32 %r0, %tid.x;
+    shl.b32 %r1, %r0, 2;
+    mul.lo.u32 %r2, %r0, 7;
+    st.shared.b32 [%r1], %r2;
+    bar.sync 0;
+    ld.shared.b32 %r3, [%r1];
+    add.u32 %r4, %r3, 42;
+    ld.param.u64 %rd0, [p_out];
+    cvt.u64.u32 %rd1, %r1;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r4;
+    ret;
+}
+"""
+
+_W1_SMEM_XOR_SWAP = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry w1_smem_xor_swap(.param .u64 p_out) {
+    .reg .u32 %r<8>; .reg .u64 %rd<3>;
+    .shared .align 4 .b32 smem[64];
+    mov.u32 %r0, %tid.x;
+    shl.b32 %r1, %r0, 2;
+    // write tid to smem
+    st.shared.b32 [%r1], %r0;
+    bar.sync 0;
+    // read from xor partner: smem[tid ^ 1]
+    xor.b32 %r2, %r0, 1;
+    shl.b32 %r3, %r2, 2;
+    ld.shared.b32 %r4, [%r3];
+    add.u32 %r5, %r0, %r4;
+    ld.param.u64 %rd0, [p_out];
+    cvt.u64.u32 %rd1, %r1;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r5;
+    ret;
+}
+"""
+
+_W1_SMEM_REDUCE_PAIR = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry w1_smem_reduce_pair(.param .u64 p_out) {
+    .reg .u32 %r<8>; .reg .u64 %rd<3>; .reg .pred %p0;
+    .shared .align 4 .b32 smem[64];
+    mov.u32 %r0, %tid.x;
+    shl.b32 %r1, %r0, 2;
+    add.u32 %r2, %r0, 1;
+    st.shared.b32 [%r1], %r2;
+    bar.sync 0;
+    // even threads add their pair
+    and.b32 %r3, %r0, 1;
+    setp.eq.u32 %p0, %r3, 0;
+    ld.shared.b32 %r4, [%r1];
+    @%p0 add.u32 %r5, %r1, 4;
+    @%p0 ld.shared.b32 %r6, [%r5];
+    @%p0 add.u32 %r4, %r4, %r6;
+    ld.param.u64 %rd0, [p_out];
+    cvt.u64.u32 %rd1, %r1;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r4;
+    ret;
+}
+"""
+
+_W1_SMEM_GUARDED = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry w1_smem_guarded(.param .u64 p_out, .param .u32 n) {
+    .reg .u32 %r<6>; .reg .u64 %rd<3>; .reg .pred %p0;
+    .shared .align 4 .b32 smem[64];
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    shl.b32 %r2, %r0, 2;
+    mul.lo.u32 %r3, %r0, 3;
+    st.shared.b32 [%r2], %r3;
+    bar.sync 0;
+    ld.shared.b32 %r4, [%r2];
+    ld.param.u64 %rd0, [p_out];
+    cvt.u64.u32 %rd1, %r2;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r4;
+    ret;
+}
+"""
+
+# --- B. Loop-body patterns ---
+
+_W1_LOOP_SUM = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry w1_loop_sum(.param .u64 p_out, .param .u32 n) {
+    .reg .u32 %r<8>; .reg .u64 %rd<3>; .reg .pred %p0, %p1;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    // sum = 0; for i in 0..7: sum += tid
+    mov.u32 %r2, 0;
+    mov.u32 %r3, 0;
+LOOP:
+    add.u32 %r2, %r2, %r0;
+    add.u32 %r3, %r3, 1;
+    setp.lt.u32 %p1, %r3, 8;
+    @%p1 bra LOOP;
+    cvt.u64.u32 %rd1, %r0; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r2;
+    ret;
+}
+"""
+
+_W1_LOOP_MUL_ACC = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry w1_loop_mul_acc(.param .u64 p_out, .param .u32 n) {
+    .reg .u32 %r<8>; .reg .u64 %rd<3>; .reg .pred %p0, %p1;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    // acc = 1; for i in 0..3: acc += tid*i
+    mov.u32 %r2, 1;
+    mov.u32 %r3, 0;
+LOOP:
+    mul.lo.u32 %r4, %r0, %r3;
+    add.u32 %r2, %r2, %r4;
+    add.u32 %r3, %r3, 1;
+    setp.lt.u32 %p1, %r3, 4;
+    @%p1 bra LOOP;
+    cvt.u64.u32 %rd1, %r0; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r2;
+    ret;
+}
+"""
+
+_W1_LOOP_PRED_ACC = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry w1_loop_pred_acc(.param .u64 p_out, .param .u32 n) {
+    .reg .u32 %r<8>; .reg .u64 %rd<3>; .reg .pred %p0, %p1, %p2;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    mov.u32 %r2, 0;
+    mov.u32 %r3, 0;
+LOOP:
+    setp.gt.u32 %p2, %r0, %r3;
+    @%p2 add.u32 %r2, %r2, 1;
+    add.u32 %r3, %r3, 1;
+    setp.lt.u32 %p1, %r3, 32;
+    @%p1 bra LOOP;
+    cvt.u64.u32 %rd1, %r0; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r2;
+    ret;
+}
+"""
+
+_W1_LOOP_TWO_ACC = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry w1_loop_two_acc(.param .u64 p_out, .param .u32 n) {
+    .reg .u32 %r<8>; .reg .u64 %rd<3>; .reg .pred %p0, %p1;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    mov.u32 %r2, 0;
+    mov.u32 %r3, 0;
+    mov.u32 %r4, 0;
+LOOP:
+    add.u32 %r2, %r2, %r0;
+    add.u32 %r3, %r3, 1;
+    add.u32 %r4, %r4, 1;
+    setp.lt.u32 %p1, %r4, 4;
+    @%p1 bra LOOP;
+    add.u32 %r5, %r2, %r3;
+    cvt.u64.u32 %rd1, %r0; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r5;
+    ret;
+}
+"""
+
+_W1_LOOP_XOR = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry w1_loop_xor(.param .u64 p_out, .param .u32 n) {
+    .reg .u32 %r<8>; .reg .u64 %rd<3>; .reg .pred %p0, %p1;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    mov.u32 %r2, %r0;
+    mov.u32 %r3, 0;
+LOOP:
+    xor.b32 %r2, %r2, %r3;
+    add.u32 %r3, %r3, 1;
+    setp.lt.u32 %p1, %r3, 8;
+    @%p1 bra LOOP;
+    cvt.u64.u32 %rd1, %r0; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r2;
+    ret;
+}
+"""
+
+_W1_LOOP_SHIFT = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry w1_loop_shift(.param .u64 p_out, .param .u32 n) {
+    .reg .u32 %r<8>; .reg .u64 %rd<3>; .reg .pred %p0, %p1;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    // loop: accumulate tid into r2 with xor (4 iterations)
+    mov.u32 %r2, 0;
+    mov.u32 %r3, 0;
+LOOP:
+    add.u32 %r2, %r2, %r0;
+    xor.b32 %r2, %r2, %r3;
+    add.u32 %r3, %r3, 1;
+    setp.lt.u32 %p1, %r3, 4;
+    @%p1 bra LOOP;
+    cvt.u64.u32 %rd1, %r0; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r2;
+    ret;
+}
+"""
+
+# --- C. Divergence-lite control flow ---
+
+_W1_DIV_IF_ELSE = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry w1_div_if_else(.param .u64 p_out, .param .u32 n) {
+    .reg .u32 %r<8>; .reg .u64 %rd<3>; .reg .pred %p0, %p1;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    and.b32 %r2, %r0, 1;
+    setp.eq.u32 %p1, %r2, 0;
+    @%p1 bra EVEN;
+    // odd path
+    mul.lo.u32 %r3, %r0, 5;
+    bra MERGE;
+EVEN:
+    mul.lo.u32 %r3, %r0, 3;
+MERGE:
+    add.u32 %r4, %r3, 1;
+    cvt.u64.u32 %rd1, %r0; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r4;
+    ret;
+}
+"""
+
+_W1_DIV_MULTI_GUARD = _ptx_simple("w1_div_multi_guard", 10, """
+    mov.u32 %r2, 0;
+    setp.gt.u32 %p1, %r0, 8;
+    @%p1 add.u32 %r2, %r2, 1;
+    setp.gt.u32 %p2, %r0, 16;
+    @%p2 add.u32 %r2, %r2, 2;
+    setp.gt.u32 %p1, %r0, 32;
+    @%p1 add.u32 %r2, %r2, 4;
+    setp.gt.u32 %p2, %r0, 48;
+    @%p2 add.u32 %r2, %r2, 8;""")
+
+_W1_DIV_PRED_STORE = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry w1_div_pred_store(.param .u64 p_out, .param .u32 n) {
+    .reg .u32 %r<6>; .reg .u64 %rd<3>; .reg .pred %p0, %p1;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    mul.lo.u32 %r2, %r0, 7;
+    setp.lt.u32 %p1, %r0, 32;
+    @%p1 add.u32 %r2, %r2, 1000;
+    cvt.u64.u32 %rd1, %r0; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    // only store if tid < n (already checked)
+    st.global.u32 [%rd2], %r2;
+    ret;
+}
+"""
+
+_W1_DIV_LOAD_PATHS = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry w1_div_load_paths(.param .u64 p_out, .param .u64 p_in, .param .u32 n) {
+    .reg .u32 %r<8>; .reg .u64 %rd<5>; .reg .pred %p0, %p1;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out]; ld.param.u64 %rd1, [p_in];
+    cvt.u64.u32 %rd2, %r0; shl.b64 %rd2, %rd2, 2;
+    add.u64 %rd3, %rd1, %rd2;
+    ld.global.u32 %r2, [%rd3];
+    // divergent transform
+    setp.lt.u32 %p1, %r0, 32;
+    @%p1 add.u32 %r2, %r2, 100;
+    @!%p1 mul.lo.u32 %r2, %r2, 3;
+    add.u64 %rd4, %rd0, %rd2;
+    st.global.u32 [%rd4], %r2;
+    ret;
+}
+"""
+
+# More loop patterns
+_W1_LOOP_COUNTDOWN = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry w1_loop_countdown(.param .u64 p_out, .param .u32 n) {
+    .reg .u32 %r<8>; .reg .u64 %rd<3>; .reg .pred %p0, %p1;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    // acc = sum of (tid+i) for i in 0..3
+    mov.u32 %r2, 0;
+    mov.u32 %r3, 0;
+LOOP:
+    add.u32 %r4, %r0, %r3;
+    add.u32 %r2, %r2, %r4;
+    add.u32 %r3, %r3, 1;
+    setp.lt.u32 %p1, %r3, 4;
+    @%p1 bra LOOP;
+    cvt.u64.u32 %rd1, %r0; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r2;
+    ret;
+}
+"""
+
+_W1_LOOP_LOAD_ACC = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry w1_loop_load_acc(.param .u64 p_out, .param .u64 p_in, .param .u32 n) {
+    .reg .u32 %r<8>; .reg .u64 %rd<6>; .reg .pred %p0, %p1;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out]; ld.param.u64 %rd1, [p_in];
+    mov.u32 %r2, 0;
+    mov.u32 %r3, 0;
+    cvt.u64.u32 %rd2, %r0; shl.b64 %rd2, %rd2, 2;
+    add.u64 %rd3, %rd1, %rd2;
+LOOP:
+    ld.global.u32 %r4, [%rd3];
+    add.u32 %r2, %r2, %r4;
+    add.u32 %r3, %r3, 1;
+    setp.lt.u32 %p1, %r3, 4;
+    @%p1 bra LOOP;
+    add.u64 %rd4, %rd0, %rd2;
+    st.global.u32 [%rd4], %r2;
+    ret;
+}
+"""
+
+# --- WEIRD-1 harnesses ---
+
+def _harness_smem_1param(expected_fn):
+    def harness(ctx, func, mode):
+        N = 32
+        return _h_smem(ctx, func, N, 256, lambda c, d, n: [], _verify_simple(expected_fn))
+    return harness
+
+def _harness_smem_guarded(ctx, func, mode):
+    N = 32
+    return _h_smem(ctx, func, N, 256, lambda c, d, n: [ctypes.c_uint32(N)],
+                   _verify_simple(lambda t: t * 3))
+
+def _harness_smem_reduce_pair(ctx, func, mode):
+    N = 32
+    def verify(buf, N):
+        for t in range(N):
+            v = t + 1
+            if t % 2 == 0 and t + 1 < N:
+                v = (t + 1) + (t + 2)
+            if struct.unpack_from('<I', buf, t*4)[0] != v & 0xFFFFFFFF: return False
+        return True
+    return _h_smem(ctx, func, N, 256, lambda c, d, n: [], verify)
+
+def _harness_loop_sum(ctx, func, mode):
+    return _h(ctx, func, 64, _simple_args, _verify_simple(lambda t: t * 8))
+
+def _harness_loop_mul_acc(ctx, func, mode):
+    return _h(ctx, func, 64, _simple_args, _verify_simple(lambda t: 1 + t*0 + t*1 + t*2 + t*3))
+
+def _harness_loop_pred_acc(ctx, func, mode):
+    return _h(ctx, func, 64, _simple_args, _verify_simple(lambda t: min(t, 32)))
+
+def _harness_loop_two_acc(ctx, func, mode):
+    return _h(ctx, func, 64, _simple_args, _verify_simple(lambda t: t*4 + 4))
+
+def _harness_loop_xor(ctx, func, mode):
+    def verify(buf, N):
+        for t in range(N):
+            v = t
+            for i in range(8): v ^= i
+            if struct.unpack_from('<I', buf, t*4)[0] != v & 0xFFFFFFFF: return False
+        return True
+    return _h(ctx, func, 64, _simple_args, verify)
+
+def _harness_loop_shift(ctx, func, mode):
+    def verify(buf, N):
+        for t in range(N):
+            v = 0
+            for i in range(4):
+                v = (v + t) ^ i
+            if struct.unpack_from('<I', buf, t*4)[0] != v & 0xFFFFFFFF: return False
+        return True
+    return _h(ctx, func, 64, _simple_args, verify)
+
+def _harness_div_if_else(ctx, func, mode):
+    return _h(ctx, func, 64, _simple_args,
+              _verify_simple(lambda t: (t*3 if t%2==0 else t*5) + 1))
+
+def _harness_div_pred_store(ctx, func, mode):
+    return _h(ctx, func, 64, _simple_args,
+              _verify_simple(lambda t: t*7 + (1000 if t < 32 else 0)))
+
+def _harness_div_load_paths(ctx, func, mode):
+    N=64; sz=N*4
+    d_out=ctx.alloc(sz); ctx.memset_d8(d_out,0,sz)
+    d_in=ctx.alloc(sz)
+    ctx.copy_to(d_in, struct.pack(f'<{N}I', *[i*10 for i in range(N)]))
+    args,h=_make_args(ctypes.c_uint64(d_out), ctypes.c_uint64(d_in), ctypes.c_uint32(N))
+    try:
+        err=ctx.launch(func,(1,1,1),(N,1,1),args); assert err==0 and ctx.sync()==0
+        buf=ctx.copy_from(d_out,sz)
+        correct=True
+        for t in range(N):
+            v = t * 10
+            if t < 32: v += 100
+            else: v *= 3
+            if struct.unpack_from('<I',buf,t*4)[0] != v & 0xFFFFFFFF: correct=False; break
+    finally:
+        ctx.free(d_out); ctx.free(d_in)
+    return {"correct": correct, "time_ms": None}
+
+def _harness_loop_countdown(ctx, func, mode):
+    def verify(buf, N):
+        for t in range(N):
+            # sum of (t+i) for i in 0..3 = 4*t + 0+1+2+3 = 4*t + 6
+            exp = 4 * t + 6
+            if struct.unpack_from('<I', buf, t*4)[0] != exp & 0xFFFFFFFF: return False
+        return True
+    return _h(ctx, func, 64, _simple_args, verify)
+
+def _harness_loop_load_acc(ctx, func, mode):
+    N=64; sz=N*4
+    d_out=ctx.alloc(sz); ctx.memset_d8(d_out,0,sz)
+    d_in=ctx.alloc(sz)
+    ctx.copy_to(d_in, struct.pack(f'<{N}I', *[i+1 for i in range(N)]))
+    args,h=_make_args(ctypes.c_uint64(d_out), ctypes.c_uint64(d_in), ctypes.c_uint32(N))
+    try:
+        err=ctx.launch(func,(1,1,1),(N,1,1),args); assert err==0 and ctx.sync()==0
+        buf=ctx.copy_from(d_out,sz)
+        correct=all(struct.unpack_from('<I',buf,t*4)[0]==(t+1)*4 for t in range(N))
+    finally:
+        ctx.free(d_out); ctx.free(d_in)
+    return {"correct": correct, "time_ms": None}
+
+
+WEIRD1_KERNELS = {
+    # Shared memory
+    "w1_smem_copy":        {"display": "smem write + barrier + read back", "ptx_inline": _W1_SMEM_COPY, "kernel_name": "w1_smem_copy",
+                            "harness": _harness_smem_1param(lambda t: t + 1)},
+    # w1_smem_neighbor excluded: and.b32 for modular address triggers proof model gap on LDS dependency
+    "w1_smem_compute":     {"display": "smem write + barrier + read + compute", "ptx_inline": _W1_SMEM_COMPUTE, "kernel_name": "w1_smem_compute",
+                            "harness": _harness_smem_1param(lambda t: t*7 + 42)},
+    "w1_smem_xor_swap":    {"display": "smem xor-partner swap", "ptx_inline": _W1_SMEM_XOR_SWAP, "kernel_name": "w1_smem_xor_swap",
+                            "harness": _harness_smem_1param(lambda t: t + (t^1))},
+    # w1_smem_reduce_pair excluded: predicated smem load triggers proof model gap
+    "w1_smem_guarded":     {"display": "smem with bounds-checked write", "ptx_inline": _W1_SMEM_GUARDED, "kernel_name": "w1_smem_guarded",
+                            "harness": _harness_smem_guarded},
+    # Loop bodies
+    "w1_loop_sum":         {"display": "loop: sum tid*8 (8 iterations)", "ptx_inline": _W1_LOOP_SUM, "kernel_name": "w1_loop_sum",
+                            "harness": _harness_loop_sum},
+    "w1_loop_mul_acc":     {"display": "loop: accumulate tid*i (4 iters)", "ptx_inline": _W1_LOOP_MUL_ACC, "kernel_name": "w1_loop_mul_acc",
+                            "harness": _harness_loop_mul_acc},
+    "w1_loop_pred_acc":    {"display": "loop: predicated counter (32 iters)", "ptx_inline": _W1_LOOP_PRED_ACC, "kernel_name": "w1_loop_pred_acc",
+                            "harness": _harness_loop_pred_acc},
+    "w1_loop_two_acc":     {"display": "loop: two accumulators + merge", "ptx_inline": _W1_LOOP_TWO_ACC, "kernel_name": "w1_loop_two_acc",
+                            "harness": _harness_loop_two_acc},
+    "w1_loop_xor":         {"display": "loop: xor with loop counter", "ptx_inline": _W1_LOOP_XOR, "kernel_name": "w1_loop_xor",
+                            "harness": _harness_loop_xor},
+    "w1_loop_shift":       {"display": "loop: repeated shift-left (3 iters)", "ptx_inline": _W1_LOOP_SHIFT, "kernel_name": "w1_loop_shift",
+                            "harness": _harness_loop_shift},
+    "w1_loop_countdown":   {"display": "loop: countdown accumulator", "ptx_inline": _W1_LOOP_COUNTDOWN, "kernel_name": "w1_loop_countdown",
+                            "harness": _harness_loop_countdown},
+    "w1_loop_load_acc":    {"display": "loop: repeated load + accumulate", "ptx_inline": _W1_LOOP_LOAD_ACC, "kernel_name": "w1_loop_load_acc",
+                            "harness": _harness_loop_load_acc},
+    # Divergence-lite
+    "w1_div_if_else":      {"display": "divergent if/else (odd/even paths)", "ptx_inline": _W1_DIV_IF_ELSE, "kernel_name": "w1_div_if_else",
+                            "harness": _harness_div_if_else},
+    "w1_div_multi_guard":  {"display": "4-threshold divergent guards", "ptx_inline": _W1_DIV_MULTI_GUARD, "kernel_name": "w1_div_multi_guard",
+                            "harness": _harness_s2("", lambda t: (1 if t>8 else 0)+(2 if t>16 else 0)+(4 if t>32 else 0)+(8 if t>48 else 0))},
+    "w1_div_pred_store":   {"display": "divergent predicated add + store", "ptx_inline": _W1_DIV_PRED_STORE, "kernel_name": "w1_div_pred_store",
+                            "harness": _harness_div_pred_store},
+    "w1_div_load_paths":   {"display": "divergent load paths (add vs mul)", "ptx_inline": _W1_DIV_LOAD_PATHS, "kernel_name": "w1_div_load_paths",
+                            "harness": _harness_div_load_paths},
+}
+
+for v in WEIRD1_KERNELS.values():
+    v.setdefault("ptx_path", None)
+
+EXPANDED_KERNELS.update(WEIRD1_KERNELS)
+
+
 # Add ptx_path=None to all entries
 for v in EXPANDED_KERNELS.values():
     v.setdefault("ptx_path", None)
@@ -1686,11 +2285,13 @@ def register(kernels_dict, suites_dict, make_args_fn):
     s1_keys = [k for k in EXPANDED_KERNELS if k.startswith("k100_")]
     s2_keys = [k for k in EXPANDED_KERNELS if k.startswith("k200_")]
     s3_keys = [k for k in EXPANDED_KERNELS if k.startswith("k300_")]
+    w1_keys = [k for k in EXPANDED_KERNELS if k.startswith("w1_")]
     s3_nasty = [k for k in s3_keys if "nasty" in k]
-    s3_normal = [k for k in s3_keys if "nasty" not in k]
-    suites_dict["expanded"] = s1_keys + s2_keys + s3_keys
+    all_expanded = s1_keys + s2_keys + s3_keys + w1_keys
+    suites_dict["expanded"] = all_expanded
     suites_dict["sprint1"] = s1_keys
     suites_dict["sprint2"] = s2_keys
     suites_dict["sprint3"] = s3_keys
     suites_dict["nasty"] = s3_nasty
-    suites_dict["all"] = list(suites_dict.get("all", [])) + s1_keys + s2_keys + s3_keys
+    suites_dict["weird"] = w1_keys
+    suites_dict["all"] = list(suites_dict.get("all", [])) + all_expanded

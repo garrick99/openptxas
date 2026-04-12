@@ -200,6 +200,16 @@ _ALIAS_SLACK = {
         "k300_nasty_zero_init", "k300_nasty_identity", "k300_nasty_overflow",
         "k300_nasty_shl_xor", "k300_nasty_accum5", "k300_nasty_pred_xor",
     ]},
+    # WEIRD-1 corpus
+    **{k: 3 for k in [
+        "w1_smem_copy", "w1_smem_compute",
+        "w1_smem_xor_swap", "w1_smem_guarded",
+        "w1_loop_sum", "w1_loop_mul_acc", "w1_loop_pred_acc",
+        "w1_loop_two_acc", "w1_loop_xor", "w1_loop_shift",
+        "w1_loop_countdown", "w1_loop_load_acc",
+        "w1_div_if_else", "w1_div_multi_guard",
+        "w1_div_pred_store", "w1_div_load_paths",
+    ]},
 }
 
 

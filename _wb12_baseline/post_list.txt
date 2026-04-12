@@ -1,0 +1,32 @@
+Available kernels:
+  reduce_sum           reduce_sum (warp butterfly, u64)
+  conv2d_looped        conv2d 3x3 looped (u64)
+  hmma_zero            HMMA m16n8k8 zero accumulator
+  imma_zero            IMMA m16n8k32 S8 zero accumulator
+  dmma_zero            DMMA m8n8k4 F64 zero accumulator
+  qmma_zero            QMMA m16n8k32 E4M3 zero accumulator
+  cp_async             cp.async global->shared broadcast
+  warp_reduce          warp_reduce fp32 shfl.down butterfly
+  atom_or              atom.global.or.b32
+  conv2d_unrolled      conv2d 3x3 fully-unrolled (u64)
+  vecadd_large         vecadd_large (1M-thread, 4-param, bounds check)
+  multi_ldg            multi_ldg aliased base (FB-5 canary)
+  smem_exchange        shared-memory write/barrier/read
+  atomg_add            atom.global.add.u32
+  fmax                 max.f32 scalar (FMNMX)
+  smem_cycle           smem write/barrier/read cycle (param-base)
+  bar_ldc_xor          bar.sync + LDC param + XOR
+  dual_ldg64_dadd      dual LDG.E.64 + DADD (FP64 multi-load)
+  multi_block_atomic   64-block atom.add scatter (grid contention)
+  atom_cas64           atom.global.cas.b64 (64-bit CAS)
+  redux_sum            redux.sync.add.s32 (warp REDUX)
+
+Available suites:
+  core                 (3) reduce_sum, conv2d_looped, hmma_zero
+  tensor               (4) hmma_zero, imma_zero, dmma_zero, qmma_zero
+  extended             (9) reduce_sum, conv2d_looped, hmma_zero, imma_zero, dmma_zero, qmma_zero, cp_async, warp_reduce, atom_or
+  stress               (3) vecadd_large, smem_exchange, multi_ldg
+  contrast             (4) conv2d_looped, conv2d_unrolled, warp_reduce, hmma_zero
+  wb6                  (6) conv2d_unrolled, vecadd_large, multi_ldg, smem_exchange, atomg_add, fmax
+  all                  (21) reduce_sum, conv2d_looped, conv2d_unrolled, hmma_zero, imma_zero, dmma_zero, qmma_zero, cp_async, warp_reduce, atom_or, atomg_add, vecadd_large, multi_ldg, smem_exchange, fmax, smem_cycle, bar_ldc_xor, dual_ldg64_dadd, multi_block_atomic, atom_cas64, redux_sum
+  frontier             (6) smem_cycle, bar_ldc_xor, dual_ldg64_dadd, multi_block_atomic, atom_cas64, redux_sum

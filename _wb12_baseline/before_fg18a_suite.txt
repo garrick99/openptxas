@@ -1,0 +1,50 @@
+    sass_total:   24
+    sass_non_nop: 9
+    compile_ms:   16.6
+    time_ms:      0.0068
+
+  delta:
+    regs:         +0
+    sass_total:   +0
+    sass_non_nop: +0
+    time_ms_mean: +0.0184
+
+
+================================================================
+LEADERBOARD
+================================================================
+
+  A. EXACT PARITY (regs / sass / non-NOP all match ptxas)  (11 kernels)
+    kernel             deltas
+    reduce_sum         regs=+0  sass_total=+0  sass_non_nop=+0
+    conv2d_looped      regs=+0  sass_total=+0  sass_non_nop=+0
+    conv2d_unrolled    regs=+0  sass_total=+0  sass_non_nop=+0
+    cp_async           regs=+0  sass_total=+0  sass_non_nop=+0
+    warp_reduce        regs=+0  sass_total=+0  sass_non_nop=+0
+    multi_ldg          regs=+0  sass_total=+0  sass_non_nop=+0
+    smem_exchange      regs=+0  sass_total=+0  sass_non_nop=+0
+    fmax               regs=+0  sass_total=+0  sass_non_nop=+0
+    smem_cycle         regs=+0  sass_total=+0  sass_non_nop=+0
+    bar_ldc_xor        regs=+0  sass_total=+0  sass_non_nop=+0
+    redux_sum          regs=+0  sass_total=+0  sass_non_nop=+0
+
+  B. NATIVE WINS (ours <= ptxas on every metric, < on at least one)  (7 kernels)
+    kernel             deltas
+    hmma_zero          regs=+0  sass_total=-16  sass_non_nop=-3
+    imma_zero          regs=+0  sass_total=-16  sass_non_nop=-5
+    dmma_zero          regs=+0  sass_total=-8  sass_non_nop=+0
+    qmma_zero          regs=+0  sass_total=-8  sass_non_nop=-1
+    atom_or            regs=+0  sass_total=-8  sass_non_nop=-4
+    atomg_add          regs=+0  sass_total=-8  sass_non_nop=-4
+    atom_cas64         regs=-2  sass_total=-8  sass_non_nop=-1
+
+  C. REMAINING GAPS (ours >= ptxas on every metric, > on at least one)  (1 kernels)
+    kernel             deltas
+    vecadd_large       regs=+0  sass_total=+0  sass_non_nop=+1
+
+  D. MIXED (some better, some worse)  (2 kernels)
+    kernel             deltas
+    dual_ldg64_dadd    regs=+2  sass_total=-8  sass_non_nop=+0
+    multi_block_atomic regs=+3  sass_total=-8  sass_non_nop=-2
+
+[workbench] suite artifact: C:\Users\kraken\openptxas\results\20260410_182330_suite_all.json

@@ -1,0 +1,1236 @@
+{
+  "schema": "workbench.suite/v1",
+  "suite": "all",
+  "timestamp": "20260410_195230",
+  "mode": "bench",
+  "repeat": 1,
+  "compare": "ptxas",
+  "commits": {
+    "openptxas": "0318671",
+    "forge": "4654c73",
+    "opencuda": "1763d8a"
+  },
+  "machine": {
+    "platform": "Windows-11-10.0.26200-SP0",
+    "python": "3.14.0",
+    "node": "BigDaddy"
+  },
+  "aggregate": {
+    "kernels": 21,
+    "parity": 11,
+    "native_wins": 7,
+    "gaps": 1,
+    "mixed": 2,
+    "no_compare": 0
+  },
+  "ranking": {
+    "PARITY": [
+      "reduce_sum",
+      "conv2d_looped",
+      "conv2d_unrolled",
+      "cp_async",
+      "warp_reduce",
+      "multi_ldg",
+      "smem_exchange",
+      "fmax",
+      "smem_cycle",
+      "bar_ldc_xor",
+      "redux_sum"
+    ],
+    "NATIVE_WIN": [
+      "hmma_zero",
+      "imma_zero",
+      "dmma_zero",
+      "qmma_zero",
+      "atom_or",
+      "atomg_add",
+      "atom_cas64"
+    ],
+    "GAP": [
+      "vecadd_large"
+    ],
+    "MIXED": [
+      "dual_ldg64_dadd",
+      "multi_block_atomic"
+    ],
+    "NO_COMPARE": []
+  },
+  "kernels": [
+    {
+      "kernel": "reduce_sum",
+      "display": "reduce_sum (warp butterfly, u64)",
+      "mode": "bench",
+      "repeat": 1,
+      "ptx_source": "C:\\Users\\kraken\\forge\\benchmarks\\fb0_baseline\\reduce_sum_open.ptx",
+      "build": "PASS",
+      "correctness": "PASS",
+      "ours": {
+        "regs": 12,
+        "sass_total": 56,
+        "sass_non_nop": 45,
+        "compile_ms": 22.160100052133203,
+        "time_ms_runs": [
+          0.024815999902784824
+        ],
+        "time_ms_stats": {
+          "min": 0.024815999902784824,
+          "max": 0.024815999902784824,
+          "mean": 0.024815999902784824,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "ptxas": {
+        "regs": 12,
+        "sass_total": 56,
+        "sass_non_nop": 45,
+        "compile_ms": 27.209099964238703,
+        "time_ms_runs": [
+          0.006895999889820814
+        ],
+        "time_ms_stats": {
+          "min": 0.006895999889820814,
+          "max": 0.006895999889820814,
+          "mean": 0.006895999889820814,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "deltas": {
+        "regs": 0,
+        "sass_total": 0,
+        "sass_non_nop": 0,
+        "time_ms_mean": 0.01792000001296401
+      },
+      "metadata": {
+        "compaction_attempted": true,
+        "compaction_covered": true,
+        "compacted": true,
+        "compact_regs_before": 14,
+        "compact_regs_after": 12,
+        "compacted_insts": 40,
+        "gpr_fields_rewritten": 83
+      }
+    },
+    {
+      "kernel": "conv2d_looped",
+      "display": "conv2d 3x3 looped (u64)",
+      "mode": "bench",
+      "repeat": 1,
+      "ptx_source": "C:\\Users\\kraken\\forge\\benchmarks\\fb0_baseline\\conv2d_looped.ptx",
+      "build": "PASS",
+      "correctness": "PASS",
+      "ours": {
+        "regs": 22,
+        "sass_total": 320,
+        "sass_non_nop": 306,
+        "compile_ms": 29.071600059978664,
+        "time_ms_runs": [
+          0.025536000728607178
+        ],
+        "time_ms_stats": {
+          "min": 0.025536000728607178,
+          "max": 0.025536000728607178,
+          "mean": 0.025536000728607178,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "ptxas": {
+        "regs": 22,
+        "sass_total": 320,
+        "sass_non_nop": 306,
+        "compile_ms": 22.38700003363192,
+        "time_ms_runs": [
+          0.009135999716818333
+        ],
+        "time_ms_stats": {
+          "min": 0.009135999716818333,
+          "max": 0.009135999716818333,
+          "mean": 0.009135999716818333,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "deltas": {
+        "regs": 0,
+        "sass_total": 0,
+        "sass_non_nop": 0,
+        "time_ms_mean": 0.016400001011788845
+      },
+      "metadata": {
+        "compaction_attempted": true,
+        "compaction_covered": true,
+        "compacted": true,
+        "compact_regs_before": 30,
+        "compact_regs_after": 22,
+        "compacted_insts": 70,
+        "gpr_fields_rewritten": 145
+      }
+    },
+    {
+      "kernel": "conv2d_unrolled",
+      "display": "conv2d 3x3 fully-unrolled (u64)",
+      "mode": "bench",
+      "repeat": 1,
+      "ptx_source": "C:\\Users\\kraken\\forge\\benchmarks\\fb0_baseline\\conv2d_open.ptx",
+      "build": "PASS",
+      "correctness": "PASS",
+      "ours": {
+        "regs": 24,
+        "sass_total": 296,
+        "sass_non_nop": 281,
+        "compile_ms": 40.62159999739379,
+        "time_ms_runs": [
+          0.008927999995648861
+        ],
+        "time_ms_stats": {
+          "min": 0.008927999995648861,
+          "max": 0.008927999995648861,
+          "mean": 0.008927999995648861,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "ptxas": {
+        "regs": 24,
+        "sass_total": 296,
+        "sass_non_nop": 281,
+        "compile_ms": 31.051199999637902,
+        "time_ms_runs": [
+          0.009279999881982803
+        ],
+        "time_ms_stats": {
+          "min": 0.009279999881982803,
+          "max": 0.009279999881982803,
+          "mean": 0.009279999881982803,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "deltas": {
+        "regs": 0,
+        "sass_total": 0,
+        "sass_non_nop": 0,
+        "time_ms_mean": -0.0003519998863339424
+      },
+      "metadata": {
+        "compaction_attempted": true,
+        "compaction_covered": true,
+        "compacted": true,
+        "compact_regs_before": 36,
+        "compact_regs_after": 30,
+        "compacted_insts": 291,
+        "gpr_fields_rewritten": 660
+      }
+    },
+    {
+      "kernel": "hmma_zero",
+      "display": "HMMA m16n8k8 zero accumulator",
+      "mode": "bench",
+      "repeat": 1,
+      "ptx_source": "(inline)",
+      "build": "PASS",
+      "correctness": "PASS",
+      "ours": {
+        "regs": 8,
+        "sass_total": 8,
+        "sass_non_nop": 7,
+        "compile_ms": 28.66469998843968,
+        "time_ms_runs": [
+          0.02246400061994791
+        ],
+        "time_ms_stats": {
+          "min": 0.02246400061994791,
+          "max": 0.02246400061994791,
+          "mean": 0.02246400061994791,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "ptxas": {
+        "regs": 8,
+        "sass_total": 24,
+        "sass_non_nop": 10,
+        "compile_ms": 16.299800015985966,
+        "time_ms_runs": [
+          0.007167999865487218
+        ],
+        "time_ms_stats": {
+          "min": 0.007167999865487218,
+          "max": 0.007167999865487218,
+          "mean": 0.007167999865487218,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "deltas": {
+        "regs": 0,
+        "sass_total": -16,
+        "sass_non_nop": -3,
+        "time_ms_mean": 0.015296000754460692
+      },
+      "metadata": {
+        "compaction_attempted": true,
+        "compaction_covered": true,
+        "compacted": true,
+        "compact_regs_before": 12,
+        "compact_regs_after": 8,
+        "compacted_insts": 2,
+        "gpr_fields_rewritten": 3
+      }
+    },
+    {
+      "kernel": "imma_zero",
+      "display": "IMMA m16n8k32 S8 zero accumulator",
+      "mode": "bench",
+      "repeat": 1,
+      "ptx_source": "(inline)",
+      "build": "PASS",
+      "correctness": "PASS",
+      "ours": {
+        "regs": 8,
+        "sass_total": 8,
+        "sass_non_nop": 7,
+        "compile_ms": 19.307599985040724,
+        "time_ms_runs": [
+          0.0071199999656528234
+        ],
+        "time_ms_stats": {
+          "min": 0.0071199999656528234,
+          "max": 0.0071199999656528234,
+          "mean": 0.0071199999656528234,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "ptxas": {
+        "regs": 8,
+        "sass_total": 24,
+        "sass_non_nop": 12,
+        "compile_ms": 16.144399996846914,
+        "time_ms_runs": [
+          0.006720000179484487
+        ],
+        "time_ms_stats": {
+          "min": 0.006720000179484487,
+          "max": 0.006720000179484487,
+          "mean": 0.006720000179484487,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "deltas": {
+        "regs": 0,
+        "sass_total": -16,
+        "sass_non_nop": -5,
+        "time_ms_mean": 0.00039999978616833687
+      },
+      "metadata": {
+        "compaction_attempted": true,
+        "compaction_covered": true,
+        "compacted": true,
+        "compact_regs_before": 12,
+        "compact_regs_after": 8,
+        "compacted_insts": 2,
+        "gpr_fields_rewritten": 3
+      }
+    },
+    {
+      "kernel": "dmma_zero",
+      "display": "DMMA m8n8k4 F64 zero accumulator",
+      "mode": "bench",
+      "repeat": 1,
+      "ptx_source": "(inline)",
+      "build": "PASS",
+      "correctness": "PASS",
+      "ours": {
+        "regs": 8,
+        "sass_total": 8,
+        "sass_non_nop": 7,
+        "compile_ms": 17.913400079123676,
+        "time_ms_runs": [
+          0.023856000043451786
+        ],
+        "time_ms_stats": {
+          "min": 0.023856000043451786,
+          "max": 0.023856000043451786,
+          "mean": 0.023856000043451786,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "ptxas": {
+        "regs": 8,
+        "sass_total": 16,
+        "sass_non_nop": 7,
+        "compile_ms": 26.399599970318377,
+        "time_ms_runs": [
+          0.00660800002515316
+        ],
+        "time_ms_stats": {
+          "min": 0.00660800002515316,
+          "max": 0.00660800002515316,
+          "mean": 0.00660800002515316,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "deltas": {
+        "regs": 0,
+        "sass_total": -8,
+        "sass_non_nop": 0,
+        "time_ms_mean": 0.017248000018298626
+      },
+      "metadata": {
+        "compaction_attempted": true,
+        "compaction_covered": true,
+        "compacted": false,
+        "compact_regs_before": 8,
+        "compact_regs_after": 8,
+        "compacted_insts": 0,
+        "gpr_fields_rewritten": 0
+      }
+    },
+    {
+      "kernel": "qmma_zero",
+      "display": "QMMA m16n8k32 E4M3 zero accumulator",
+      "mode": "bench",
+      "repeat": 1,
+      "ptx_source": "(inline)",
+      "build": "PASS",
+      "correctness": "PASS",
+      "ours": {
+        "regs": 8,
+        "sass_total": 16,
+        "sass_non_nop": 11,
+        "compile_ms": 18.07540003210306,
+        "time_ms_runs": [
+          0.025456000119447708
+        ],
+        "time_ms_stats": {
+          "min": 0.025456000119447708,
+          "max": 0.025456000119447708,
+          "mean": 0.025456000119447708,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "ptxas": {
+        "regs": 8,
+        "sass_total": 24,
+        "sass_non_nop": 12,
+        "compile_ms": 15.818099956959486,
+        "time_ms_runs": [
+          0.006943999789655209
+        ],
+        "time_ms_stats": {
+          "min": 0.006943999789655209,
+          "max": 0.006943999789655209,
+          "mean": 0.006943999789655209,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "deltas": {
+        "regs": 0,
+        "sass_total": -8,
+        "sass_non_nop": -1,
+        "time_ms_mean": 0.0185120003297925
+      },
+      "metadata": {
+        "compaction_attempted": true,
+        "compaction_covered": true,
+        "compacted": false,
+        "compact_regs_before": 8,
+        "compact_regs_after": 8,
+        "compacted_insts": 0,
+        "gpr_fields_rewritten": 0
+      }
+    },
+    {
+      "kernel": "cp_async",
+      "display": "cp.async global->shared broadcast",
+      "mode": "bench",
+      "repeat": 1,
+      "ptx_source": "(inline)",
+      "build": "PASS",
+      "correctness": "PASS",
+      "ours": {
+        "regs": 8,
+        "sass_total": 32,
+        "sass_non_nop": 21,
+        "compile_ms": 18.769600079394877,
+        "time_ms_runs": [
+          0.0244159996509552
+        ],
+        "time_ms_stats": {
+          "min": 0.0244159996509552,
+          "max": 0.0244159996509552,
+          "mean": 0.0244159996509552,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "ptxas": {
+        "regs": 8,
+        "sass_total": 32,
+        "sass_non_nop": 21,
+        "compile_ms": 16.94670005235821,
+        "time_ms_runs": [
+          0.007327999919652939
+        ],
+        "time_ms_stats": {
+          "min": 0.007327999919652939,
+          "max": 0.007327999919652939,
+          "mean": 0.007327999919652939,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "deltas": {
+        "regs": 0,
+        "sass_total": 0,
+        "sass_non_nop": 0,
+        "time_ms_mean": 0.01708799973130226
+      },
+      "metadata": {
+        "compaction_attempted": true,
+        "compaction_covered": true,
+        "compacted": false,
+        "compact_regs_before": 10,
+        "compact_regs_after": 10,
+        "compacted_insts": 0,
+        "gpr_fields_rewritten": 0
+      }
+    },
+    {
+      "kernel": "warp_reduce",
+      "display": "warp_reduce fp32 shfl.down butterfly",
+      "mode": "bench",
+      "repeat": 1,
+      "ptx_source": "(inline)",
+      "build": "PASS",
+      "correctness": "PASS",
+      "ours": {
+        "regs": 10,
+        "sass_total": 40,
+        "sass_non_nop": 26,
+        "compile_ms": 29.229599982500076,
+        "time_ms_runs": [
+          0.007663999916985631
+        ],
+        "time_ms_stats": {
+          "min": 0.007663999916985631,
+          "max": 0.007663999916985631,
+          "mean": 0.007663999916985631,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "ptxas": {
+        "regs": 10,
+        "sass_total": 40,
+        "sass_non_nop": 26,
+        "compile_ms": 17.84750004298985,
+        "time_ms_runs": [
+          0.0071680000983178616
+        ],
+        "time_ms_stats": {
+          "min": 0.0071680000983178616,
+          "max": 0.0071680000983178616,
+          "mean": 0.0071680000983178616,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "deltas": {
+        "regs": 0,
+        "sass_total": 0,
+        "sass_non_nop": 0,
+        "time_ms_mean": 0.0004959998186677694
+      },
+      "metadata": {
+        "compaction_attempted": true,
+        "compaction_covered": true,
+        "compacted": false,
+        "compact_regs_before": 10,
+        "compact_regs_after": 10,
+        "compacted_insts": 0,
+        "gpr_fields_rewritten": 0
+      }
+    },
+    {
+      "kernel": "atom_or",
+      "display": "atom.global.or.b32",
+      "mode": "bench",
+      "repeat": 1,
+      "ptx_source": "(inline)",
+      "build": "PASS",
+      "correctness": "PASS",
+      "ours": {
+        "regs": 6,
+        "sass_total": 16,
+        "sass_non_nop": 9,
+        "compile_ms": 18.674800056032836,
+        "time_ms_runs": [
+          0.007071999832987785
+        ],
+        "time_ms_stats": {
+          "min": 0.007071999832987785,
+          "max": 0.007071999832987785,
+          "mean": 0.007071999832987785,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "ptxas": {
+        "regs": 6,
+        "sass_total": 24,
+        "sass_non_nop": 13,
+        "compile_ms": 17.071500071324408,
+        "time_ms_runs": [
+          0.007023999933153391
+        ],
+        "time_ms_stats": {
+          "min": 0.007023999933153391,
+          "max": 0.007023999933153391,
+          "mean": 0.007023999933153391,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "deltas": {
+        "regs": 0,
+        "sass_total": -8,
+        "sass_non_nop": -4,
+        "time_ms_mean": 4.7999899834394455e-05
+      },
+      "metadata": {
+        "compaction_attempted": true,
+        "compaction_covered": true,
+        "compacted": false,
+        "compact_regs_before": 6,
+        "compact_regs_after": 6,
+        "compacted_insts": 0,
+        "gpr_fields_rewritten": 0
+      }
+    },
+    {
+      "kernel": "atomg_add",
+      "display": "atom.global.add.u32",
+      "mode": "bench",
+      "repeat": 1,
+      "ptx_source": "(inline)",
+      "build": "PASS",
+      "correctness": "PASS",
+      "ours": {
+        "regs": 6,
+        "sass_total": 16,
+        "sass_non_nop": 9,
+        "compile_ms": 18.562700017355382,
+        "time_ms_runs": [
+          0.02465599961578846
+        ],
+        "time_ms_stats": {
+          "min": 0.02465599961578846,
+          "max": 0.02465599961578846,
+          "mean": 0.02465599961578846,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "ptxas": {
+        "regs": 6,
+        "sass_total": 24,
+        "sass_non_nop": 13,
+        "compile_ms": 27.105499990284443,
+        "time_ms_runs": [
+          0.007359999930486083
+        ],
+        "time_ms_stats": {
+          "min": 0.007359999930486083,
+          "max": 0.007359999930486083,
+          "mean": 0.007359999930486083,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "deltas": {
+        "regs": 0,
+        "sass_total": -8,
+        "sass_non_nop": -4,
+        "time_ms_mean": 0.017295999685302377
+      },
+      "metadata": {
+        "compaction_attempted": true,
+        "compaction_covered": true,
+        "compacted": false,
+        "compact_regs_before": 6,
+        "compact_regs_after": 6,
+        "compacted_insts": 0,
+        "gpr_fields_rewritten": 0
+      }
+    },
+    {
+      "kernel": "vecadd_large",
+      "display": "vecadd_large (1M-thread, 4-param, bounds check)",
+      "mode": "bench",
+      "repeat": 1,
+      "ptx_source": "(inline)",
+      "build": "PASS",
+      "correctness": "PASS",
+      "ours": {
+        "regs": 10,
+        "sass_total": 32,
+        "sass_non_nop": 23,
+        "compile_ms": 19.20290000271052,
+        "time_ms_runs": [
+          0.025311999954283237
+        ],
+        "time_ms_stats": {
+          "min": 0.025311999954283237,
+          "max": 0.025311999954283237,
+          "mean": 0.025311999954283237,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "ptxas": {
+        "regs": 10,
+        "sass_total": 32,
+        "sass_non_nop": 22,
+        "compile_ms": 17.499900073744357,
+        "time_ms_runs": [
+          0.009440000168979168
+        ],
+        "time_ms_stats": {
+          "min": 0.009440000168979168,
+          "max": 0.009440000168979168,
+          "mean": 0.009440000168979168,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "deltas": {
+        "regs": 0,
+        "sass_total": 0,
+        "sass_non_nop": 1,
+        "time_ms_mean": 0.01587199978530407
+      },
+      "metadata": {
+        "compaction_attempted": true,
+        "compaction_covered": true,
+        "compacted": false,
+        "compact_regs_before": 10,
+        "compact_regs_after": 10,
+        "compacted_insts": 0,
+        "gpr_fields_rewritten": 0
+      }
+    },
+    {
+      "kernel": "multi_ldg",
+      "display": "multi_ldg aliased base (FB-5 canary)",
+      "mode": "bench",
+      "repeat": 1,
+      "ptx_source": "(inline)",
+      "build": "PASS",
+      "correctness": "PASS",
+      "ours": {
+        "regs": 8,
+        "sass_total": 24,
+        "sass_non_nop": 14,
+        "compile_ms": 22.418999928049743,
+        "time_ms_runs": [
+          0.007183999987319112
+        ],
+        "time_ms_stats": {
+          "min": 0.007183999987319112,
+          "max": 0.007183999987319112,
+          "mean": 0.007183999987319112,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "ptxas": {
+        "regs": 8,
+        "sass_total": 24,
+        "sass_non_nop": 14,
+        "compile_ms": 17.265500035136938,
+        "time_ms_runs": [
+          0.006576000014320016
+        ],
+        "time_ms_stats": {
+          "min": 0.006576000014320016,
+          "max": 0.006576000014320016,
+          "mean": 0.006576000014320016,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "deltas": {
+        "regs": 0,
+        "sass_total": 0,
+        "sass_non_nop": 0,
+        "time_ms_mean": 0.0006079999729990959
+      },
+      "metadata": {
+        "compaction_attempted": true,
+        "compaction_covered": true,
+        "compacted": false,
+        "compact_regs_before": 8,
+        "compact_regs_after": 8,
+        "compacted_insts": 0,
+        "gpr_fields_rewritten": 0
+      }
+    },
+    {
+      "kernel": "smem_exchange",
+      "display": "shared-memory write/barrier/read",
+      "mode": "bench",
+      "repeat": 1,
+      "ptx_source": "(inline)",
+      "build": "PASS",
+      "correctness": "PASS",
+      "ours": {
+        "regs": 8,
+        "sass_total": 24,
+        "sass_non_nop": 15,
+        "compile_ms": 28.89710001181811,
+        "time_ms_runs": [
+          0.006704000057652593
+        ],
+        "time_ms_stats": {
+          "min": 0.006704000057652593,
+          "max": 0.006704000057652593,
+          "mean": 0.006704000057652593,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "ptxas": {
+        "regs": 8,
+        "sass_total": 24,
+        "sass_non_nop": 15,
+        "compile_ms": 17.60419993661344,
+        "time_ms_runs": [
+          0.0066720000468194485
+        ],
+        "time_ms_stats": {
+          "min": 0.0066720000468194485,
+          "max": 0.0066720000468194485,
+          "mean": 0.0066720000468194485,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "deltas": {
+        "regs": 0,
+        "sass_total": 0,
+        "sass_non_nop": 0,
+        "time_ms_mean": 3.200001083314419e-05
+      },
+      "metadata": {
+        "compaction_attempted": true,
+        "compaction_covered": true,
+        "compacted": false,
+        "compact_regs_before": 10,
+        "compact_regs_after": 10,
+        "compacted_insts": 0,
+        "gpr_fields_rewritten": 0
+      }
+    },
+    {
+      "kernel": "fmax",
+      "display": "max.f32 scalar (FMNMX)",
+      "mode": "bench",
+      "repeat": 1,
+      "ptx_source": "(inline)",
+      "build": "PASS",
+      "correctness": "PASS",
+      "ours": {
+        "regs": 10,
+        "sass_total": 24,
+        "sass_non_nop": 11,
+        "compile_ms": 17.82960002310574,
+        "time_ms_runs": [
+          0.0068159999791532755
+        ],
+        "time_ms_stats": {
+          "min": 0.0068159999791532755,
+          "max": 0.0068159999791532755,
+          "mean": 0.0068159999791532755,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "ptxas": {
+        "regs": 10,
+        "sass_total": 24,
+        "sass_non_nop": 11,
+        "compile_ms": 16.298000002279878,
+        "time_ms_runs": [
+          0.006784000201150775
+        ],
+        "time_ms_stats": {
+          "min": 0.006784000201150775,
+          "max": 0.006784000201150775,
+          "mean": 0.006784000201150775,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "deltas": {
+        "regs": 0,
+        "sass_total": 0,
+        "sass_non_nop": 0,
+        "time_ms_mean": 3.1999778002500534e-05
+      },
+      "metadata": {
+        "compaction_attempted": true,
+        "compaction_covered": true,
+        "compacted": false,
+        "compact_regs_before": 8,
+        "compact_regs_after": 8,
+        "compacted_insts": 0,
+        "gpr_fields_rewritten": 0
+      }
+    },
+    {
+      "kernel": "smem_cycle",
+      "display": "smem write/barrier/read cycle (param-base)",
+      "mode": "bench",
+      "repeat": 1,
+      "ptx_source": "(inline)",
+      "build": "PASS",
+      "correctness": "PASS",
+      "ours": {
+        "regs": 8,
+        "sass_total": 24,
+        "sass_non_nop": 16,
+        "compile_ms": 18.089199904352427,
+        "time_ms_runs": [
+          0.0071199999656528234
+        ],
+        "time_ms_stats": {
+          "min": 0.0071199999656528234,
+          "max": 0.0071199999656528234,
+          "mean": 0.0071199999656528234,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "ptxas": {
+        "regs": 8,
+        "sass_total": 24,
+        "sass_non_nop": 16,
+        "compile_ms": 27.073899982497096,
+        "time_ms_runs": [
+          0.007151999976485968
+        ],
+        "time_ms_stats": {
+          "min": 0.007151999976485968,
+          "max": 0.007151999976485968,
+          "mean": 0.007151999976485968,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "deltas": {
+        "regs": 0,
+        "sass_total": 0,
+        "sass_non_nop": 0,
+        "time_ms_mean": -3.200001083314419e-05
+      },
+      "metadata": {
+        "compaction_attempted": true,
+        "compaction_covered": true,
+        "compacted": false,
+        "compact_regs_before": 10,
+        "compact_regs_after": 10,
+        "compacted_insts": 0,
+        "gpr_fields_rewritten": 0
+      }
+    },
+    {
+      "kernel": "bar_ldc_xor",
+      "display": "bar.sync + LDC param + XOR",
+      "mode": "bench",
+      "repeat": 1,
+      "ptx_source": "(inline)",
+      "build": "PASS",
+      "correctness": "PASS",
+      "ours": {
+        "regs": 8,
+        "sass_total": 32,
+        "sass_non_nop": 19,
+        "compile_ms": 18.373999977484345,
+        "time_ms_runs": [
+          0.024800000712275505
+        ],
+        "time_ms_stats": {
+          "min": 0.024800000712275505,
+          "max": 0.024800000712275505,
+          "mean": 0.024800000712275505,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "ptxas": {
+        "regs": 8,
+        "sass_total": 32,
+        "sass_non_nop": 19,
+        "compile_ms": 17.08869996946305,
+        "time_ms_runs": [
+          0.006927999900653958
+        ],
+        "time_ms_stats": {
+          "min": 0.006927999900653958,
+          "max": 0.006927999900653958,
+          "mean": 0.006927999900653958,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "deltas": {
+        "regs": 0,
+        "sass_total": 0,
+        "sass_non_nop": 0,
+        "time_ms_mean": 0.017872000811621547
+      },
+      "metadata": {
+        "compaction_attempted": true,
+        "compaction_covered": true,
+        "compacted": false,
+        "compact_regs_before": 8,
+        "compact_regs_after": 8,
+        "compacted_insts": 0,
+        "gpr_fields_rewritten": 0
+      }
+    },
+    {
+      "kernel": "dual_ldg64_dadd",
+      "display": "dual LDG.E.64 + DADD (FP64 multi-load)",
+      "mode": "bench",
+      "repeat": 1,
+      "ptx_source": "(inline)",
+      "build": "PASS",
+      "correctness": "PASS",
+      "ours": {
+        "regs": 12,
+        "sass_total": 24,
+        "sass_non_nop": 19,
+        "compile_ms": 21.754999994300306,
+        "time_ms_runs": [
+          0.0072480000089854
+        ],
+        "time_ms_stats": {
+          "min": 0.0072480000089854,
+          "max": 0.0072480000089854,
+          "mean": 0.0072480000089854,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "ptxas": {
+        "regs": 10,
+        "sass_total": 32,
+        "sass_non_nop": 19,
+        "compile_ms": 16.974300029687583,
+        "time_ms_runs": [
+          0.024848000146448612
+        ],
+        "time_ms_stats": {
+          "min": 0.024848000146448612,
+          "max": 0.024848000146448612,
+          "mean": 0.024848000146448612,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "deltas": {
+        "regs": 2,
+        "sass_total": -8,
+        "sass_non_nop": 0,
+        "time_ms_mean": -0.017600000137463212
+      },
+      "metadata": {
+        "compaction_attempted": true,
+        "compaction_covered": true,
+        "compacted": false,
+        "compact_regs_before": 12,
+        "compact_regs_after": 12,
+        "compacted_insts": 0,
+        "gpr_fields_rewritten": 0
+      }
+    },
+    {
+      "kernel": "multi_block_atomic",
+      "display": "64-block atom.add scatter (grid contention)",
+      "mode": "bench",
+      "repeat": 1,
+      "ptx_source": "(inline)",
+      "build": "PASS",
+      "correctness": "PASS",
+      "ours": {
+        "regs": 6,
+        "sass_total": 16,
+        "sass_non_nop": 9,
+        "compile_ms": 27.73259999230504,
+        "time_ms_runs": [
+          0.013888000044971704
+        ],
+        "time_ms_stats": {
+          "min": 0.013888000044971704,
+          "max": 0.013888000044971704,
+          "mean": 0.013888000044971704,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "ptxas": {
+        "regs": 3,
+        "sass_total": 24,
+        "sass_non_nop": 11,
+        "compile_ms": 16.001899959519506,
+        "time_ms_runs": [
+          0.0068159999791532755
+        ],
+        "time_ms_stats": {
+          "min": 0.0068159999791532755,
+          "max": 0.0068159999791532755,
+          "mean": 0.0068159999791532755,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "deltas": {
+        "regs": 3,
+        "sass_total": -8,
+        "sass_non_nop": -2,
+        "time_ms_mean": 0.007072000065818429
+      },
+      "metadata": {
+        "compaction_attempted": true,
+        "compaction_covered": true,
+        "compacted": false,
+        "compact_regs_before": 6,
+        "compact_regs_after": 6,
+        "compacted_insts": 0,
+        "gpr_fields_rewritten": 0
+      }
+    },
+    {
+      "kernel": "atom_cas64",
+      "display": "atom.global.cas.b64 (64-bit CAS)",
+      "mode": "bench",
+      "repeat": 1,
+      "ptx_source": "(inline)",
+      "build": "PASS",
+      "correctness": "PASS",
+      "ours": {
+        "regs": 10,
+        "sass_total": 16,
+        "sass_non_nop": 10,
+        "compile_ms": 17.630399903282523,
+        "time_ms_runs": [
+          0.006799999857321382
+        ],
+        "time_ms_stats": {
+          "min": 0.006799999857321382,
+          "max": 0.006799999857321382,
+          "mean": 0.006799999857321382,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "ptxas": {
+        "regs": 12,
+        "sass_total": 24,
+        "sass_non_nop": 11,
+        "compile_ms": 15.80860000103712,
+        "time_ms_runs": [
+          0.006640000035986304
+        ],
+        "time_ms_stats": {
+          "min": 0.006640000035986304,
+          "max": 0.006640000035986304,
+          "mean": 0.006640000035986304,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "deltas": {
+        "regs": -2,
+        "sass_total": -8,
+        "sass_non_nop": -1,
+        "time_ms_mean": 0.00015999982133507729
+      },
+      "metadata": {
+        "compaction_attempted": true,
+        "compaction_covered": true,
+        "compacted": false,
+        "compact_regs_before": 10,
+        "compact_regs_after": 10,
+        "compacted_insts": 0,
+        "gpr_fields_rewritten": 0
+      }
+    },
+    {
+      "kernel": "redux_sum",
+      "display": "redux.sync.add.s32 (warp REDUX)",
+      "mode": "bench",
+      "repeat": 1,
+      "ptx_source": "(inline)",
+      "build": "PASS",
+      "correctness": "PASS",
+      "ours": {
+        "regs": 6,
+        "sass_total": 24,
+        "sass_non_nop": 9,
+        "compile_ms": 17.509400029666722,
+        "time_ms_runs": [
+          0.007040000054985285
+        ],
+        "time_ms_stats": {
+          "min": 0.007040000054985285,
+          "max": 0.007040000054985285,
+          "mean": 0.007040000054985285,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "ptxas": {
+        "regs": 6,
+        "sass_total": 24,
+        "sass_non_nop": 9,
+        "compile_ms": 26.210200041532516,
+        "time_ms_runs": [
+          0.006975999800488353
+        ],
+        "time_ms_stats": {
+          "min": 0.006975999800488353,
+          "max": 0.006975999800488353,
+          "mean": 0.006975999800488353,
+          "stddev": 0.0,
+          "n": 1
+        }
+      },
+      "deltas": {
+        "regs": 0,
+        "sass_total": 0,
+        "sass_non_nop": 0,
+        "time_ms_mean": 6.400025449693203e-05
+      },
+      "metadata": {
+        "compaction_attempted": true,
+        "compaction_covered": true,
+        "compacted": false,
+        "compact_regs_before": 6,
+        "compact_regs_after": 6,
+        "compacted_insts": 0,
+        "gpr_fields_rewritten": 0
+      }
+    }
+  ]
+}

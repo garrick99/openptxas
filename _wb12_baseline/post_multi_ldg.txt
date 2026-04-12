@@ -1,0 +1,29 @@
+[workbench] kernel=multi_ldg  (multi_ldg aliased base (FB-5 canary))
+  build:    PASS
+  correct:  PASS
+  repeat:   1
+  forge:     4654c73
+  opencuda:  1763d8a
+  openptxas: 0318671
+
+  ours:
+    regs:         8
+    sass_total:   24
+    sass_non_nop: 14
+    compile_ms:   23.5
+    time_ms:      0.0072
+
+  ptxas:
+    regs:         8
+    sass_total:   24
+    sass_non_nop: 14
+    compile_ms:   16.7
+    time_ms:      0.0072
+
+  delta:
+    regs:         +0
+    sass_total:   +0
+    sass_non_nop: +0
+    time_ms_mean: +0.0000
+
+[workbench] artifact: C:\Users\kraken\openptxas\results\20260410_132557_multi_ldg.json

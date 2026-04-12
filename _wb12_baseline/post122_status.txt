@@ -1,0 +1,35 @@
+commit:   0318671
+date:     2026-04-10 14:01:46
+kernels:  21
+
+PARITY:   11
+WINS:      7
+GAPS:      1
+MIXED:     2
+
+leaderboard:
+  PARITY:
+    reduce_sum
+    conv2d_looped
+    conv2d_unrolled
+    cp_async
+    warp_reduce
+    multi_ldg
+    smem_exchange
+    fmax
+    smem_cycle
+    bar_ldc_xor
+    redux_sum
+  NATIVE WIN:
+    hmma_zero
+    imma_zero
+    dmma_zero
+    qmma_zero
+    atom_or
+    atomg_add
+    atom_cas64
+  GAP:
+    vecadd_large
+  MIXED:
+    dual_ldg64_dadd
+    multi_block_atomic

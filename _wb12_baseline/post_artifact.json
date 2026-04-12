@@ -1,0 +1,63 @@
+{
+  "schema": "workbench.kernel/v1",
+  "timestamp": "20260410_132536",
+  "commits": {
+    "openptxas": "0318671",
+    "forge": "4654c73",
+    "opencuda": "1763d8a"
+  },
+  "kernel": "vecadd_large",
+  "display": "vecadd_large (1M-thread, 4-param, bounds check)",
+  "mode": "bench",
+  "repeat": 1,
+  "ptx_source": "(inline)",
+  "build": "PASS",
+  "correctness": "PASS",
+  "ours": {
+    "regs": 10,
+    "sass_total": 32,
+    "sass_non_nop": 23,
+    "compile_ms": 20.649900077842176,
+    "time_ms_runs": [
+      0.00940799992531538
+    ],
+    "time_ms_stats": {
+      "min": 0.00940799992531538,
+      "max": 0.00940799992531538,
+      "mean": 0.00940799992531538,
+      "stddev": 0.0,
+      "n": 1
+    }
+  },
+  "ptxas": {
+    "regs": 10,
+    "sass_total": 32,
+    "sass_non_nop": 22,
+    "compile_ms": 17.015299992635846,
+    "time_ms_runs": [
+      0.00878399983048439
+    ],
+    "time_ms_stats": {
+      "min": 0.00878399983048439,
+      "max": 0.00878399983048439,
+      "mean": 0.00878399983048439,
+      "stddev": 0.0,
+      "n": 1
+    }
+  },
+  "deltas": {
+    "regs": 0,
+    "sass_total": 0,
+    "sass_non_nop": 1,
+    "time_ms_mean": 0.0006240000948309898
+  },
+  "metadata": {
+    "compaction_attempted": true,
+    "compaction_covered": true,
+    "compacted": false,
+    "compact_regs_before": 10,
+    "compact_regs_after": 10,
+    "compacted_insts": 0,
+    "gpr_fields_rewritten": 0
+  }
+}

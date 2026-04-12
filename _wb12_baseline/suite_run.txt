@@ -1,0 +1,652 @@
+[workbench] running suite 'all' (21 kernels)
+  mode=bench  repeat=1  compare=ptxas
+  forge=4654c73  opencuda=1763d8a  openptxas=0318671
+
+--- reduce_sum ---
+[workbench] kernel=reduce_sum  (reduce_sum (warp butterfly, u64))
+  build:    PASS
+  correct:  PASS
+  repeat:   1
+  forge:     4654c73
+  opencuda:  1763d8a
+  openptxas: 0318671
+
+  ours:
+    regs:         12
+    sass_total:   56
+    sass_non_nop: 45
+    compile_ms:   29.6
+    time_ms:      0.0069
+
+  ptxas:
+    regs:         12
+    sass_total:   56
+    sass_non_nop: 45
+    compile_ms:   24.6
+    time_ms:      0.0069
+
+  delta:
+    regs:         +0
+    sass_total:   +0
+    sass_non_nop: +0
+    time_ms_mean: +0.0000
+
+--- conv2d_looped ---
+[workbench] kernel=conv2d_looped  (conv2d 3x3 looped (u64))
+  build:    PASS
+  correct:  PASS
+  repeat:   1
+  forge:     4654c73
+  opencuda:  1763d8a
+  openptxas: 0318671
+
+  ours:
+    regs:         22
+    sass_total:   320
+    sass_non_nop: 306
+    compile_ms:   34.6
+    time_ms:      0.0258
+
+  ptxas:
+    regs:         22
+    sass_total:   320
+    sass_non_nop: 306
+    compile_ms:   38.2
+    time_ms:      0.0090
+
+  delta:
+    regs:         +0
+    sass_total:   +0
+    sass_non_nop: +0
+    time_ms_mean: +0.0168
+
+--- conv2d_unrolled ---
+[workbench] kernel=conv2d_unrolled  (conv2d 3x3 fully-unrolled (u64))
+  build:    PASS
+  correct:  PASS
+  repeat:   1
+  forge:     4654c73
+  opencuda:  1763d8a
+  openptxas: 0318671
+
+  ours:
+    regs:         24
+    sass_total:   296
+    sass_non_nop: 281
+    compile_ms:   40.6
+    time_ms:      0.0255
+
+  ptxas:
+    regs:         24
+    sass_total:   296
+    sass_non_nop: 281
+    compile_ms:   29.0
+    time_ms:      0.0093
+
+  delta:
+    regs:         +0
+    sass_total:   +0
+    sass_non_nop: +0
+    time_ms_mean: +0.0162
+
+--- hmma_zero ---
+[workbench] kernel=hmma_zero  (HMMA m16n8k8 zero accumulator)
+  build:    PASS
+  correct:  PASS
+  repeat:   1
+  forge:     4654c73
+  opencuda:  1763d8a
+  openptxas: 0318671
+
+  ours:
+    regs:         8
+    sass_total:   8
+    sass_non_nop: 7
+    compile_ms:   27.7
+    time_ms:      0.0242
+
+  ptxas:
+    regs:         8
+    sass_total:   24
+    sass_non_nop: 10
+    compile_ms:   16.9
+    time_ms:      0.0070
+
+  delta:
+    regs:         +0
+    sass_total:   -16
+    sass_non_nop: -3
+    time_ms_mean: +0.0172
+
+--- imma_zero ---
+[workbench] kernel=imma_zero  (IMMA m16n8k32 S8 zero accumulator)
+  build:    PASS
+  correct:  PASS
+  repeat:   1
+  forge:     4654c73
+  opencuda:  1763d8a
+  openptxas: 0318671
+
+  ours:
+    regs:         8
+    sass_total:   8
+    sass_non_nop: 7
+    compile_ms:   24.0
+    time_ms:      0.0072
+
+  ptxas:
+    regs:         8
+    sass_total:   24
+    sass_non_nop: 12
+    compile_ms:   16.7
+    time_ms:      0.0066
+
+  delta:
+    regs:         +0
+    sass_total:   -16
+    sass_non_nop: -5
+    time_ms_mean: +0.0005
+
+--- dmma_zero ---
+[workbench] kernel=dmma_zero  (DMMA m8n8k4 F64 zero accumulator)
+  build:    PASS
+  correct:  PASS
+  repeat:   1
+  forge:     4654c73
+  opencuda:  1763d8a
+  openptxas: 0318671
+
+  ours:
+    regs:         8
+    sass_total:   8
+    sass_non_nop: 7
+    compile_ms:   23.8
+    time_ms:      0.0257
+
+  ptxas:
+    regs:         8
+    sass_total:   16
+    sass_non_nop: 7
+    compile_ms:   16.0
+    time_ms:      0.0072
+
+  delta:
+    regs:         +0
+    sass_total:   -8
+    sass_non_nop: +0
+    time_ms_mean: +0.0185
+
+--- qmma_zero ---
+[workbench] kernel=qmma_zero  (QMMA m16n8k32 E4M3 zero accumulator)
+  build:    PASS
+  correct:  PASS
+  repeat:   1
+  forge:     4654c73
+  opencuda:  1763d8a
+  openptxas: 0318671
+
+  ours:
+    regs:         8
+    sass_total:   16
+    sass_non_nop: 11
+    compile_ms:   22.8
+    time_ms:      0.0258
+
+  ptxas:
+    regs:         8
+    sass_total:   24
+    sass_non_nop: 12
+    compile_ms:   16.6
+    time_ms:      0.0069
+
+  delta:
+    regs:         +0
+    sass_total:   -8
+    sass_non_nop: -1
+    time_ms_mean: +0.0188
+
+--- cp_async ---
+[workbench] kernel=cp_async  (cp.async global->shared broadcast)
+  build:    PASS
+  correct:  PASS
+  repeat:   1
+  forge:     4654c73
+  opencuda:  1763d8a
+  openptxas: 0318671
+
+  ours:
+    regs:         8
+    sass_total:   32
+    sass_non_nop: 21
+    compile_ms:   33.9
+    time_ms:      0.0255
+
+  ptxas:
+    regs:         8
+    sass_total:   32
+    sass_non_nop: 21
+    compile_ms:   17.8
+    time_ms:      0.0069
+
+  delta:
+    regs:         +0
+    sass_total:   +0
+    sass_non_nop: +0
+    time_ms_mean: +0.0186
+
+--- warp_reduce ---
+[workbench] kernel=warp_reduce  (warp_reduce fp32 shfl.down butterfly)
+  build:    PASS
+  correct:  PASS
+  repeat:   1
+  forge:     4654c73
+  opencuda:  1763d8a
+  openptxas: 0318671
+
+  ours:
+    regs:         10
+    sass_total:   40
+    sass_non_nop: 26
+    compile_ms:   24.8
+    time_ms:      0.0072
+
+  ptxas:
+    regs:         10
+    sass_total:   40
+    sass_non_nop: 26
+    compile_ms:   17.0
+    time_ms:      0.0069
+
+  delta:
+    regs:         +0
+    sass_total:   +0
+    sass_non_nop: +0
+    time_ms_mean: +0.0003
+
+--- atom_or ---
+[workbench] kernel=atom_or  (atom.global.or.b32)
+  build:    PASS
+  correct:  PASS
+  repeat:   1
+  forge:     4654c73
+  opencuda:  1763d8a
+  openptxas: 0318671
+
+  ours:
+    regs:         6
+    sass_total:   16
+    sass_non_nop: 9
+    compile_ms:   23.0
+    time_ms:      0.0256
+
+  ptxas:
+    regs:         6
+    sass_total:   24
+    sass_non_nop: 13
+    compile_ms:   16.6
+    time_ms:      0.0074
+
+  delta:
+    regs:         +0
+    sass_total:   -8
+    sass_non_nop: -4
+    time_ms_mean: +0.0182
+
+--- atomg_add ---
+[workbench] kernel=atomg_add  (atom.global.add.u32)
+  build:    PASS
+  correct:  PASS
+  repeat:   1
+  forge:     4654c73
+  opencuda:  1763d8a
+  openptxas: 0318671
+
+  ours:
+    regs:         6
+    sass_total:   16
+    sass_non_nop: 9
+    compile_ms:   24.5
+    time_ms:      0.0253
+
+  ptxas:
+    regs:         6
+    sass_total:   24
+    sass_non_nop: 13
+    compile_ms:   18.1
+    time_ms:      0.0071
+
+  delta:
+    regs:         +0
+    sass_total:   -8
+    sass_non_nop: -4
+    time_ms_mean: +0.0182
+
+--- vecadd_large ---
+[workbench] kernel=vecadd_large  (vecadd_large (1M-thread, 4-param, bounds check))
+  build:    PASS
+  correct:  PASS
+  repeat:   1
+  forge:     4654c73
+  opencuda:  1763d8a
+  openptxas: 0318671
+
+  ours:
+    regs:         10
+    sass_total:   32
+    sass_non_nop: 23
+    compile_ms:   24.5
+    time_ms:      0.0104
+
+  ptxas:
+    regs:         10
+    sass_total:   32
+    sass_non_nop: 22
+    compile_ms:   16.4
+    time_ms:      0.0093
+
+  delta:
+    regs:         +0
+    sass_total:   +0
+    sass_non_nop: +1
+    time_ms_mean: +0.0012
+
+--- multi_ldg ---
+[workbench] kernel=multi_ldg  (multi_ldg aliased base (FB-5 canary))
+  build:    PASS
+  correct:  PASS
+  repeat:   1
+  forge:     4654c73
+  opencuda:  1763d8a
+  openptxas: 0318671
+
+  ours:
+    regs:         8
+    sass_total:   24
+    sass_non_nop: 14
+    compile_ms:   23.5
+    time_ms:      0.0072
+
+  ptxas:
+    regs:         8
+    sass_total:   24
+    sass_non_nop: 14
+    compile_ms:   25.8
+    time_ms:      0.0072
+
+  delta:
+    regs:         +0
+    sass_total:   +0
+    sass_non_nop: +0
+    time_ms_mean: -0.0000
+
+--- smem_exchange ---
+[workbench] kernel=smem_exchange  (shared-memory write/barrier/read)
+  build:    PASS
+  correct:  PASS
+  repeat:   1
+  forge:     4654c73
+  opencuda:  1763d8a
+  openptxas: 0318671
+
+  ours:
+    regs:         8
+    sass_total:   24
+    sass_non_nop: 15
+    compile_ms:   23.2
+    time_ms:      0.0257
+
+  ptxas:
+    regs:         8
+    sass_total:   24
+    sass_non_nop: 15
+    compile_ms:   17.0
+    time_ms:      0.0070
+
+  delta:
+    regs:         +0
+    sass_total:   +0
+    sass_non_nop: +0
+    time_ms_mean: +0.0188
+
+--- fmax ---
+[workbench] kernel=fmax  (max.f32 scalar (FMNMX))
+  build:    PASS
+  correct:  PASS
+  repeat:   1
+  forge:     4654c73
+  opencuda:  1763d8a
+  openptxas: 0318671
+
+  ours:
+    regs:         10
+    sass_total:   24
+    sass_non_nop: 11
+    compile_ms:   22.5
+    time_ms:      0.0072
+
+  ptxas:
+    regs:         10
+    sass_total:   24
+    sass_non_nop: 11
+    compile_ms:   16.2
+    time_ms:      0.0065
+
+  delta:
+    regs:         +0
+    sass_total:   +0
+    sass_non_nop: +0
+    time_ms_mean: +0.0008
+
+--- smem_cycle ---
+[workbench] kernel=smem_cycle  (smem write/barrier/read cycle (param-base))
+  build:    PASS
+  correct:  PASS
+  repeat:   1
+  forge:     4654c73
+  opencuda:  1763d8a
+  openptxas: 0318671
+
+  ours:
+    regs:         8
+    sass_total:   24
+    sass_non_nop: 16
+    compile_ms:   24.8
+    time_ms:      0.0247
+
+  ptxas:
+    regs:         8
+    sass_total:   24
+    sass_non_nop: 16
+    compile_ms:   17.1
+    time_ms:      0.0068
+
+  delta:
+    regs:         +0
+    sass_total:   +0
+    sass_non_nop: +0
+    time_ms_mean: +0.0179
+
+--- bar_ldc_xor ---
+[workbench] kernel=bar_ldc_xor  (bar.sync + LDC param + XOR)
+  build:    PASS
+  correct:  PASS
+  repeat:   1
+  forge:     4654c73
+  opencuda:  1763d8a
+  openptxas: 0318671
+
+  ours:
+    regs:         8
+    sass_total:   32
+    sass_non_nop: 19
+    compile_ms:   24.2
+    time_ms:      0.0065
+
+  ptxas:
+    regs:         8
+    sass_total:   32
+    sass_non_nop: 19
+    compile_ms:   17.0
+    time_ms:      0.0065
+
+  delta:
+    regs:         +0
+    sass_total:   +0
+    sass_non_nop: +0
+    time_ms_mean: -0.0000
+
+--- dual_ldg64_dadd ---
+[workbench] kernel=dual_ldg64_dadd  (dual LDG.E.64 + DADD (FP64 multi-load))
+  build:    PASS
+  correct:  PASS
+  repeat:   1
+  forge:     4654c73
+  opencuda:  1763d8a
+  openptxas: 0318671
+
+  ours:
+    regs:         12
+    sass_total:   24
+    sass_non_nop: 19
+    compile_ms:   24.0
+    time_ms:      0.0071
+
+  ptxas:
+    regs:         10
+    sass_total:   32
+    sass_non_nop: 19
+    compile_ms:   16.5
+    time_ms:      0.0067
+
+  delta:
+    regs:         +2
+    sass_total:   -8
+    sass_non_nop: +0
+    time_ms_mean: +0.0005
+
+--- multi_block_atomic ---
+[workbench] kernel=multi_block_atomic  (64-block atom.add scatter (grid contention))
+  build:    PASS
+  correct:  PASS
+  repeat:   1
+  forge:     4654c73
+  opencuda:  1763d8a
+  openptxas: 0318671
+
+  ours:
+    regs:         6
+    sass_total:   16
+    sass_non_nop: 9
+    compile_ms:   31.4
+    time_ms:      0.0237
+
+  ptxas:
+    regs:         3
+    sass_total:   24
+    sass_non_nop: 11
+    compile_ms:   17.0
+    time_ms:      0.0074
+
+  delta:
+    regs:         +3
+    sass_total:   -8
+    sass_non_nop: -2
+    time_ms_mean: +0.0163
+
+--- atom_cas64 ---
+[workbench] kernel=atom_cas64  (atom.global.cas.b64 (64-bit CAS))
+  build:    PASS
+  correct:  PASS
+  repeat:   1
+  forge:     4654c73
+  opencuda:  1763d8a
+  openptxas: 0318671
+
+  ours:
+    regs:         10
+    sass_total:   16
+    sass_non_nop: 10
+    compile_ms:   22.9
+    time_ms:      0.0072
+
+  ptxas:
+    regs:         12
+    sass_total:   24
+    sass_non_nop: 11
+    compile_ms:   16.5
+    time_ms:      0.0065
+
+  delta:
+    regs:         -2
+    sass_total:   -8
+    sass_non_nop: -1
+    time_ms_mean: +0.0007
+
+--- redux_sum ---
+[workbench] kernel=redux_sum  (redux.sync.add.s32 (warp REDUX))
+  build:    PASS
+  correct:  PASS
+  repeat:   1
+  forge:     4654c73
+  opencuda:  1763d8a
+  openptxas: 0318671
+
+  ours:
+    regs:         6
+    sass_total:   24
+    sass_non_nop: 9
+    compile_ms:   22.9
+    time_ms:      0.0075
+
+  ptxas:
+    regs:         6
+    sass_total:   24
+    sass_non_nop: 9
+    compile_ms:   16.7
+    time_ms:      0.0066
+
+  delta:
+    regs:         +0
+    sass_total:   +0
+    sass_non_nop: +0
+    time_ms_mean: +0.0009
+
+
+================================================================
+LEADERBOARD
+================================================================
+
+  A. EXACT PARITY (regs / sass / non-NOP all match ptxas)  (11 kernels)
+    kernel             deltas
+    reduce_sum         regs=+0  sass_total=+0  sass_non_nop=+0
+    conv2d_looped      regs=+0  sass_total=+0  sass_non_nop=+0
+    conv2d_unrolled    regs=+0  sass_total=+0  sass_non_nop=+0
+    cp_async           regs=+0  sass_total=+0  sass_non_nop=+0
+    warp_reduce        regs=+0  sass_total=+0  sass_non_nop=+0
+    multi_ldg          regs=+0  sass_total=+0  sass_non_nop=+0
+    smem_exchange      regs=+0  sass_total=+0  sass_non_nop=+0
+    fmax               regs=+0  sass_total=+0  sass_non_nop=+0
+    smem_cycle         regs=+0  sass_total=+0  sass_non_nop=+0
+    bar_ldc_xor        regs=+0  sass_total=+0  sass_non_nop=+0
+    redux_sum          regs=+0  sass_total=+0  sass_non_nop=+0
+
+  B. NATIVE WINS (ours <= ptxas on every metric, < on at least one)  (7 kernels)
+    kernel             deltas
+    hmma_zero          regs=+0  sass_total=-16  sass_non_nop=-3
+    imma_zero          regs=+0  sass_total=-16  sass_non_nop=-5
+    dmma_zero          regs=+0  sass_total=-8  sass_non_nop=+0
+    qmma_zero          regs=+0  sass_total=-8  sass_non_nop=-1
+    atom_or            regs=+0  sass_total=-8  sass_non_nop=-4
+    atomg_add          regs=+0  sass_total=-8  sass_non_nop=-4
+    atom_cas64         regs=-2  sass_total=-8  sass_non_nop=-1
+
+  C. REMAINING GAPS (ours >= ptxas on every metric, > on at least one)  (1 kernels)
+    kernel             deltas
+    vecadd_large       regs=+0  sass_total=+0  sass_non_nop=+1
+
+  D. MIXED (some better, some worse)  (2 kernels)
+    kernel             deltas
+    dual_ldg64_dadd    regs=+2  sass_total=-8  sass_non_nop=+0
+    multi_block_atomic regs=+3  sass_total=-8  sass_non_nop=-2
+
+[workbench] suite artifact: C:\Users\kraken\openptxas\results\20260410_140146_suite_all.json

@@ -1,0 +1,29 @@
+[workbench] kernel=vecadd_large  (vecadd_large (1M-thread, 4-param, bounds check))
+  build:    PASS
+  correct:  PASS
+  repeat:   1
+  forge:     4654c73
+  opencuda:  1763d8a
+  openptxas: 0318671
+
+  ours:
+    regs:         10
+    sass_total:   32
+    sass_non_nop: 23
+    compile_ms:   20.3
+    time_ms:      0.0103
+
+  ptxas:
+    regs:         10
+    sass_total:   32
+    sass_non_nop: 22
+    compile_ms:   17.3
+    time_ms:      0.0090
+
+  delta:
+    regs:         +0
+    sass_total:   +0
+    sass_non_nop: +1
+    time_ms_mean: +0.0013
+
+[workbench] artifact: C:\Users\kraken\openptxas\results\20260410_132233_vecadd_large.json

@@ -1,0 +1,36 @@
+{
+  "commit": "0318671",
+  "timestamp": "2026-04-10T14:01:46",
+  "kernel_count": 21,
+  "buckets": {
+    "PARITY": [
+      "reduce_sum",
+      "conv2d_looped",
+      "conv2d_unrolled",
+      "cp_async",
+      "warp_reduce",
+      "multi_ldg",
+      "smem_exchange",
+      "fmax",
+      "smem_cycle",
+      "bar_ldc_xor",
+      "redux_sum"
+    ],
+    "NATIVE_WIN": [
+      "hmma_zero",
+      "imma_zero",
+      "dmma_zero",
+      "qmma_zero",
+      "atom_or",
+      "atomg_add",
+      "atom_cas64"
+    ],
+    "GAP": [
+      "vecadd_large"
+    ],
+    "MIXED": [
+      "dual_ldg64_dadd",
+      "multi_block_atomic"
+    ]
+  }
+}

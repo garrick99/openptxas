@@ -1,0 +1,42 @@
+{
+  "kernel": "vecadd_large",
+  "bucket": "GAP",
+  "ours": {
+    "regs": 10,
+    "sass_total": 32,
+    "sass_non_nop": 23,
+    "compile_ms": 24.54910008236766,
+    "time_ms_runs": [
+      0.0104479999281466
+    ],
+    "time_ms_stats": {
+      "min": 0.0104479999281466,
+      "max": 0.0104479999281466,
+      "mean": 0.0104479999281466,
+      "stddev": 0.0,
+      "n": 1
+    }
+  },
+  "ptxas": {
+    "regs": 10,
+    "sass_total": 32,
+    "sass_non_nop": 22,
+    "compile_ms": 16.41759998165071,
+    "time_ms_runs": [
+      0.009296000003814697
+    ],
+    "time_ms_stats": {
+      "min": 0.009296000003814697,
+      "max": 0.009296000003814697,
+      "mean": 0.009296000003814697,
+      "stddev": 0.0,
+      "n": 1
+    }
+  },
+  "delta": {
+    "regs": 0,
+    "sass_total": 0,
+    "sass_non_nop": 1,
+    "time_ms_mean": 0.0011519999243319035
+  }
+}

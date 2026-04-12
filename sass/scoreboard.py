@@ -789,6 +789,43 @@ def _is_memory_gpr_producer(opc: int) -> bool:
     return opc in _OPCODES_MEMORY_GPR
 
 
+def _is_zero_init_fastpath(raw: bytes) -> bool:
+    """FG-4.1: semantic predicate for the HFMA2 zero-init trick.
+
+    ptxas emits `HFMA2 Rd, -RZ, imm_fp16x2, RZ` as a register-zero
+    init primitive: the computation is (-0.0) * imm + 0.0 = 0.0 for
+    any finite FP16x2 immediate, so the result is deterministically
+    zero and the hardware can forward it to a consumer on the next
+    cycle regardless of the normal 1-instruction ALU GPR latency.
+
+    Encoding ground truth (sass/encoding/sm_120_opcodes.py line 3109):
+        HFMA2 R2, -RZ, RZ, 0, 0
+        b0=0x31, b1=0x74     → opcode 0x431
+        b2 = dest
+        b3 = 0xff            → src0 = -RZ (negated zero-latency src)
+        b4 = 0               → FP16x2 immediate (0.0 in encoder,
+                               but ptxas observed to emit non-zero
+                               values like 0x2a, 0x07; irrelevant
+                               because src0 = -RZ makes the product 0)
+        b8 = 0xff            → src2 = RZ (zero accumulator)
+
+    The predicate is intentionally narrow: BOTH b3 and b8 must be
+    0xff.  A non-RZ source on either side is a real FMA and retains
+    the standard 1-instruction latency.  The b4 immediate does not
+    constrain the predicate because src0 = RZ forces the product
+    regardless of its value.
+
+    This predicate is the only exemption FG-4.1 adds to the ALU
+    latency rule; see sass/schedule.py verify_proof rule R8 for the
+    consumer.
+    """
+    if len(raw) < 16:
+        return False
+    if _get_opcode(raw) != 0x431:
+        return False
+    return raw[3] == 0xff and raw[8] == 0xff
+
+
 def _is_memory_ur_producer(opc: int) -> bool:
     """Return True if `opc` writes the UR register bank and is
     eligible for the FG-3.2 UR memory proof model (rule R10).

@@ -45,6 +45,7 @@ class ProofClass(str, Enum):
     FORWARDING_SAFE        = "FORWARDING_SAFE"        # pair on _FORWARDING_SAFE_PAIRS list
     CTRLWORD_SAFE          = "CTRLWORD_SAFE"          # reserved / legacy (unused after FG-3.3)
     GAP_SAFE               = "GAP_SAFE"               # ALU: instruction-stream gap ≥ min_gpr_gap
+    ZERO_INIT_SAFE         = "ZERO_INIT_SAFE"         # FG-4.1: semantic fastpath (HFMA2 zero-init)
     # FG-3.1 memory latency classes (GPR memory producers)
     MEMORY_SCOREBOARD_SAFE = "MEMORY_SCOREBOARD_SAFE"  # rbar wait bit proven in window
     MEMORY_INERT           = "MEMORY_INERT"            # producer wdep no-track (FG-3.2)
@@ -150,6 +151,7 @@ class ProofReport:
             f"INERT={c[ProofClass.LATENCY_INERT]}  "
             f"FWD={c[ProofClass.FORWARDING_SAFE]}  "
             f"GAP={c[ProofClass.GAP_SAFE]}  "
+            f"ZI={c[ProofClass.ZERO_INIT_SAFE]}  "
             f"MSB={c[ProofClass.MEMORY_SCOREBOARD_SAFE]}  "
             f"MIN={c[ProofClass.MEMORY_INERT]}  "
             f"MVIOL={c[ProofClass.MEMORY_VIOLATION]}  "
@@ -548,6 +550,7 @@ def verify_proof(instrs: list[SassInstr]) -> ProofReport:
         _get_src_regs  as _sc_src,
         _get_opcode    as _sc_opc,
         _is_forwarding_safe_pair,
+        _is_zero_init_fastpath,
         _WDEP_TO_RBAR_MASK,
         _LATENCY_INERT_WDEPS,
         _LDCU_GAP_SAFE_MIN,
@@ -893,6 +896,18 @@ def verify_proof(instrs: list[SassInstr]) -> ProofReport:
                 rat = (f"pair (0x{opc_i:03x}, 0x{opc_j:03x}) in FG-2.4 "
                        f"_FORWARDING_SAFE_PAIRS: hardware operand "
                        f"forwarding covers the 1-cycle latency")
+            elif _is_zero_init_fastpath(instrs[i].raw):
+                # FG-4.1: narrow semantic exemption — the HFMA2
+                # zero-init trick (HFMA2 Rd, -RZ, imm, RZ) produces a
+                # deterministic zero that the hardware can forward
+                # without observing the 1-instruction ALU latency.
+                # Scoped to exactly the all-RZ source pattern; any
+                # HFMA2 with non-RZ sources retains the standard
+                # VIOLATION classification.
+                cls = ProofClass.ZERO_INIT_SAFE
+                rat = (f"writer HFMA2 Rd, -RZ, imm, RZ — zero-init "
+                       f"fastpath (result is deterministically 0; "
+                       f"hardware forwards without ALU latency)")
             else:
                 cls = ProofClass.VIOLATION
                 rat = (f"0-gap RAW with no forwarding-safe exemption: "

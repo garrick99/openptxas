@@ -23,7 +23,7 @@ from sass.encoding.sm_120_opcodes import (
     encode_imad_ur, encode_mov, encode_nop,
     encode_imad_wide_rr, encode_iadd3,
     encode_ldg_e, encode_lds, encode_ldc,
-    encode_ldcu_64,
+    encode_ldcu_64, encode_hfma2_zero,
 )
 
 
@@ -1395,6 +1395,158 @@ def test_inv_ag_synthetic_safe_ldcu_inert():
 # ---------------------------------------------------------------------------
 # INV AH — the real corpus remains SAFE after LDCU unification
 # ---------------------------------------------------------------------------
+
+# ===========================================================================
+# FG-4.1 INVARIANTS (ADJ1–ADJ4) — HFMA2 zero-init precision refinement
+# ===========================================================================
+#
+# FG-4.1 adds a narrow semantic exemption to the ALU latency rule:
+# the HFMA2 zero-init trick (HFMA2 Rd, -RZ, imm_fp16x2, RZ) has a
+# deterministically-zero result and the hardware forwards it to the
+# next consumer without observing the standard 1-instruction latency.
+# The exemption is gated by `_is_zero_init_fastpath(raw)` which tests
+# `opcode==0x431 AND b3==0xff AND b8==0xff` — nothing else.
+#
+# Evidence for the refinement: five FG-4.0 adversarial false
+# positives (f3_shadowed_gap0, f4_setp_exit_ne, f5_mov_shadow,
+# f5_ld_shadow, f5_long_shadow) all trace to the same PTXAS-emitted
+# HFMA2 bytes with src0=0xff and src2=0xff.
+
+
+def _patch_hfma2_non_rz(raw: bytes, new_src0: int = 0x05,
+                         new_src2: int = 0x06) -> bytes:
+    """Turn an encode_hfma2_zero() output into a non-zero-init HFMA2
+    by overwriting the b3 (src0) and b8 (src2) fields with GPR
+    indices.  Everything else (opcode, dest, immediate, ctrl word)
+    is preserved.
+    """
+    buf = bytearray(raw)
+    buf[3] = new_src0 & 0xff
+    buf[8] = new_src2 & 0xff
+    return bytes(buf)
+
+
+def test_inv_adj1_hfma2_zero_init_safe():
+    """INV ADJ1: HFMA2 Rd, -RZ, imm, RZ followed by an immediate
+    consumer must be classified ZERO_INIT_SAFE, not VIOLATION.  This
+    is the FG-4.1 precision refinement in its most direct form.
+    """
+    instrs = _stream(
+        encode_hfma2_zero(dest=5),
+        # Consumer at gap=0 reading R5 — MOV R6, R5.
+        encode_mov(dest=6, src=5),
+    )
+    report = verify_proof(instrs)
+    assert report.safe, (
+        f"INV ADJ1 failed: HFMA2 zero-init → MOV should be SAFE. "
+        f"Report: {report.summary_line()}"
+    )
+    zi_edges = [e for e in report.edges
+                if e.classification == ProofClass.ZERO_INIT_SAFE]
+    assert len(zi_edges) == 1, (
+        f"INV ADJ1: expected 1 ZERO_INIT_SAFE edge, got "
+        f"{[(e.classification, e.rationale[:80]) for e in report.edges]}"
+    )
+    assert zi_edges[0].writer_opc == 0x431
+    assert zi_edges[0].reader_opc == 0x202
+    assert 5 in zi_edges[0].regs
+
+
+def test_inv_adj2_hfma2_non_rz_still_violation():
+    """INV ADJ2: nearby non-zero-init HFMA2 (either src0 or src2 is
+    a real register, not RZ) must STILL be flagged as VIOLATION —
+    the fastpath rule is narrow and does not accidentally whitelist
+    all HFMA2.
+    """
+    # Start from the zero-init encoding and patch src0 / src2 to
+    # GPR indices.
+    hfma_raw = _patch_hfma2_non_rz(encode_hfma2_zero(dest=5),
+                                    new_src0=0x05, new_src2=0x06)
+    instrs = _stream(hfma_raw, encode_mov(dest=6, src=5))
+    report = verify_proof(instrs)
+    assert not report.safe, (
+        f"INV ADJ2 failed: non-RZ HFMA2 at gap=0 should still be "
+        f"UNSAFE. Report: {report.summary_line()}"
+    )
+    viols = [v for v in report.violations
+             if v.writer_opc == 0x431]
+    assert len(viols) == 1, (
+        f"INV ADJ2: expected 1 HFMA2 VIOLATION, got "
+        f"{[(v.classification, v.rationale[:80]) for v in report.violations]}"
+    )
+    # And the safe-edge list must NOT include a ZERO_INIT_SAFE.
+    zi_edges = [e for e in report.edges
+                if e.classification == ProofClass.ZERO_INIT_SAFE]
+    assert len(zi_edges) == 0
+
+
+def test_inv_adj2b_hfma2_src0_only_rz_still_violation():
+    """INV ADJ2b: even if src0 is RZ but src2 is a real register,
+    the edge must NOT be classified ZERO_INIT_SAFE — the trick
+    requires BOTH src0 and src2 to be RZ.
+    """
+    hfma_raw = _patch_hfma2_non_rz(encode_hfma2_zero(dest=5),
+                                    new_src0=0xff, new_src2=0x06)
+    instrs = _stream(hfma_raw, encode_mov(dest=6, src=5))
+    report = verify_proof(instrs)
+    assert not report.safe
+    zi_edges = [e for e in report.edges
+                if e.classification == ProofClass.ZERO_INIT_SAFE]
+    assert len(zi_edges) == 0
+
+
+def test_inv_adj2c_hfma2_src2_only_rz_still_violation():
+    """INV ADJ2c: even if src2 is RZ but src0 is a real register,
+    the edge must NOT be classified ZERO_INIT_SAFE."""
+    hfma_raw = _patch_hfma2_non_rz(encode_hfma2_zero(dest=5),
+                                    new_src0=0x05, new_src2=0xff)
+    instrs = _stream(hfma_raw, encode_mov(dest=6, src=5))
+    report = verify_proof(instrs)
+    assert not report.safe
+    zi_edges = [e for e in report.edges
+                if e.classification == ProofClass.ZERO_INIT_SAFE]
+    assert len(zi_edges) == 0
+
+
+def test_inv_adj3_no_false_negatives_introduced():
+    """INV ADJ3: the FG-4.1 refinement must NOT turn any VIOLATION
+    from the existing negative-control INV tests into SAFE.
+    """
+    # Reuse the FG-2.5 INV L hazard (IMAD.R-UR → MOV) — must still
+    # be UNSAFE.
+    from sass.encoding.sm_120_opcodes import encode_imad_ur
+    instrs = _stream(
+        encode_imad_ur(dest=4, src0=3, ur_src=6, src2=2),
+        encode_mov(dest=5, src=4),
+    )
+    report = verify_proof(instrs)
+    assert not report.safe, (
+        "INV ADJ3 regression: FG-2.5 INV L IMAD.R-UR → MOV hazard "
+        "no longer flagged — FG-4.1 refinement leaked"
+    )
+
+
+def test_inv_adj4_corpus_safe_after_refinement():
+    """INV ADJ4: the full corpus remains SAFE after the FG-4.1
+    precision refinement — zero VIOLATION / MEMORY_VIOLATION /
+    UR_MEMORY_VIOLATION in aggregate.
+    """
+    corpus = _workbench_kernels() + _probe_kernels() + _fg21_predicate_kernels()
+    viol = 0
+    problem = []
+    for label, ptx in corpus:
+        try:
+            report = _proof_for(ptx)
+        except Exception:
+            continue
+        viol += len(report.violations)
+        if report.violations:
+            problem.append(label)
+    assert viol == 0, (
+        f"INV ADJ4: {viol} violation edge(s) after FG-4.1 in "
+        f"{problem[:10]}"
+    )
+
 
 def test_inv_ah_corpus_safe_under_fg33():
     """INV AH: the full corpus remains SAFE with zero VIOLATION,

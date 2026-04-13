@@ -1058,12 +1058,42 @@ def compile_function(fn: Function, verbose: bool = False,
         _ur_activation.append(SassInstr(bytes(_umov),
             'UMOV UR5, UR0  // P3-7: must follow UIADD'))
 
-    # TODO: Phase-4 UR scheduler hook
-    # The _ur_activation block handles S2UR→0x886→LDCU→S2UR→0x2bd→UIADD→UMOV.
-    # For atom.xor with tid+constant, a post-scheduling reorder pass is needed
-    # to ensure ISETP.RUR (UR flush) + sync + ATOMG are contiguous after UMOV
-    # with NO UR-writing instructions (S2UR, LDCU) in between.
-    # See docs/phase4/UR_SCHEDULER.md for the design.
+    # PHASE-4.1: Post-scheduling UR micro-scheduler.
+    # UMOV is in _ur_activation (preamble). ALL body instructions come after it.
+    # Hoist UR-writing instructions from body to BEFORE the activation block.
+    # Also insert ISETP.RUR flush before ATOMG.
+    _UR_WRITE_OPCODES = frozenset({0x919, 0x9c3, 0x7ac})  # S2UR variants, LDCU
+    if _ur_act_sr is not None and body_scheduled:
+        _opc = lambda r: struct.unpack_from('<Q', r.raw, 0)[0] & 0xFFF
+        _atomg_pos = -1
+        for _j, _si in enumerate(body_scheduled):
+            if _opc(_si) == 0x98e:
+                _atomg_pos = _j; break
+        if _atomg_pos >= 0:
+            # Hoist ALL UR writes from body[0:_atomg_pos] to before activation
+            _hoisted = []
+            _remaining = []
+            for _j in range(_atomg_pos):
+                _si = body_scheduled[_j]
+                if _opc(_si) in _UR_WRITE_OPCODES:
+                    _hoisted.append(_si)
+                else:
+                    _remaining.append(_si)
+            # Insert ISETP.RUR flush before ATOMG if not present
+            _has_flush = any(_opc(s) == 0xc0c for s in _remaining)
+            if not _has_flush:
+                _flush = bytearray(bytes.fromhex('0c7c0001040000007020f00b00ce4f00'))
+                _flush[4] = ctx.ur_desc & 0xFF
+                _remaining.append(SassInstr(bytes(_flush),
+                    f'ISETP.RUR P0, R1, UR{ctx.ur_desc}  // P4.1: UR flush'))
+            body_scheduled = _remaining + body_scheduled[_atomg_pos:]
+            # Hoisted UR writes go INSIDE the activation block, after LDCU[2]
+            # and before S2UR UR2[3]. This matches PTXAS interleaving pattern.
+            if _hoisted and len(_ur_activation) >= 4:
+                # Insert after position 2 (after LDCU.64 desc) in activation
+                _ur_activation = (_ur_activation[:3]    # S2UR UR0, 0x886, LDCU
+                                  + _hoisted              # hoisted body UR writes
+                                  + _ur_activation[3:])   # S2UR UR2, 0x2bd, UIADD, UMOV
 
     sass_instrs = preamble_instrs + _ur_activation + body_scheduled
 

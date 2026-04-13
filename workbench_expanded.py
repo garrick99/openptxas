@@ -2531,9 +2531,9 @@ def _harness_pred_load(ctx, func, mode):
 
 
 WEIRD2_KERNELS = {
-    # w2_atom_xor_reduce: P3-7 got activation ordering correct ([0]-[7] match PTXAS)
-    # but UR value still doesn't reach ATOMG. Gap between UMOV and ATOMG is too large
-    # (10 instrs in OURS vs 3 in PTXAS). Requires body restructuring.
+    # w2_atom_xor_reduce: P4.1 micro-scheduler hoists body UR writes and inserts flush,
+    # but activation-internal order (0x886/0x2bd/UIADD) must be kernel-adaptive.
+    # PTXAS w2 uses UIADD→0x886→LDCU→UMOV→0x2bd (different from simple kernel order).
     "w2_atom_and_reduce":  {"display": "atom.global.and.b32 reduce", "ptx_inline": _W2_ATOM_AND_REDUCE, "kernel_name": "w2_atom_and_reduce",
                             "harness": _harness_atom_and_reduce},
     "w2_loop_atom_add":    {"display": "loop: 3x atom.add per thread", "ptx_inline": _W2_LOOP_ATOM_ADD, "kernel_name": "w2_loop_atom_add",

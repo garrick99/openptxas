@@ -1,6 +1,6 @@
 # Phase 4: UR Scheduling Synthesis
 
-**Status:** Planning (not yet implemented)
+**Status:** IMPLEMENTED (Phase 4.3 TEMPLATE_SUCCESS, frozen at FREEZE-4)
 
 ## 1. Problem Definition
 

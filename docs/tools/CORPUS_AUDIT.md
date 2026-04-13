@@ -55,6 +55,7 @@ allocation (TE7-A proved zero REG_ONLY differences exist).
 
 PTXAS uses the UR file extensively for parameter handling:
 - ISETP.R-UR (+114 instances over OURS)
+- ISETP.UR-UR (+164)
 - LDCU (+101), UIADD (+93)
 
 OURS uses GPR equivalents:
@@ -62,3 +63,19 @@ OURS uses GPR equivalents:
 - IADD3.IMM (+154), IMAD.WIDE (+102)
 
 Both produce correct code. The gap is in isel-level UR utilization.
+
+## TE8 Findings: Why the Gap Is Hard to Close
+
+TE8-B attempted to route u32 setp params through preamble LDCU.32→UR to
+enable ISETP.R-UR.  This caused 17 regressions and was reverted.
+
+Root cause: the "body LDCU poisons IADD.64-UR" hazard creates a circular
+dependency.  Our address computation uses IADD.64-UR, which is incompatible
+with body LDCU.  Even preamble LDCU changes the instruction count and breaks
+BRA fixup invariants.
+
+To close the ISETP gap, the address computation path must first be changed
+from IADD.64-UR to UIADD-based (Rule 4 from TE8-A policy).  This is a deep
+isel/address-gen change, not a local substitution.  The 20.1% byte-exact
+rate and 47.9% instruction-parity rate represent the practical ceiling
+achievable with the current address computation architecture.

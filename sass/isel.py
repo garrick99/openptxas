@@ -1327,6 +1327,12 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
         # use ISETP R-R (not R-UR). LDCU.32 poisons IADD.64-UR and
         # LDCU.64 reads past the 4-byte param boundary.
         # Simply record the param offset; the setp handler will use LDC.
+        #
+        # TE8-B note: preamble LDCU.32→UR was attempted to enable
+        # ISETP.R-UR, but caused 17 regressions because _setp_only_params
+        # is not perfectly accurate (some params have non-setp consumers
+        # or the extra preamble instructions break BRA fixup offsets).
+        # The GPR LDC path remains the safe default.
         if ctx and dest.name in getattr(ctx, '_setp_only_params', set()):
             ctx._reg_param_off[dest.name] = byte_off
             d = ra.r32(dest.name)

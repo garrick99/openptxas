@@ -854,7 +854,7 @@ EXPANDED_KERNELS = {
     "k100_pred_arith":       {"display": "dual predicated add (multi-threshold)", "ptx_inline": _K100_PRED_ARITH, "kernel_name": "k100_pred_arith", "harness": _harness_pred_arith},
     "k100_setp_combo":       {"display": "dual setp + selp combination", "ptx_inline": _K100_SETP_COMBO, "kernel_name": "k100_setp_combo", "harness": _harness_setp_combo},
     "k100_atom_add":         {"display": "atom.global.add.u32 (N threads)", "ptx_inline": _K100_ATOM_ADD, "kernel_name": "k100_atom_add", "harness": _harness_atom_add},
-    # k100_atom_xor excluded: ATOMG_XOR=0x06 encoding produces wrong results (needs ground-truth investigation)
+    "k100_atom_xor":         {"display": "atom.global.xor.b32 (reduce XOR)", "ptx_inline": _K100_ATOM_XOR, "kernel_name": "k100_atom_xor", "harness": _harness_atom_xor},
     "k100_atom_min":         {"display": "atom.global.min.u32 (find min)", "ptx_inline": _K100_ATOM_MIN, "kernel_name": "k100_atom_min", "harness": _harness_atom_min},
     "k100_atom_max":         {"display": "atom.global.max.u32 (find max)", "ptx_inline": _K100_ATOM_MAX, "kernel_name": "k100_atom_max", "harness": _harness_atom_max},
     "k100_atom_cas32":       {"display": "atom.global.cas.b32 (race)", "ptx_inline": _K100_ATOM_CAS32, "kernel_name": "k100_atom_cas32", "harness": _harness_atom_cas32},
@@ -2531,7 +2531,8 @@ def _harness_pred_load(ctx, func, mode):
 
 
 WEIRD2_KERNELS = {
-    # w2_atom_xor_reduce excluded: ATOMG_XOR encoding needs ground truth (0x98e family has different descriptor model)
+    # w2_atom_xor_reduce: UIADD (tid+K) pipeline doesn't deliver value in our cubins.
+    # k100_atom_xor (direct tid.x) works. UIADD encoding grounded but execution fails.
     "w2_atom_and_reduce":  {"display": "atom.global.and.b32 reduce", "ptx_inline": _W2_ATOM_AND_REDUCE, "kernel_name": "w2_atom_and_reduce",
                             "harness": _harness_atom_and_reduce},
     "w2_loop_atom_add":    {"display": "loop: 3x atom.add per thread", "ptx_inline": _W2_LOOP_ATOM_ADD, "kernel_name": "w2_loop_atom_add",

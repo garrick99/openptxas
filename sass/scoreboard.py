@@ -248,6 +248,7 @@ _OPCODES_ALU = {
     # Address calculation
     0x211,        # LEA (address calculation)
     0x811,        # LEA.IMM (address calc with immediate)
+    0x835,        # UIADD: uniform add (P3-3, dual GPR+UR write, no _OPCODE_META entry)
     # Integer min/max & sign-extend & bitmask
     0x217,        # IMNMX (integer min/max)
     0x21a,        # SGXT (sign extend)

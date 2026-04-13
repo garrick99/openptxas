@@ -2562,8 +2562,48 @@ def encode_atomg_u32(dest: int, addr_base: int, offset: int, data: int,
     return bytes(raw)
 
 
+def encode_uiadd_imm(dest: int, src: int, imm32: int, ctrl: int = 0) -> bytes:
+    """Encode UIADD: uniform add with 32-bit immediate (opcode 0x835).
+
+    Writes BOTH R[dest] (GPR) and UR[dest] (uniform register) simultaneously:
+        R[dest]  = R[src]  + imm32
+        UR[dest] = UR[src] + imm32
+
+    PTXAS ground truth (SM_120):
+        UIADD R0, R0, 1 → 35780000 01000000 00008e07 00c81f00
+        b2=dest(00), b3=src(00), b4-7=imm32(1)
+        b9=0x00, b10=0x8e, b11=0x07
+
+    Note: PTXAS only emits this for R0/UR0. Other register indices may work
+    but are unverified. Use dest=0, src=0 for proven-safe behavior.
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0]  = 0x35
+    raw[1]  = 0x78
+    raw[2]  = dest & 0xFF
+    raw[3]  = src & 0xFF
+    imm32 = imm32 & 0xFFFFFFFF
+    raw[4]  = imm32 & 0xFF
+    raw[5]  = (imm32 >> 8) & 0xFF
+    raw[6]  = (imm32 >> 16) & 0xFF
+    raw[7]  = (imm32 >> 24) & 0xFF
+    raw[8]  = 0x00
+    raw[9]  = 0x00
+    raw[10] = 0x8e
+    raw[11] = 0x07
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
 def encode_umov_gpr_to_ur(ur_dest: int, gpr_src: int, ctrl: int = 0) -> bytes:
-    """Encode UMOV: move GPR value to uniform register (GPR → UR).
+    """Encode UMOV: UR-to-UR copy (0x3c4). Note: name is historical;
+    this actually copies UR[b3] → UR[b2], not GPR → UR.
 
     PTXAS ground truth (SM_120, opcode 0x3c4):
         UMOV UR5, R0 → c4730500000000000080000000261e00

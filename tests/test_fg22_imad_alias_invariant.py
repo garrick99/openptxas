@@ -175,7 +175,7 @@ _ALIAS_SLACK = {
         "k100_guarded_store", "k100_early_exit", "k100_if_else_merge",
         "k100_pred_arith", "k100_setp_combo", "k100_shfl_down",
         "k100_shfl_up", "k100_shfl_xor", "k100_redux_and",
-        "k100_atom_add", "k100_atom_min",
+        "k100_atom_add", "k100_atom_xor", "k100_atom_min",
         "k100_atom_max", "k100_atom_cas32", "k100_add64_chain",
     ]},
     # KERNEL-100.2 sprint 2 corpus

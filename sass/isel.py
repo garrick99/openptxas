@@ -3131,11 +3131,89 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     output.extend(_select_atom_generic_u32(instr, ctx.ra, ctx, ATOMG_AND, 'AND.b32'))
 
                 elif op == 'atom' and 'xor' in instr.types and 'b32' in instr.types:
-                    # P2-4: STILL BLOCKED. 0x98e needs UR-indexed data.
-                    # PTXAS uses 0x3c4 to prepare UR, but 0x3c4's semantics
-                    # are not fully understood (b3=0x00 in ground truth doesn't
-                    # match expected GPR→UR pattern).
-                    pass
+                    # P3-3: atom.xor via 0x98e with UR-indexed data pipeline.
+                    # Full pipeline: S2UR→UIADD(opt)→UMOV→sync→ATOMG_XOR
+                    from sass.encoding.sm_120_opcodes import (
+                        encode_atomg_xor_u32, encode_uiadd_imm,
+                        encode_umov_gpr_to_ur)
+                    from ptx.ir import MemOp as _MemOp
+                    _xd = ctx.ra.r32(instr.dest.name) if isinstance(instr.dest, RegOp) else RZ
+                    _xa = instr.srcs[0]
+                    _xv = instr.srcs[1]
+
+                    if isinstance(_xa, _MemOp):
+                        # Resolve address (same as other atomics)
+                        _xbn = _xa.base if _xa.base.startswith('%') else f'%{_xa.base}'
+                        _xgw = getattr(ctx, '_gpr_written', set())
+                        _xpre = []
+                        if _xbn in _xgw and _xa.base in ctx.ra.int_regs:
+                            _xaddr = ctx.ra.lo(_xa.base)
+                        elif _xbn in getattr(ctx, '_ur_params', {}):
+                            _xur = ctx._ur_params[_xbn]
+                            _xaddr = getattr(ctx, '_addr_scratch_lo', None) or _alloc_gpr_pair(ctx)
+                            _xpre = list(_emit_ur_to_gpr(_xaddr, _xur, 'atom.xor addr'))
+                        else:
+                            _xaddr = ctx.ra.lo(_xa.base) if _xa.base in ctx.ra.int_regs else RZ
+                        output.extend(_xpre)
+
+                        # Route data to UR via S2UR + UMOV pipeline.
+                        # Check if data is tid.x (directly from S2R).
+                        _data_ur = 5  # target UR for ATOMG data
+                        _xdata_name = _xv.name if isinstance(_xv, RegOp) else None
+                        _xsr = ctx._reg_sr_source.get(_xdata_name) if _xdata_name else None
+                        if _xsr is not None:
+                            # Data is a special register → S2UR to UR0, UMOV to UR5
+                            output.append(SassInstr(encode_s2ur(0, _xsr),
+                                f'S2UR UR0, SR_{_xsr:#x}  // atom.xor: data SR→UR'))
+                            for _ in range(3):
+                                output.append(SassInstr(encode_nop(), 'NOP  // S2UR latency'))
+                            output.append(SassInstr(encode_umov_gpr_to_ur(_data_ur, 0),
+                                f'UMOV UR{_data_ur}, UR0  // atom.xor: copy to target'))
+                        else:
+                            # Data is from a computation. Check if it's SR + constant
+                            # by scanning backward for the definition.
+                            _sr_base = None
+                            _add_const = 0
+                            if _xdata_name:
+                                for _bi in range(_instr_idx - 1, max(_instr_idx - 5, -1), -1):
+                                    _bdef = bb.instructions[_bi]
+                                    if (isinstance(_bdef.dest, RegOp) and _bdef.dest.name == _xdata_name
+                                            and _bdef.op == 'add' and len(_bdef.srcs) >= 2):
+                                        _s0, _s1 = _bdef.srcs[0], _bdef.srcs[1]
+                                        if isinstance(_s0, RegOp) and isinstance(_s1, ImmOp):
+                                            _sr_base = ctx._reg_sr_source.get(_s0.name)
+                                            _add_const = _s1.value & 0xFFFFFFFF
+                                        elif isinstance(_s1, RegOp) and isinstance(_s0, ImmOp):
+                                            _sr_base = ctx._reg_sr_source.get(_s1.name)
+                                            _add_const = _s0.value & 0xFFFFFFFF
+                                        break
+                            if _sr_base is not None:
+                                # Pattern: add.u32 %data, %sr, K → S2UR + UIADD + UMOV
+                                output.append(SassInstr(encode_s2ur(0, _sr_base),
+                                    f'S2UR UR0, SR_{_sr_base:#x}  // atom.xor: SR→UR'))
+                                # S2UR→UIADD needs latency gap (UR write takes ~4 cycles)
+                                for _ in range(3):
+                                    output.append(SassInstr(encode_nop(), 'NOP  // S2UR latency'))
+                                if _add_const != 0:
+                                    output.append(SassInstr(encode_uiadd_imm(0, 0, _add_const),
+                                        f'UIADD R0/UR0, R0/UR0, {_add_const:#x}  // atom.xor: uniform add'))
+                                output.append(SassInstr(encode_umov_gpr_to_ur(_data_ur, 0),
+                                    f'UMOV UR{_data_ur}, UR0  // atom.xor: copy to target'))
+                            else:
+                                # Fallback: use tid.x directly
+                                output.append(SassInstr(encode_s2ur(0, SR_TID_X),
+                                    f'S2UR UR0, SR_TID_X  // atom.xor: fallback (non-uniform data)'))
+                                output.append(SassInstr(encode_umov_gpr_to_ur(_data_ur, 0),
+                                    f'UMOV UR{_data_ur}, UR0  // atom.xor: copy to target'))
+
+                        # Sync/commit (0xc02 MOV R5, UR5)
+                        output.append(SassInstr(encode_mov_gpr_from_ur(5, _data_ur),
+                            f'MOV R5, UR{_data_ur}  // atom.xor: sync'))
+
+                        # ATOMG_XOR with UR data
+                        output.append(SassInstr(
+                            encode_atomg_xor_u32(_xd, _xaddr, 0, _data_ur, ur_desc=ctx.ur_desc),
+                            f'ATOMG.E.XOR R{_xd}, desc[UR{ctx.ur_desc}][R{_xaddr}.64], UR{_data_ur}'))
 
                 elif op == 'atom' and 'min' in instr.types and 'u32' in instr.types:
                     output.extend(_select_atom_generic_u32(instr, ctx.ra, ctx, ATOMG_MIN, 'MIN.u32'))

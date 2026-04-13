@@ -2562,6 +2562,37 @@ def encode_atomg_u32(dest: int, addr_base: int, offset: int, data: int,
     return bytes(raw)
 
 
+def encode_umov_gpr_to_ur(ur_dest: int, gpr_src: int, ctrl: int = 0) -> bytes:
+    """Encode UMOV: move GPR value to uniform register (GPR → UR).
+
+    PTXAS ground truth (SM_120, opcode 0x3c4):
+        UMOV UR5, R0 → c4730500000000000080000000261e00
+        b0=0xc4, b1=0x73, b2=ur_dest(05), b3=gpr_src(00)
+        b9=0x80 (mode), b10=0x00, b11=0x00
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0]  = 0xc4
+    raw[1]  = 0x73
+    raw[2]  = ur_dest & 0xFF
+    raw[3]  = gpr_src & 0xFF
+    raw[4]  = 0x00
+    raw[5]  = 0x00
+    raw[6]  = 0x00
+    raw[7]  = 0x00
+    raw[8]  = 0x00
+    raw[9]  = 0x80
+    raw[10] = 0x00
+    raw[11] = 0x00
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
 def encode_atomg_xor_u32(dest: int, addr_base: int, offset: int, data: int,
                           ctrl: int = 0, ur_desc: int = 4) -> bytes:
     """Encode ATOMG.E.XOR.STRONG.GPU for u32 using the 0x98e opcode family.

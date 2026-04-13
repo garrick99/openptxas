@@ -1323,23 +1323,30 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
             return []
         d = ra.r32(dest.name)
 
-        # u32 params consumed only by setp: load to GPR via LDC, then
-        # use ISETP R-R (not R-UR). LDCU.32 poisons IADD.64-UR and
-        # LDCU.64 reads past the 4-byte param boundary.
-        # Simply record the param offset; the setp handler will use LDC.
-        #
-        # TE8-B note: preamble LDCU.32→UR was attempted to enable
-        # ISETP.R-UR, but caused 17 regressions because _setp_only_params
-        # is not perfectly accurate (some params have non-setp consumers
-        # or the extra preamble instructions break BRA fixup offsets).
-        # The GPR LDC path remains the safe default.
+        # u32 params consumed only by setp:
+        # TE9-B: UR-native path — load to UR via LDCU.32 (not GPR via LDC)
+        # to enable ISETP.R-UR in the setp handler.  This is a 1:1
+        # instruction swap (LDCU.32 replaces LDC), no extra instructions.
+        # Trigger: SM_120 + no VOTE + no BAR + no atom.xor template.
         if ctx and dest.name in getattr(ctx, '_setp_only_params', set()):
             ctx._reg_param_off[dest.name] = byte_off
             d = ra.r32(dest.name)
-            # SM_120 rule: constant-bank loads (LDC/LDCU) in the body poison
-            # IADD.64-UR in BAR.SYNC kernels. For BAR kernels, load in preamble.
-            # For non-BAR kernels, keep in body (avoids register liveness issues).
             has_bar = getattr(ctx, '_has_bar_sync', False)
+            has_vote = getattr(ctx, '_has_vote', False)
+            has_ur_act = getattr(ctx, '_ur_activation_sr', None) is not None
+            ur_native_ok = (ctx.sm_version == 120
+                            and not has_bar and not has_vote and not has_ur_act)
+            if False and ur_native_ok:  # TE9-B: DISABLED — see note below
+                # TE9-B attempt: inline LDCU.32→UR + ISETP.R-UR for setp params.
+                # Result: 2 regressions (test_isetp_ur_branch, test_alu_isetp_raw).
+                # The ISETP.R-UR encoding is correct (matches PTXAS template),
+                # but body LDCU.32→UR interaction with the scheduler produces
+                # wrong comparison results.  Root cause: the scheduler doesn't
+                # track UR write→read dependencies, so ctrl bytes don't encode
+                # the latency between LDCU.32 and ISETP.R-UR.
+                # Closing this gap requires UR-aware scheduling infrastructure.
+                pass
+            # Fallback: GPR LDC path
             if ctx.sm_version == 120 and has_bar:
                 if not hasattr(ctx, '_preamble_ldcus'):
                     ctx._preamble_ldcus = []

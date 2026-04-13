@@ -1036,40 +1036,40 @@ def compile_function(fn: Function, verbose: bool = False,
         _ur_act_add = getattr(ctx, '_ur_activation_add', 0)
 
         # ---------------------------------------------------------------
-        # TEMPLATE-ENGINE-5D: spec-driven rendering from auto-generated
-        # templates.  For Variant A (direct SR, no UIADD), uses the
-        # generalized atom_ur spec that also covers MIN/MAX via
-        # operation-specific parameter fields.  Falls back to inline
-        # bytes if spec loading fails.
+        # TEMPLATE-ENGINE-6A: unified family model for atom.xor variants.
+        # Loads the family_atom_ur.json spec which contains both Variant A
+        # (direct SR) and Variant B (tid+constant).  Selects the correct
+        # variant based on _ur_act_add.  Falls back to inline bytes.
         # ---------------------------------------------------------------
         _spec_ok = False
         try:
             import json as _json
             from pathlib import Path as _Path
             _spec_dir = _Path(__file__).resolve().parent.parent / 'tools' / 'template_engine' / 'generated'
-            if _ur_act_add != 0:
-                _spec_file = _spec_dir / 'atom_xor_uniform_tid_plus_constant.json'
-            else:
-                # TE5-D: use generalized spec (covers XOR/MIN/MAX via params)
-                _spec_file = _spec_dir / 'atom_ur_generalized_xor_min_max.json'
+            _family_file = _spec_dir / 'family_atom_ur.json'
 
-            if _spec_file.exists():
-                _spec_data = _json.loads(_spec_file.read_text(encoding='utf-8'))
-                _spec_instrs = _spec_data['instructions']
-                _T = []
-                for _si in _spec_instrs[1:]:  # skip preamble S2R
-                    _raw = bytearray(bytes.fromhex(_si['bytes']))
-                    for _p in _si.get('params', []):
-                        if _p['name'] == 'add_imm_K':
-                            for _bi in range(_p['byte_length']):
-                                _raw[_p['byte_offset'] + _bi] = (_ur_act_add >> (8 * _bi)) & 0xFF
-                        # TE5-D: generalized spec params use representative
-                        # values (XOR operation).  No patching needed for XOR
-                        # since the representative IS atom_xor.
-                    _T.append(SassInstr(bytes(_raw), f"{_si['role']}  // TE5"))
-                body_scheduled = []
-                _ur_activation = _T
-                _spec_ok = True
+            if _family_file.exists():
+                _fam = _json.loads(_family_file.read_text(encoding='utf-8'))
+                # Select variant by ur_activation_add
+                _variant = None
+                for _v in _fam['variants']:
+                    if 'add != 0' in _v['selector'] and _ur_act_add != 0:
+                        _variant = _v; break
+                    if 'add == 0' in _v['selector'] and _ur_act_add == 0:
+                        _variant = _v; break
+
+                if _variant is not None:
+                    _T = []
+                    for _si in _variant['instructions'][1:]:  # skip preamble S2R
+                        _raw = bytearray(bytes.fromhex(_si['bytes']))
+                        for _p in _si.get('params', []):
+                            if _p['name'] == 'add_imm_K':
+                                for _bi in range(_p['byte_length']):
+                                    _raw[_p['byte_offset'] + _bi] = (_ur_act_add >> (8 * _bi)) & 0xFF
+                        _T.append(SassInstr(bytes(_raw), f"{_si['role']}  // TE6"))
+                    body_scheduled = []
+                    _ur_activation = _T
+                    _spec_ok = True
         except Exception:
             pass  # fall through to inline fallback
 

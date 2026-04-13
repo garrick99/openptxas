@@ -1035,62 +1035,74 @@ def compile_function(fn: Function, verbose: bool = False,
     if _ur_act_sr is not None:
         _ur_act_add = getattr(ctx, '_ur_activation_add', 0)
 
-        # Build a PTXAS-faithful instruction block that replaces the
-        # normal activation + body for the atom.xor path.  Every byte is
-        # copied from a working PTXAS cubin; only the UIADD immediate is
-        # patched for the tid+constant variant.
-        #
-        # Template A (direct SR, no UIADD):
-        #   S2UR UR0←TID → LDCU UR4(param n) → ISETP.RUR(bounds) → EXIT
-        #   → S2UR UR2←LANEID → UMOV UR5←UR0 → 0x886 → LDCU UR6(desc)
-        #   → 0x2bd → MOV.UR R5←UR5 → ISETP.RUR(flush) → S2R R2(addr)
-        #   → ATOMG
-        #
-        # Template B (tid+constant, has UIADD):
-        #   S2UR UR0←TID → LDCU UR4(param n) → ISETP.RUR(bounds) → EXIT
-        #   → S2UR UR2←LANEID → UIADD UR0+=K → 0x886 → LDCU UR6(desc)
-        #   → UMOV UR5←UR0 → 0x2bd → MOV.UR R5←UR5 → ISETP.RUR(flush)
-        #   → S2R R2(addr) → ATOMG
+        # ---------------------------------------------------------------
+        # TEMPLATE-ENGINE-4: spec-driven PTXAS template rendering.
+        # Load the auto-generated JSON template specs and render the
+        # instruction block, patching only the UIADD immediate K.
+        # Falls back to inline bytes if spec loading fails.
+        # ---------------------------------------------------------------
+        _spec_ok = False
+        try:
+            import json as _json
+            from pathlib import Path as _Path
+            _spec_dir = _Path(__file__).resolve().parent.parent / 'tools' / 'template_engine' / 'generated'
+            if _ur_act_add != 0:
+                _spec_file = _spec_dir / 'atom_xor_uniform_tid_plus_constant.json'
+            else:
+                _spec_file = _spec_dir / 'atom_xor_uniform_direct_sr.json'
 
-        _T = []  # template instructions (after preamble S2R R1)
+            if _spec_file.exists():
+                _spec_data = _json.loads(_spec_file.read_text(encoding='utf-8'))
+                _spec_instrs = _spec_data['instructions']
+                # Skip instruction [0] (S2R R1 preamble — already in preamble_instrs)
+                _T = []
+                for _si in _spec_instrs[1:]:  # skip preamble S2R
+                    _raw = bytearray(bytes.fromhex(_si['bytes']))
+                    # Patch parameterized fields
+                    for _p in _si.get('params', []):
+                        if _p['name'] == 'add_imm_K':
+                            for _bi in range(_p['byte_length']):
+                                _raw[_p['byte_offset'] + _bi] = (_ur_act_add >> (8 * _bi)) & 0xFF
+                    _T.append(SassInstr(bytes(_raw), f"{_si['role']}  // TE4"))
+                body_scheduled = []
+                _ur_activation = _T
+                _spec_ok = True
+        except Exception:
+            pass  # fall through to inline fallback
 
-        # Shared prefix: [1]-[5]
-        _T.append(SassInstr(bytes.fromhex('19790000000000000021000000220e00'), 'S2UR UR0, TID.X  // P4.3'))
-        _T.append(SassInstr(bytes.fromhex('ac7704ff007100000008000800240e00'), 'LDCU UR4, c[0x71]  // P4.3: param n'))
-        _T.append(SassInstr(bytes.fromhex('0c7c0000040000007060f00b00da1f00'), 'ISETP.RUR bounds  // P4.3'))
-        _T.append(SassInstr(bytes.fromhex('4d090000000000000000800300ea0f00'), 'EXIT @P0  // P4.3'))
-        _T.append(SassInstr(bytes.fromhex('19790200000000000000000000220e00'), 'S2UR UR2, LANEID  // P4.3'))
-
-        if _ur_act_add != 0:
-            # Variant B: UIADD present — tid+constant
-            _uiadd_b = bytearray(bytes.fromhex('357800000100000000008e0700e20f00'))
-            _uiadd_b[4] = _ur_act_add & 0xFF
-            _uiadd_b[5] = (_ur_act_add >> 8) & 0xFF
-            _uiadd_b[6] = (_ur_act_add >> 16) & 0xFF
-            _T.append(SassInstr(bytes(_uiadd_b), f'UIADD UR0 += {_ur_act_add}  // P4.3'))
-            _T.append(SassInstr(bytes.fromhex('867804000000000000018e0300e20f00'), '0x886  // P4.3'))
-            _T.append(SassInstr(bytes.fromhex('ac7706ff006b0000000a000800640e00'), 'LDCU UR6, desc  // P4.3'))
-            _T.append(SassInstr(bytes.fromhex('c4730500000000000080000000a20e00'), 'UMOV UR5, UR0  // P4.3'))
-            _T.append(SassInstr(bytes.fromhex('bd7204000400000000000e0800e20f00'), '0x2bd  // P4.3'))
-            _T.append(SassInstr(bytes.fromhex('027c050005000000000f000800ca4f00'), 'MOV.UR R5, UR5  // P4.3'))
-            _T.append(SassInstr(bytes.fromhex('0c7c0002040000007020f00b00e41f00'), 'ISETP.RUR flush  // P4.3'))
-            _T.append(SassInstr(bytes.fromhex('827b02ff00e00000000a000000760e00'), 'S2R R2, param_addr  // P4.3'))
-            _T.append(SassInstr(bytes.fromhex('8e0900020500000006e1920f00e22f00'), 'ATOMG.XOR  // P4.3'))
-        else:
-            # Variant A: direct SR — no UIADD
-            _T.append(SassInstr(bytes.fromhex('c4730500000000000080000000620e00'), 'UMOV UR5, UR0  // P4.3'))
-            _T.append(SassInstr(bytes.fromhex('867804000000000000018e0300e20f00'), '0x886  // P4.3'))
-            _T.append(SassInstr(bytes.fromhex('ac7706ff006b0000000a000800a20e00'), 'LDCU UR6, desc  // P4.3'))
-            _T.append(SassInstr(bytes.fromhex('bd7204000400000000000e0800e20f00'), '0x2bd  // P4.3'))
-            _T.append(SassInstr(bytes.fromhex('027c050005000000000f000800ca2f00'), 'MOV.UR R5, UR5  // P4.3'))
-            _T.append(SassInstr(bytes.fromhex('0c7c0002040000007020f00b00e41f00'), 'ISETP.RUR flush  // P4.3'))
-            _T.append(SassInstr(bytes.fromhex('827b02ff00e00000000a000000b60e00'), 'S2R R2, param_addr  // P4.3'))
-            _T.append(SassInstr(bytes.fromhex('8e0900020500000006e1920f00e24f00'), 'ATOMG.XOR  // P4.3'))
-
-        # The template replaces BOTH activation and body.  The body's
-        # instructions (bounds check, address computation, MOV.UR, ATOMG)
-        # are all inside the template — the scheduler's body is discarded.
-        body_scheduled = []
+        if not _spec_ok:
+            # Inline fallback (original P4.3 hardcoded bytes)
+            _T = []
+            _T.append(SassInstr(bytes.fromhex('19790000000000000021000000220e00'), 'S2UR UR0, TID.X  // P4.3'))
+            _T.append(SassInstr(bytes.fromhex('ac7704ff007100000008000800240e00'), 'LDCU UR4, c[0x71]  // P4.3'))
+            _T.append(SassInstr(bytes.fromhex('0c7c0000040000007060f00b00da1f00'), 'ISETP.RUR bounds  // P4.3'))
+            _T.append(SassInstr(bytes.fromhex('4d090000000000000000800300ea0f00'), 'EXIT @P0  // P4.3'))
+            _T.append(SassInstr(bytes.fromhex('19790200000000000000000000220e00'), 'S2UR UR2, LANEID  // P4.3'))
+            if _ur_act_add != 0:
+                _uiadd_b = bytearray(bytes.fromhex('357800000100000000008e0700e20f00'))
+                _uiadd_b[4] = _ur_act_add & 0xFF
+                _uiadd_b[5] = (_ur_act_add >> 8) & 0xFF
+                _uiadd_b[6] = (_ur_act_add >> 16) & 0xFF
+                _T.append(SassInstr(bytes(_uiadd_b), f'UIADD UR0 += {_ur_act_add}  // P4.3'))
+                _T.append(SassInstr(bytes.fromhex('867804000000000000018e0300e20f00'), '0x886  // P4.3'))
+                _T.append(SassInstr(bytes.fromhex('ac7706ff006b0000000a000800640e00'), 'LDCU UR6, desc  // P4.3'))
+                _T.append(SassInstr(bytes.fromhex('c4730500000000000080000000a20e00'), 'UMOV UR5, UR0  // P4.3'))
+                _T.append(SassInstr(bytes.fromhex('bd7204000400000000000e0800e20f00'), '0x2bd  // P4.3'))
+                _T.append(SassInstr(bytes.fromhex('027c050005000000000f000800ca4f00'), 'MOV.UR R5, UR5  // P4.3'))
+                _T.append(SassInstr(bytes.fromhex('0c7c0002040000007020f00b00e41f00'), 'ISETP.RUR flush  // P4.3'))
+                _T.append(SassInstr(bytes.fromhex('827b02ff00e00000000a000000760e00'), 'S2R R2, addr  // P4.3'))
+                _T.append(SassInstr(bytes.fromhex('8e0900020500000006e1920f00e22f00'), 'ATOMG.XOR  // P4.3'))
+            else:
+                _T.append(SassInstr(bytes.fromhex('c4730500000000000080000000620e00'), 'UMOV UR5, UR0  // P4.3'))
+                _T.append(SassInstr(bytes.fromhex('867804000000000000018e0300e20f00'), '0x886  // P4.3'))
+                _T.append(SassInstr(bytes.fromhex('ac7706ff006b0000000a000800a20e00'), 'LDCU UR6, desc  // P4.3'))
+                _T.append(SassInstr(bytes.fromhex('bd7204000400000000000e0800e20f00'), '0x2bd  // P4.3'))
+                _T.append(SassInstr(bytes.fromhex('027c050005000000000f000800ca2f00'), 'MOV.UR R5, UR5  // P4.3'))
+                _T.append(SassInstr(bytes.fromhex('0c7c0002040000007020f00b00e41f00'), 'ISETP.RUR flush  // P4.3'))
+                _T.append(SassInstr(bytes.fromhex('827b02ff00e00000000a000000b60e00'), 'S2R R2, addr  // P4.3'))
+                _T.append(SassInstr(bytes.fromhex('8e0900020500000006e1920f00e24f00'), 'ATOMG.XOR  // P4.3'))
+            body_scheduled = []
+            _ur_activation = _T
         _ur_activation = _T
 
     sass_instrs = preamble_instrs + _ur_activation + body_scheduled

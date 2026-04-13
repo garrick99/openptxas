@@ -1058,6 +1058,13 @@ def compile_function(fn: Function, verbose: bool = False,
         _ur_activation.append(SassInstr(bytes(_umov),
             'UMOV UR5, UR0  // P3-7: must follow UIADD'))
 
+    # TODO: Phase-4 UR scheduler hook
+    # The _ur_activation block handles S2UR→0x886→LDCU→S2UR→0x2bd→UIADD→UMOV.
+    # For atom.xor with tid+constant, a post-scheduling reorder pass is needed
+    # to ensure ISETP.RUR (UR flush) + sync + ATOMG are contiguous after UMOV
+    # with NO UR-writing instructions (S2UR, LDCU) in between.
+    # See docs/phase4/UR_SCHEDULER.md for the design.
+
     sass_instrs = preamble_instrs + _ur_activation + body_scheduled
 
     # 5. BRA offset fixup: resolve branch targets AFTER scheduling.

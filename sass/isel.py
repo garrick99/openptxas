@@ -3188,15 +3188,13 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             _add_const = _s0.value & 0xFFFFFFFF
                                         break
                             if _sr_base is not None:
-                                # Pattern: add.u32 %data, %sr, K → S2UR + UIADD + UMOV
-                                output.append(SassInstr(encode_s2ur(0, _sr_base),
-                                    f'S2UR UR0, SR_{_sr_base:#x}  // atom.xor: SR→UR'))
-                                # S2UR→UIADD needs latency gap (UR write takes ~4 cycles)
-                                for _ in range(3):
-                                    output.append(SassInstr(encode_nop(), 'NOP  // S2UR latency'))
-                                if _add_const != 0:
-                                    output.append(SassInstr(encode_uiadd_imm(0, 0, _add_const),
-                                        f'UIADD R0/UR0, R0/UR0, {_add_const:#x}  // atom.xor: uniform add'))
+                                # P3-5: Mark that preamble needs UR activation sequence.
+                                # UIADD is emitted in the preamble (not inline) for
+                                # the UR write to propagate correctly.
+                                if not hasattr(ctx, '_ur_activation_sr'):
+                                    ctx._ur_activation_sr = _sr_base
+                                    ctx._ur_activation_add = _add_const
+                                # Do NOT emit inline UIADD — it's in the preamble
                                 output.append(SassInstr(encode_umov_gpr_to_ur(_data_ur, 0),
                                     f'UMOV UR{_data_ur}, UR0  // atom.xor: copy to target'))
                             else:

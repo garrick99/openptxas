@@ -901,6 +901,41 @@ def compile_function(fn: Function, verbose: bool = False,
     # Body (scoreboard ctrl, scheduled):
     #   [S2R] [rest of body without hoisted loads]
     preamble_ldcus = getattr(ctx, '_preamble_ldcus', [])
+
+    # P3-5: inject UR pipeline activation sequence for ATOMG_XOR(0x98e)
+    # Must be in preamble with PTXAS-matched ctrl words for UIADD to propagate.
+    _ur_act_sr = getattr(ctx, '_ur_activation_sr', None)
+    if _ur_act_sr is not None:
+        _ur_act_add = getattr(ctx, '_ur_activation_add', 0)
+        # Hard-coded PTXAS ground truth bytes with exact ctrl words.
+        # These have been proven to work via cubin-patch forensics (P3-5).
+        from sass.encoding.sm_120_opcodes import encode_s2ur
+        # S2UR UR0 ← SR (ctrl=0x000e22 from PTXAS)
+        _s2ur0 = bytearray(encode_s2ur(0, _ur_act_sr))
+        _s2ur0[13] = 0x22; _s2ur0[14] = 0x0e; _s2ur0[15] = 0x00
+        preamble_ldcus.append(SassInstr(bytes(_s2ur0),
+            f'S2UR UR0, SR_{_ur_act_sr:#x}  // P3-5'))
+        # 0x886 (ctrl=0x000fe2 from PTXAS)
+        preamble_ldcus.append(SassInstr(
+            bytes.fromhex('867804000000000000018e0300e20f00'),
+            'UR_PIPE_INIT R4  // P3-5: 0x886'))
+        # S2UR UR2 ← LANEID (ctrl=0x000ea2 from PTXAS)
+        _s2ur2 = bytearray(encode_s2ur(2, 0x00))
+        _s2ur2[13] = 0xa2; _s2ur2[14] = 0x0e; _s2ur2[15] = 0x00
+        preamble_ldcus.append(SassInstr(bytes(_s2ur2),
+            'S2UR UR2, SR_LANEID  // P3-5'))
+        # 0x2bd (ctrl=0x000fe2 from PTXAS)
+        _2bd_raw = bytearray(bytes.fromhex('bd7204000400000000000e0800e20f00'))
+        _2bd_raw[4] = ctx.ur_desc & 0xFF
+        preamble_ldcus.append(SassInstr(bytes(_2bd_raw),
+            f'UR_PIPE_FINAL R4, UR{ctx.ur_desc}  // P3-5'))
+        # UIADD with PTXAS ctrl (0x001fc8)
+        if _ur_act_add != 0:
+            from sass.encoding.sm_120_opcodes import encode_uiadd_imm
+            _uiadd = bytearray(encode_uiadd_imm(0, 0, _ur_act_add))
+            _uiadd[13] = 0xc8; _uiadd[14] = 0x1f; _uiadd[15] = 0x00
+            preamble_ldcus.append(SassInstr(bytes(_uiadd),
+                f'UIADD R0/UR0 += {_ur_act_add:#x}  // P3-5'))
     hoisted_loads = [body_instrs[i] for i in sorted(hoist_indices)]
     body_without_hoisted = [si for i, si in enumerate(body_instrs) if i not in hoist_indices]
 

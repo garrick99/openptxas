@@ -2531,8 +2531,11 @@ def _harness_pred_load(ctx, func, mode):
 
 
 WEIRD2_KERNELS = {
-    # w2_atom_xor_reduce: UIADD needs specific preamble ordering (P3-5 confirmed).
-    # S2UR UR0 must precede LDCU.64 in the preamble. Requires pipeline restructuring.
+    # w2_atom_xor_reduce: STRUCTURALLY_BLOCKED. P3-6 proved scheduler prevents correct ordering.
+    # The UR activation must be in scheduler-immune preamble but preamble construction
+    # doesn't support the required S2UR→0x886→LDCU→S2UR→0x2bd→UIADD order.
+    # Additionally, S2UR must use opcode 0x919 (not our 0x9c3). Both addressed but
+    # still fails — deeper UR pipeline state dependency remains unresolved.
     "w2_atom_and_reduce":  {"display": "atom.global.and.b32 reduce", "ptx_inline": _W2_ATOM_AND_REDUCE, "kernel_name": "w2_atom_and_reduce",
                             "harness": _harness_atom_and_reduce},
     "w2_loop_atom_add":    {"display": "loop: 3x atom.add per thread", "ptx_inline": _W2_LOOP_ATOM_ADD, "kernel_name": "w2_loop_atom_add",

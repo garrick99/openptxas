@@ -1432,14 +1432,17 @@ def _select_ld_global(instr: Instruction, ra: RegAlloc,
     else:
         addr = RZ
 
-    off_str = f' + 0x{extra_offset:x}' if extra_offset else ''
+    # BREAK-1B: combine WB-7 fold offset with MemOp inline offset [base+N]
+    mem_offset = src.offset if isinstance(src.offset, int) else 0
+    total_offset = extra_offset + mem_offset
+    off_str = f' + 0x{total_offset:x}' if total_offset else ''
     if is_64:
         d = ra.lo(dest.name)
-        result.append(SassInstr(encode_ldg_e_64(d, ur_desc, addr, imm_offset=extra_offset),
+        result.append(SassInstr(encode_ldg_e_64(d, ur_desc, addr, imm_offset=total_offset),
                           f'LDG.E.64 R{d}, desc[UR{ur_desc}][R{addr}.64{off_str}]'))
     else:
         d = ra.r32(dest.name)
-        result.append(SassInstr(encode_ldg_e(d, ur_desc, addr, width=32, imm_offset=extra_offset),
+        result.append(SassInstr(encode_ldg_e(d, ur_desc, addr, width=32, imm_offset=total_offset),
                           f'LDG.E R{d}, desc[UR{ur_desc}][R{addr}.64{off_str}]'))
     return result
 

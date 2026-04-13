@@ -2537,6 +2537,8 @@ def encode_atomg_u32(dest: int, addr_base: int, offset: int, data: int,
         ATOMG_AND:  (0xf1, 0x1e, 0x14),
         ATOMG_OR:   (0xf1, 0x1e, 0x1c),
         ATOMG_EXCH: (0xf1, 0x1e, 0x0c),
+        # ATOMG_XOR: not grounded. PTXAS uses 0x98e family with different descriptor model.
+        # Requires dedicated investigation. See BREAK-1A notes.
     }
     b9_val, b10_val, b11_val = _ATOMG_MODES.get(atom_op, (0xf1, 0x1e, 0x08))
     raw = bytearray(16)
@@ -2553,6 +2555,39 @@ def encode_atomg_u32(dest: int, addr_base: int, offset: int, data: int,
     raw[9]  = b9_val
     raw[10] = b10_val
     raw[11] = b11_val          # operation discriminator
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+def encode_atomg_xor_u32(dest: int, addr_base: int, offset: int, data: int,
+                          ctrl: int = 0, ur_desc: int = 4) -> bytes:
+    """Encode ATOMG.E.XOR.STRONG.GPU for u32 using the 0x98e opcode family.
+
+    PTXAS ground truth (SM_120):
+      atom.global.xor.b32 → 8e0900020500000006e1920f00e22f00
+      b0=0x8e, b1=0x09, opcode=0x98e
+      b2=dest(00), b3=addr(02), b4=ur_desc(05), b8=data(06)
+      b9=0xe1, b10=0x92, b11=0x0f
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0]  = 0x8e
+    raw[1]  = 0x09
+    raw[2]  = dest & 0xFF
+    raw[3]  = addr_base & 0xFF
+    raw[4]  = data & 0xFF
+    raw[5]  = offset & 0xFF
+    raw[6]  = (offset >> 8) & 0xFF
+    raw[7]  = (offset >> 16) & 0xFF
+    raw[8]  = ur_desc & 0xFF
+    raw[9]  = 0xe1
+    raw[10] = 0x92
+    raw[11] = 0x0f
     raw[12] = 0x00
     raw[13] = b13
     raw[14] = b14

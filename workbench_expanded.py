@@ -2529,7 +2529,7 @@ def _harness_pred_load(ctx, func, mode):
 
 
 WEIRD2_KERNELS = {
-    # w2_atom_xor_reduce excluded: ATOMG_XOR encoding needs ground truth
+    # w2_atom_xor_reduce excluded: ATOMG_XOR encoding needs ground truth (0x98e family has different descriptor model)
     "w2_atom_and_reduce":  {"display": "atom.global.and.b32 reduce", "ptx_inline": _W2_ATOM_AND_REDUCE, "kernel_name": "w2_atom_and_reduce",
                             "harness": _harness_atom_and_reduce},
     "w2_loop_atom_add":    {"display": "loop: 3x atom.add per thread", "ptx_inline": _W2_LOOP_ATOM_ADD, "kernel_name": "w2_loop_atom_add",

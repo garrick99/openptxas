@@ -164,7 +164,8 @@ _OPCODE_META: dict[int, _OpMeta] = {
 # Opcode classification (includes both SM_120 and SM_89 variants)
 _OPCODES_LDG = {0x981, 0xf60, 0xf63, 0xf66, 0xf6f, 0xf99}  # LDG, TEX, TLD, TLD4, TXQ, SULD
 _OPCODES_ATOMG = {0x3a9,   # ATOMG.E.CAS.b32 / CAS.b64
-                 0x9a8,   # ATOMG.E.{ADD|MIN|MAX|EXCH}.u32
+                 0x9a8,   # ATOMG.E.{ADD|MIN|MAX|EXCH|OR|AND}.u32
+                 0x98e,   # ATOMG.E.XOR.b32 (BREAK-1A, 0x98e family)
                  0x9a3}   # ATOMG.E.ADD.F32
 _OPCODES_LDC = {0xb82, 0x7ac, 0x919, 0x9c3,  # SM_120: LDC, LDCU, S2R, S2UR
                 0x624, 0xab9, 0xa02}           # SM_89: IMAD.MOV.U32(cbuf), ULDC.64, MOV(cbuf)
@@ -363,8 +364,9 @@ def _get_src_regs(raw: bytes) -> set[int]:
         # LDG: src_addr at b3
         if raw[3] < 255: regs |= {raw[3], raw[3]+1}
     elif opcode in _OPCODES_ATOMG:
-        # All ATOMG ops: addr at b3 (64-bit pair), data at b4
+        # ATOMG ops: addr at b3 (64-bit pair)
         if raw[3] < 255: regs |= {raw[3], raw[3]+1}
+        # All ATOMG families: data at b4
         if raw[4] < 255: regs.add(raw[4])
         if opcode == 0x3a9:
             # ATOMG.CAS: also reads new_val at b8

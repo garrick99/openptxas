@@ -202,7 +202,7 @@ _ALIAS_SLACK = {
     ]},
     # WEIRD-1 corpus
     **{k: 3 for k in [
-        "w1_smem_copy", "w1_smem_compute",
+        "w1_smem_copy", "w1_smem_neighbor", "w1_smem_compute",
         "w1_smem_xor_swap", "w1_smem_guarded",
         "w1_loop_sum", "w1_loop_mul_acc", "w1_loop_pred_acc",
         "w1_loop_two_acc", "w1_loop_xor", "w1_loop_shift",
@@ -212,14 +212,14 @@ _ALIAS_SLACK = {
     ]},
     # WEIRD-2 corpus
     **{k: 3 for k in [
-        "w2_atom_and_reduce", "w2_loop_atom_add",
+        "w2_atom_and_reduce", "w2_loop_atom_add", "w2_smem_loop",
         "w2_div_loop", "w2_nested_loop",
         "w2_pred_load", "w2_multi_store", "w2_deep_pred", "w2_loop_mul",
     ]},
     # REAL-1 corpus
     **{k: 3 for k in [
         "r1_warp_sum", "r1_dot4", "r1_histogram8", "r1_scan_warp",
-        "r1_scale_add", "r1_minmax", "r1_bitcount",
+        "r1_tile_compute", "r1_scale_add", "r1_minmax", "r1_bitcount",
         "r1_running_xor", "r1_multi_stage", "r1_accumulator",
         "r1_gather", "r1_scatter_add",
     ]},

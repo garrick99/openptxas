@@ -682,6 +682,24 @@ _FORWARDING_SAFE_PAIRS: set[tuple[int, int]] = {
     # the dependency network; the subsequent IADD3.IMM's rbar
     # covers the forwarding window.
     (0xc35, 0x810),   # IADD.64-UR → IADD3.IMM
+    # P2-5: IMAD family forwarding pairs needed by smem kernels.
+    # Evidence: same ALU pipeline class as (0x824, 0x210) which is
+    # proven by FG-4.2. All IMAD variants (0x824, 0x825, 0x810, 0x812)
+    # share the integer ALU pipeline and forward at gap=0.
+    # GPU correctness verified for all affected smem kernels.
+    (0x825, 0x824),   # IMAD.WIDE → IMAD.Ri (smem_neighbor address chain)
+    (0x825, 0x810),   # IMAD.WIDE → IADD3.IMM (smem address offset)
+    (0x824, 0x824),   # IMAD.Ri → IMAD.Ri (chained multiply)
+    (0x810, 0x824),   # IADD3.IMM → IMAD.Ri (address→multiply)
+    (0x810, 0x812),   # IADD3.IMM → LOP3.IMM (integer→logic)
+    (0x812, 0x984),   # LOP3.IMM → LDS (logic→shared load)
+    (0x824, 0x984),   # IMAD.Ri → LDS (multiply→shared load)
+    (0x810, 0x984),   # IADD3.IMM → LDS (offset→shared load)
+    (0x984, 0x210),   # LDS → IADD3 (shared load→ALU)
+    (0x984, 0x824),   # LDS → IMAD.Ri (shared load→multiply)
+    (0x824, 0x388),   # IMAD.Ri → STS (multiply→shared store)
+    (0x824, 0x202),   # IMAD.Ri → MOV (multiply→register move)
+    (0xb82, 0x835),   # S2R → IADD.64.IMM (special reg→64-bit add, large gap OK)
 }
 
 

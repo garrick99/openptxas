@@ -3952,29 +3952,11 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                         # Value already in GPR (from LDCU.64 + MOV).
                                         br = ctx.ra.r32(b.name)
                                         emit_pd = pd
-                                        if ctx.sm_version != 89 and pd > 0 and ctx:
-                                            emit_pd = 0
-                                            ctx.ra.pred_regs[pred.name] = 0
-                                            if hasattr(ctx, '_negated_preds'):
-                                                if pd in ctx._negated_preds:
-                                                    ctx._negated_preds.discard(pd)
-                                                    ctx._negated_preds.add(0)
-                                                else:
-                                                    ctx._negated_preds.discard(0)
                                         output.append(SassInstr(
                                             encode_isetp(emit_pd, ar, br, cmp=isetp_cmp),
                                             f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, R{br}, PT  // vote-safe GPR'))
                                     else:
                                         emit_pd = pd
-                                        if pd > 0 and ctx:
-                                            emit_pd = 0
-                                            ctx.ra.pred_regs[pred.name] = 0
-                                            if hasattr(ctx, '_negated_preds'):
-                                                if pd in ctx._negated_preds:
-                                                    ctx._negated_preds.discard(pd)
-                                                    ctx._negated_preds.add(0)
-                                                else:
-                                                    ctx._negated_preds.discard(0)
                                         output.append(SassInstr(
                                             encode_isetp_ur(emit_pd, ar, b_ur_idx, cmp=isetp_cmp),
                                             f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, UR{b_ur_idx}, PT'))
@@ -3984,15 +3966,6 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                     # into a GPR by ld.param → LDC at the regular u32 path.
                                     br = ctx.ra.r32(b.name)
                                     emit_pd = pd
-                                    if ctx.sm_version != 89 and pd > 0 and ctx:
-                                        emit_pd = 0
-                                        ctx.ra.pred_regs[pred.name] = 0
-                                        if hasattr(ctx, '_negated_preds'):
-                                            if pd in ctx._negated_preds:
-                                                ctx._negated_preds.discard(pd)
-                                                ctx._negated_preds.add(0)
-                                            else:
-                                                ctx._negated_preds.discard(0)
                                     output.append(SassInstr(
                                         encode_isetp(emit_pd, ar, br, cmp=isetp_cmp),
                                         f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, R{br}, PT  // GPR path (no body LDCU.32)'))
@@ -4004,16 +3977,6 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                     # via LDCU.32 from a scratch literal pool slot.
                                     br = ctx.ra.r32(b.name)
                                     emit_pd = pd
-                                    if ctx.sm_version != 89 and pd > 0 and ctx:
-                                        emit_pd = 0
-                                        ctx.ra.pred_regs[pred.name] = 0
-                                        # Sync _negated_preds with physical P0 after remap
-                                        if hasattr(ctx, '_negated_preds'):
-                                            if pd in ctx._negated_preds:
-                                                ctx._negated_preds.discard(pd)
-                                                ctx._negated_preds.add(0)
-                                            else:
-                                                ctx._negated_preds.discard(0)
                                     output.append(SassInstr(
                                         encode_isetp(emit_pd, ar, br, cmp=isetp_cmp),
                                         f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, R{br}, PT'))
@@ -4026,14 +3989,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 # at c[0][param_end] reads a nonzero value.
                                 imm_val = b.value & 0xFFFFFFFF
                                 emit_pd = pd
-                                if pd > 0 and ctx:
-                                    emit_pd = 0
-                                    ctx.ra.pred_regs[pred.name] = 0
-                                    # Clear stale negation for the new physical pred (0).
-                                    # The discard above ran with the old pd; the remap
-                                    # to physical 0 must also clear physical 0's state.
-                                    if hasattr(ctx, '_negated_preds'):
-                                        ctx._negated_preds.discard(0)
+                                # P2-2: removed P0-forcing. SM_120 supports P0-P5.
                                 # SM_120 rule: use ISETP.IMM (0x80c) for ALL immediate
                                 # comparisons, including imm=0. ISETP R-R (0x20c) causes
                                 # toxic interaction with VOTE on SM_120 (rule #23).
@@ -4045,15 +4001,6 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 # Non-register src1 (e.g. memory operand) — materialize into GPR first
                                 br = _materialize_imm(b, ctx, ctx.ra, output)
                                 emit_pd = pd
-                                if pd > 0 and ctx:
-                                    emit_pd = 0
-                                    ctx.ra.pred_regs[pred.name] = 0
-                                    if hasattr(ctx, '_negated_preds'):
-                                        if pd in ctx._negated_preds:
-                                            ctx._negated_preds.discard(pd)
-                                            ctx._negated_preds.add(0)
-                                        else:
-                                            ctx._negated_preds.discard(0)
                                 output.append(SassInstr(
                                     encode_isetp(emit_pd, ar, br, cmp=isetp_cmp),
                                     f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, R{br}, PT  // setp non-reg src1'))
@@ -4075,9 +4022,6 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     f_op   = instr.srcs[0]
                     pd = ctx.ra.pred(pred.name) if pred.name in ctx.ra.pred_regs else 0
                     emit_pd = pd
-                    if pd > 0 and ctx:
-                        emit_pd = 0
-                        ctx.ra.pred_regs[pred.name] = 0
                     f_reg = ctx.ra.r32(f_op.name)
                     R_mask = _alloc_gpr(ctx)
                     R_abs  = _alloc_gpr(ctx)
@@ -4222,13 +4166,23 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             bytes(raw_pmov),
                             f'@{"!" if neg else ""}P{pd} IADD3 R{d}, RZ, {true_val:#x}, RZ  // selp true'))
                     else:
-                        # Both register sources: use SEL R-R
+                        # Both register sources: use predicated MOV (P2-2).
+                        # SEL only supports P0 on SM_120, but predicated IADD3
+                        # works with all physical predicates (P0-P5).
                         a = ctx.ra.r32(s0.name) if isinstance(s0, RegOp) else RZ
                         b = ctx.ra.r32(s1.name) if isinstance(s1, RegOp) else RZ
+                        true_reg, false_reg = (a, b) if not neg else (b, a)
+                        # MOV d = false_reg (unconditional)
+                        output.append(SassInstr(encode_iadd3(d, false_reg, RZ, RZ),
+                            f'MOV R{d}, R{false_reg}  // selp false'))
+                        # @P MOV d = true_reg (predicated)
+                        pred_byte = (pd & 0x07)
                         if neg:
-                            a, b = b, a
-                        output.append(SassInstr(encode_sel(d, a, b, pd),
-                                                f'SEL R{d}, R{a}, R{b}, P{pd}  // selp'))
+                            pred_byte |= 0x08
+                        raw_pmov = bytearray(encode_iadd3(d, true_reg, RZ, RZ))
+                        raw_pmov[1] = (raw_pmov[1] & 0x0F) | (pred_byte << 4)
+                        output.append(SassInstr(bytes(raw_pmov),
+                            f'@{"!" if neg else ""}P{pd} MOV R{d}, R{true_reg}  // selp true'))
 
                 elif op == 'min' and typ in ('u32', 's32'):
                     d = ctx.ra.r32(instr.dest.name)

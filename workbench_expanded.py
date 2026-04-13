@@ -1644,7 +1644,7 @@ SPRINT3_KERNELS = {
     "k300_nasty_imm_heavy": {"display": "nasty: 4 wide immediates", "ptx_inline": _K300_NASTY_IMM_HEAVY, "kernel_name": "k300_nasty_imm_heavy",
                               "harness": _harness_s2("", lambda t: (((t+0x11111)^0x22222)&0x33333)|0x44000)},
     "k300_nasty_pred_nest3": {"display": "nasty: 3-level nested predication", "ptx_inline": _K300_NASTY_PRED_NEST3, "kernel_name": "k300_nasty_pred_nest3",
-                               "harness": _harness_s2("", lambda t: (1 if t>5 else 0)+(2 if t>15 else 0)+(4 if t>30 else 0))},
+                               "harness": _harness_s2("", lambda t: (1+2+4 if t>30 else (1+2 if t>15 else (1+4 if t>5 else 0))))},
     "k300_nasty_mul_chain3": {"display": "nasty: 3-mul serial chain", "ptx_inline": _K300_NASTY_MUL_CHAIN3, "kernel_name": "k300_nasty_mul_chain3",
                                "harness": _harness_s2("", lambda t: (t*3*5*7)&0xFFFF)},
     "k300_nasty_add_wrap": {"display": "nasty: unsigned add wraparound", "ptx_inline": _K300_NASTY_ADD_WRAP, "kernel_name": "k300_nasty_add_wrap",

@@ -79,3 +79,22 @@ from IADD.64-UR to UIADD-based (Rule 4 from TE8-A policy).  This is a deep
 isel/address-gen change, not a local substitution.  The 20.1% byte-exact
 rate and 47.9% instruction-parity rate represent the practical ceiling
 achievable with the current address computation architecture.
+
+## TE9 Findings: UR-Native Path Blocker
+
+TE9-B attempted LDCU.32→UR for setp params to enable ISETP.R-UR.  Three
+approaches tried (body, preamble, inline), all failed with 2-17 regressions.
+
+The single blocker: **the scheduler does not track UR write→read dependencies**.
+LDCU.32 writes UR, ISETP.R-UR reads UR, but the scheduler only tracks GPR
+dependencies.  Without UR-aware scheduling, ctrl bytes cannot encode the
+required latency between producer and consumer.
+
+The ISETP.R-UR encoding is verified correct (matches PTXAS byte-for-byte).
+The blocker is scheduler infrastructure, not instruction encoding.
+
+To close the gap:
+1. Add UR dependency tracking to the scheduler (new dependency class)
+2. This unlocks LDCU.32→UR + ISETP.R-UR for 33 parity kernels
+3. Then UIADD substitution for 93 more instructions
+4. Combined: ~60-70% of structural gap could close

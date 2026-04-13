@@ -3159,51 +3159,31 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         # Route data to UR via S2UR + UMOV pipeline.
                         # Check if data is tid.x (directly from S2R).
                         _data_ur = 5  # target UR for ATOMG data
+                        # P3-7: ALL S2UR + activation goes in preamble (pipeline.py).
+                        # Isel ONLY emits UMOV + sync + ATOMG.
                         _xdata_name = _xv.name if isinstance(_xv, RegOp) else None
                         _xsr = ctx._reg_sr_source.get(_xdata_name) if _xdata_name else None
-                        if _xsr is not None:
-                            # Data is a special register → S2UR to UR0, UMOV to UR5
-                            output.append(SassInstr(encode_s2ur(0, _xsr),
-                                f'S2UR UR0, SR_{_xsr:#x}  // atom.xor: data SR→UR'))
-                            for _ in range(3):
-                                output.append(SassInstr(encode_nop(), 'NOP  // S2UR latency'))
-                            output.append(SassInstr(encode_umov_gpr_to_ur(_data_ur, 0),
-                                f'UMOV UR{_data_ur}, UR0  // atom.xor: copy to target'))
-                        else:
-                            # Data is from a computation. Check if it's SR + constant
-                            # by scanning backward for the definition.
-                            _sr_base = None
-                            _add_const = 0
-                            if _xdata_name:
-                                for _bi in range(_instr_idx - 1, max(_instr_idx - 5, -1), -1):
-                                    _bdef = bb.instructions[_bi]
-                                    if (isinstance(_bdef.dest, RegOp) and _bdef.dest.name == _xdata_name
-                                            and _bdef.op == 'add' and len(_bdef.srcs) >= 2):
-                                        _s0, _s1 = _bdef.srcs[0], _bdef.srcs[1]
-                                        if isinstance(_s0, RegOp) and isinstance(_s1, ImmOp):
-                                            _sr_base = ctx._reg_sr_source.get(_s0.name)
-                                            _add_const = _s1.value & 0xFFFFFFFF
-                                        elif isinstance(_s1, RegOp) and isinstance(_s0, ImmOp):
-                                            _sr_base = ctx._reg_sr_source.get(_s1.name)
-                                            _add_const = _s0.value & 0xFFFFFFFF
-                                        break
-                            if _sr_base is not None:
-                                # P3-5: Mark that preamble needs UR activation sequence.
-                                # UIADD is emitted in the preamble (not inline) for
-                                # the UR write to propagate correctly.
-                                if not hasattr(ctx, '_ur_activation_sr'):
-                                    ctx._ur_activation_sr = _sr_base
-                                    ctx._ur_activation_add = _add_const
-                                # Do NOT emit inline UIADD — it's in the preamble
-                                output.append(SassInstr(encode_umov_gpr_to_ur(_data_ur, 0),
-                                    f'UMOV UR{_data_ur}, UR0  // atom.xor: copy to target'))
-                            else:
-                                # Fallback: use tid.x directly
-                                output.append(SassInstr(encode_s2ur(0, SR_TID_X),
-                                    f'S2UR UR0, SR_TID_X  // atom.xor: fallback (non-uniform data)'))
-                                output.append(SassInstr(encode_umov_gpr_to_ur(_data_ur, 0),
-                                    f'UMOV UR{_data_ur}, UR0  // atom.xor: copy to target'))
-
+                        _sr_for_preamble = _xsr
+                        _add_for_preamble = 0
+                        if _sr_for_preamble is None and _xdata_name:
+                            for _bi in range(_instr_idx - 1, max(_instr_idx - 5, -1), -1):
+                                _bdef = bb.instructions[_bi]
+                                if (isinstance(_bdef.dest, RegOp) and _bdef.dest.name == _xdata_name
+                                        and _bdef.op == 'add' and len(_bdef.srcs) >= 2):
+                                    _s0, _s1 = _bdef.srcs[0], _bdef.srcs[1]
+                                    if isinstance(_s0, RegOp) and isinstance(_s1, ImmOp):
+                                        _sr_for_preamble = ctx._reg_sr_source.get(_s0.name)
+                                        _add_for_preamble = _s1.value & 0xFFFFFFFF
+                                    elif isinstance(_s1, RegOp) and isinstance(_s0, ImmOp):
+                                        _sr_for_preamble = ctx._reg_sr_source.get(_s1.name)
+                                        _add_for_preamble = _s0.value & 0xFFFFFFFF
+                                    break
+                        if _sr_for_preamble is None:
+                            _sr_for_preamble = SR_TID_X
+                        if not hasattr(ctx, '_ur_activation_sr'):
+                            ctx._ur_activation_sr = _sr_for_preamble
+                            ctx._ur_activation_add = _add_for_preamble
+                        # UMOV is in preamble (P3-7). Only emit sync + ATOMG here.
                         # Sync/commit (0xc02 MOV R5, UR5)
                         output.append(SassInstr(encode_mov_gpr_from_ur(5, _data_ur),
                             f'MOV R5, UR{_data_ur}  // atom.xor: sync'))

@@ -902,40 +902,8 @@ def compile_function(fn: Function, verbose: bool = False,
     #   [S2R] [rest of body without hoisted loads]
     preamble_ldcus = getattr(ctx, '_preamble_ldcus', [])
 
-    # P3-5: inject UR pipeline activation sequence for ATOMG_XOR(0x98e)
-    # Must be in preamble with PTXAS-matched ctrl words for UIADD to propagate.
-    _ur_act_sr = getattr(ctx, '_ur_activation_sr', None)
-    if _ur_act_sr is not None:
-        _ur_act_add = getattr(ctx, '_ur_activation_add', 0)
-        # Hard-coded PTXAS ground truth bytes with exact ctrl words.
-        # These have been proven to work via cubin-patch forensics (P3-5).
-        from sass.encoding.sm_120_opcodes import encode_s2ur
-        # S2UR UR0 ← SR (ctrl=0x000e22 from PTXAS)
-        _s2ur0 = bytearray(encode_s2ur(0, _ur_act_sr))
-        _s2ur0[13] = 0x22; _s2ur0[14] = 0x0e; _s2ur0[15] = 0x00
-        preamble_ldcus.append(SassInstr(bytes(_s2ur0),
-            f'S2UR UR0, SR_{_ur_act_sr:#x}  // P3-5'))
-        # 0x886 (ctrl=0x000fe2 from PTXAS)
-        preamble_ldcus.append(SassInstr(
-            bytes.fromhex('867804000000000000018e0300e20f00'),
-            'UR_PIPE_INIT R4  // P3-5: 0x886'))
-        # S2UR UR2 ← LANEID (ctrl=0x000ea2 from PTXAS)
-        _s2ur2 = bytearray(encode_s2ur(2, 0x00))
-        _s2ur2[13] = 0xa2; _s2ur2[14] = 0x0e; _s2ur2[15] = 0x00
-        preamble_ldcus.append(SassInstr(bytes(_s2ur2),
-            'S2UR UR2, SR_LANEID  // P3-5'))
-        # 0x2bd (ctrl=0x000fe2 from PTXAS)
-        _2bd_raw = bytearray(bytes.fromhex('bd7204000400000000000e0800e20f00'))
-        _2bd_raw[4] = ctx.ur_desc & 0xFF
-        preamble_ldcus.append(SassInstr(bytes(_2bd_raw),
-            f'UR_PIPE_FINAL R4, UR{ctx.ur_desc}  // P3-5'))
-        # UIADD with PTXAS ctrl (0x001fc8)
-        if _ur_act_add != 0:
-            from sass.encoding.sm_120_opcodes import encode_uiadd_imm
-            _uiadd = bytearray(encode_uiadd_imm(0, 0, _ur_act_add))
-            _uiadd[13] = 0xc8; _uiadd[14] = 0x1f; _uiadd[15] = 0x00
-            preamble_ldcus.append(SassInstr(bytes(_uiadd),
-                f'UIADD R0/UR0 += {_ur_act_add:#x}  // P3-5'))
+    # P3-7: UR activation is now handled AFTER scheduling (see line ~1050).
+    # The old P3-5 preamble_ldcus injection is removed.
     hoisted_loads = [body_instrs[i] for i in sorted(hoist_indices)]
     body_without_hoisted = [si for i, si in enumerate(body_instrs) if i not in hoist_indices]
 
@@ -948,7 +916,9 @@ def compile_function(fn: Function, verbose: bool = False,
     else:
         # Non-BAR kernel: insert preamble LDCUs + UR4 into body_instrs
         # at s2r_pos (the original pattern that works for these kernels).
-        all_inserted = preamble_ldcus + [ur4_desc_instr]
+        # P3-7: skip ur4_desc_instr if already emitted in activation sequence
+        _skip_ur4 = getattr(ctx, '_ur_activation_sr', None) is not None
+        all_inserted = preamble_ldcus + ([] if _skip_ur4 else [ur4_desc_instr])
         for pi, item in enumerate(all_inserted):
             body_without_hoisted.insert(s2r_pos + pi, item)
         body_instrs = body_without_hoisted
@@ -1043,7 +1013,52 @@ def compile_function(fn: Function, verbose: bool = False,
     # prelude region instead. The value stays in UR and is consumed by
     # ISETP.UR or MOV UR→GPR at point of use.
     # Insert BEFORE the S2R instruction (which must come before LDCU params).
-    sass_instrs = preamble_instrs + body_scheduled
+    # P3-7: inject UR activation sequence AFTER scheduling, BEFORE body.
+    # This ensures the scheduler NEVER sees or reorders these instructions.
+    # They go between the preamble (S2R R1) and the scheduled body.
+    _ur_activation = []
+    _ur_act_sr = getattr(ctx, '_ur_activation_sr', None)
+    if _ur_act_sr is not None:
+        _ur_act_add = getattr(ctx, '_ur_activation_add', 0)
+        # Golden sequence from PTXAS (exact bytes, hardcoded ctrl):
+        # [1] S2UR UR0 ← SR (opcode 0x919, ctrl=0x000e22)
+        _s = bytearray(16)
+        _s[0]=0x19; _s[1]=0x79; _s[2]=0x00; _s[9]=_ur_act_sr&0xFF
+        _s[13]=0x22; _s[14]=0x0e; _s[15]=0x00
+        _ur_activation.append(SassInstr(bytes(_s), f'S2UR UR0, SR_{_ur_act_sr:#x}  // P3-7'))
+        # [2] 0x886 R4 (ctrl=0x000fe2)
+        _ur_activation.append(SassInstr(
+            bytes.fromhex('867804000000000000018e0300e20f00'),
+            'UR_PIPE_INIT R4  // P3-7'))
+        # [3] LDCU.64 for descriptor (ctrl=0x000e62) — REQUIRED as gap
+        # Use the ur4_desc_instr that was already constructed
+        _ur_activation.append(SassInstr(ur4_desc_instr.raw,
+            f'{ur4_desc_instr.comment}  // P3-7: moved to UR activation'))
+        # [4] S2UR UR2 ← LANEID (opcode 0x919, ctrl=0x000ea2)
+        _s2 = bytearray(16)
+        _s2[0]=0x19; _s2[1]=0x79; _s2[2]=0x02; _s2[9]=0x00
+        _s2[13]=0xa2; _s2[14]=0x0e; _s2[15]=0x00
+        _ur_activation.append(SassInstr(bytes(_s2), 'S2UR UR2, SR_LANEID  // P3-7'))
+        # [5] 0x2bd R4, UR_desc (ctrl=0x000fe2)
+        _2bd = bytearray(bytes.fromhex('bd7204000400000000000e0800e20f00'))
+        _2bd[4] = ctx.ur_desc & 0xFF
+        _ur_activation.append(SassInstr(bytes(_2bd),
+            f'UR_PIPE_FINAL R4, UR{ctx.ur_desc}  // P3-7'))
+        # [6] UIADD (ctrl=0x001fc8) if constant needed
+        if _ur_act_add != 0:
+            from sass.encoding.sm_120_opcodes import encode_uiadd_imm
+            _u = bytearray(encode_uiadd_imm(0, 0, _ur_act_add))
+            _u[13]=0xc8; _u[14]=0x1f; _u[15]=0x00
+            _ur_activation.append(SassInstr(bytes(_u),
+                f'UIADD R0/UR0 += {_ur_act_add:#x}  // P3-7'))
+        # [7] UMOV UR5 ← UR0 — MUST immediately follow UIADD (PTXAS pattern)
+        from sass.encoding.sm_120_opcodes import encode_umov_gpr_to_ur
+        _umov = bytearray(encode_umov_gpr_to_ur(5, 0))
+        _umov[13]=0x22; _umov[14]=0x0e; _umov[15]=0x00  # PTXAS ctrl
+        _ur_activation.append(SassInstr(bytes(_umov),
+            'UMOV UR5, UR0  // P3-7: must follow UIADD'))
+
+    sass_instrs = preamble_instrs + _ur_activation + body_scheduled
 
     # 5. BRA offset fixup: resolve branch targets AFTER scheduling.
     # ctx.label_map and ctx._bra_fixups have been updated for UR4 insertion

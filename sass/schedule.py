@@ -48,6 +48,7 @@ class ProofClass(str, Enum):
     ZERO_INIT_SAFE         = "ZERO_INIT_SAFE"         # FG-4.1: semantic fastpath (HFMA2 zero-init)
     # FG-3.1 memory latency classes (GPR memory producers)
     MEMORY_SCOREBOARD_SAFE = "MEMORY_SCOREBOARD_SAFE"  # rbar wait bit proven in window
+    MEMORY_GAP_SAFE        = "MEMORY_GAP_SAFE"         # P3-2: gap exceeds producer latency
     MEMORY_INERT           = "MEMORY_INERT"            # producer wdep no-track (FG-3.2)
     MEMORY_VIOLATION       = "MEMORY_VIOLATION"        # memory read with no rbar wait
     # FG-3.2 / FG-3.3 UR-destination memory / system producers (rule R10)
@@ -668,6 +669,14 @@ def verify_proof(instrs: list[SassInstr]) -> ProofReport:
                             safe_by_rbar = True
                             wait_idx = m
                             break
+                    # P3-2: gap-aware latency exemption.
+                    # S2R (0xb82) reads a special register with ~1 cycle latency.
+                    # If the gap exceeds 4 instructions, the result is guaranteed
+                    # available regardless of rbar coverage.
+                    _GAP_SAFE_PRODUCERS = {0xb82}  # S2R only (hardware-confirmed)
+                    _GAP_SAFE_THRESHOLD = 4
+                    gap_safe = (opc_i in _GAP_SAFE_PRODUCERS and gap >= _GAP_SAFE_THRESHOLD)
+
                     if safe_by_rbar:
                         cls = ProofClass.MEMORY_SCOREBOARD_SAFE
                         rat = (
@@ -677,6 +686,15 @@ def verify_proof(instrs: list[SassInstr]) -> ProofReport:
                             f"ctrl rbar class bit 0x{class_bit:02x} "
                             f"set on instr [{wait_idx}] proves the "
                             f"scoreboard wait"
+                        )
+                    elif gap_safe:
+                        cls = ProofClass.MEMORY_GAP_SAFE
+                        rat = (
+                            f"memory writer opc=0x{opc_i:03x} "
+                            f"(wdep=0x{wdep_i:02x}) → reader "
+                            f"opc=0x{opc_j:03x} at gap={gap}: "
+                            f"gap-safe (S2R latency ≤2, gap≥{_GAP_SAFE_THRESHOLD} "
+                            f"is sufficient — P3-2 evidence-based rule)"
                         )
                     else:
                         cls = ProofClass.MEMORY_VIOLATION

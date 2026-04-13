@@ -96,6 +96,7 @@ _OPCODE_META: dict[int, _OpMeta] = {
     0x311: _OpMeta('F2I.F64',   1, 0x3e, 1),  # F2I.F64 float64-to-int32 conversion
     0x312: _OpMeta('I2F.F64',   1, 0x3e, 1),  # I2F.F64 int32-to-float64 conversion (writes pair)
     0x81a: _OpMeta('BFE_SEXT',  1, 0x3e, 1),  # BFE sign-extension step (bfe.s32 lowering)
+    0x207: _OpMeta('SEL',       0, 0x3e, 1),  # SEL: register select (P3-2)
     0x22a: _OpMeta('DSETP',     0, 0x3e, 0),  # DSETP FP64 compare → predicate (misc=0, like ISETP)
     # Tensor core MMA: wdep=0x3e (ALU), min_gpr_gap=1, misc from ptxas (2 for HMMA/DMMA)
     0x23c: _OpMeta('HMMA',      1, 0x3e, 2),  # HMMA FP16/BF16/TF32 MMA (m16n8k*) misc=2 ptxas-observed

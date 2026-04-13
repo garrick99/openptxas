@@ -691,6 +691,7 @@ def test_inv_t_memory_writers_are_classified():
                     w = _get_wdep(instrs[e.writer_idx].raw)
                     if w in _WDEP_TO_RBAR_MASK and e.classification not in (
                             ProofClass.MEMORY_SCOREBOARD_SAFE,
+                            ProofClass.MEMORY_GAP_SAFE,
                             ProofClass.MEMORY_VIOLATION):
                         bad.append((label, e.writer_idx, e.reader_idx,
                                     hex(e.writer_opc), e.classification))

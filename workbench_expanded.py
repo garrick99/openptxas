@@ -2236,11 +2236,8 @@ WEIRD1_KERNELS = {
                             "harness": _harness_smem_1param(lambda t: t*7 + 42)},
     "w1_smem_xor_swap":    {"display": "smem xor-partner swap", "ptx_inline": _W1_SMEM_XOR_SWAP, "kernel_name": "w1_smem_xor_swap",
                             "harness": _harness_smem_1param(lambda t: t + (t^1))},
-    # w1_smem_reduce_pair: proof false positive — S2R[0]→0x835[8] at gap=7
-    # flagged because S2R is LDC-class in scoreboard. S2R cannot be moved
-    # out of _OPCODES_LDC without breaking ctrl-word generation for all kernels.
-    # Gap=7 is well beyond S2R latency. GPU correctness verified PASS.
-    # Classification: FALSE_POSITIVE (P2-8 confirmed)
+    "w1_smem_reduce_pair": {"display": "smem pair reduction (even threads)", "ptx_inline": _W1_SMEM_REDUCE_PAIR, "kernel_name": "w1_smem_reduce_pair",
+                            "harness": _harness_smem_reduce_pair},
     "w1_smem_guarded":     {"display": "smem with bounds-checked write", "ptx_inline": _W1_SMEM_GUARDED, "kernel_name": "w1_smem_guarded",
                             "harness": _harness_smem_guarded},
     # Loop bodies

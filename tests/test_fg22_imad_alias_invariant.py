@@ -203,7 +203,7 @@ _ALIAS_SLACK = {
     # WEIRD-1 corpus
     **{k: 3 for k in [
         "w1_smem_copy", "w1_smem_neighbor", "w1_smem_compute",
-        "w1_smem_xor_swap", "w1_smem_guarded",
+        "w1_smem_xor_swap", "w1_smem_reduce_pair", "w1_smem_guarded",
         "w1_loop_sum", "w1_loop_mul_acc", "w1_loop_pred_acc",
         "w1_loop_two_acc", "w1_loop_xor", "w1_loop_shift",
         "w1_loop_countdown", "w1_loop_load_acc",

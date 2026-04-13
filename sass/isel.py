@@ -3131,7 +3131,10 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     output.extend(_select_atom_generic_u32(instr, ctx.ra, ctx, ATOMG_AND, 'AND.b32'))
 
                 elif op == 'atom' and 'xor' in instr.types and 'b32' in instr.types:
-                    output.extend(_select_atom_generic_u32(instr, ctx.ra, ctx, ATOMG_XOR, 'XOR.b32'))
+                    # P2-1: INCONCLUSIVE. 0x98e uses UR-indexed data (b4=UR),
+                    # but GPR→UR move encoding not yet grounded.
+                    # Falls through to unimplemented warning.
+                    pass
 
                 elif op == 'atom' and 'min' in instr.types and 'u32' in instr.types:
                     output.extend(_select_atom_generic_u32(instr, ctx.ra, ctx, ATOMG_MIN, 'MIN.u32'))

@@ -2580,11 +2580,11 @@ def encode_atomg_xor_u32(dest: int, addr_base: int, offset: int, data: int,
     raw[1]  = 0x09
     raw[2]  = dest & 0xFF
     raw[3]  = addr_base & 0xFF
-    raw[4]  = data & 0xFF
+    raw[4]  = data & 0xFF  # GPR data register (same as 0x9a8)
     raw[5]  = offset & 0xFF
     raw[6]  = (offset >> 8) & 0xFF
-    raw[7]  = (offset >> 16) & 0xFF
-    raw[8]  = ur_desc & 0xFF
+    raw[7]  = 0x00  # no descriptor-mode flag (unlike 0x9a8 which sets 0x80)
+    raw[8]  = ur_desc & 0xFF  # UR descriptor index
     raw[9]  = 0xe1
     raw[10] = 0x92
     raw[11] = 0x0f

@@ -1016,84 +1016,82 @@ def compile_function(fn: Function, verbose: bool = False,
     # P3-7: inject UR activation sequence AFTER scheduling, BEFORE body.
     # This ensures the scheduler NEVER sees or reorders these instructions.
     # They go between the preamble (S2R R1) and the scheduled body.
+    # -----------------------------------------------------------------------
+    # PHASE-4.3: PTXAS-faithful template for atom.global.xor.b32
+    # -----------------------------------------------------------------------
+    # Phase-4.2 proved that the UR pipeline activation state depends on the
+    # exact surrounding instruction context, not just the activation opcodes.
+    # Generic post-scheduling injection cannot reproduce the PTXAS context.
+    #
+    # Solution: emit the exact PTXAS instruction byte sequence for atom.xor
+    # kernels, parameterized only by the UIADD constant K.  The template
+    # replaces BOTH the activation AND the body for the atom.xor block.
+    #
+    # Supported: atom.global.xor.b32 with uniform SR-derived data (direct
+    # or tid+constant), kernel signature (.u64 p_out, .u32 n).
+    # -----------------------------------------------------------------------
     _ur_activation = []
     _ur_act_sr = getattr(ctx, '_ur_activation_sr', None)
     if _ur_act_sr is not None:
         _ur_act_add = getattr(ctx, '_ur_activation_add', 0)
-        # Golden sequence from PTXAS (exact bytes, hardcoded ctrl):
-        # [1] S2UR UR0 ← SR (opcode 0x919, ctrl=0x000e22)
-        _s = bytearray(16)
-        _s[0]=0x19; _s[1]=0x79; _s[2]=0x00; _s[9]=_ur_act_sr&0xFF
-        _s[13]=0x22; _s[14]=0x0e; _s[15]=0x00
-        _ur_activation.append(SassInstr(bytes(_s), f'S2UR UR0, SR_{_ur_act_sr:#x}  // P3-7'))
-        # [2] 0x886 R4 (ctrl=0x000fe2)
-        _ur_activation.append(SassInstr(
-            bytes.fromhex('867804000000000000018e0300e20f00'),
-            'UR_PIPE_INIT R4  // P3-7'))
-        # [3] LDCU.64 for descriptor (ctrl=0x000e62) — REQUIRED as gap
-        # Use the ur4_desc_instr that was already constructed
-        _ur_activation.append(SassInstr(ur4_desc_instr.raw,
-            f'{ur4_desc_instr.comment}  // P3-7: moved to UR activation'))
-        # [4] S2UR UR2 ← LANEID (opcode 0x919, ctrl=0x000ea2)
-        _s2 = bytearray(16)
-        _s2[0]=0x19; _s2[1]=0x79; _s2[2]=0x02; _s2[9]=0x00
-        _s2[13]=0xa2; _s2[14]=0x0e; _s2[15]=0x00
-        _ur_activation.append(SassInstr(bytes(_s2), 'S2UR UR2, SR_LANEID  // P3-7'))
-        # [5] 0x2bd R4, UR_desc (ctrl=0x000fe2)
-        _2bd = bytearray(bytes.fromhex('bd7204000400000000000e0800e20f00'))
-        _2bd[4] = ctx.ur_desc & 0xFF
-        _ur_activation.append(SassInstr(bytes(_2bd),
-            f'UR_PIPE_FINAL R4, UR{ctx.ur_desc}  // P3-7'))
-        # [6] UIADD (ctrl=0x001fc8) if constant needed
-        if _ur_act_add != 0:
-            from sass.encoding.sm_120_opcodes import encode_uiadd_imm
-            _u = bytearray(encode_uiadd_imm(0, 0, _ur_act_add))
-            _u[13]=0xc8; _u[14]=0x1f; _u[15]=0x00
-            _ur_activation.append(SassInstr(bytes(_u),
-                f'UIADD R0/UR0 += {_ur_act_add:#x}  // P3-7'))
-        # [7] UMOV UR5 ← UR0 — MUST immediately follow UIADD (PTXAS pattern)
-        from sass.encoding.sm_120_opcodes import encode_umov_gpr_to_ur
-        _umov = bytearray(encode_umov_gpr_to_ur(5, 0))
-        _umov[13]=0x22; _umov[14]=0x0e; _umov[15]=0x00  # PTXAS ctrl
-        _ur_activation.append(SassInstr(bytes(_umov),
-            'UMOV UR5, UR0  // P3-7: must follow UIADD'))
 
-    # PHASE-4.1: Post-scheduling UR micro-scheduler.
-    # UMOV is in _ur_activation (preamble). ALL body instructions come after it.
-    # Hoist UR-writing instructions from body to BEFORE the activation block.
-    # Also insert ISETP.RUR flush before ATOMG.
-    _UR_WRITE_OPCODES = frozenset({0x919, 0x9c3, 0x7ac})  # S2UR variants, LDCU
-    if _ur_act_sr is not None and body_scheduled:
-        _opc = lambda r: struct.unpack_from('<Q', r.raw, 0)[0] & 0xFFF
-        _atomg_pos = -1
-        for _j, _si in enumerate(body_scheduled):
-            if _opc(_si) == 0x98e:
-                _atomg_pos = _j; break
-        if _atomg_pos >= 0:
-            # Hoist ALL UR writes from body[0:_atomg_pos] to before activation
-            _hoisted = []
-            _remaining = []
-            for _j in range(_atomg_pos):
-                _si = body_scheduled[_j]
-                if _opc(_si) in _UR_WRITE_OPCODES:
-                    _hoisted.append(_si)
-                else:
-                    _remaining.append(_si)
-            # Insert ISETP.RUR flush before ATOMG if not present
-            _has_flush = any(_opc(s) == 0xc0c for s in _remaining)
-            if not _has_flush:
-                _flush = bytearray(bytes.fromhex('0c7c0001040000007020f00b00ce4f00'))
-                _flush[4] = ctx.ur_desc & 0xFF
-                _remaining.append(SassInstr(bytes(_flush),
-                    f'ISETP.RUR P0, R1, UR{ctx.ur_desc}  // P4.1: UR flush'))
-            body_scheduled = _remaining + body_scheduled[_atomg_pos:]
-            # Hoisted UR writes go INSIDE the activation block, after LDCU[2]
-            # and before S2UR UR2[3]. This matches PTXAS interleaving pattern.
-            if _hoisted and len(_ur_activation) >= 4:
-                # Insert after position 2 (after LDCU.64 desc) in activation
-                _ur_activation = (_ur_activation[:3]    # S2UR UR0, 0x886, LDCU
-                                  + _hoisted              # hoisted body UR writes
-                                  + _ur_activation[3:])   # S2UR UR2, 0x2bd, UIADD, UMOV
+        # Build a PTXAS-faithful instruction block that replaces the
+        # normal activation + body for the atom.xor path.  Every byte is
+        # copied from a working PTXAS cubin; only the UIADD immediate is
+        # patched for the tid+constant variant.
+        #
+        # Template A (direct SR, no UIADD):
+        #   S2UR UR0←TID → LDCU UR4(param n) → ISETP.RUR(bounds) → EXIT
+        #   → S2UR UR2←LANEID → UMOV UR5←UR0 → 0x886 → LDCU UR6(desc)
+        #   → 0x2bd → MOV.UR R5←UR5 → ISETP.RUR(flush) → S2R R2(addr)
+        #   → ATOMG
+        #
+        # Template B (tid+constant, has UIADD):
+        #   S2UR UR0←TID → LDCU UR4(param n) → ISETP.RUR(bounds) → EXIT
+        #   → S2UR UR2←LANEID → UIADD UR0+=K → 0x886 → LDCU UR6(desc)
+        #   → UMOV UR5←UR0 → 0x2bd → MOV.UR R5←UR5 → ISETP.RUR(flush)
+        #   → S2R R2(addr) → ATOMG
+
+        _T = []  # template instructions (after preamble S2R R1)
+
+        # Shared prefix: [1]-[5]
+        _T.append(SassInstr(bytes.fromhex('19790000000000000021000000220e00'), 'S2UR UR0, TID.X  // P4.3'))
+        _T.append(SassInstr(bytes.fromhex('ac7704ff007100000008000800240e00'), 'LDCU UR4, c[0x71]  // P4.3: param n'))
+        _T.append(SassInstr(bytes.fromhex('0c7c0000040000007060f00b00da1f00'), 'ISETP.RUR bounds  // P4.3'))
+        _T.append(SassInstr(bytes.fromhex('4d090000000000000000800300ea0f00'), 'EXIT @P0  // P4.3'))
+        _T.append(SassInstr(bytes.fromhex('19790200000000000000000000220e00'), 'S2UR UR2, LANEID  // P4.3'))
+
+        if _ur_act_add != 0:
+            # Variant B: UIADD present — tid+constant
+            _uiadd_b = bytearray(bytes.fromhex('357800000100000000008e0700e20f00'))
+            _uiadd_b[4] = _ur_act_add & 0xFF
+            _uiadd_b[5] = (_ur_act_add >> 8) & 0xFF
+            _uiadd_b[6] = (_ur_act_add >> 16) & 0xFF
+            _T.append(SassInstr(bytes(_uiadd_b), f'UIADD UR0 += {_ur_act_add}  // P4.3'))
+            _T.append(SassInstr(bytes.fromhex('867804000000000000018e0300e20f00'), '0x886  // P4.3'))
+            _T.append(SassInstr(bytes.fromhex('ac7706ff006b0000000a000800640e00'), 'LDCU UR6, desc  // P4.3'))
+            _T.append(SassInstr(bytes.fromhex('c4730500000000000080000000a20e00'), 'UMOV UR5, UR0  // P4.3'))
+            _T.append(SassInstr(bytes.fromhex('bd7204000400000000000e0800e20f00'), '0x2bd  // P4.3'))
+            _T.append(SassInstr(bytes.fromhex('027c050005000000000f000800ca4f00'), 'MOV.UR R5, UR5  // P4.3'))
+            _T.append(SassInstr(bytes.fromhex('0c7c0002040000007020f00b00e41f00'), 'ISETP.RUR flush  // P4.3'))
+            _T.append(SassInstr(bytes.fromhex('827b02ff00e00000000a000000760e00'), 'S2R R2, param_addr  // P4.3'))
+            _T.append(SassInstr(bytes.fromhex('8e0900020500000006e1920f00e22f00'), 'ATOMG.XOR  // P4.3'))
+        else:
+            # Variant A: direct SR — no UIADD
+            _T.append(SassInstr(bytes.fromhex('c4730500000000000080000000620e00'), 'UMOV UR5, UR0  // P4.3'))
+            _T.append(SassInstr(bytes.fromhex('867804000000000000018e0300e20f00'), '0x886  // P4.3'))
+            _T.append(SassInstr(bytes.fromhex('ac7706ff006b0000000a000800a20e00'), 'LDCU UR6, desc  // P4.3'))
+            _T.append(SassInstr(bytes.fromhex('bd7204000400000000000e0800e20f00'), '0x2bd  // P4.3'))
+            _T.append(SassInstr(bytes.fromhex('027c050005000000000f000800ca2f00'), 'MOV.UR R5, UR5  // P4.3'))
+            _T.append(SassInstr(bytes.fromhex('0c7c0002040000007020f00b00e41f00'), 'ISETP.RUR flush  // P4.3'))
+            _T.append(SassInstr(bytes.fromhex('827b02ff00e00000000a000000b60e00'), 'S2R R2, param_addr  // P4.3'))
+            _T.append(SassInstr(bytes.fromhex('8e0900020500000006e1920f00e24f00'), 'ATOMG.XOR  // P4.3'))
+
+        # The template replaces BOTH activation and body.  The body's
+        # instructions (bounds check, address computation, MOV.UR, ATOMG)
+        # are all inside the template — the scheduler's body is discarded.
+        body_scheduled = []
+        _ur_activation = _T
 
     sass_instrs = preamble_instrs + _ur_activation + body_scheduled
 

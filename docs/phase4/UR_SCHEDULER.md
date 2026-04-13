@@ -68,22 +68,53 @@ Key observations:
 
 **Recommended: Option A** — most practical balance of generality and complexity.
 
-## 5. Phase 4.1 Prototype Plan
+## 5. Phase 4.3 — PTXAS-Faithful Template (IMPLEMENTED)
 
-### Goal
-Enable tid+constant atom.xor for the w2_atom_xor_reduce kernel.
+### Problem
+Phase 4.2 proved that generic post-scheduling UR activation injection cannot
+produce the correct UR pipeline state.  The exact surrounding instruction
+context matters — not just the activation opcodes or their ordering.
 
-### Steps
-1. Analyze the w2 kernel's PTXAS instruction order
-2. Build a specialized reordering pass for the atom.xor body
-3. Move S2UR/LDCU before the activation window
-4. Ensure ISETP.RUR + sync + ATOMG are contiguous after UMOV
-5. Validate on GPU
+### Solution
+Emit exact PTXAS instruction bytes for the atom.xor block, parameterized
+only by the UIADD immediate constant K.  Two variants:
 
-### Success criteria
-- w2_atom_xor_reduce PASS (1-thread: 1, 32-thread: 32)
-- All 143 existing kernels still PASS
-- No regressions
+**Variant A (direct SR, no UIADD):**
+```
+S2UR UR0←TID → LDCU UR4(param n) → ISETP.RUR(bounds) → EXIT
+→ S2UR UR2←LANEID → UMOV UR5←UR0 → 0x886 → LDCU UR6(desc)
+→ 0x2bd → MOV.UR R5←UR5 → ISETP.RUR(flush) → S2R R2(addr) → ATOMG
+```
+
+**Variant B (tid+constant, has UIADD):**
+```
+S2UR UR0←TID → LDCU UR4(param n) → ISETP.RUR(bounds) → EXIT
+→ S2UR UR2←LANEID → UIADD UR0+=K → 0x886 → LDCU UR6(desc)
+→ UMOV UR5←UR0 → 0x2bd → MOV.UR R5←UR5 → ISETP.RUR(flush)
+→ S2R R2(addr) → ATOMG
+```
+
+### Key findings (Phase 4.2 forensics)
+1. ATOMG 0x98e reads data from **GPR** (not UR directly) — confirmed by
+   NOPing MOV.UR in PTXAS cubin (produces garbage, not tid.x)
+2. Any non-clobbered GPR works for MOV.UR→ATOMG data delivery
+3. Descriptor UR register is flexible (UR4 and UR6 both work)
+4. Max stall everywhere does NOT fix generic activation — issue is functional
+5. The UR pipeline requires specific instruction context that generic
+   scheduling cannot reproduce
+
+### Parameterization surface
+| Field | Location | Source | Why parameterized |
+|---|---|---|---|
+| UIADD immediate K | Variant B [6] b4-b6 | ctx._ur_activation_add | Per-kernel constant |
+
+All other bytes are invariant PTXAS ground truth.
+
+### Success criteria (MET)
+- w2_atom_xor_reduce PASS (1-thread: 1, 32-thread: 32) ✓
+- k100_atom_xor PASS (N=3,5,7,32,64 all correct) ✓
+- All 143 existing kernels still PASS ✓
+- Zero regressions ✓
 
 ## 6. Risks
 

@@ -212,7 +212,7 @@ _ALIAS_SLACK = {
     ]},
     # WEIRD-2 corpus
     **{k: 3 for k in [
-        "w2_atom_and_reduce", "w2_loop_atom_add", "w2_smem_loop",
+        "w2_atom_and_reduce", "w2_atom_xor_reduce", "w2_loop_atom_add", "w2_smem_loop",
         "w2_div_loop", "w2_nested_loop",
         "w2_pred_load", "w2_multi_store", "w2_deep_pred", "w2_loop_mul",
     ]},

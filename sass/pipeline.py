@@ -1036,10 +1036,11 @@ def compile_function(fn: Function, verbose: bool = False,
         _ur_act_add = getattr(ctx, '_ur_activation_add', 0)
 
         # ---------------------------------------------------------------
-        # TEMPLATE-ENGINE-4: spec-driven PTXAS template rendering.
-        # Load the auto-generated JSON template specs and render the
-        # instruction block, patching only the UIADD immediate K.
-        # Falls back to inline bytes if spec loading fails.
+        # TEMPLATE-ENGINE-5D: spec-driven rendering from auto-generated
+        # templates.  For Variant A (direct SR, no UIADD), uses the
+        # generalized atom_ur spec that also covers MIN/MAX via
+        # operation-specific parameter fields.  Falls back to inline
+        # bytes if spec loading fails.
         # ---------------------------------------------------------------
         _spec_ok = False
         try:
@@ -1049,21 +1050,23 @@ def compile_function(fn: Function, verbose: bool = False,
             if _ur_act_add != 0:
                 _spec_file = _spec_dir / 'atom_xor_uniform_tid_plus_constant.json'
             else:
-                _spec_file = _spec_dir / 'atom_xor_uniform_direct_sr.json'
+                # TE5-D: use generalized spec (covers XOR/MIN/MAX via params)
+                _spec_file = _spec_dir / 'atom_ur_generalized_xor_min_max.json'
 
             if _spec_file.exists():
                 _spec_data = _json.loads(_spec_file.read_text(encoding='utf-8'))
                 _spec_instrs = _spec_data['instructions']
-                # Skip instruction [0] (S2R R1 preamble — already in preamble_instrs)
                 _T = []
                 for _si in _spec_instrs[1:]:  # skip preamble S2R
                     _raw = bytearray(bytes.fromhex(_si['bytes']))
-                    # Patch parameterized fields
                     for _p in _si.get('params', []):
                         if _p['name'] == 'add_imm_K':
                             for _bi in range(_p['byte_length']):
                                 _raw[_p['byte_offset'] + _bi] = (_ur_act_add >> (8 * _bi)) & 0xFF
-                    _T.append(SassInstr(bytes(_raw), f"{_si['role']}  // TE4"))
+                        # TE5-D: generalized spec params use representative
+                        # values (XOR operation).  No patching needed for XOR
+                        # since the representative IS atom_xor.
+                    _T.append(SassInstr(bytes(_raw), f"{_si['role']}  // TE5"))
                 body_scheduled = []
                 _ur_activation = _T
                 _spec_ok = True

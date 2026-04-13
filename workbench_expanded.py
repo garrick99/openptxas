@@ -2230,12 +2230,12 @@ WEIRD1_KERNELS = {
     # Shared memory
     "w1_smem_copy":        {"display": "smem write + barrier + read back", "ptx_inline": _W1_SMEM_COPY, "kernel_name": "w1_smem_copy",
                             "harness": _harness_smem_1param(lambda t: t + 1)},
-    # w1_smem_neighbor excluded: and.b32 for modular address triggers proof model gap on LDS dependency
+    # w1_smem_neighbor: genuine LDS→ALU proof gap (P2-3 confirmed, needs evidence collection)
     "w1_smem_compute":     {"display": "smem write + barrier + read + compute", "ptx_inline": _W1_SMEM_COMPUTE, "kernel_name": "w1_smem_compute",
                             "harness": _harness_smem_1param(lambda t: t*7 + 42)},
     "w1_smem_xor_swap":    {"display": "smem xor-partner swap", "ptx_inline": _W1_SMEM_XOR_SWAP, "kernel_name": "w1_smem_xor_swap",
                             "harness": _harness_smem_1param(lambda t: t + (t^1))},
-    # w1_smem_reduce_pair excluded: predicated smem load triggers proof model gap
+    # w1_smem_reduce_pair: genuine LDS→ALU proof gap (predicated smem)
     "w1_smem_guarded":     {"display": "smem with bounds-checked write", "ptx_inline": _W1_SMEM_GUARDED, "kernel_name": "w1_smem_guarded",
                             "harness": _harness_smem_guarded},
     # Loop bodies
@@ -2534,7 +2534,7 @@ WEIRD2_KERNELS = {
                             "harness": _harness_atom_and_reduce},
     "w2_loop_atom_add":    {"display": "loop: 3x atom.add per thread", "ptx_inline": _W2_LOOP_ATOM_ADD, "kernel_name": "w2_loop_atom_add",
                             "harness": _harness_loop_atom_add},
-    # w2_smem_loop excluded: smem+loop combo triggers proof model gap on LDS dependency
+    # w2_smem_loop: genuine LDS→ALU proof gap (smem+loop combo)
     "w2_div_loop":         {"display": "divergent loop count (tid-dependent iters)", "ptx_inline": _W2_DIV_LOOP, "kernel_name": "w2_div_loop",
                             "harness": _harness_div_loop},
     "w2_nested_loop":      {"display": "nested 2x3 loop + tid merge", "ptx_inline": _W2_NESTED_LOOP, "kernel_name": "w2_nested_loop",
@@ -2880,7 +2880,7 @@ REAL1_KERNELS = {
                         "harness": _harness_histogram8},
     "r1_scan_warp":    {"display": "warp inclusive prefix sum (5-stage shuffle)", "ptx_inline": _R1_SCAN_WARP, "kernel_name": "r1_scan_warp",
                         "harness": _harness_scan_warp},
-    # r1_tile_compute excluded: global→smem→compute pattern triggers proof model gap
+    # r1_tile_compute: genuine LDS→ALU proof gap (global→smem→compute)
     "r1_scale_add":    {"display": "scale + offset (real-world normalize shape)", "ptx_inline": _R1_SCALE_ADD, "kernel_name": "r1_scale_add",
                         "harness": _harness_s2("", lambda t: (t*3+7)*2)},
     "r1_minmax":       {"display": "predicated clamp [16,200]", "ptx_inline": _R1_MINMAX, "kernel_name": "r1_minmax",

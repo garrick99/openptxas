@@ -1152,10 +1152,10 @@ def compile_function(fn: Function, verbose: bool = False,
                     if _wide_dest == _iadd_gpr:
                         _new.append(SassInstr(
                             encode_iadd3_ur_lo(_iadd_dest, _wide_src32, _iadd_ur),
-                            f'IADD3.UR R{_iadd_dest}, R{_wide_src32}, UR{_iadd_ur}  // TE17: addr lo'))
+                            f'IADD3.UR R{_iadd_dest}, R{_wide_src32}, UR{_iadd_ur}  // TE19: addr lo'))
                         _new.append(SassInstr(
                             encode_iadd3_ur_hi(_iadd_dest + 1, _wide_src32, _iadd_ur + 1),
-                            f'IADD3.UR.X R{_iadd_dest+1}, R{_wide_src32}, UR{_iadd_ur+1}  // TE17: addr hi'))
+                            f'IADD3.UR.X R{_iadd_dest+1}, R{_wide_src32}, UR{_iadd_ur+1}  // TE19: addr hi'))
                         _skip = True
                         continue
             _new.append(_si)

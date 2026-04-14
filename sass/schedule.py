@@ -483,6 +483,11 @@ def _enforce_gpr_latency(instrs: list[SassInstr]) -> list[SassInstr]:
                     continue
 
         meta_i = _OPCODE_META.get(opc_i)
+        # TE21: 0xc11 (IADD3.R-UR) needs min_gpr_gap=1 like 0xc35, but
+        # is NOT in _OPCODE_META (avoids global misc counter shift).
+        if meta_i is None and opc_i == 0xc11:
+            class _M: min_gpr_gap = 1
+            meta_i = _M()
         if meta_i is None or meta_i.min_gpr_gap == 0:
             i += 1
             continue

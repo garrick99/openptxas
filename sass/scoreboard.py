@@ -591,6 +591,10 @@ _FORWARDING_SAFE_PAIRS: set[tuple[int, int]] = {
     # ALU → STG: store addr/data pair read covered by STG's own
     # read barrier, not instruction-stream gap.
     (0xc35, 0x986),   # IADD.64-UR → STG.E
+    (0xc11, 0x986),   # TE21: IADD3.R-UR → STG.E (carry-chain addr → store)
+    (0xc11, 0x981),   # TE21: IADD3.R-UR → LDG.E (carry-chain addr → load)
+    (0xc11, 0xc11),   # TE21: IADD3.R-UR → IADD3.R-UR (lo → hi carry chain)
+    (0xc11, 0x235),   # TE21: IADD3.R-UR → IADD.64
     (0xc02, 0x986),   # MOV.UR     → STG.E
     (0x221, 0x986),   # FADD       → STG.E
     (0x235, 0x986),   # IADD.64    → STG.E
@@ -1201,6 +1205,7 @@ _OPCODE_MISC: dict[int, int] = {
     0xc2b: 2,   # DFMA R-UR-UR: misc=2 (b1=0x7c form)
     0x22a: 2,   # DSETP: misc=2 (ptxas ground truth — all DSETP variants use 2)
     0xc35: 5,   # IADD.64-UR: misc=5 (wide ALU result)
+    0xc11: 5,   # TE21: IADD3.R-UR carry chain (fixed misc, not in _OPCODE_META)
     0xc0c: 0,   # ISETP R-UR: misc=0 default (overridden for VOTE-adjacent context)
     0x20c: 0,   # ISETP R-R: misc=0 default (overridden for VOTE-adjacent context)
     0x80c: 0,   # ISETP IMM: misc=0 default (overridden for VOTE-adjacent context)
@@ -1361,7 +1366,7 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
                     rbar = rbar | _WDEP_TO_RBAR[pw]
         # LDCU consumers: any instruction using UR operands needs rbar for LDCU
         # Check byte 4 for UR source in R-UR instructions
-        if opcode in (0xc35, 0xc0c, 0xc24, 0xc0b):  # IADD.64-UR, ISETP R-UR, IMAD R-UR, FSETP R-UR
+        if opcode in (0xc35, 0xc0c, 0xc24, 0xc0b, 0xc11):  # IADD.64-UR, ISETP R-UR, IMAD R-UR, FSETP R-UR, IADD3.R-UR
             ur_src = si.raw[4]
             if ur_src in pending_ur_writes:
                 _, pw = pending_ur_writes[ur_src]

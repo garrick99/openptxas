@@ -385,12 +385,33 @@ def _hoist_ldcu64(instrs: list[SassInstr]) -> list[SassInstr]:
     if ldcu64s:
         ldcu64s.sort(key=_consumer_pos)
         if non_s2r_remaining:
-            # Order: LDC R1, S2R(s), LDCU.64(s), rest
-            # TE25 note: moving LDCU.64 to post-boundary (after EXIT) was
-            # attempted to match PTXAS layout.  11 regressions remain due
-            # to ATOMG/LDG consumers needing UR params before body ALU
-            # fillers are available.  Kept as pre-boundary (original).
-            pre_result = non_s2r_remaining[:1] + s2r_instrs + ldcu64s + non_s2r_remaining[1:]
+            # TE26-B: family-aware LDCU.64 placement.
+            # For STG-only kernels: move LDCU.64 to post-boundary (after EXIT),
+            # matching PTXAS layout.  LDG/ATOMG kernels keep pre-boundary.
+            _is_stg_only = (
+                any(_get_opcode(si.raw) == 0x986 for si in post_boundary)  # has STG
+                and not any(_get_opcode(si.raw) in (0x981, 0x98e, 0x9a8, 0x9ae, 0x3a9)
+                            for si in post_boundary)  # no LDG/ATOMG
+            )
+            if _is_stg_only:
+                # STG-only: LDCU.64 goes post-EXIT with latency NOP padding
+                pre_result = non_s2r_remaining[:1] + s2r_instrs + non_s2r_remaining[1:]
+                _padded = []
+                for _lsi in ldcu64s:
+                    _padded.append(_lsi)
+                    _ur_d = _lsi.raw[2]
+                    _need_pad = any(
+                        _get_opcode(post_boundary[_pi].raw) in _UR_CONSUMER_OPCODES
+                        and post_boundary[_pi].raw[4] in (_ur_d, _ur_d + 1)
+                        for _pi in range(min(3, len(post_boundary)))
+                    )
+                    if _need_pad:
+                        for _ in range(3):
+                            _padded.append(SassInstr(_encode_nop(), 'NOP  // TE26 latency'))
+                post_boundary = _padded + list(post_boundary)
+            else:
+                # LDG/ATOMG: keep LDCU.64 pre-boundary (original safe order)
+                pre_result = non_s2r_remaining[:1] + s2r_instrs + ldcu64s + non_s2r_remaining[1:]
         else:
             pre_result = s2r_instrs + ldcu64s
     else:

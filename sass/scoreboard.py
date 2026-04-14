@@ -263,6 +263,7 @@ _OPCODES_ALU = {
     0x822,        # FSWZADD (float swizzle-add)
     # 64-bit add with UR
     0xc35,        # IADD.64-UR (64-bit add with UR)
+    0xc11,        # TE12: IADD3.R-UR (carry-chain 64-bit address add)
     # Miscellaneous / div.u32 helpers
     0x431,        # HFMA2 (zero-init trick)
     0x810,        # IADD3 immediate form

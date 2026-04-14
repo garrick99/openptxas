@@ -190,9 +190,9 @@ _EXPECTED_COUNTS = {
     # LDC.64 → consumer chain and shifts one UR_MEMORY_* edge.
     "min_store_guarded":     (5, 0, 0, 0, 0, 2, 0, 0, 2, 1, 0, 0, 0),
     "probe_fresh":           (5, 0, 0, 0, 0, 2, 0, 0, 2, 1, 0, 0, 0),
-    "reduce_sum":            (18, 4, 6, 0, 0, 3, 0, 0, 4, 0, 1, 0, 0),
-    "conv2d_looped":         (113, 14, 0, 0, 0, 63, 0, 0, 36, 0, 0, 0, 0),  # P3-3: updated after forwarding pair expansion
-    "conv2d_unrolled":       (91, 1, 8, 0, 0, 47, 0, 0, 35, 0, 0, 0, 0),
+    "reduce_sum":            (19, 5, 6, 0, 0, 3, 0, 0, 4, 0, 1, 0, 0),  # TE12: 0xc11 now ALU
+    "conv2d_looped":         (114, 23, 0, 0, 0, 55, 0, 0, 36, 0, 0, 0, 0),  # TE12: 0xc11 now ALU
+    "conv2d_unrolled":       (93, 3, 8, 0, 0, 47, 0, 0, 35, 0, 0, 0, 0),  # TE12: 0xc11 now ALU
     "fg21:k_ge":             (5, 0, 0, 0, 0, 2, 0, 0, 2, 1, 0, 0, 0),
     "fg21:k_lt":             (5, 0, 0, 0, 0, 2, 0, 0, 2, 1, 0, 0, 0),
     "fg21:k_gt":             (5, 0, 0, 0, 0, 2, 0, 0, 2, 1, 0, 0, 0),

@@ -104,6 +104,19 @@ However, byte-exact count remains at 29 (20.1%).  The ISETP substitution
 alone doesn't close the gap because IMAD.WIDE and instruction ordering
 differences dominate the remaining structural divergence.
 
+## TE11 Findings: IMAD.WIDE Replacement Attempted
+
+TE11 built a 0xc11 (IADD3.R-UR) encoder from 226 PTXAS ground truth
+instances.  Attempted to replace IMAD.WIDE(0x825)+IADD.64-UR(0xc35)
+with 0xc11 carry-chain pair.  61 regressions from isel + 15 from
+scoreboard integration → reverted.
+
+The encoder is retained (`sass/encoding/iadd3_ur.py`) but needs:
+1. GPU validation of carry propagation between lo/hi halves
+2. Isolated scoreboard integration (adding to _OPCODE_META breaks
+   proof engine misc/wdep assignment globally)
+
 Remaining path to further gap closure:
-1. Replace IMAD.WIDE with UIADD-based address gen
-2. Match PTXAS instruction ordering in the body
+1. GPU-verify 0xc11 carry chain in isolation
+2. Add 0xc11 to scoreboard with isolated wdep/misc handling
+3. Match PTXAS instruction ordering (bounds check before param loads)

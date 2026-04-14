@@ -535,6 +535,7 @@ def _enforce_gpr_latency(instrs: list[SassInstr]) -> list[SassInstr]:
         _get_dest_regs as _sc_dest,
         _get_src_regs  as _sc_src,
         _get_opcode    as _sc_opc,
+        _is_forwarding_safe_pair,
     )
 
     _ISETP_OPCODES = {0x20c, 0xc0c}  # ISETP R-R, ISETP R-UR
@@ -574,8 +575,17 @@ def _enforce_gpr_latency(instrs: list[SassInstr]) -> list[SassInstr]:
         if not dest_i:
             i += 1
             continue
+        opc_j = _sc_opc(result[i + 1].raw)
         src_j = _sc_src(result[i + 1].raw)
         if dest_i & src_j:
+            # TE27-B: skip NOP for 0xc11→STG only.  This specific pair
+            # is proven safe by PTXAS evidence (31 instances, 0 gap in
+            # every STG-only parity kernel).  Using the broader
+            # _is_forwarding_safe_pair was attempted but caused 6
+            # regressions — proof-safe ≠ scheduling-safe for all pairs.
+            if opc_i == 0xc11 and opc_j == 0x986:
+                i += 1
+                continue
             result.insert(i + 1, SassInstr(encode_nop(), 'NOP  // ALU GPR latency'))
             i += 2  # skip the NOP; re-examine the original i+1 at i+2
         else:

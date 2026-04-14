@@ -443,6 +443,60 @@ def _hoist_ldcu64(instrs: list[SassInstr]) -> list[SassInstr]:
     return pre_result + post_boundary
 
 
+def _hoist_bounds_check(instrs: list[SassInstr]) -> list[SassInstr]:
+    """TE24-B: move bounds-check (ISETP.RUR + predicated EXIT) before LDCU.64s.
+
+    After _hoist_ldcu64, the stream has:
+      S2R, S2UR, [LDCU.64s], LDCU.32, ISETP.RUR, EXIT, ...body
+
+    PTXAS layout is:
+      S2R, S2UR, LDCU.32, ISETP.RUR, EXIT, [LDCU.64s], ...body
+
+    This pass finds LDCU.64 instructions that are between S2UR and
+    ISETP.RUR+EXIT, and moves them to AFTER the EXIT.  The ISETP+EXIT
+    effectively "jump over" the LDCU.64s.
+
+    Safety: LDCU.64 writes to UR; ISETP.RUR reads a different UR (the
+    LDCU.32 param, not the LDCU.64 descriptor/param).  No dependency.
+    """
+    result = list(instrs)
+
+    # Find the ISETP.RUR + predicated EXIT pair
+    isetp_pos = -1
+    for i in range(len(result) - 1):
+        if (_get_opcode(result[i].raw) == 0xc0c and
+                _get_opcode(result[i + 1].raw) == 0x94d and
+                (result[i + 1].raw[1] >> 4) & 0xF != 0x7):
+            isetp_pos = i
+            break
+    if isetp_pos < 0:
+        return result
+
+    # Find LDCU.64 instructions BEFORE the ISETP that can be moved after EXIT
+    # These are at positions between S2UR (pos ~1) and ISETP (pos isetp_pos)
+    isetp_ur = result[isetp_pos].raw[4]  # UR source of the comparison
+    movable_ldcu64 = []
+    keep = []
+    for i in range(isetp_pos):
+        si = result[i]
+        opc = _get_opcode(si.raw)
+        if (opc == 0x7ac and si.raw[9] == 0x0a  # LDCU.64
+                and si.raw[2] != isetp_ur          # doesn't write the ISETP's UR
+                and si.raw[2] + 1 != isetp_ur):    # pair doesn't either
+            movable_ldcu64.append(si)
+        else:
+            keep.append(si)
+
+    if not movable_ldcu64:
+        return result  # nothing to move
+
+    # Reconstruct: keep[...] + ISETP + EXIT + movable_ldcu64[...] + rest
+    exit_pos = isetp_pos + 1
+    rest = result[exit_pos + 1:]  # everything after EXIT
+    new_result = keep + [result[isetp_pos], result[exit_pos]] + movable_ldcu64 + rest
+    return new_result
+
+
 def _enforce_gpr_latency(instrs: list[SassInstr]) -> list[SassInstr]:
     """Insert NOPs between adjacent ALU instructions with GPR read-after-write hazards.
 
@@ -1229,6 +1283,12 @@ def schedule(instrs: list[SassInstr]) -> list[SassInstr]:
     Ctrl assignment is handled separately by sass.scoreboard.assign_ctrl().
     """
     instrs = _hoist_ldcu64(instrs)
+    # TE24: _hoist_bounds_check disabled — moving LDCU.64 after EXIT
+    # violates the ≥3-instruction latency constraint between LDCU.64
+    # and its UR consumer.  The PTXAS layout works because PTXAS
+    # interleaves LDCU.64 with enough instructions after EXIT to
+    # satisfy the gap.  Our body layout doesn't have those fillers.
+    # instrs = _hoist_bounds_check(instrs)
     instrs = _enforce_gpr_latency(instrs)
     instrs = _fill_ldcu_latency(instrs)
     instrs = _enforce_gpr_latency(instrs)  # re-check after fill reordering

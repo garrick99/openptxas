@@ -2399,11 +2399,23 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                 elif op == 'add' and typ in ('u32', 's32'):
                     d = ctx.ra.r32(instr.dest.name)
                     if isinstance(instr.srcs[1], ImmOp):
-                        # IADD3 with 32-bit immediate: dest = src0 + imm
-                        a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
+                        # TE35: check if source is SR-derived (UR-eligible).
+                        # If so, use UIADD instead of IADD3.IMM.
+                        _src0_name = instr.srcs[0].name if isinstance(instr.srcs[0], RegOp) else None
+                        _sr_source = ctx._reg_sr_source.get(_src0_name) if _src0_name else None
                         imm = instr.srcs[1].value & 0xFFFFFFFF
-                        output.append(SassInstr(encode_iadd3_imm32(d, a, imm, RZ),
-                                                f'IADD3 R{d}, R{a}, 0x{imm:x}, RZ  // add.{typ} imm'))
+                        if (_sr_source is not None and ctx.sm_version == 120
+                                and not getattr(ctx, '_has_vote', False)
+                                and not getattr(ctx, '_has_bar_sync', False)):
+                            # UIADD: adds immediate to UR-eligible value
+                            from sass.encoding.sm_120_opcodes import encode_uiadd_imm
+                            a = ctx.ra.r32(_src0_name) if _src0_name in ctx.ra.int_regs else _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
+                            output.append(SassInstr(encode_uiadd_imm(d, a, imm),
+                                                    f'UIADD R{d}, R{a}, 0x{imm:x}  // TE35: SR-derived add.{typ}'))
+                        else:
+                            a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
+                            output.append(SassInstr(encode_iadd3_imm32(d, a, imm, RZ),
+                                                    f'IADD3 R{d}, R{a}, 0x{imm:x}, RZ  // add.{typ} imm'))
                     elif isinstance(instr.srcs[0], ImmOp):
                         b = _materialize_imm(instr.srcs[1], ctx, ctx.ra, output)
                         imm = instr.srcs[0].value & 0xFFFFFFFF

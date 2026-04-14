@@ -40,12 +40,40 @@ To use the PTXAS-style 0xc11 element-index path, OpenPTXas would need
 to emit .nv.info metadata that tells the driver to use element-indexed
 descriptors (including attr=0x66 which PTXAS emits but we don't).
 
+## attr=0x66: Descriptor Mode Flag
+
+PTXAS emits attr=0x66 with value 0x00000003 in .nv.info for ALL 144
+kernels.  OpenPTXas does NOT emit this attribute.
+
+This attribute controls how the CUDA driver configures the memory
+descriptor: with element-stride (PTXAS, scale by element_size) or
+byte-stride (OpenPTXas, no scaling).
+
 ## What This Rules Out
 
 The 0xc11 carry-chain path **cannot** simply replace IMAD.WIDE + IADD.64-UR
 in non-byte-exact kernels by using raw tid.x.  The descriptor stride mode
-must also be changed, which requires .nv.info attr=0x66 support.
+must also be changed by adding attr=0x66 to .nv.info.
+
+Adding attr=0x66 is an **all-or-nothing** change: it switches ALL memory
+operations to element-indexed descriptors.  ALL existing address computations
+(explicit byte offsets via IMAD.WIDE) would need to change simultaneously.
 
 The current 13 byte-exact kernels work because our output is identical to
 PTXAS (including the nv.info from our PTXAS-matched template), so the
 descriptor is configured identically by the driver.
+
+## Compiler Decision: BYTE_OFFSET_REQUIRED (for now)
+
+The 0xc11 expansion to the 38 parity kernels requires:
+1. Add attr=0x66 to .nv.info (value 0x00000003)
+2. Change ALL address computations from byte-offset to element-index
+3. Remove all IMAD.WIDE + IADD.64-UR → use 0xc11 carry chain
+
+This is a bounded but whole-compiler address-mode change.
+
+## Next Recommended Sprint
+
+TE19: Add attr=0x66 to .nv.info + switch address path to element-index.
+This is the single remaining step to expand the 0xc11 path from 13 to
+potentially all 99 IMAD.WIDE kernels.

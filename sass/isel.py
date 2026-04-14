@@ -828,14 +828,6 @@ def _select_shl_b64(instr: Instruction, ra: RegAlloc,
             # Remove trailing MOV lo copy (if present)
             if output and 'cvt.64.32 lo' in output[-1].comment:
                 output.pop()
-        # TE13 finding: IMAD.WIDE → 0xc11 carry chain cannot be a clean
-        # 2-for-2 swap.  Our IMAD.WIDE fuses cvt.u64.u32 + shl.b64 into
-        # one instruction (multiply + widen).  PTXAS reuses a body-ALU-
-        # computed byte offset and feeds it directly to the 0xc11 pair.
-        # Decomposing IMAD.WIDE into multiply + 0xc11 pair = 3 instrs,
-        # which is +1 over the current 2 (IMAD.WIDE + IADD.64-UR).
-        # Closing this gap requires changing how cvt+shl is fused, which
-        # is a deep isel refactoring beyond the current sprint.
         if ctx:
             if not hasattr(ctx, '_widened_from_32'):
                 ctx._widened_from_32 = set()
@@ -1160,11 +1152,6 @@ def _select_add_u64(instr: Instruction, ra: RegAlloc,
             ra.int_regs[dest.name] = d_lo
         if ctx:
             ctx._gpr_written.add(dest.name)
-
-        # TE13 finding: 0xc11 carry chain can't replace IMAD.WIDE + IADD.64-UR
-        # as a clean 2-for-2 swap because IMAD.WIDE fuses multiply + widen.
-        # Decomposing produces 3 instrs (+1).  The 0xc11 encoder and scoreboard
-        # support are ready but require deeper cvt+shl fusion refactoring.
 
         # IADD.64-UR (original, working path)
         return [

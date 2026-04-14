@@ -1336,16 +1336,26 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
             has_ur_act = getattr(ctx, '_ur_activation_sr', None) is not None
             ur_native_ok = (ctx.sm_version == 120
                             and not has_bar and not has_vote and not has_ur_act)
-            if False and ur_native_ok:  # TE9-B: DISABLED — see note below
-                # TE9-B attempt: inline LDCU.32→UR + ISETP.R-UR for setp params.
-                # Result: 2 regressions (test_isetp_ur_branch, test_alu_isetp_raw).
-                # The ISETP.R-UR encoding is correct (matches PTXAS template),
-                # but body LDCU.32→UR interaction with the scheduler produces
-                # wrong comparison results.  Root cause: the scheduler doesn't
-                # track UR write→read dependencies, so ctrl bytes don't encode
-                # the latency between LDCU.32 and ISETP.R-UR.
-                # Closing this gap requires UR-aware scheduling infrastructure.
-                pass
+            if ur_native_ok:
+                # TE10-B: UR-native path.  LDCU.32 goes in the BODY so
+                # the scoreboard sets correct rbar on the ISETP.R-UR.
+                # GUARD: only for kernels with exactly ONE setp-only u32
+                # param.  Multiple LDCU.32→ISETP.R-UR pairs in the same
+                # kernel produce wrong comparison results (TE10 finding:
+                # second ISETP.R-UR fails for 3-param kernels).
+                # Guard: single setp-only u32 param AND param is used by at
+                # most one setp instruction.  Multiple setp→EXIT sequences
+                # reusing the same UR cause the second ISETP.R-UR to fail
+                # (TE10 finding: @Px EXIT disrupts subsequent UR reads).
+                _n_setp_only_u32 = sum(1 for p in getattr(ctx, '_setp_only_params', set())
+                                        if p in ctx._reg_param_off)
+                _n_setp_uses = getattr(ctx, '_setp_use_count', {}).get(dest.name, 1)
+                if _n_setp_only_u32 <= 1 and _n_setp_uses <= 1:
+                    ur_idx = ctx._next_ur
+                    ctx._next_ur = ur_idx + 1
+                    ctx._ur_params[dest.name] = ur_idx
+                    return [SassInstr(encode_ldcu_32(ur_idx, 0, byte_off),
+                                      f'LDCU.32 UR{ur_idx}, c[0][0x{byte_off:x}]  // TE10: setp UR-native')]
             # Fallback: GPR LDC path
             if ctx.sm_version == 120 and has_bar:
                 if not hasattr(ctx, '_preamble_ldcus'):

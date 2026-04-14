@@ -818,6 +818,18 @@ def compile_function(fn: Function, verbose: bool = False,
                 _setp_only_params.add(pname)
         if _setp_only_params:
             ctx._setp_only_params = _setp_only_params
+            # TE10: count how many setp instructions use each param
+            _setp_use_count = {}
+            for pname in _setp_only_params:
+                cnt = 0
+                for bb in fn.blocks:
+                    for inst in bb.instructions:
+                        if inst.op == 'setp' and any(
+                                getattr(s, 'name', None) == pname
+                                for s in (inst.srcs or [])):
+                            cnt += 1
+                _setp_use_count[pname] = cnt
+            ctx._setp_use_count = _setp_use_count
 
     # Pre-scan: detect if kernel uses bar.sync (shared memory synchronization).
     # Kernels with bar.sync need preamble-only constant loads to avoid

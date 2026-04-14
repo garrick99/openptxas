@@ -1055,12 +1055,21 @@ def compile_function(fn: Function, verbose: bool = False,
                             _safe = False
                             break
                     if _safe:
+                        _lo_dest = _pnext.raw[2]
+                        _lo_src = _psi.raw[3]
+                        # ALLOC-2: check if we can reuse the dying source register.
+                        # PTXAS pattern: lo_dest = src-1, hi_dest = src.
+                        # Only works when lo_dest + 1 == lo_src (consecutive pair).
+                        if _lo_dest + 1 == _lo_src:
+                            _hi_dest = _lo_src  # reuse dying source
+                        else:
+                            _hi_dest = _lo_dest + 1  # standard consecutive pair
                         _pre_new.append(SassInstr(
-                            encode_iadd3_ur_lo(_pnext.raw[2], _psi.raw[3], _pnext.raw[4]),
-                            f'IADD3.UR R{_pnext.raw[2]}, R{_psi.raw[3]}, UR{_pnext.raw[4]}  // TE20: addr lo'))
+                            encode_iadd3_ur_lo(_lo_dest, _lo_src, _pnext.raw[4]),
+                            f'IADD3.UR R{_lo_dest}, R{_lo_src}, UR{_pnext.raw[4]}  // ALLOC: addr lo'))
                         _pre_new.append(SassInstr(
-                            encode_iadd3_ur_hi(_pnext.raw[2] + 1, _psi.raw[3], _pnext.raw[4] + 1),
-                            f'IADD3.UR.X R{_pnext.raw[2]+1}, R{_psi.raw[3]}, UR{_pnext.raw[4]+1}  // TE20: addr hi'))
+                            encode_iadd3_ur_hi(_hi_dest, _lo_src, _pnext.raw[4] + 1),
+                            f'IADD3.UR.X R{_hi_dest}, R{_lo_src}, UR{_pnext.raw[4]+1}  // ALLOC: addr hi'))
                         _pre_skip = True
                         continue
             _pre_new.append(_psi)

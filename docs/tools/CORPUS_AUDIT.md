@@ -93,8 +93,17 @@ required latency between producer and consumer.
 The ISETP.R-UR encoding is verified correct (matches PTXAS byte-for-byte).
 The blocker is scheduler infrastructure, not instruction encoding.
 
-To close the gap:
-1. Add UR dependency tracking to the scheduler (new dependency class)
-2. This unlocks LDCU.32→UR + ISETP.R-UR for 33 parity kernels
-3. Then UIADD substitution for 93 more instructions
-4. Combined: ~60-70% of structural gap could close
+## TE10 Result: UR-Native Path Active
+
+TE10 solved the scheduler blocker: body LDCU.32→UR is tracked by the
+scoreboard's `pending_ur_writes`, and ISETP.R-UR gets correct rbar=0x03.
+
+**ISETP.R-UR now fires for 119/144 kernels** (83% of corpus).
+
+However, byte-exact count remains at 29 (20.1%).  The ISETP substitution
+alone doesn't close the gap because IMAD.WIDE and instruction ordering
+differences dominate the remaining structural divergence.
+
+Remaining path to further gap closure:
+1. Replace IMAD.WIDE with UIADD-based address gen
+2. Match PTXAS instruction ordering in the body

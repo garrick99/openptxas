@@ -737,6 +737,8 @@ def _is_forwarding_safe_pair(writer_opc: int, reader_opc: int) -> bool:
 _LDCU_GAP_EXEMPT_CONSUMERS: set[int] = {
     0xc35,  # IADD.64-UR: wdep/rbar on the add covers the LDCU latency
     0x981,  # LDG.E.64: LDG's own read barrier covers the addr pair
+    0x986,  # TE29: STG.E: rbar on store covers descriptor LDCU latency
+    0xc11,  # TE29: IADD3.R-UR: rbar covers LDCU latency (like 0xc35)
 }
 
 
@@ -1383,6 +1385,13 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
             ur_desc = si.raw[4]
             if ur_desc in pending_ur_writes:
                 _, pw = pending_ur_writes[ur_desc]
+                if pw in _WDEP_TO_RBAR:
+                    rbar = rbar | _WDEP_TO_RBAR[pw]
+        # TE29: STG UR descriptor at b8 — needs rbar for LDCU that loaded it
+        if opcode in _OPCODES_STG:
+            ur_desc_stg = si.raw[8]
+            if ur_desc_stg in pending_ur_writes:
+                _, pw = pending_ur_writes[ur_desc_stg]
                 if pw in _WDEP_TO_RBAR:
                     rbar = rbar | _WDEP_TO_RBAR[pw]
         # STG UR descriptor: ptxas uses rbar=1 for STG, relying on instruction

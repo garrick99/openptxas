@@ -183,7 +183,7 @@ _EXPECTED_COUNTS = {
     #   - Totals grow by the number of LDCU edges R1 used to miss
     #     (STG-consumer edges and LDCU.32 edges).
     "diag":                  (4, 0, 0, 0, 0, 1, 0, 0, 3, 0, 0, 0, 0),
-    "diag3":                 (4, 0, 0, 0, 0, 1, 0, 0, 2, 1, 0, 0, 0),
+    "diag3":                 (4, 0, 0, 0, 0, 1, 0, 0, 3, 0, 0, 0, 0),  # TE29: STG rbar covers desc LDCU
     # FG-4.4 drift: the bug-1 fix moves one u64 param from UR to GPR
     # (LDC.64 direct) on kernels where the param register is redefined
     # later.  That adds one MEMORY_SCOREBOARD_SAFE edge for the new

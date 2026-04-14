@@ -1011,6 +1011,49 @@ def compile_function(fn: Function, verbose: bool = False,
 
     body_instrs = _wb8_pack_ldcu_128(body_instrs)
 
+    # TE20-A: pre-scheduler 0xc11 replacement.  Run BEFORE scheduling so the
+    # GPR latency enforcement pass sees the 0xc11 pair (no IMAD.WIDE→IADD.64-UR
+    # dependency = no stale NOP insertion).  This is the key pipeline reordering
+    # that unlocks the 0xc11 rollout beyond the 13 byte-exact kernels.
+    _ur_act_sr_pre = getattr(ctx, '_ur_activation_sr', None)
+    if _ur_act_sr_pre is None:
+        from sass.encoding.iadd3_ur import encode_iadd3_ur_lo, encode_iadd3_ur_hi
+        from sass.scoreboard import _get_src_regs as _sc_src
+        _pre_new = []
+        _pre_skip = False
+        for _pi in range(len(body_instrs)):
+            if _pre_skip:
+                _pre_skip = False
+                continue
+            _psi = body_instrs[_pi]
+            _popc = struct.unpack_from('<Q', _psi.raw, 0)[0] & 0xFFF
+            if _popc == 0x825 and _pi + 1 < len(body_instrs):
+                _pnext = body_instrs[_pi + 1]
+                _pnext_opc = struct.unpack_from('<Q', _pnext.raw, 0)[0] & 0xFFF
+                if _pnext_opc == 0xc35 and _pnext.raw[3] == _psi.raw[2]:
+                    # Safety check: IMAD.WIDE dest pair must not be read by
+                    # any instruction other than the IADD.64-UR consumer.
+                    _wide_dest = _psi.raw[2]
+                    _wide_pair = {_wide_dest, _wide_dest + 1}
+                    _safe = True
+                    for _pk in range(_pi + 2, len(body_instrs)):
+                        _sk = body_instrs[_pk]
+                        _reads = {_sk.raw[3], _sk.raw[4], _sk.raw[8]}
+                        if _reads & _wide_pair:
+                            _safe = False
+                            break
+                    if _safe:
+                        _pre_new.append(SassInstr(
+                            encode_iadd3_ur_lo(_pnext.raw[2], _psi.raw[3], _pnext.raw[4]),
+                            f'IADD3.UR R{_pnext.raw[2]}, R{_psi.raw[3]}, UR{_pnext.raw[4]}  // TE20: addr lo'))
+                        _pre_new.append(SassInstr(
+                            encode_iadd3_ur_hi(_pnext.raw[2] + 1, _psi.raw[3], _pnext.raw[4] + 1),
+                            f'IADD3.UR.X R{_pnext.raw[2]+1}, R{_psi.raw[3]}, UR{_pnext.raw[4]+1}  // TE20: addr hi'))
+                        _pre_skip = True
+                        continue
+            _pre_new.append(_psi)
+        body_instrs = _pre_new
+
     # 4. Schedule: reorder for LDG latency, then assign ctrl via scoreboard
     raw_instrs = preamble + body_instrs
     reordered = schedule(raw_instrs)
@@ -1122,44 +1165,8 @@ def compile_function(fn: Function, verbose: bool = False,
 
     sass_instrs = preamble_instrs + _ur_activation + body_scheduled
 
-    # TE14/16/17: post-processing pass — replace ADJACENT IMAD.WIDE +
-    # IADD.64-UR pairs with 0xc11 carry-chain pairs.  Adjacent-only is
-    # safe because it only fires on kernels where our output already
-    # matches PTXAS opcode layout (proven byte-exact).  Widening the
-    # search window to non-adjacent pairs was attempted (TE17-B) but
-    # caused 91 regressions — the 0xc11 pair computes a different
-    # address form (element index vs byte offset) that requires
-    # descriptor stride support not yet verified for non-exact kernels.
-    if _ur_act_sr is None:  # skip for atom.xor template kernels
-        from sass.encoding.iadd3_ur import encode_iadd3_ur_lo, encode_iadd3_ur_hi
-        _new = []
-        _skip = False
-        for _idx in range(len(sass_instrs)):
-            if _skip:
-                _skip = False
-                continue
-            _si = sass_instrs[_idx]
-            _opc = struct.unpack_from('<Q', _si.raw, 0)[0] & 0xFFF
-            if (_opc == 0x825 and _idx + 1 < len(sass_instrs)):
-                _next = sass_instrs[_idx + 1]
-                _opc_next = struct.unpack_from('<Q', _next.raw, 0)[0] & 0xFFF
-                if _opc_next == 0xc35:
-                    _wide_dest = _si.raw[2]
-                    _wide_src32 = _si.raw[3]
-                    _iadd_dest = _next.raw[2]
-                    _iadd_gpr = _next.raw[3]
-                    _iadd_ur = _next.raw[4]
-                    if _wide_dest == _iadd_gpr:
-                        _new.append(SassInstr(
-                            encode_iadd3_ur_lo(_iadd_dest, _wide_src32, _iadd_ur),
-                            f'IADD3.UR R{_iadd_dest}, R{_wide_src32}, UR{_iadd_ur}  // TE19: addr lo'))
-                        _new.append(SassInstr(
-                            encode_iadd3_ur_hi(_iadd_dest + 1, _wide_src32, _iadd_ur + 1),
-                            f'IADD3.UR.X R{_iadd_dest+1}, R{_wide_src32}, UR{_iadd_ur+1}  // TE19: addr hi'))
-                        _skip = True
-                        continue
-            _new.append(_si)
-        sass_instrs = _new
+    # TE20: 0xc11 replacement now runs PRE-scheduler (see TE20-A above).
+    # Post-scheduling pass removed — no longer needed.
 
     # 5. BRA offset fixup: resolve branch targets AFTER scheduling.
     # ctx.label_map and ctx._bra_fixups have been updated for UR4 insertion

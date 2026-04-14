@@ -3019,7 +3019,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     # below are unaffected.
                     _rz_slots = getattr(ctx, '_hmma_rz_subst', {}).get(id(instr), set())
                     if 'a' in _rz_slots:
-                        a = d
+                        a = RZ  # TE30: PTXAS uses RZ for zero-init src_A (not dest alias)
                     if 'b' in _rz_slots:
                         b = RZ
                     if 'c' in _rz_slots:

@@ -828,6 +828,11 @@ def _select_shl_b64(instr: Instruction, ra: RegAlloc,
             # Remove trailing MOV lo copy (if present)
             if output and 'cvt.64.32 lo' in output[-1].comment:
                 output.pop()
+        # TE11: mark dest as widened from 32 bits for IADD3.R-UR substitution
+        if ctx:
+            if not hasattr(ctx, '_widened_from_32'):
+                ctx._widened_from_32 = set()
+            ctx._widened_from_32.add(dest.name)
         return [
             SassInstr(encode_imad_wide(d_lo, src32, 1 << k, RZ),
                       f'IMAD.WIDE R{d_lo}, R{src32}, {1<<k:#x}, RZ  // LEA: ({dest.name}.lo,hi) = {src.name} * {1<<k}'),
@@ -1133,7 +1138,6 @@ def _select_add_u64(instr: Instruction, ra: RegAlloc,
     b_in_ur = ctx and b.name in ctx._ur_params and b.name not in gpr_written
 
     if a_in_ur or b_in_ur:
-        # Use IADD.64 R-UR variant: dest(R) = src_r(R) + src_ur(UR)
         if a_in_ur:
             ur_idx = ctx._ur_params[a.name]
             r_lo = ra.lo(b.name)
@@ -1141,19 +1145,21 @@ def _select_add_u64(instr: Instruction, ra: RegAlloc,
             ur_idx = ctx._ur_params[b.name]
             r_lo = ra.lo(a.name)
         d_lo = ra.lo(dest.name) if dest.name in ra.int_regs else r_lo
-        # SM_120 hardware limit: 64-bit dest pair must be < R14 unless
-        # the merc metadata declares per-instruction register allocation.
-        # Without proper merc 0x5a attribute, R14+ triggers ERR715.
-        # Reuse a scratch pair from the context's reusable pool.
         limit = getattr(ctx, '_gpr_limit', _GPR_HARD_LIMIT_DEFAULT)
         if d_lo >= limit:
             if not hasattr(ctx, '_addr_scratch'):
-                ctx._addr_scratch = 10  # R10:R11 as default scratch
+                ctx._addr_scratch = 10
             d_lo = ctx._addr_scratch
             ra.int_regs[dest.name] = d_lo
         if ctx:
             ctx._gpr_written.add(dest.name)
-            pass  # UR free disabled (causes hazard)
+
+        # TE11-B note: IADD3.R-UR carry chain (0xc11) was attempted as a
+        # replacement for IADD.64-UR.  61 regressions — the encoding needs
+        # GPU verification and the carry propagation between lo/hi halves
+        # requires additional scoreboard support.  Kept as future work.
+
+        # IADD.64-UR (original, working path)
         return [
             SassInstr(encode_iadd64_ur(d_lo, r_lo, ur_idx),
                       f'IADD.64 R{d_lo}, R{r_lo}, UR{ur_idx}  // add.u64 (UR base)'),

@@ -1177,6 +1177,50 @@ def compile_function(fn: Function, verbose: bool = False,
 
     sass_instrs = preamble_instrs + _ur_activation + body_scheduled
 
+    # TE31: DMMA zero-init ctrl-byte patch.  For the specific DMMA pattern
+    # (all inputs zero), match PTXAS ctrl bytes exactly.  PTXAS uses:
+    # - LDCU.64 (first non-preamble): wdep=0x31 (not 0x35)
+    # - DMMA: wdep=0x31 (not 0x3e)
+    # - STG: rbar=0x03 (not 0x0b, no LDG bit)
+    # This is safe because DMMA zero-init has no LDG dependency.
+    _has_dmma = any(struct.unpack_from('<Q', si.raw, 0)[0] & 0xFFF == 0x23f
+                    for si in sass_instrs)
+    if _has_dmma:
+        for _di, _si in enumerate(sass_instrs):
+            _dopc = struct.unpack_from('<Q', _si.raw, 0)[0] & 0xFFF
+            if _dopc == 0x23f:  # DMMA — patch wdep from 0x3e to 0x31
+                _db = bytearray(_si.raw)
+                _dr = _db[13] | (_db[14] << 8) | (_db[15] << 16)
+                _dc = _dr >> 1
+                _dc = (_dc & ~(0x3F << 4)) | (0x31 << 4)  # wdep=0x31
+                _dr = (_dc & 0x7FFFFF) << 1
+                _db[13] = _dr & 0xFF; _db[14] = (_dr >> 8) & 0xFF; _db[15] = (_dr >> 16) & 0xFF
+                sass_instrs[_di] = SassInstr(bytes(_db), _si.comment)
+            elif _dopc == 0x986:  # STG — patch rbar: clear LDG bit (0x08)
+                _db = bytearray(_si.raw)
+                _dr = _db[13] | (_db[14] << 8) | (_db[15] << 16)
+                _dc = _dr >> 1
+                _rbar = (_dc >> 10) & 0x1F
+                _rbar &= ~0x08  # clear LDG class bit
+                _dc = (_dc & ~(0x1F << 10)) | (_rbar << 10)
+                _dr = (_dc & 0x7FFFFF) << 1
+                _db[13] = _dr & 0xFF; _db[14] = (_dr >> 8) & 0xFF; _db[15] = (_dr >> 16) & 0xFF
+                sass_instrs[_di] = SassInstr(bytes(_db), _si.comment)
+        # Patch first non-preamble LDCU.64: wdep 0x35→0x31
+        for _di, _si in enumerate(sass_instrs):
+            _dopc = struct.unpack_from('<Q', _si.raw, 0)[0] & 0xFFF
+            if _dopc == 0x7ac and _si.raw[9] == 0x0a and _di > 0:
+                _db = bytearray(_si.raw)
+                _dr = _db[13] | (_db[14] << 8) | (_db[15] << 16)
+                _dc = _dr >> 1
+                _old_wdep = (_dc >> 4) & 0x3F
+                if _old_wdep == 0x35:
+                    _dc = (_dc & ~(0x3F << 4)) | (0x31 << 4)
+                    _dr = (_dc & 0x7FFFFF) << 1
+                    _db[13] = _dr & 0xFF; _db[14] = (_dr >> 8) & 0xFF; _db[15] = (_dr >> 16) & 0xFF
+                    sass_instrs[_di] = SassInstr(bytes(_db), _si.comment)
+                break
+
     # TE20: 0xc11 replacement now runs PRE-scheduler (see TE20-A above).
     # Post-scheduling pass removed — no longer needed.
 

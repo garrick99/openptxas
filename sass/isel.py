@@ -828,7 +828,11 @@ def _select_shl_b64(instr: Instruction, ra: RegAlloc,
             # Remove trailing MOV lo copy (if present)
             if output and 'cvt.64.32 lo' in output[-1].comment:
                 output.pop()
-        # TE11: mark dest as widened from 32 bits for IADD3.R-UR substitution
+        # TE12 note: IMAD.WIDE → 0xc11 carry chain requires coordinated
+        # changes between shl.b64 (produces IMAD.WIDE) and add.u64 (consumes
+        # it with IADD.64-UR).  Needs isel-level consumer-aware emission,
+        # which is beyond single-sprint scope.  The _widened_from_32 flag
+        # is tracked for future use but IMAD.WIDE is still emitted.
         if ctx:
             if not hasattr(ctx, '_widened_from_32'):
                 ctx._widened_from_32 = set()
@@ -1154,10 +1158,10 @@ def _select_add_u64(instr: Instruction, ra: RegAlloc,
         if ctx:
             ctx._gpr_written.add(dest.name)
 
-        # TE11-B note: IADD3.R-UR carry chain (0xc11) was attempted as a
-        # replacement for IADD.64-UR.  61 regressions — the encoding needs
-        # GPU verification and the carry propagation between lo/hi halves
-        # requires additional scoreboard support.  Kept as future work.
+        # TE12 note: IADD3.R-UR (0xc11) carry chain is GPU-validated and
+        # scoreboard-supported, but integration requires coordinated
+        # IMAD.WIDE suppression across shl.b64 and add.u64 handlers.
+        # Kept as future work — the encoder + scoreboard are ready.
 
         # IADD.64-UR (original, working path)
         return [

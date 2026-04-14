@@ -386,6 +386,10 @@ def _hoist_ldcu64(instrs: list[SassInstr]) -> list[SassInstr]:
         ldcu64s.sort(key=_consumer_pos)
         if non_s2r_remaining:
             # Order: LDC R1, S2R(s), LDCU.64(s), rest
+            # TE25 note: moving LDCU.64 to post-boundary (after EXIT) was
+            # attempted to match PTXAS layout.  11 regressions remain due
+            # to ATOMG/LDG consumers needing UR params before body ALU
+            # fillers are available.  Kept as pre-boundary (original).
             pre_result = non_s2r_remaining[:1] + s2r_instrs + ldcu64s + non_s2r_remaining[1:]
         else:
             pre_result = s2r_instrs + ldcu64s

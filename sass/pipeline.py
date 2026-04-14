@@ -1122,11 +1122,14 @@ def compile_function(fn: Function, verbose: bool = False,
 
     sass_instrs = preamble_instrs + _ur_activation + body_scheduled
 
-    # TE14/16: post-processing pass — replace IMAD.WIDE + IADD.64-UR pairs
-    # with 0xc11 carry-chain pairs.  This is a safe local transformation
-    # on the already-emitted instruction stream (no cross-handler state).
-    # Pattern: IMAD.WIDE(0x825) at [i] followed by IADD.64-UR(0xc35) at [i+1]
-    # where IMAD.WIDE dest pair == IADD.64-UR GPR source.
+    # TE14/16/17: post-processing pass — replace ADJACENT IMAD.WIDE +
+    # IADD.64-UR pairs with 0xc11 carry-chain pairs.  Adjacent-only is
+    # safe because it only fires on kernels where our output already
+    # matches PTXAS opcode layout (proven byte-exact).  Widening the
+    # search window to non-adjacent pairs was attempted (TE17-B) but
+    # caused 91 regressions — the 0xc11 pair computes a different
+    # address form (element index vs byte offset) that requires
+    # descriptor stride support not yet verified for non-exact kernels.
     if _ur_act_sr is None:  # skip for atom.xor template kernels
         from sass.encoding.iadd3_ur import encode_iadd3_ur_lo, encode_iadd3_ur_hi
         _new = []
@@ -1141,22 +1144,18 @@ def compile_function(fn: Function, verbose: bool = False,
                 _next = sass_instrs[_idx + 1]
                 _opc_next = struct.unpack_from('<Q', _next.raw, 0)[0] & 0xFFF
                 if _opc_next == 0xc35:
-                    # IMAD.WIDE dest at b2, src32 at b3
                     _wide_dest = _si.raw[2]
                     _wide_src32 = _si.raw[3]
-                    # IADD.64-UR dest at b2, gpr_src at b3, ur_src at b4
                     _iadd_dest = _next.raw[2]
                     _iadd_gpr = _next.raw[3]
                     _iadd_ur = _next.raw[4]
-                    # Check: IMAD.WIDE dest pair == IADD.64-UR GPR source
                     if _wide_dest == _iadd_gpr:
-                        # Replace with 0xc11 carry chain
                         _new.append(SassInstr(
                             encode_iadd3_ur_lo(_iadd_dest, _wide_src32, _iadd_ur),
-                            f'IADD3.UR R{_iadd_dest}, R{_wide_src32}, UR{_iadd_ur}  // TE16: addr lo'))
+                            f'IADD3.UR R{_iadd_dest}, R{_wide_src32}, UR{_iadd_ur}  // TE17: addr lo'))
                         _new.append(SassInstr(
                             encode_iadd3_ur_hi(_iadd_dest + 1, _wide_src32, _iadd_ur + 1),
-                            f'IADD3.UR.X R{_iadd_dest+1}, R{_wide_src32}, UR{_iadd_ur+1}  // TE16: addr hi'))
+                            f'IADD3.UR.X R{_iadd_dest+1}, R{_wide_src32}, UR{_iadd_ur+1}  // TE17: addr hi'))
                         _skip = True
                         continue
             _new.append(_si)

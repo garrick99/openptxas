@@ -184,6 +184,13 @@ def _build_nv_info_kernel(num_gprs: int = 8, num_params: int = 2,
 
     buf = bytearray()
 
+    # TE19-A: EIATTR 0x66 — descriptor element-stride mode.
+    # PTXAS emits this for ALL SM_120 kernels (value 0x03).  It tells the
+    # driver to configure memory descriptors with element-size scaling so
+    # STG/LDG use element-index addressing (GPR holds element index, not
+    # byte offset).  Without this, descriptors use byte addressing.
+    buf.extend(bytes([0x04, 0x66, 0x04, 0x00, 0x03, 0x00, 0x00, 0x00]))
+
     # EIATTR_REGCOUNT (0x37): always 0x82
     buf.extend(bytes([0x04, 0x37, 0x04, 0x00, 0x82, 0x00, 0x00, 0x00]))
 

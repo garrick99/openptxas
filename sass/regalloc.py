@@ -622,6 +622,9 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
     free_regs_32: list[int] = []  # available single registers
     quarantine_64: list[int] = []  # FB-5.1: address pairs in 1-step cooldown
     next_gpr = 3 if _reserve_r2_for_addr else 2  # R0-R1 reserved; R2 for 0xc11 addr pair
+    # FG27 HARD BAIL: R0 body-temp reuse causes 90 GPU failures.
+    # Register shift propagates through scheduling/scoreboard.
+    # R0 remains reserved (not allocated).
 
     for name, is_64, first_def, last_use in reg_info:
         # FB-5.1: previous step's quarantine becomes available now.

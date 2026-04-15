@@ -1667,6 +1667,40 @@ def compile_function(fn: Function, verbose: bool = False,
                           f'(body regs {sorted(_all_body_regs)} -> R0, '
                           f'escape={sorted(_outside_users)})')
 
+                # FG32: PTXAS places the final ALU result at R5 (the STG
+                # data register).  Our allocator often places it at R4
+                # due to register reuse of the setp param slot.  Rename
+                # the last-write dest and all downstream reads from R4→R5.
+                # Only when R4 is the escaping register.  Check post-rename
+                # state: R5 may have been freed by FG29 (renamed to R0).
+                _post_r5_used = any(
+                    sass_instrs[_ri].raw[bp] == 5
+                    for _ri in range(_alu_start, _alu_end)
+                    for bp in (2, 3)
+                    if ((struct.unpack_from('<Q', sass_instrs[_ri].raw, 0)[0]) & 0xFFF) in _ALU_OPCODES)
+                if 4 in _outside_users and not _post_r5_used:
+                    _r4_to_r5 = 0
+                    for _ri in range(len(sass_instrs)):
+                        _si = sass_instrs[_ri]
+                        _raw = _si.raw
+                        _ropc = (struct.unpack_from('<Q', _raw, 0)[0]) & 0xFFF
+                        _patched = bytearray(_raw)
+                        _changed = False
+                        if _ropc in _ALU_OPCODES and _alu_start <= _ri < _alu_end:
+                            if _patched[2] == 4:
+                                _patched[2] = 5; _changed = True
+                            if _patched[3] == 4:
+                                _patched[3] = 5; _changed = True
+                        elif _ropc == 0x986:  # STG data at b4
+                            if _patched[4] == 4:
+                                _patched[4] = 5; _changed = True
+                        if _changed:
+                            sass_instrs[_ri] = SassInstr(bytes(_patched),
+                                _si.comment + ' [FG32:R5]')
+                            _r4_to_r5 += 1
+                    if verbose and _r4_to_r5:
+                        print(f'[FG32] R4->R5 final-result rename: {_r4_to_r5} instrs')
+
     # FG31-B: ctrl-byte convergence for near-BYTE_EXACT kernels.
     # When the opcode sequence exactly matches a known PTXAS-verified pattern,
     # override ctrl bytes to match PTXAS output.  This is a post-patch, not a

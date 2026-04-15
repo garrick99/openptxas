@@ -90,6 +90,7 @@ class AllocResult:
     num_pred: int                     # predicate regs used
     num_uniform: int                  # uniform regs used
     direct_ldc_params: set = None     # WB-5.0: u64 params eligible for LDC.64
+    addr_pair_colocated: bool = False  # ALLOC-SUBSYS-2: add.u64 dest co-located with cvt pair
 
     def __post_init__(self):
         if self.direct_ldc_params is None:
@@ -527,6 +528,56 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
     # Identify 32-bit registers that are cvt.u64.u32 sources — prefer even alignment
     cvt_sources = set(cvt_colocate.values()) if cvt_colocate else set()
 
+    # FB-5.1 (moved up for ALLOC-SUBSYS-2): u64 vregs used as memory address
+    # bases (ld/st/atom MemOp.base).
+    addr_vregs: set[str] = set()
+    for inst in all_instrs:
+        if inst.op in ('ld', 'st', 'atom') and 'global' in inst.types:
+            for src in inst.srcs:
+                if isinstance(src, MemOp) and isinstance(src.base, str):
+                    bn = src.base if src.base.startswith('%') else f'%{src.base}'
+                    addr_vregs.add(bn)
+
+    # ALLOC-SUBSYS-2: Reserve R2 for 0xc11 address pair lo when the kernel
+    # has cvt.u64.u32 AND global memory operations.  PTXAS assigns the
+    # first PTX virtual register (element offset from mad.lo) to R3, keeping
+    # R2 free for the carry-chain lo dest so the pair {R2,R3} forms naturally.
+    # Without this, our allocator puts the offset at R2, making the constrained
+    # pair {R1,R2} which collides with the preamble-reserved R1.
+    #
+    # The cvt.u64.u32 widens an element index to 64-bit, which feeds (via shl +
+    # add.u64) into the global memory address.  The condition is: cvt_colocate
+    # is non-empty (has cvt.u64.u32) AND the kernel has global ld/st/atom
+    # (addr_vregs non-empty, meaning some vreg is a global memory base).
+    _has_global_mem = bool(addr_vregs)
+    _reserve_r2_for_addr = bool(cvt_colocate) and _has_global_mem
+
+    # ALLOC-SUBSYS-2b: Address-chain co-location.  When add.u64 %rd2, %X, %rd1
+    # where %rd1 is from cvt.u64.u32 and %rd2 is used as a global address base,
+    # co-locate %rd2 at %rd1's pair.  PTXAS does this: the 0xc11 pair overwrites
+    # the widened offset pair with the final address in-place.
+    add_colocate: dict[str, str] = {}  # add dest → cvt dest (= pair to reuse)
+    if _reserve_r2_for_addr:
+        cvt_dests = set(cvt_colocate.keys())
+        for inst in all_instrs:
+            if (inst.op == 'add'
+                    and any(t in ('u64', 's64', 'b64') for t in inst.types)
+                    and isinstance(inst.dest, RegOp)
+                    and len(inst.srcs) >= 2):
+                dest_name = inst.dest.name
+                if dest_name not in addr_vregs:
+                    continue
+                # Check if either source is a cvt.u64.u32 result
+                for src in inst.srcs:
+                    if isinstance(src, RegOp) and src.name in cvt_dests:
+                        # Verify the cvt result dies at this add (last_use == add's index)
+                        cvt_dest_name = src.name
+                        cvt_last = reg_last_use.get(cvt_dest_name, -1)
+                        add_def = reg_first_def.get(dest_name, -1)
+                        if cvt_last <= add_def:
+                            add_colocate[dest_name] = cvt_dest_name
+                        break
+
     # Linear scan register allocation for GPRs
     # Sort registers by first definition order
     reg_info = []  # (name, is_64, first_def, last_use)
@@ -559,20 +610,10 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
     # Sort by first definition
     reg_info.sort(key=lambda x: x[2])
 
-    # FB-5.1: u64 vregs used as memory address bases (ld/st/atom MemOp.base).
-    # When such a vreg expires, its pair must NOT be immediately reused as the
-    # destination of the next 64-bit allocation: the next IADD.64-UR would
-    # write the same R4:R5 the in-flight LDG.E is still consuming as address,
-    # producing a WAR hazard the existing single-NOP wait-state pass cannot
-    # cover.  We defer such pair into a one-step "quarantine" so it is only
-    # available to the allocation AFTER the immediate next one.
-    addr_vregs: set[str] = set()
-    for inst in all_instrs:
-        if inst.op in ('ld', 'st', 'atom') and 'global' in inst.types:
-            for src in inst.srcs:
-                if isinstance(src, MemOp) and isinstance(src.base, str):
-                    bn = src.base if src.base.startswith('%') else f'%{src.base}'
-                    addr_vregs.add(bn)
+    # FB-5.1: addr_vregs (computed above) drives quarantine — when such a vreg
+    # expires, its pair enters a one-step cooldown to prevent WAR hazards where
+    # the next IADD.64-UR would write the same pair an in-flight LDG.E still
+    # consumes as address.
 
     # Linear scan: assign physical registers, reclaiming dead ones
     # active = [(name, phys_reg, last_use, is_64)]
@@ -580,7 +621,7 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
     free_regs_64: list[int] = []  # available even-aligned register pairs
     free_regs_32: list[int] = []  # available single registers
     quarantine_64: list[int] = []  # FB-5.1: address pairs in 1-step cooldown
-    next_gpr = 2  # R0-R1 reserved
+    next_gpr = 3 if _reserve_r2_for_addr else 2  # R0-R1 reserved; R2 for 0xc11 addr pair
 
     for name, is_64, first_def, last_use in reg_info:
         # FB-5.1: previous step's quarantine becomes available now.
@@ -690,6 +731,47 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
                             active = [(n, r, l, w) for n, r, l, w in active
                                       if n != src_name]
                             colocated = True
+                    elif src_phys % 2 == 1 and _reserve_r2_for_addr and src_phys >= 1:
+                        # ALLOC-SUBSYS-2: Odd-aligned co-location for 0xc11
+                        # address pair.  Place pair at (src-1):(src) so
+                        # the carry-chain lo dest = src-1 and hi = src
+                        # (reusing the dying element offset register).
+                        lo_slot = src_phys - 1
+                        pair_ok = True
+                        for aname, areg, alast, a64 in active:
+                            if aname == src_name:
+                                continue
+                            if a64 and areg == lo_slot:
+                                pair_ok = False; break
+                            if not a64 and areg == lo_slot and alast >= first_def:
+                                pair_ok = False; break
+                        if pair_ok:
+                            phys = lo_slot  # even-aligned pair base
+                            if phys in free_regs_64:
+                                free_regs_64.remove(phys)
+                            if phys in free_regs_32:
+                                free_regs_32.remove(phys)
+                            if phys + 1 in free_regs_32:
+                                free_regs_32.remove(phys + 1)
+                            if next_gpr <= phys + 1:
+                                next_gpr = phys + 2
+                            active = [(n, r, l, w) for n, r, l, w in active
+                                      if n != src_name]
+                            colocated = True
+            # ALLOC-SUBSYS-2b: address-chain co-location (add.u64 dest → cvt pair).
+            if not colocated and name in add_colocate:
+                cvt_pair_name = add_colocate[name]
+                if cvt_pair_name in int_regs:
+                    pair_phys = int_regs[cvt_pair_name]
+                    # Reuse the cvt result's pair.  The cvt result dies at this
+                    # add instruction, so we can safely take over its slot.
+                    phys = pair_phys
+                    # Remove the cvt result from active (its slot is ours now)
+                    active = [(n, r, l, w) for n, r, l, w in active
+                              if n != cvt_pair_name]
+                    if phys in free_regs_64:
+                        free_regs_64.remove(phys)
+                    colocated = True
             if not colocated and free_regs_64:
                 phys = free_regs_64.pop(0)
             elif not colocated:
@@ -754,8 +836,10 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
                 # directly so all 4 accumulator registers are contiguous in GPR space.
                 phys = next_gpr
                 next_gpr += 1
-            elif name in cvt_sources and any(r % 2 == 0 for r in free_regs_32):
-                # cvt.u64.u32 source: prefer even-aligned for co-location
+            elif (name in cvt_sources and not _reserve_r2_for_addr
+                  and any(r % 2 == 0 for r in free_regs_32)):
+                # cvt.u64.u32 source: prefer even-aligned for co-location.
+                # Skip when R2 is reserved — odd co-location handles it.
                 even = next(r for r in sorted(free_regs_32) if r % 2 == 0)
                 free_regs_32.remove(even)
                 phys = even
@@ -779,8 +863,11 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
                     phys = next_gpr
                     next_gpr += 1
             else:
-                if name in cvt_sources and next_gpr % 2 != 0:
-                    # cvt source: bump to even for co-location
+                if (name in cvt_sources and next_gpr % 2 != 0
+                        and not _reserve_r2_for_addr):
+                    # cvt source: bump to even for co-location.
+                    # Skip when R2 is reserved — odd co-location handles
+                    # the pair at (src-1):(src) instead.
                     free_regs_32.append(next_gpr)
                     next_gpr += 1
                 phys = next_gpr
@@ -876,4 +963,5 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
         num_pred=max(next_pred, 1),
         num_uniform=max(next_ur, 5),
         direct_ldc_params=direct_ldc_params if sm_version == 120 else set(),
+        addr_pair_colocated=bool(add_colocate),
     )

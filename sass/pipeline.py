@@ -1035,22 +1035,43 @@ def compile_function(fn: Function, verbose: bool = False,
                     # any instruction other than the IADD.64-UR consumer.
                     # Use b3 and b4 for GPR reads; b8 is UR for STG/LDG
                     # (not GPR) so exclude it to avoid false UR/GPR aliasing.
+                    #
+                    # FG23: when IADD.64-UR dest == IMAD.WIDE dest (co-located
+                    # address pair from ALLOC-SUBSYS-2), STG/LDG b3 reads the
+                    # 0xc11 OUTPUT (the computed address), not the IMAD.WIDE
+                    # intermediate. Exclude memory-instruction address reads
+                    # (b3 for STG/LDG) from the check in this case.
                     _wide_dest = _psi.raw[2]
                     _wide_pair = {_wide_dest, _wide_dest + 1}
+                    _iadd_dest = _pnext.raw[2]
+                    # FG23: co-located address pair from ALLOC-SUBSYS-2.
+                    # Only R2:R3 (the reserved pair) qualifies.  Non-address
+                    # IMAD.WIDE (HMMA/DMMA data widening) at other pairs must
+                    # NOT bypass the safety check.
+                    _colocated = (alloc.addr_pair_colocated
+                                  and _iadd_dest == _wide_dest
+                                  and _wide_dest == 2)
                     _safe = True
                     for _pk in range(_pi + 2, len(body_instrs)):
                         _sk = body_instrs[_pk]
                         _sk_opc = struct.unpack_from('<Q', _sk.raw, 0)[0] & 0xFFF
                         # GPR source registers: b3 (always), b4 (for STG data,
                         # ALU src1); b8 only for non-memory ALU ops
-                        _reads = {_sk.raw[3]}
-                        if _sk_opc not in (0x986, 0x981, 0x7ac, 0x94d, 0x947, 0x918):
-                            _reads.add(_sk.raw[4])
-                            _reads.add(_sk.raw[8])
-                        else:
-                            # STG: b4 is data register (GPR)
+                        _reads = set()
+                        if _sk_opc in (0x986, 0x981):
+                            # STG/LDG: b3 is address pair lo.
+                            # When co-located, b3 reads the 0xc11 output — safe.
+                            if not _colocated:
+                                _reads.add(_sk.raw[3])
+                            # STG: b4 is data register (always a real GPR read)
                             if _sk_opc == 0x986:
                                 _reads.add(_sk.raw[4])
+                        elif _sk_opc in (0x7ac, 0x94d, 0x947, 0x918):
+                            _reads.add(_sk.raw[3])
+                        else:
+                            _reads.add(_sk.raw[3])
+                            _reads.add(_sk.raw[4])
+                            _reads.add(_sk.raw[8])
                         if _reads & _wide_pair:
                             _safe = False
                             break

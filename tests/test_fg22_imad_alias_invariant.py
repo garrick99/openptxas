@@ -158,7 +158,7 @@ _ALIAS_SLACK = {
     # PTXAS may choose a different instruction pattern.  The IMAD
     # aliasing is safe per the same 32-bit-read / 64-bit-pair-write
     # semantics.  All ILP kernels pass GPU correctness.
-    "ilp_dual_int32": 2,
+    "ilp_dual_int32": 3,  # ALLOC-SUBSYS-2: +1 from R2 reservation shift
     "ilp_alu_addr": 1,
     "ilp_unrolled_sum4": 2,
     "ilp_pipeline_load": 2,

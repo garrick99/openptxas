@@ -865,8 +865,10 @@ def encode_isetp_ur(pred_dest: int, src_reg: int, ur_src: int,
     """
     if ctrl == 0:
         ctrl = _CTRL_DEFAULT
-    parity_bit = 0x02 if (src_reg & 1) else 0x00
-    b9_val = ((cmp & 0xF) << 4) | parity_bit
+    # FG31: PTXAS always uses parity=0 for ISETP.R-UR regardless of
+    # source register parity.  The parity bit was a misread of the
+    # ground truth (FG-2.1) — src_reg oddness does NOT set bit 1.
+    b9_val = (cmp & 0xF) << 4
     b8_val = 0x70
     return _build(0x0c, 0x7c,
                   b2=pred_dest & 0xFF, b3=src_reg, b4=ur_src & 0xFF,

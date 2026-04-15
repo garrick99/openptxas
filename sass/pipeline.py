@@ -1476,24 +1476,52 @@ def compile_function(fn: Function, verbose: bool = False,
         for i, si in enumerate(sass_instrs):
             print(f"  +{i*16:4d}: {si.hex()}  // {si.comment}")
 
-    # SM_120 rule #29: the first LDCU.64 param load after @P0 EXIT must use
-    # b9=0x0c (not 0x0a). ptxas uses this encoding. Without it, post-EXIT
-    # param loads cause 715.
-    if sm_version >= 120:
-        found_exit = False
+    # FG30-B: swap post-EXIT LDCU ordering for MIXED-eligible kernels.
+    # PTXAS places addr base LDCU first, descriptor LDCU second.
+    # Our scheduler places descriptor first.  Swap them.
+    _fg30_eligible = getattr(ctx, '_fg26_ur4_start', False)
+    if _fg30_eligible and sm_version >= 120:
+        # Find the two post-EXIT LDCU.64 instructions
+        _post_exit = False
+        _post_ldcu_indices = []
         for i, si in enumerate(sass_instrs):
             opc = (si.raw[0] | (si.raw[1] << 8)) & 0xFFF
             guard = (si.raw[1] >> 4) & 0xF
             if opc == 0x94d and guard != 7:  # predicated EXIT
-                found_exit = True
-            if found_exit and opc == 0x7ac and si.raw[9] == 0x0a:
-                if si.raw[5] >= 0x70 and 'deferred' not in si.comment:
-                    # Only patch non-deferred post-EXIT LDCU.64 (preamble loads).
-                    # Deferred LDCU.64 deep in the body use standard b9=0x0a.
-                    patched = bytearray(si.raw)
-                    patched[9] = 0x0c
-                    sass_instrs[i] = SassInstr(bytes(patched), si.comment + ' [b9=0x0c]')
-                    break
+                _post_exit = True
+            if _post_exit and opc == 0x7ac and si.raw[9] in (0x0a, 0x0c):
+                _post_ldcu_indices.append(i)
+        if len(_post_ldcu_indices) >= 2:
+            _i1, _i2 = _post_ldcu_indices[0], _post_ldcu_indices[1]
+            _si1 = sass_instrs[_i1]
+            _si2 = sass_instrs[_i2]
+            # Check: first is descriptor (UR4), second is addr base (UR6+)
+            if _si1.raw[2] == 4 and _si2.raw[2] >= 6:
+                # Swap: put addr base first, descriptor second
+                # Both use b9=0x0a (PTXAS convention — no b9=0x0c needed)
+                _p1 = bytearray(_si2.raw)
+                _p2 = bytearray(_si1.raw)
+                _p1[9] = 0x0a  # addr base: standard encoding
+                _p2[9] = 0x0a  # descriptor: standard encoding
+                sass_instrs[_i1] = SassInstr(bytes(_p1), _si2.comment + ' [FG30:swap]')
+                sass_instrs[_i2] = SassInstr(bytes(_p2), _si1.comment + ' [FG30:swap]')
+    else:
+        # SM_120 rule #29: the first LDCU.64 param load after @P0 EXIT must use
+        # b9=0x0c (not 0x0a). ptxas uses this encoding. Without it, post-EXIT
+        # param loads cause 715.
+        if sm_version >= 120:
+            found_exit = False
+            for i, si in enumerate(sass_instrs):
+                opc = (si.raw[0] | (si.raw[1] << 8)) & 0xFFF
+                guard = (si.raw[1] >> 4) & 0xF
+                if opc == 0x94d and guard != 7:  # predicated EXIT
+                    found_exit = True
+                if found_exit and opc == 0x7ac and si.raw[9] == 0x0a:
+                    if si.raw[5] >= 0x70 and 'deferred' not in si.comment:
+                        patched = bytearray(si.raw)
+                        patched[9] = 0x0c
+                        sass_instrs[i] = SassInstr(bytes(patched), si.comment + ' [b9=0x0c]')
+                        break
 
     # FG29-C: post-scheduling R0 normalization for MIXED kernels.
     # Rename body ALU temp registers {R4, R5, R6, ...} → R0 where PTXAS

@@ -1707,31 +1707,96 @@ def compile_function(fn: Function, verbose: bool = False,
     # scoreboard change — it only fires for exact pattern matches.
     if _fg30_eligible:
         _fg31_opcodes = [((si.raw[0] | (si.raw[1] << 8)) & 0xFFF) for si in sass_instrs]
-        # Pattern: k100_imm_heavy / k200_wide_imm family
-        # LDC S2R LDCU ISETP EXIT LDCU UIADD LDCU LOP3 LOP3 LOP3 IADD3.UR IADD3.UR STG EXIT BRA
-        _FG31_PATTERN_A = [0xb82, 0x919, 0x7ac, 0xc0c, 0x94d,
-                           0x7ac, 0x835, 0x7ac, 0x812, 0x812, 0x812,
-                           0xc11, 0xc11, 0x986, 0x94d, 0x947]
-        _FG31_CTRL_A = [
-            (0xe2, 0x0f, 0x00), (0x22, 0x0e, 0x00), (0x24, 0x0e, 0x00),
-            (0xda, 0x1f, 0x00), (0xea, 0x0f, 0x00), (0x22, 0x0e, 0x00),
-            (0xe2, 0x0f, 0x00), (0x68, 0x0e, 0x00), (0xc8, 0x0f, 0x00),
-            (0xc8, 0x0f, 0x00), (0xe4, 0x0f, 0x00), (0xc8, 0x1f, 0x00),
-            (0xca, 0x0f, 0x00), (0xe2, 0x2f, 0x00), (0xea, 0x0f, 0x00),
-            (0xc0, 0x0f, 0x00)]
+        _fg31_n = len(sass_instrs)
 
-        if _fg31_opcodes == _FG31_PATTERN_A:
+        # FG33: generalized ctrl-byte convergence for the MIXED-kernel family.
+        # Structure: [LDC, S2R, LDCU, ISETP, EXIT, LDCU, ALU_0, LDCU, ...body ALU...,
+        #             IADD3.UR, IADD3.UR, STG, EXIT, BRA]
+        # Preamble (positions 0-7) and postamble (last 5) have fixed ctrl.
+        # Body ALU (positions 8 to n-6): intermediate=0xc80f, last=0xe40f
+        # (IMAD variant: intermediate=0xca0f, last=0xe20f)
+        _FG33_PREAMBLE = {
+            0: (0xe2, 0x0f), 1: (0x22, 0x0e), 2: (0x24, 0x0e),
+            3: (0xda, 0x1f), 4: (0xea, 0x0f), 5: (0x22, 0x0e),
+            6: (0xe2, 0x0f),  # first body ALU (UIADD or equiv)
+        }
+        # Position 7 (LDCU after first ALU): 0x68 for IMAD/UIADD body, 0x66 for LOP3
+        _FG33_POSTAMBLE = {
+            -5: (0xc8, 0x1f), -4: (0xca, 0x0f), -3: (0xe2, 0x2f),
+            -2: (0xea, 0x0f), -1: (0xc0, 0x0f),
+        }
+
+        # Validate structure: preamble must be LDC S2R LDCU ISETP EXIT LDCU ALU LDCU
+        _preamble_opc = [0xb82, 0x919, 0x7ac, 0xc0c, 0x94d, 0x7ac]
+        _postamble_opc = [0xc11, 0xc11, 0x986, 0x94d, 0x947]
+        _fg33_ok = (_fg31_n >= 14
+                    and _fg31_opcodes[:6] == _preamble_opc
+                    and _fg31_opcodes[-5:] == _postamble_opc
+                    and _fg31_opcodes[7] == 0x7ac)  # LDCU at position 7
+
+        if _fg33_ok:
             _fg31_patched = 0
-            for _fi in range(len(sass_instrs)):
+            for _fi in range(_fg31_n):
                 _si = sass_instrs[_fi]
-                _b13, _b14, _b15 = _FG31_CTRL_A[_fi]
-                if _si.raw[13] != _b13 or _si.raw[14] != _b14 or _si.raw[15] != _b15:
-                    _p = bytearray(_si.raw)
-                    _p[13] = _b13; _p[14] = _b14; _p[15] = _b15
-                    sass_instrs[_fi] = SassInstr(bytes(_p), _si.comment + ' [FG31:ctrl]')
-                    _fg31_patched += 1
+                _target = None
+
+                # Preamble positions (0-5 from table, 6 special-cased)
+                if _fi in _FG33_PREAMBLE and _fi != 6:
+                    _target = _FG33_PREAMBLE[_fi]
+                # Postamble positions (relative to end)
+                elif _fi - _fg31_n in _FG33_POSTAMBLE:
+                    _target = _FG33_POSTAMBLE[_fi - _fg31_n]
+                # Position 6 (first body ALU): PTXAS sets rdep=2 (b15=0x04)
+                # when the body ALU region has 0 additional instructions
+                # (the only body ALU IS at position 6, feeding 0xc11 directly).
+                elif _fi == 6:
+                    _body_alu_count = _fg31_n - 5 - 8  # [8..n-6)
+                    if _body_alu_count <= 0:
+                        _target = (0xe2, 0x0f)  # will set b15=0x04 below
+                    else:
+                        _target = (0xe2, 0x0f)
+                # Position 7 (LDCU): depends on body ALU opcode at position 6
+                elif _fi == 7:
+                    _alu0_opc = _fg31_opcodes[6]
+                    if _alu0_opc in (0x812, 0x212):  # LOP3 body
+                        _target = (0x66, 0x0e)
+                    else:  # IMAD/UIADD body
+                        _target = (0x68, 0x0e)
+                # Body ALU (positions 8 to n-6)
+                elif 8 <= _fi < _fg31_n - 5:
+                    _is_last_body = (_fi == _fg31_n - 6)
+                    _body_opc = _fg31_opcodes[_fi]
+                    if _is_last_body:
+                        # Last body ALU: 0xe40f for LOP3, 0xe20f for IMAD
+                        if _body_opc in (0x824, 0xc24):
+                            _target = (0xe2, 0x0f)
+                        else:
+                            _target = (0xe4, 0x0f)
+                    else:
+                        # Intermediate body ALU: 0xc80f for LOP3, 0xca0f for
+                        # IMAD or LOP3-before-IMAD.
+                        _next_opc = _fg31_opcodes[_fi + 1] if _fi + 1 < _fg31_n else 0
+                        if _body_opc in (0x812, 0x212, 0x810) and _next_opc not in (0x824, 0xc24):
+                            _target = (0xc8, 0x0f)
+                        else:
+                            _target = (0xca, 0x0f)
+
+                if _target:
+                    _b13, _b14 = _target
+                    # FG34: position 6 gets b15=0x04 when body has 0 extra
+                    # ALU instructions (short body: only UIADD/LOP3 at [6]
+                    # feeds 0xc11 directly via LDCU at [7]).
+                    _b15 = 0x00
+                    _body_count = _fg31_n - 5 - 8
+                    if _fi == 6 and _body_count <= 1:
+                        _b15 = 0x04
+                    if _si.raw[13] != _b13 or _si.raw[14] != _b14 or _si.raw[15] != _b15:
+                        _p = bytearray(_si.raw)
+                        _p[13] = _b13; _p[14] = _b14; _p[15] = _b15
+                        sass_instrs[_fi] = SassInstr(bytes(_p), _si.comment + ' [FG33:ctrl]')
+                        _fg31_patched += 1
             if verbose and _fg31_patched:
-                print(f'[FG31] ctrl-byte patched {_fg31_patched} instrs (pattern A)')
+                print(f'[FG33] ctrl-byte patched {_fg31_patched} instrs')
 
     # 3. Concatenate SASS bytes
     # FB-4.2: field-safe register compaction. Only runs if all opcodes have

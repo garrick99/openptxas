@@ -1798,7 +1798,7 @@ def compile_function(fn: Function, verbose: bool = False,
         if _fg36_start is not None:
             _fg36_len = _fg36_end - _fg36_start
             # Only fire for the 7-length region (not handled by FG29's <=5 limit)
-            if _fg36_len == 7:
+            if _fg36_len in (6, 7):
                 # Collect ALU instructions in the region (skip NOPs and LDCU)
                 _alu_instrs = []
                 for _ri in range(_fg36_start, _fg36_end):
@@ -1806,20 +1806,36 @@ def compile_function(fn: Function, verbose: bool = False,
                     if _ropc in _ALU_OPCODES_36:
                         _alu_instrs.append(_ri)
                 if len(_alu_instrs) == 4:
-                    # Verify the liveness pattern: last instruction reads two
-                    # different body regs (liveness overlap).  Apply specific
-                    # PTXAS mapping: first 2 ALU dests → R0, third → R5,
-                    # fourth (final) → R5 with STG data → R5.
-                    _fg36_map = {}  # sass_instrs index → list of (byte_pos, new_val)
+                    # Check if the final instruction reads two DIFFERENT body
+                    # regs (liveness overlap).  LOP3.IMM (0x812) only reads
+                    # one GPR at b3 — b4 is an immediate, not a register.
                     _i0, _i1, _i2, _i3 = _alu_instrs
-                    # [_i0] intermediate: dst → R0
-                    _fg36_map[_i0] = [(2, 0)]
-                    # [_i1] intermediate: dst → R0, src0 → R0
-                    _fg36_map[_i1] = [(2, 0), (3, 0)]
-                    # [_i2] pre-final: dst → R5, src0 → R0
-                    _fg36_map[_i2] = [(2, 5), (3, 0)]
-                    # [_i3] final: dst → R5, src0 → R5, src2(b4) → R0
-                    _fg36_map[_i3] = [(2, 5), (3, 5), (4, 0)]
+                    # Check if the final ALU reads two different body regs.
+                    # LOP3.R (0x212) / IADD3 (0x210): b4 is a GPR source.
+                    # LOP3.IMM (0x812) / UIADD (0x835): b4 is immediate.
+                    _i3_opc = (struct.unpack_from('<Q', sass_instrs[_i3].raw, 0)[0]) & 0xFFF
+                    _i3_b4_is_gpr = _i3_opc in (0x210, 0x212, 0x225)
+                    _i3_raw = sass_instrs[_i3].raw
+                    _body_written = {sass_instrs[_ri].raw[2] for _ri in _alu_instrs[:3]
+                                     if (struct.unpack_from('<Q', sass_instrs[_ri].raw, 0)[0]) & 0xFFF in _ALU_OPCODES_36}
+                    _i3_has_overlap = (_i3_b4_is_gpr
+                                       and _i3_raw[4] in _body_written
+                                       and _i3_raw[3] in _body_written
+                                       and _i3_raw[3] != _i3_raw[4])
+
+                    _fg36_map = {}
+                    if _i3_has_overlap:
+                        # Two body regs consumed by final: use R5 for pre-final
+                        _fg36_map[_i0] = [(2, 0)]
+                        _fg36_map[_i1] = [(2, 0), (3, 0)]
+                        _fg36_map[_i2] = [(2, 5), (3, 0)]
+                        _fg36_map[_i3] = [(2, 5), (3, 5), (4, 0)]
+                    else:
+                        # No overlap: ALL intermediates → R0, final dest → R5
+                        _fg36_map[_i0] = [(2, 0)]
+                        _fg36_map[_i1] = [(2, 0), (3, 0)]
+                        _fg36_map[_i2] = [(2, 0), (3, 0)]
+                        _fg36_map[_i3] = [(2, 5), (3, 0)]
                     # STG: data → R5
                     for _ri in range(_fg36_end, len(sass_instrs)):
                         _ropc = (struct.unpack_from('<Q', sass_instrs[_ri].raw, 0)[0]) & 0xFFF
@@ -1924,7 +1940,7 @@ def compile_function(fn: Function, verbose: bool = False,
                                 continue
                             _next_alu_opc = _njopc
                             break
-                        if _body_opc in (0x812, 0x212, 0x810) and _next_alu_opc not in (0x824, 0xc24):
+                        if _body_opc in (0x812, 0x212, 0x810) and _next_alu_opc not in (0x824, 0xc24, 0x835):
                             _target = (0xc8, 0x0f)
                         else:
                             _target = (0xca, 0x0f)

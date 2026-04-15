@@ -549,6 +549,43 @@ def compile_function(fn: Function, verbose: bool = False,
     # 0b. Sink ld.param from entry block to first-use block (reduces GPR pressure)
     _sink_param_loads(fn)
 
+    # FG39: consecutive shift merge.  When two shl.b32 instructions
+    # operate in sequence (shl %B, %A, K1; shl %C, %B, K2) and %B is
+    # not used elsewhere, merge to a single shl %C, %A, K1+K2.  Matches
+    # PTXAS's peephole for the k200_shl_chain family.
+    from ptx.ir import RegOp, ImmOp
+    for bb in fn.blocks:
+        instrs = bb.instructions
+        i = 0
+        while i < len(instrs) - 1:
+            a, b = instrs[i], instrs[i + 1]
+            if (a.op == 'shl' and b.op == 'shl'
+                    and a.types == b.types  # same type (b32/b64)
+                    and isinstance(a.dest, RegOp) and isinstance(b.dest, RegOp)
+                    and len(a.srcs) >= 2 and len(b.srcs) >= 2
+                    and isinstance(a.srcs[1], ImmOp) and isinstance(b.srcs[1], ImmOp)
+                    and isinstance(b.srcs[0], RegOp)
+                    and b.srcs[0].name == a.dest.name):
+                # Check %B is not used elsewhere (only by the second shl)
+                mid_name = a.dest.name
+                used_elsewhere = False
+                for other_inst in instrs:
+                    if other_inst is a or other_inst is b:
+                        continue
+                    for src in (other_inst.srcs or []):
+                        if isinstance(src, RegOp) and src.name == mid_name:
+                            used_elsewhere = True
+                            break
+                    if used_elsewhere:
+                        break
+                if not used_elsewhere:
+                    # Merge: shl %C, %A, K1+K2
+                    merged_k = a.srcs[1].value + b.srcs[1].value
+                    b.srcs = [a.srcs[0], ImmOp(merged_k)]
+                    instrs.pop(i)  # remove first shl
+                    continue
+            i += 1
+
     # WB-7: pre-allocator address-fold analysis.  Detects
     # `add.u64 %A, %B, IMM` patterns whose only consumer folds the
     # offset into a load/store.  The dead-add's dest vreg is then
@@ -1631,10 +1668,39 @@ def compile_function(fn: Function, verbose: bool = False,
                 if _ropc in _ALU_OPCODES and _raw[2] in _all_body_regs:
                     _last_write[_raw[2]] = _ri
 
+            # FG39: detect liveness overlap — if any ALU instruction reads
+            # two different body regs (both would become R0), the second-
+            # to-last producer must keep its dest at the escape register
+            # (R5) instead of R0.  This matches the PTXAS pattern.
+            _r0_conflict_reg = None  # reg that must stay non-R0
+            for _ri in range(_alu_start, _alu_end):
+                _raw = sass_instrs[_ri].raw
+                _ropc = (struct.unpack_from('<Q', _raw, 0)[0]) & 0xFFF
+                if _ropc not in _ALU_OPCODES:
+                    continue
+                _src_body = set()
+                for _bp in (3, 4):
+                    if _raw[_bp] in _all_body_regs:
+                        _src_body.add(_raw[_bp])
+                if len(_src_body) >= 2:
+                    # Two body regs read simultaneously — the one whose MOST
+                    # RECENT write is closest to this consumer (but not this
+                    # instruction itself) must keep its register.
+                    def _prev_write(r):
+                        for _wri in range(_ri - 1, _alu_start - 1, -1):
+                            _wr = sass_instrs[_wri].raw
+                            _wopc = (struct.unpack_from('<Q', _wr, 0)[0]) & 0xFFF
+                            if _wopc in _ALU_OPCODES and _wr[2] == r:
+                                return _wri
+                        return -1
+                    _r0_conflict_reg = max(_src_body, key=_prev_write)
+                    break
+
             if (_rename_candidates or _outside_users) and not _r0_used:
                 # Apply rename: for each ALU instruction in the region,
                 # rename GPR fields to R0 EXCEPT the last write of a
                 # register that escapes (whose dest must stay).
+                # Also except the conflict reg (liveness overlap).
                 _renamed = 0
                 for _ri in range(_alu_start, _alu_end):
                     _si = sass_instrs[_ri]
@@ -1645,19 +1711,26 @@ def compile_function(fn: Function, verbose: bool = False,
                     _patched = bytearray(_raw)
                     _changed = False
                     # Rename dest (b2) → R0 unless it's the last write of
-                    # an escaping register
+                    # an escaping register or the conflict reg.
                     _dst = _patched[2]
                     if _dst in _all_body_regs and _dst not in {0, 1, 2, 3, 255}:
                         _is_last_escape = (_dst in _outside_users
                                            and _last_write.get(_dst) == _ri)
-                        if not _is_last_escape:
+                        _is_conflict = (_r0_conflict_reg is not None
+                                        and _dst == _r0_conflict_reg
+                                        and _last_write.get(_dst) == _ri)
+                        if not _is_last_escape and not _is_conflict:
                             _patched[2] = 0
                             _changed = True
-                    # Rename src (b3) → R0 unconditionally for body temps
-                    _src = _patched[3]
-                    if _src in _all_body_regs and _src not in {0, 1, 2, 3, 255}:
-                        _patched[3] = 0
-                        _changed = True
+                    # Rename src fields → R0 for body temps.
+                    # b3 = src0, b4 = src1 for ALU ops with two GPR sources.
+                    # EXCEPT reads of the conflict reg at its last-write position.
+                    for _sbp in (3, 4):
+                        _src = _patched[_sbp]
+                        if _src in _all_body_regs and _src not in {0, 1, 2, 3, 255}:
+                            if _src != _r0_conflict_reg:
+                                _patched[_sbp] = 0
+                                _changed = True
                     if _changed:
                         sass_instrs[_ri] = SassInstr(bytes(_patched),
                             _si.comment + ' [FG29:R0]')
@@ -1673,12 +1746,11 @@ def compile_function(fn: Function, verbose: bool = False,
                 # the last-write dest and all downstream reads from R4→R5.
                 # Only when R4 is the escaping register.  Check post-rename
                 # state: R5 may have been freed by FG29 (renamed to R0).
-                _post_r5_used = any(
-                    sass_instrs[_ri].raw[bp] == 5
-                    for _ri in range(_alu_start, _alu_end)
-                    for bp in (2, 3)
-                    if ((struct.unpack_from('<Q', sass_instrs[_ri].raw, 0)[0]) & 0xFFF) in _ALU_OPCODES)
-                if 4 in _outside_users and not _post_r5_used:
+                # After FG29/FG39 conflict handling, R5 may be used in the ALU
+                # region as the conflict reg (liveness-preserved intermediate).
+                # Only block FG32 if R5 is used as a DESTINATION that escapes
+                # the ALU region (i.e., R5 is in _outside_users).
+                if 4 in _outside_users and 5 not in _outside_users:
                     _r4_to_r5 = 0
                     for _ri in range(len(sass_instrs)):
                         _si = sass_instrs[_ri]

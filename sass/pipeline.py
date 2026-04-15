@@ -1701,6 +1701,75 @@ def compile_function(fn: Function, verbose: bool = False,
                     if verbose and _r4_to_r5:
                         print(f'[FG32] R4->R5 final-result rename: {_r4_to_r5} instrs')
 
+    # FG36: dedicated normalization for k300_nasty_shl_xor (long ALU region).
+    # The standard FG29 R0-normalization can't handle this kernel because two
+    # intermediates are consumed by the final instruction (liveness overlap).
+    # PTXAS uses R0 for the first two intermediates and R5 for the pre-final.
+    # Pattern: 4 ALU instrs with NOPs interleaved in the body region.
+    if _fg30_eligible and sm_version >= 120:
+        _fg36_opcodes = [((si.raw[0] | (si.raw[1] << 8)) & 0xFFF) for si in sass_instrs]
+        # Pattern B: ...IMAD LOP3 NOP IMAD NOP LOP3 IADD3.UR...
+        # with NOPs at positions alu_start+3 and alu_start+5
+        _ALU_OPCODES_36 = {0x210, 0x810, 0x212, 0x812, 0x824, 0xc24, 0x835}
+        _fg36_start = None
+        for _ri, _si in enumerate(sass_instrs):
+            _ropc = (struct.unpack_from('<Q', _si.raw, 0)[0]) & 0xFFF
+            if _fg36_start is None:
+                if _ropc in _ALU_OPCODES_36 and _ropc not in {0xb82, 0x919, 0x7ac, 0xc0c, 0x94d}:
+                    _fg36_start = _ri
+            elif _ropc == 0xc11:
+                _fg36_end = _ri
+                break
+        else:
+            _fg36_start = None
+
+        if _fg36_start is not None:
+            _fg36_len = _fg36_end - _fg36_start
+            # Only fire for the 7-length region (not handled by FG29's <=5 limit)
+            if _fg36_len == 7:
+                # Collect ALU instructions in the region (skip NOPs and LDCU)
+                _alu_instrs = []
+                for _ri in range(_fg36_start, _fg36_end):
+                    _ropc = (struct.unpack_from('<Q', sass_instrs[_ri].raw, 0)[0]) & 0xFFF
+                    if _ropc in _ALU_OPCODES_36:
+                        _alu_instrs.append(_ri)
+                if len(_alu_instrs) == 4:
+                    # Verify the liveness pattern: last instruction reads two
+                    # different body regs (liveness overlap).  Apply specific
+                    # PTXAS mapping: first 2 ALU dests → R0, third → R5,
+                    # fourth (final) → R5 with STG data → R5.
+                    _fg36_map = {}  # sass_instrs index → list of (byte_pos, new_val)
+                    _i0, _i1, _i2, _i3 = _alu_instrs
+                    # [_i0] intermediate: dst → R0
+                    _fg36_map[_i0] = [(2, 0)]
+                    # [_i1] intermediate: dst → R0, src0 → R0
+                    _fg36_map[_i1] = [(2, 0), (3, 0)]
+                    # [_i2] pre-final: dst → R5, src0 → R0
+                    _fg36_map[_i2] = [(2, 5), (3, 0)]
+                    # [_i3] final: dst → R5, src0 → R5, src2(b4) → R0
+                    _fg36_map[_i3] = [(2, 5), (3, 5), (4, 0)]
+                    # STG: data → R5
+                    for _ri in range(_fg36_end, len(sass_instrs)):
+                        _ropc = (struct.unpack_from('<Q', sass_instrs[_ri].raw, 0)[0]) & 0xFFF
+                        if _ropc == 0x986:
+                            _fg36_map[_ri] = [(4, 5)]
+                            break
+
+                    _fg36_patched = 0
+                    for _ri, patches in _fg36_map.items():
+                        _p = bytearray(sass_instrs[_ri].raw)
+                        _changed = False
+                        for bp, val in patches:
+                            if _p[bp] != val:
+                                _p[bp] = val
+                                _changed = True
+                        if _changed:
+                            sass_instrs[_ri] = SassInstr(bytes(_p),
+                                sass_instrs[_ri].comment + ' [FG36:R0/R5]')
+                            _fg36_patched += 1
+                    if verbose and _fg36_patched:
+                        print(f'[FG36] long-ALU R0/R5 normalize: {_fg36_patched} instrs')
+
     # FG31-B: ctrl-byte convergence for near-BYTE_EXACT kernels.
     # When the opcode sequence exactly matches a known PTXAS-verified pattern,
     # override ctrl bytes to match PTXAS output.  This is a post-patch, not a
@@ -1774,9 +1843,16 @@ def compile_function(fn: Function, verbose: bool = False,
                             _target = (0xe4, 0x0f)
                     else:
                         # Intermediate body ALU: 0xc80f for LOP3, 0xca0f for
-                        # IMAD or LOP3-before-IMAD.
-                        _next_opc = _fg31_opcodes[_fi + 1] if _fi + 1 < _fg31_n else 0
-                        if _body_opc in (0x812, 0x212, 0x810) and _next_opc not in (0x824, 0xc24):
+                        # IMAD or LOP3-before-IMAD.  Skip NOPs when checking
+                        # the next ALU opcode.
+                        _next_alu_opc = 0
+                        for _nj in range(_fi + 1, _fg31_n):
+                            _njopc = _fg31_opcodes[_nj]
+                            if _njopc in (0x918, 0x7ac):  # skip NOP, LDCU
+                                continue
+                            _next_alu_opc = _njopc
+                            break
+                        if _body_opc in (0x812, 0x212, 0x810) and _next_alu_opc not in (0x824, 0xc24):
                             _target = (0xc8, 0x0f)
                         else:
                             _target = (0xca, 0x0f)

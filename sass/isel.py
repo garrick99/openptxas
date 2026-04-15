@@ -2335,6 +2335,13 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     output.extend(_select_shl_b64(instr, ctx.ra, ctx, output))
 
                 elif op == 'shl' and typ in ('b32', 'u32', 's32'):
+                    # UNIF-1: propagate SR-derived tag through shl-with-immediate.
+                    if (isinstance(instr.srcs[1], ImmOp)
+                            and isinstance(instr.srcs[0], RegOp)
+                            and isinstance(instr.dest, RegOp)):
+                        _src_sr = ctx._reg_sr_source.get(instr.srcs[0].name)
+                        if _src_sr is not None:
+                            ctx._reg_sr_source[instr.dest.name] = _src_sr
                     # 32-bit shift left: IMAD.SHL or SHF.L.U32 for constants,
                     # SHF.L.U32.VAR (opcode 0x7299) for runtime register shifts.
                     d = ctx.ra.r32(instr.dest.name)
@@ -2406,10 +2413,17 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                 elif op == 'add' and typ in ('u32', 's32'):
                     d = ctx.ra.r32(instr.dest.name)
                     if isinstance(instr.srcs[1], ImmOp):
-                        # TE35: check if source is SR-derived (UR-eligible).
-                        # If so, use UIADD instead of IADD3.IMM.
+                        # UNIF-1: propagate SR-derived tag through add-with-immediate.
+                        # If source is SR-derived, dest is also SR-derived.
+                        # Guard: don't propagate in atom.xor kernels.
                         _src0_name = instr.srcs[0].name if isinstance(instr.srcs[0], RegOp) else None
                         _sr_source = ctx._reg_sr_source.get(_src0_name) if _src0_name else None
+                        _has_atom_xor_add = any(
+                            i2.op == 'atom' and 'xor' in i2.types
+                            for i2 in bb.instructions if hasattr(i2, 'op'))
+                        if (_sr_source is not None and isinstance(instr.dest, RegOp)
+                                and not _has_atom_xor_add):
+                            ctx._reg_sr_source[instr.dest.name] = _sr_source
                         imm = instr.srcs[1].value & 0xFFFFFFFF
                         if (_sr_source is not None and ctx.sm_version == 120
                                 and not getattr(ctx, '_has_vote', False)
@@ -2454,6 +2468,19 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                                 f'IADD3 R{d}, R{a}, -R{b}, RZ  // sub.{typ}'))
 
                 elif op in ('and', 'or', 'xor') and typ in ('b32', 'u32', 's32'):
+                    # UNIF-1: propagate SR-derived tag through bitwise-with-immediate.
+                    # Guard: don't propagate in atom.xor kernels (the template has
+                    # its own SR-source handling and extra tags cause regression).
+                    _has_atom_xor = any(
+                        i2.op == 'atom' and 'xor' in i2.types
+                        for i2 in bb.instructions if hasattr(i2, 'op'))
+                    if (isinstance(instr.srcs[1], ImmOp)
+                            and isinstance(instr.srcs[0], RegOp)
+                            and isinstance(instr.dest, RegOp)
+                            and not _has_atom_xor):
+                        _src_sr = ctx._reg_sr_source.get(instr.srcs[0].name)
+                        if _src_sr is not None:
+                            ctx._reg_sr_source[instr.dest.name] = _src_sr
                     d = ctx.ra.r32(instr.dest.name)
                     a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     lut = {'and': LOP3_AND, 'or': LOP3_OR, 'xor': LOP3_XOR}[op]

@@ -1268,7 +1268,9 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
         # via LDCU.64 UR6 + _emit_ur_to_gpr so LDCU stays in post-EXIT region.
         if ctx and ctx.sm_version == 120:
             # UR4+5 for descriptor, UR6+7 reserved. Params start at UR8.
-            if ctx._next_ur < 8:
+            # FG26: when address pair is co-located, the setp param used
+            # UR4 (now dead), so the u64 param can take UR6:UR7 directly.
+            if ctx._next_ur < 8 and not getattr(ctx, '_fg26_ur4_start', False):
                 ctx._next_ur = 8
             # Safety: predicated ld.param.u64 is in a divergent path (if-converted).
             # The deferred LDCU.64 would execute unconditionally (warp-wide) but
@@ -1353,6 +1355,11 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
                 if _n_setp_only_u32 <= 1 and _n_setp_uses <= 1:
                     ur_idx = ctx._next_ur
                     ctx._next_ur = ur_idx + 1
+                    # FG26: if setp param landed at UR4, skip UR5 (descriptor
+                    # hi half).  Descriptor LDCU.64 writes UR4:UR5, so UR5
+                    # must not be assigned to S2UR or u64 params.
+                    if ur_idx == 4:
+                        ctx._next_ur = 6
                     ctx._ur_params[dest.name] = ur_idx
                     return [SassInstr(encode_ldcu_32(ur_idx, 0, byte_off),
                                       f'LDCU.32 UR{ur_idx}, c[0][0x{byte_off:x}]  // TE10: setp UR-native')]

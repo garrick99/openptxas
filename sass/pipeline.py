@@ -645,6 +645,7 @@ def compile_function(fn: Function, verbose: bool = False,
         sm_version=sm_version,
     )
     ctx._addr_scratch_lo = _addr_scratch_base  # dedicated addr pair: R(base):R(base+1)
+    # FG26 UR4 start is applied below, after _setp_only_params detection.
     # WB-7: aliased-base address-chain folding (analysis ran above
     # before allocate() so the dead vregs are excluded from int_regs).
     # Pass the maps to isel via ctx.
@@ -830,6 +831,28 @@ def compile_function(fn: Function, verbose: bool = False,
                             cnt += 1
                 _setp_use_count[pname] = cnt
             ctx._setp_use_count = _setp_use_count
+
+    # FG26: start UR allocation at UR4 when address pair is co-located
+    # AND the kernel has a setp-only u32 param AND no ctaid/ntid (no
+    # S2UR that would consume a UR between setp and descriptor, colliding
+    # with UR5).  PTXAS loads the setp param into UR4, uses it in
+    # ISETP.R-UR, then reuses UR4:UR5 for the descriptor.
+    _has_ctaid_ntid = any(
+        inst.op == 'mov' and inst.srcs and hasattr(inst.srcs[0], 'name')
+        and inst.srcs[0].name in ('%ctaid.x', '%ctaid.y', '%ctaid.z',
+                                   '%ntid.x', '%ntid.y', '%ntid.z')
+        for bb in fn.blocks for inst in bb.instructions if hasattr(inst, 'op'))
+    # Additional guard: exactly one setp-only param with at most one setp
+    # use (matching the TE10 LDCU.32 guard at isel.py line 1355).
+    _fg26_setp_ok = False
+    if _setp_only_params and len(_setp_only_params) == 1:
+        _fg26_pname = next(iter(_setp_only_params))
+        _fg26_setp_cnt = ctx._setp_use_count.get(_fg26_pname, 0)
+        _fg26_setp_ok = (_fg26_setp_cnt <= 1)
+    if (alloc.addr_pair_colocated and _fg26_setp_ok
+            and not _has_ctaid_ntid):
+        ctx._next_ur = 4
+        ctx._fg26_ur4_start = True
 
     # Pre-scan: detect if kernel uses bar.sync (shared memory synchronization).
     # Kernels with bar.sync need preamble-only constant loads to avoid

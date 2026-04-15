@@ -1495,6 +1495,150 @@ def compile_function(fn: Function, verbose: bool = False,
                     sass_instrs[i] = SassInstr(bytes(patched), si.comment + ' [b9=0x0c]')
                     break
 
+    # FG29-C: post-scheduling R0 normalization for MIXED kernels.
+    # Rename body ALU temp registers {R4, R5, R6, ...} → R0 where PTXAS
+    # uses R0 for the same role.  Only fires when:
+    #   (1) addr_pair_colocated (the 0xc11 address pattern)
+    #   (2) kernel has matching body ALU region between preamble and 0xc11
+    #   (3) target regs form a strictly sequential write→read chain (no overlap)
+    #   (4) R0 is not read or written by any other instruction in the region
+    _fg29_eligible = (alloc.addr_pair_colocated and sm_version >= 120
+                       and getattr(ctx, '_fg26_ur4_start', False))
+    if _fg29_eligible:
+        # Opcodes in the body ALU region (between ISETP/EXIT and 0xc11/STG)
+        _ALU_OPCODES = {0x210, 0x810, 0x212, 0x812, 0x824, 0xc24, 0x825,
+                        0x835, 0x819, 0x202, 0x424}
+        _BOUNDARY = {0xc11, 0x986, 0x981, 0x94d, 0x947}  # 0xc11/STG/EXIT/BRA
+        _PREAMBLE = {0xb82, 0x919, 0x7ac, 0xc0c, 0x94d}  # LDC/S2R/LDCU/ISETP/EXIT
+
+        # Find body ALU region: first non-preamble ALU to first boundary
+        _alu_start = None
+        _alu_end = None
+        for _ri, _si in enumerate(sass_instrs):
+            _ropc = (struct.unpack_from('<Q', _si.raw, 0)[0]) & 0xFFF
+            if _alu_start is None:
+                if _ropc in _ALU_OPCODES and _ropc not in _PREAMBLE:
+                    _alu_start = _ri
+            elif _ropc in _BOUNDARY:
+                _alu_end = _ri
+                break
+
+        _alu_len = (_alu_end - _alu_start) if (_alu_start is not None and _alu_end is not None) else 0
+        if _alu_start is not None and _alu_end is not None and _alu_len <= 5:
+            # Collect GPR indices used as temps in the ALU region
+            _alu_gprs_written = set()
+            _alu_gprs_read = set()
+            for _ri in range(_alu_start, _alu_end):
+                _raw = sass_instrs[_ri].raw
+                _ropc = (struct.unpack_from('<Q', _raw, 0)[0]) & 0xFFF
+                if _ropc not in _ALU_OPCODES:
+                    continue
+                _alu_gprs_written.add(_raw[2])
+                _alu_gprs_read.add(_raw[3])
+                # Some ALU ops use b4 as GPR src (not UR)
+                if _ropc not in (0x835, 0x824, 0xc24, 0x810):
+                    _alu_gprs_read.add(_raw[4])
+
+            # Target: regs written in ALU region that are NOT R0..R3 (preamble/addr)
+            # and NOT used outside the ALU region (including STG data b4).
+            # PTXAS renames intermediates to R0 but keeps the FINAL result at
+            # the original register (so STG data is unchanged).
+            _rename_candidates = _alu_gprs_written - {0, 1, 2, 3, 255}
+
+            # Identify regs used outside the ALU region — these cannot be renamed.
+            # Only check byte positions that are GPR fields for each opcode.
+            # LDCU (0x7ac): b2=UR dst, no GPR fields
+            # ISETP.R-UR (0xc0c): b3=GPR src, b4=UR src
+            # STG (0x986): b3=GPR addr, b4=GPR data
+            # 0xc11: b3=GPR src, b4=UR src
+            _GPR_FIELDS = {
+                0x986: (3, 4),   # STG: addr_lo + data
+                0x981: (3, 4),   # LDG: addr_lo + dst
+                0xc0c: (3,),     # ISETP.R-UR: GPR src only (b4 is UR)
+                0xc11: (3,),     # IADD3.UR: GPR src only (b4 is UR)
+                0x7ac: (),       # LDCU: no GPR fields
+                0x94d: (),       # EXIT
+                0x947: (),       # BRA
+                0x918: (),       # NOP
+                0x919: (),       # S2R: b2 is GPR dst but we don't rename S2R
+                0xb82: (),       # LDC: b2 is GPR dst but preamble
+                0x9c3: (),       # S2UR: no GPR
+            }
+            _outside_users = set()
+            for _ri in range(len(sass_instrs)):
+                if _alu_start <= _ri < _alu_end:
+                    continue
+                _raw = sass_instrs[_ri].raw
+                _ropc = (struct.unpack_from('<Q', _raw, 0)[0]) & 0xFFF
+                _gpr_pos = _GPR_FIELDS.get(_ropc, (2, 3, 4))  # default: all
+                for _bp in _gpr_pos:
+                    if _raw[_bp] in _rename_candidates:
+                        _outside_users.add(_raw[_bp])
+            _rename_candidates -= _outside_users
+
+            # Verify R0 is not used by any ALU instruction outside the
+            # rename region.  Only check opcodes with real GPR fields.
+            # Non-ALU opcodes (S2R, LDCU, ISETP, EXIT, BRA, STG, 0xc11)
+            # either don't have GPR at b3/b4 or use them for UR/SR/addr.
+            _r0_used = False
+            for _ri in range(len(sass_instrs)):
+                if _alu_start <= _ri < _alu_end:
+                    continue  # skip the rename region itself
+                _raw = sass_instrs[_ri].raw
+                _ropc = (struct.unpack_from('<Q', _raw, 0)[0]) & 0xFFF
+                if _ropc not in _ALU_OPCODES:
+                    continue  # only check ALU opcodes for GPR R0
+                if _raw[2] == 0 or _raw[3] == 0:
+                    _r0_used = True
+                    break
+
+            # Extended candidate set: include regs that escape the ALU region
+            # ONLY at their LAST write.  Intermediate writes can be renamed.
+            _all_body_regs = (_alu_gprs_written | _rename_candidates) - {0, 1, 2, 3, 255}
+            # Find the last write index for each reg in the ALU region
+            _last_write: dict[int, int] = {}  # reg → sass_instrs index
+            for _ri in range(_alu_start, _alu_end):
+                _raw = sass_instrs[_ri].raw
+                _ropc = (struct.unpack_from('<Q', _raw, 0)[0]) & 0xFFF
+                if _ropc in _ALU_OPCODES and _raw[2] in _all_body_regs:
+                    _last_write[_raw[2]] = _ri
+
+            if (_rename_candidates or _outside_users) and not _r0_used:
+                # Apply rename: for each ALU instruction in the region,
+                # rename GPR fields to R0 EXCEPT the last write of a
+                # register that escapes (whose dest must stay).
+                _renamed = 0
+                for _ri in range(_alu_start, _alu_end):
+                    _si = sass_instrs[_ri]
+                    _raw = _si.raw
+                    _ropc = (struct.unpack_from('<Q', _raw, 0)[0]) & 0xFFF
+                    if _ropc not in _ALU_OPCODES:
+                        continue
+                    _patched = bytearray(_raw)
+                    _changed = False
+                    # Rename dest (b2) → R0 unless it's the last write of
+                    # an escaping register
+                    _dst = _patched[2]
+                    if _dst in _all_body_regs and _dst not in {0, 1, 2, 3, 255}:
+                        _is_last_escape = (_dst in _outside_users
+                                           and _last_write.get(_dst) == _ri)
+                        if not _is_last_escape:
+                            _patched[2] = 0
+                            _changed = True
+                    # Rename src (b3) → R0 unconditionally for body temps
+                    _src = _patched[3]
+                    if _src in _all_body_regs and _src not in {0, 1, 2, 3, 255}:
+                        _patched[3] = 0
+                        _changed = True
+                    if _changed:
+                        sass_instrs[_ri] = SassInstr(bytes(_patched),
+                            _si.comment + ' [FG29:R0]')
+                        _renamed += 1
+                if verbose and _renamed:
+                    print(f'[FG29] R0-normalized {_renamed} instrs '
+                          f'(body regs {sorted(_all_body_regs)} -> R0, '
+                          f'escape={sorted(_outside_users)})')
+
     # 3. Concatenate SASS bytes
     # FB-4.2: field-safe register compaction. Only runs if all opcodes have
     # GPR field metadata. Skips entirely on coverage gating failure.

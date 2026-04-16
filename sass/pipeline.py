@@ -1360,6 +1360,11 @@ def compile_function(fn: Function, verbose: bool = False,
         # for entry/gt-4/gt-32, P2 used for gt-8/gt-48 — plus SEL+4x@P-UIADD
         # mux with R0=R3+10 pre-compute folding the first add into SEL).
         ('k300_nasty_multi_pred',2, 'non_atom_nasty_multi_pred.json','TPL/MPT17'),
+        # MPT22: sixth MP02-aware predicate-body template (k200_pred_chain,
+        # 4-setp/4-@P all on PTX %p1; PTXAS reallocates to {P0,P2,P1,P2}
+        # with P0 reused entry/gt-8 and P2 reused gt-4/gt-32, plus SEL.IMM
+        # folding the first +1 add via predicate-mux).
+        ('k200_pred_chain',      2, 'non_atom_pred_chain.json',      'TPL/MPT22'),
     ]
     if (sm_version >= 120
             and not _ur_activation):  # never override an active atom-template kernel

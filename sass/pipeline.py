@@ -1355,6 +1355,11 @@ def compile_function(fn: Function, verbose: bool = False,
         # 2-setp/2-@P; PTXAS reuses TID register R0 directly and uses the
         # MPT01-style SEL+@P-UIADD predicate-mux pattern with imm operands).
         ('k100_setp_combo',      2, 'non_atom_setp_combo.json',      'TPL/MPT13'),
+        # MPT17: fifth MP02-aware predicate-body template (k300_nasty_multi_pred,
+        # 5-setp/5-@P with PTXAS's aggressive predicate-slot reuse — P0 used
+        # for entry/gt-4/gt-32, P2 used for gt-8/gt-48 — plus SEL+4x@P-UIADD
+        # mux with R0=R3+10 pre-compute folding the first add into SEL).
+        ('k300_nasty_multi_pred',2, 'non_atom_nasty_multi_pred.json','TPL/MPT17'),
     ]
     if (sm_version >= 120
             and not _ur_activation):  # never override an active atom-template kernel

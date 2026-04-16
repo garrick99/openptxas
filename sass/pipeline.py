@@ -1209,15 +1209,30 @@ def compile_function(fn: Function, verbose: bool = False,
 
             if _family_file.exists():
                 _fam = _json.loads(_family_file.read_text(encoding='utf-8'))
-                # Select variant.  AT06 added the imm_data_K1 variant whose
-                # selector is `atom_imm == 1` (set when isel admits an
-                # ImmOp data atom with literal 1).  When _ur_activation_atom_imm
-                # is set, that variant takes priority over add/no-add SR variants.
+                # Select variant.
+                # - AT06: imm_data_K1 (selector "atom_imm == 1") for tid-guarded
+                #   atom.add.u32 K=1 (ctx._ur_activation_atom_imm == 1).
+                # - AT10: imm_data_K1_no_tid_guard (selector "atom_imm == 1
+                #   and no_tid_guard") for the no-prelude sibling
+                #   (ctx._ur_activation_atom_no_tid_guard set in addition).
+                # When _ur_activation_atom_imm is set, an atom-imm variant is
+                # selected; AT10 takes priority over AT06 when both flags are set.
                 _ur_act_imm = getattr(ctx, '_ur_activation_atom_imm', None)
+                _ur_act_no_tid = getattr(ctx, '_ur_activation_atom_no_tid_guard', False)
                 _variant = None
+                # AT10 first (most specific selector)
                 for _v in _fam['variants']:
-                    if 'atom_imm == 1' in _v['selector'] and _ur_act_imm == 1:
+                    if ('no_tid_guard' in _v['selector']
+                            and _ur_act_imm == 1 and _ur_act_no_tid):
                         _variant = _v; break
+                if _variant is None:
+                    for _v in _fam['variants']:
+                        if 'atom_imm == 1' in _v['selector'] and _ur_act_imm == 1:
+                            # Skip the no-tid-guard variant unless explicitly
+                            # requested (its selector also contains atom_imm == 1).
+                            if 'no_tid_guard' in _v['selector']:
+                                continue
+                            _variant = _v; break
                 if _variant is None:
                     for _v in _fam['variants']:
                         if 'atom_imm' in _v['selector']:

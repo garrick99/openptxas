@@ -1763,6 +1763,117 @@ def _try_atom_ur_imm_K1_template(instr, ctx, bb, instr_idx: int, atom_op: str,
     return True
 
 
+def _try_atom_ur_imm_K1_no_tid_guard_template(
+        instr, ctx, bb, instr_idx: int, atom_op: str, output: list) -> bool:
+    """AT10: atom-UR template for the K=1 immediate-data NO-tid-guard sibling.
+
+    Admits PTXAS's 11-instruction `imm_data_K1_no_tid_guard` variant
+    when ALL of:
+      - instr.srcs[0] is a MemOp (atom address)
+      - instr.srcs[1] is either:
+          * an ImmOp with value == 1, OR
+          * a RegOp whose def in the same bb is `mov.<u32|s32|b32>
+            <reg>, ImmOp(1)`  (constant-fold-aware lookback)
+      - the kernel has NO tid prelude — no register in
+        ctx._reg_sr_source maps to SR_TID_X
+      - no basic block in the function contains a `bra` instruction
+        (no loops)
+      - no other UR-activation path has already fired
+        (ctx._ur_activation_sr unset)
+
+    On admit: sets the flags pipeline.py reads to select the
+    imm_data_K1_no_tid_guard JSON variant (atom_imm=1 +
+    no_tid_guard=True).  Emits a placeholder ATOMG into `output`
+    (wiped by the template).
+
+    Returns True iff admitted.  False ⇒ caller falls back to its
+    existing generic atom path.  This is the ONLY hook for the
+    no-tid-guard sibling; tid-guarded, looped, HFMA2, computed-data,
+    CAS, and non-1 atoms all return False here.
+    """
+    from sass.encoding.sm_120_opcodes import encode_atomg_xor_u32
+    from ptx.ir import MemOp as _MemOp
+
+    if len(instr.srcs) < 2:
+        return False
+    _xa = instr.srcs[0]
+    _xv = instr.srcs[1]
+    if not isinstance(_xa, _MemOp):
+        return False
+
+    # Resolve effective immediate value.
+    _eff_imm = None
+    if isinstance(_xv, ImmOp):
+        _eff_imm = _xv.value
+    elif isinstance(_xv, RegOp):
+        # Look back in the bb for `mov.u32 %r, ImmOp(K)`.
+        for _bi in range(instr_idx - 1, max(instr_idx - 5, -1), -1):
+            _bdef = bb.instructions[_bi]
+            if (isinstance(getattr(_bdef, 'dest', None), RegOp)
+                    and _bdef.dest.name == _xv.name
+                    and getattr(_bdef, 'op', '') == 'mov'
+                    and len(_bdef.srcs) >= 1
+                    and isinstance(_bdef.srcs[0], ImmOp)):
+                _eff_imm = _bdef.srcs[0].value
+                break
+    if _eff_imm != 1:
+        return False
+
+    # NO tid prelude: no SR_TID_X tag in _reg_sr_source.
+    _has_tid = any(v == SR_TID_X for v in ctx._reg_sr_source.values())
+    if _has_tid:
+        return False
+
+    # No double-fire on a ctx that already has an SR activation.
+    if hasattr(ctx, '_ur_activation_sr'):
+        return False
+
+    # No loops anywhere in the function.
+    _fn = getattr(ctx, 'fn', None) or getattr(ctx, '_fn', None)
+    if _fn is not None:
+        for _bb in getattr(_fn, 'basic_blocks', []) or []:
+            for _i in getattr(_bb, 'instructions', []) or []:
+                if getattr(_i, 'op', '') == 'bra':
+                    return False
+    else:
+        for _i in getattr(bb, 'instructions', []) or []:
+            if getattr(_i, 'op', '') == 'bra':
+                return False
+
+    _xd = ctx.ra.r32(instr.dest.name) if isinstance(instr.dest, RegOp) else RZ
+
+    # Resolve address (broader than AT06 — multi_block_atomic's address
+    # is in _gpr_written, not _ur_params, due to the `add.u64 X, X, 0`
+    # idiom in PTX).
+    _xbn = _xa.base if _xa.base.startswith('%') else f'%{_xa.base}'
+    _xgw = getattr(ctx, '_gpr_written', set())
+    _xpre = []
+    if _xbn in _xgw and _xa.base in ctx.ra.int_regs:
+        _xaddr = ctx.ra.lo(_xa.base)
+    elif _xbn in getattr(ctx, '_ur_params', {}):
+        _xur = ctx._ur_params[_xbn]
+        _xaddr = getattr(ctx, '_addr_scratch_lo', None) or _alloc_gpr_pair(ctx)
+        _xpre = list(_emit_ur_to_gpr(_xaddr, _xur, f'atom.{atom_op} K=1 no-tid addr'))
+    else:
+        _xaddr = ctx.ra.lo(_xa.base) if _xa.base in ctx.ra.int_regs else RZ
+    output.extend(_xpre)
+
+    # Trigger imm_data_K1_no_tid_guard variant in pipeline.py dispatcher.
+    # Use SR_TID_X as the placeholder _ur_activation_sr value (the
+    # template body fully owns the prelude and never reads this value
+    # for the no-tid-guard variant).
+    ctx._ur_activation_sr = SR_TID_X
+    ctx._ur_activation_add = 0
+    ctx._ur_activation_atom_imm = 1
+    ctx._ur_activation_atom_no_tid_guard = True
+    ctx._ur_activation_atom_op = atom_op
+
+    output.append(SassInstr(
+        encode_atomg_xor_u32(_xd, _xaddr, 0, 5, ur_desc=ctx.ur_desc),
+        f'ATOMG.E.{atom_op.upper()} R{_xd}, desc[UR{ctx.ur_desc}][R{_xaddr}.64], 1  // AT10: K=1 no-tid'))
+    return True
+
+
 def _select_atom_add_u32(instr: Instruction, ra: RegAlloc,
                          ctx: 'ISelContext' = None) -> list[SassInstr]:
     """atom.global.add.u32 / atom.add.u32 → ATOMG.E.ADD.u32.
@@ -3454,11 +3565,15 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     output.extend(_select_atom_cas(instr, ctx.ra, ctx))
 
                 elif op == 'atom' and 'add' in instr.types and 'u32' in instr.types:
-                    # AT06: atom.add.u32 with literal IMM=1 + tid-guard prelude
-                    # routes through the imm_data_K1 template; everything else
-                    # falls through to the generic atom.add path.
+                    # AT06 first: tid-guarded K=1 imm-data atom.add.u32.
+                    # AT10 next:  no-tid-guard sibling for K=1 atom.add.u32.
+                    # Both helpers are mutually exclusive by their tid-presence
+                    # check; on miss, fall through to the generic atom.add path.
                     _applied = _try_atom_ur_imm_K1_template(
                         instr, ctx, bb, _instr_idx, atom_op='add', output=output)
+                    if not _applied:
+                        _applied = _try_atom_ur_imm_K1_no_tid_guard_template(
+                            instr, ctx, bb, _instr_idx, atom_op='add', output=output)
                     if not _applied:
                         output.extend(_select_atom_add_u32(instr, ctx.ra, ctx))
 

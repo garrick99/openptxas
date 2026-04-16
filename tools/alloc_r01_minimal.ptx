@@ -1,0 +1,20 @@
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry tmin(.param .u64 out, .param .u32 n) {
+    .reg .u32 %r<4>; .reg .u64 %rd<3>; .reg .pred %p0;
+    ld.param.u64 %rd0, [out];
+    ld.param.u32 %r0, [n];
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mul.lo.u32 %r1, %r1, %r2;
+    mov.u32 %r2, %tid.x;
+    add.u32 %r1, %r1, %r2;
+    setp.lt.u32 %p0, %r1, %r0;
+    @!%p0 ret;
+    shl.b32 %r3, %r1, 2;
+    cvt.u64.u32 %rd1, %r3;
+    add.u64 %rd0, %rd0, %rd1;
+    st.global.u32 [%rd0], %r1;
+    ret;
+}

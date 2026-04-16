@@ -362,19 +362,46 @@ def _hoist_ldcu64(instrs: list[SassInstr]) -> list[SassInstr]:
     # If the same dest has multiple S2R writes (register reuse),
     # only the first must be early; the second must stay in its
     # original position to avoid clobbering the first value.
+    #
+    # ALLOC-R06: LIFETIME-CORRECT S2R hoisting.  Beyond the same-dest
+    # S2R+S2R guard above, the dest may also be overwritten by an LDC
+    # (param load) or another GPR-writing op.  Forge's tid-compute
+    # pattern `mov %r2, %ntid.x; mul; mov %r2, %tid.x; add` reuses the
+    # same vreg for ntid (LDC R6 = blockDim) and tid (S2R R6).  Hoisting
+    # S2R(tid) to position 1 places it BEFORE LDC(blockDim), which then
+    # overwrites R6 and the subsequent IADD3 reads blockDim instead of
+    # tid.  Scan the entire pre_boundary for any non-S2R instruction
+    # that writes the same dest reg; if found, do not hoist.
+    # ALLOC-R06: only LDC writes a GPR from a constant bank — these are the
+    # param-load instructions that can collide with hoisted S2R.  Excluding
+    # ALU writers keeps the hoist behaviour identical for the rest of the
+    # corpus (where S2R hoisting is needed for latency hiding).
+    _GPR_WRITERS = {0xb82}  # LDC only
     s2r_instrs = []
     non_s2r_remaining = []
     s2r_dests_seen = set()
-    for si in (remaining if not ldcu64s else remaining):
+    for idx, si in enumerate(remaining):
         if _get_opcode(si.raw) == 0x919:
             dest_reg = si.raw[2]
-            if dest_reg not in s2r_dests_seen:
+            if dest_reg in s2r_dests_seen:
+                non_s2r_remaining.append(si)
+                continue
+            # ALLOC-R06: scan ENTIRE pre_boundary (both before and after the
+            # S2R) for any other GPR-writing instruction targeting the same
+            # phys reg.  Hoisting S2R reorders it past such conflicts in
+            # both directions, so the dest can be silently overwritten.
+            _conflict = False
+            for _other in pre_boundary:
+                if _other is si:
+                    continue
+                if _get_opcode(_other.raw) in _GPR_WRITERS and _other.raw[2] == dest_reg:
+                    _conflict = True
+                    break
+            if _conflict:
+                non_s2r_remaining.append(si)
+            else:
                 s2r_instrs.append(si)
                 s2r_dests_seen.add(dest_reg)
-            else:
-                # Second write to same dest — keep in place (register reuse:
-                # e.g., ctaid→multiply→tid pattern where %r1 is reused).
-                non_s2r_remaining.append(si)
         else:
             non_s2r_remaining.append(si)
 

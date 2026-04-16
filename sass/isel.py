@@ -2413,16 +2413,22 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                 elif op == 'add' and typ in ('u32', 's32'):
                     d = ctx.ra.r32(instr.dest.name)
                     if isinstance(instr.srcs[1], ImmOp):
-                        # UNIF-1: propagate SR-derived tag through add-with-immediate.
+                        # UNIF-1/FG50: propagate SR-derived tag through add-with-immediate.
                         # If source is SR-derived, dest is also SR-derived.
+                        # FG50: for predicated adds, only propagate when dest==src
+                        # (self-modify: both predicate outcomes preserve SR status).
                         # Guard: don't propagate in atom.xor kernels.
                         _src0_name = instr.srcs[0].name if isinstance(instr.srcs[0], RegOp) else None
                         _sr_source = ctx._reg_sr_source.get(_src0_name) if _src0_name else None
                         _has_atom_xor_add = any(
                             i2.op == 'atom' and 'xor' in i2.types
                             for i2 in bb.instructions if hasattr(i2, 'op'))
+                        _pred_safe = (instr.pred is None
+                                      or (isinstance(instr.dest, RegOp)
+                                          and isinstance(instr.srcs[0], RegOp)
+                                          and instr.dest.name == instr.srcs[0].name))
                         if (_sr_source is not None and isinstance(instr.dest, RegOp)
-                                and not _has_atom_xor_add):
+                                and not _has_atom_xor_add and _pred_safe):
                             ctx._reg_sr_source[instr.dest.name] = _sr_source
                         imm = instr.srcs[1].value & 0xFFFFFFFF
                         if (_sr_source is not None and ctx.sm_version == 120
@@ -2658,6 +2664,16 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
 
                     # mul.lo.s32 → IMAD R-UR or IMAD.WIDE with immediate
                     # NOTE: IMAD R-R (0x224) is NOT valid on SM_120!
+                    # FG50: propagate SR-derived tag through mul-with-immediate.
+                    if (isinstance(instr.srcs[1], ImmOp)
+                            and isinstance(instr.srcs[0], RegOp)
+                            and isinstance(instr.dest, RegOp)):
+                        _mul_sr = ctx._reg_sr_source.get(instr.srcs[0].name)
+                        _has_atom_xor_mul = any(
+                            i2.op == 'atom' and 'xor' in i2.types
+                            for i2 in bb.instructions if hasattr(i2, 'op'))
+                        if _mul_sr is not None and not _has_atom_xor_mul:
+                            ctx._reg_sr_source[instr.dest.name] = _mul_sr
                     d = ctx.ra.r32(instr.dest.name)
                     a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     if isinstance(instr.srcs[1], ImmOp):

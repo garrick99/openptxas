@@ -223,10 +223,8 @@ _LATENCY_INERT = {
     # OpenPTXas's scheduler/scoreboard so PTXAS's own ctrl-byte scheduling
     # is preserved and OpenPTXas's latency model never observes it.
     0x81c,
-    # MPT42: IMNMX clamp opcode emitted ONLY by the r1_minmax whole-kernel
-    # template (verbatim PTXAS bytes from PTXAS's clamp-idiom recognition);
-    # does not go through OpenPTXas's scheduler/scoreboard.
-    0x848,
+    # IMNMX01-04: 0x848 is now properly modeled in _OPCODE_META as
+    # IMNMX.IMM (R-imm variant of 0x217); no longer in this allowlist.
 }
 
 

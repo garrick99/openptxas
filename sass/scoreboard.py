@@ -111,6 +111,14 @@ _OPCODE_META: dict[int, _OpMeta] = {
     0x211: _OpMeta('LEA',      1, 0x3e, 1),  # LEA load effective address
     0x811: _OpMeta('LEA.IMM',  1, 0x3e, 1),  # LEA with immediate index
     0x217: _OpMeta('IMNMX',    1, 0x3e, 1),  # IMNMX integer min/max
+    0x848: _OpMeta('IMNMX.IMM',1, 0x3e, 1),  # IMNMX integer min/max with immediate
+                                              # (parallel to IMAD R-R 0x224 / R-imm 0x824).
+                                              # Same ALU class as 0x217.  Emitted by PTXAS
+                                              # only when it recognizes the clamp idiom
+                                              # (mov + setp gt + @P mov + setp lt + @P mov).
+                                              # IMNMX01-04 evidence: r1_minmax PTXAS cubin
+                                              # at [9],[10]; runtime GPU correctness matches
+                                              # PTX-body Python simulation.
     0x203: _OpMeta('P2R',      1, 0x3e, 1),  # P2R predicate to register
     0x204: _OpMeta('R2P',      0, 0x3f, 0),  # R2P register to predicate (no GPR dest)
     0x21b: _OpMeta('BMSK',     1, 0x3e, 1),  # BMSK bitmask generation
@@ -600,6 +608,12 @@ _FORWARDING_SAFE_PAIRS: set[tuple[int, int]] = {
     (0x812, 0x824),   # TE28: LOP3→IMAD (2 PTXAS gap=0 instances)
     (0x812, 0x235),   # TPL13: LOP3.IMM → IADD.64 (PTXAS gap=0 in r1_running_xor template at [8]→[9])
     (0x235, 0x812),   # TPL13: IADD.64 → LOP3.IMM (PTXAS gap=0 in r1_running_xor template at [9]→[10])
+    # IMNMX01-04: clamp-idiom RAW chain in r1_minmax template.
+    # PTXAS evidence: r1_minmax SASS [8] LOP3 → [9] IMNMX.IMM at gap=0,
+    # then [9] → [10] IMNMX.IMM → IMNMX.IMM at gap=0.  Both pairs verified
+    # GPU-correct by PTXAS cubin runtime output matching PTX-body simulation.
+    (0x812, 0x848),   # IMNMX01: LOP3.IMM → IMNMX.IMM (clamp-idiom entry)
+    (0x848, 0x848),   # IMNMX01: IMNMX.IMM → IMNMX.IMM (clamp-idiom self-chain)
     (0xc11, 0xc11),   # TE21: IADD3.R-UR → IADD3.R-UR (lo → hi carry chain)
     (0xc11, 0x235),   # TE21: IADD3.R-UR → IADD.64
     (0xc02, 0x986),   # MOV.UR     → STG.E

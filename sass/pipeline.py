@@ -1389,6 +1389,10 @@ def compile_function(fn: Function, verbose: bool = False,
         # 2x@P-UIADD chain. Direct extension of MPT34. delta=-3 lowered
         # byte-exact. 0x81c FG-2.3 allowlist already in place from MPT34).
         ('k300_nasty_pred_nest3',2, 'non_atom_nasty_pred_nest3.json','TPL/MPT38'),
+        # IMNMX01-04: re-enabled MPT42 template now that 0x848 IMNMX.IMM is
+        # properly modeled in _OPCODE_META + LOP3->IMNMX and IMNMX->IMNMX
+        # added to _FORWARDING_SAFE_PAIRS for the clamp-idiom RAW chain.
+        ('r1_minmax',            2, 'non_atom_minmax.json',          'TPL/MPT42'),
     ]
     if (sm_version >= 120
             and not _ur_activation):  # never override an active atom-template kernel

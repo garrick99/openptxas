@@ -1,0 +1,22 @@
+{
+  "name": "non_atom_scatter_add",
+  "description": "TPL09: whole-kernel template for r1_scatter_add — third non-atom whole-kernel template. PTX shape: 2 params (p_out u64; n u32) + tid-bounded guard + mul.lo.u32(%r,13) + and.b32(%r,0xFF) + add.u32(%r,%r,%tid) + cvt.u64.u32 + shl.b64 + add.u64 + STG. 15-instruction PTXAS sequence; instruction [0] (LDC R1 preamble) is provided by pipeline.py; this template provides the 14 instructions [1..14].",
+  "kernel_name_match": "r1_scatter_add",
+  "expected_param_count": 2,
+  "instructions": [
+    {"index": 1,  "opcode": "0x919", "role": "S2R_R5_TID",                  "bytes": "19790500000000000021000000220e00"},
+    {"index": 2,  "opcode": "0x7ac", "role": "LDCU_UR4_PARAM_n_0x71",       "bytes": "ac7704ff007100000008000800240e00"},
+    {"index": 3,  "opcode": "0xc0c", "role": "ISETP_RUR_BOUNDS_GUARD",      "bytes": "0c7c0005040000007060f00b00da1f00"},
+    {"index": 4,  "opcode": "0x94d", "role": "EXIT_AT_P0",                  "bytes": "4d090000000000000000800300ea0f00"},
+    {"index": 5,  "opcode": "0x7ac", "role": "LDCU_UR6_PARAM_p_out_0x70",   "bytes": "ac7706ff00700000000a000800220e00"},
+    {"index": 6,  "opcode": "0x824", "role": "IMAD_I_R0_R5_13_RZ",          "bytes": "247800050d000000ff028e0700e20f04"},
+    {"index": 7,  "opcode": "0x7ac", "role": "LDCU_UR4_DESC_0x6b",          "bytes": "ac7704ff006b0000000a000800680e00"},
+    {"index": 8,  "opcode": "0x812", "role": "LOP3_IMM_R0_R0_AND_FF",       "bytes": "12780000ff000000ffc08e0700e40f00"},
+    {"index": 9,  "opcode": "0xc11", "role": "IADD3_UR_R2_R5_UR6_ADDR_LO",  "bytes": "117c020506000000ff10800f00c81f00"},
+    {"index": 10, "opcode": "0xc11", "role": "IADD3_UR_R3_R5_UR7_ADDR_HI",  "bytes": "117c030507000000ff140f0800e20f00"},
+    {"index": 11, "opcode": "0x235", "role": "IADD64_R5_R0_R5_THE_ADD_U32", "bytes": "357205000500000000008e0700ca0f00"},
+    {"index": 12, "opcode": "0x986", "role": "STG_R2_R3_R5",                "bytes": "86790002050000000419100c00e22f00"},
+    {"index": 13, "opcode": "0x94d", "role": "EXIT",                        "bytes": "4d790000000000000000800300ea0f00"},
+    {"index": 14, "opcode": "0x947", "role": "BRA_BACK",                    "bytes": "4779fc00fcffffffffff830300c00f00"}
+  ]
+}

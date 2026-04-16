@@ -1337,6 +1337,7 @@ def compile_function(fn: Function, verbose: bool = False,
     _TPL_NON_ATOM_REGISTRY = [
         ('k100_dual_load',       4, 'non_atom_dual_load.json',       'TPL01'),
         ('k300_nasty_zero_init', 2, 'non_atom_nasty_zero_init.json', 'TPL05'),
+        ('r1_scatter_add',       2, 'non_atom_scatter_add.json',     'TPL09'),
     ]
     if (sm_version >= 120
             and not _ur_activation):  # never override an active atom-template kernel

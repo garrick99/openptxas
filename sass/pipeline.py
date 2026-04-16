@@ -1383,6 +1383,12 @@ def compile_function(fn: Function, verbose: bool = False,
         # pre-compute + SEL.REG fold of @p1 add 10, and an uncommon 0x81c
         # ALU helper. delta=-2 (under-emit) lowered byte-exact.
         ('k200_nested_pred',     2, 'non_atom_nested_pred.json',     'TPL/MPT34'),
+        # MPT38: tenth MP02-aware predicate-body template (k300_nasty_pred_nest3,
+        # extended conditional-setp chain: 2 chained @P-conditional setps with
+        # P1 reuse, 2x 0x81c uncommon-ALU helpers, SEL.IMM fold of +1 add,
+        # 2x@P-UIADD chain. Direct extension of MPT34. delta=-3 lowered
+        # byte-exact. 0x81c FG-2.3 allowlist already in place from MPT34).
+        ('k300_nasty_pred_nest3',2, 'non_atom_nasty_pred_nest3.json','TPL/MPT38'),
     ]
     if (sm_version >= 120
             and not _ur_activation):  # never override an active atom-template kernel

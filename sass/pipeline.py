@@ -1560,6 +1560,104 @@ def compile_function(fn: Function, verbose: bool = False,
                         sass_instrs[i] = SassInstr(bytes(patched), si.comment + ' [b9=0x0c]')
                         break
 
+    # FG56: bounded S2R R3->R0 rename for the 3 opcode-aligned MIXED kernels.
+    # PTXAS assigns tid.x to R0.  Our allocator assigns R3 (ALLOC-SUBSYS-2
+    # skips R0-R2).  This rename runs BEFORE FG29 so that R0 is marked
+    # "occupied" and FG29 skips R0 normalization.
+    # Admission: FG52-eligible (ISTP/IMAD reorder fired) + FG26 UR4 start.
+    _fg56_fired = False
+    if getattr(ctx, '_fg26_ur4_start', False) and sm_version >= 120:
+        # Check if FG52 reorder pattern exists (ISTP at pos 6 after EXIT)
+        _fg56_opcodes = [((si.raw[0] | (si.raw[1] << 8)) & 0xFFF) for si in sass_instrs]
+        _fg56_has_istp_at_6 = False
+        _post_exit_idx = None
+        for _ri, _ropc in enumerate(_fg56_opcodes):
+            if _ropc == 0x94d and ((sass_instrs[_ri].raw[1] >> 4) & 0xF) != 7:
+                _post_exit_idx = _ri
+                break
+        if _post_exit_idx is not None:
+            # Check: first post-EXIT LDCU, then body ALU region with
+            # ISTP.I present (pre-FG52 pattern: [IMAD, LDCU, ISTP] or
+            # post-FG52 pattern: [ISTP, IMAD, LDCU]).  Accept either.
+            _scan = _post_exit_idx + 1
+            while _scan < len(sass_instrs) and _fg56_opcodes[_scan] == 0x7ac:
+                _scan += 1
+            # Check for ISTP.I within 3 positions of the first body ALU
+            for _look in range(_scan, min(_scan + 3, len(sass_instrs))):
+                if _fg56_opcodes[_look] == 0x80c:
+                    _fg56_has_istp_at_6 = True
+                    break
+
+        if _fg56_has_istp_at_6:
+            # Verify R3 is S2R dest (tid.x) and rename R3->R0 globally
+            _has_s2r_r3 = any(
+                _fg56_opcodes[_ri] == 0x919 and sass_instrs[_ri].raw[2] == 3
+                for _ri in range(len(sass_instrs)))
+            # Verify R0 is not already used as a GPR in ALU instructions
+            # (R0 appears in ISTP.I/IST.UR dest but those are predicate/flag
+            # outputs, not GPR dests that would conflict)
+            _r0_alu_conflict = any(
+                _fg56_opcodes[_ri] in (0x824, 0x835, 0x812, 0x212, 0x810, 0x210)
+                and sass_instrs[_ri].raw[2] == 0
+                for _ri in range(len(sass_instrs)))
+
+            if _has_s2r_r3 and not _r0_alu_conflict:
+                # Global rename: every b2/b3 that is R3 -> R0
+                # (R3 = tid.x, used as source in ISETP, IMAD, C11, etc.)
+                _fg56_count = 0
+                for _ri in range(len(sass_instrs)):
+                    _si = sass_instrs[_ri]
+                    _ropc = _fg56_opcodes[_ri]
+                    _p = bytearray(_si.raw)
+                    _changed = False
+                    # S2R: rename dest R3->R0
+                    if _ropc == 0x919 and _p[2] == 3:
+                        _p[2] = 0; _changed = True
+                    # ISETP.R-UR: rename src R3->R0 at b3
+                    elif _ropc == 0xc0c and _p[3] == 3:
+                        _p[3] = 0; _changed = True
+                    # ISETP.IMM: rename src R3->R0 at b3
+                    elif _ropc == 0x80c and _p[3] == 3:
+                        _p[3] = 0; _changed = True
+                    # IMAD.I: rename src R3->R0 at b3
+                    elif _ropc == 0x824 and _p[3] == 3:
+                        _p[3] = 0; _changed = True
+                    # UIADD: rename src R3->R0 at b3
+                    elif _ropc == 0x835 and _p[3] == 3:
+                        _p[3] = 0; _changed = True
+                    # C11: rename src R3->R0 at b3
+                    elif _ropc == 0xc11 and _p[3] == 3:
+                        _p[3] = 0; _changed = True
+                    if _changed:
+                        sass_instrs[_ri] = SassInstr(bytes(_p), _si.comment + ' [FG56:R0]')
+                        _fg56_count += 1
+                _fg56_fired = _fg56_count > 0
+                if verbose and _fg56_fired:
+                    print(f'[FG56] S2R R3->R0 rename: {_fg56_count} instrs')
+
+    # FG56b: when FG56 fired, apply R4->R5 rename for body ALU result.
+    # FG29/FG32 are disabled (R0 occupied), but the accumulator still
+    # needs to be at R5 (PTXAS convention).  Rename all R4 in ALU body
+    # and STG data to R5.
+    if _fg56_fired:
+        _ALU_56 = {0x824, 0x835, 0x812, 0x212, 0x810, 0x210}
+        _fg56b_count = 0
+        for _ri in range(len(sass_instrs)):
+            _si = sass_instrs[_ri]
+            _ropc = (struct.unpack_from('<Q', _si.raw, 0)[0]) & 0xFFF
+            _p = bytearray(_si.raw)
+            _changed = False
+            if _ropc in _ALU_56:
+                if _p[2] == 4: _p[2] = 5; _changed = True
+                if _p[3] == 4: _p[3] = 5; _changed = True
+            elif _ropc == 0x986:  # STG data at b4
+                if _p[4] == 4: _p[4] = 5; _changed = True
+            if _changed:
+                sass_instrs[_ri] = SassInstr(bytes(_p), _si.comment + ' [FG56b:R5]')
+                _fg56b_count += 1
+        if verbose and _fg56b_count:
+            print(f'[FG56b] R4->R5 body rename: {_fg56b_count} instrs')
+
     # FG29-C: post-scheduling R0 normalization for MIXED kernels.
     # Rename body ALU temp registers {R4, R5, R6, ...} → R0 where PTXAS
     # uses R0 for the same role.  Only fires when:
@@ -1568,7 +1666,8 @@ def compile_function(fn: Function, verbose: bool = False,
     #   (3) target regs form a strictly sequential write→read chain (no overlap)
     #   (4) R0 is not read or written by any other instruction in the region
     _fg29_eligible = (alloc.addr_pair_colocated and sm_version >= 120
-                       and getattr(ctx, '_fg26_ur4_start', False))
+                       and getattr(ctx, '_fg26_ur4_start', False)
+                       and not _fg56_fired)  # FG56: R0 occupied by tid.x, skip R0 norm
     if _fg29_eligible:
         # Opcodes in the body ALU region (between ISETP/EXIT and 0xc11/STG)
         _ALU_OPCODES = {0x210, 0x810, 0x212, 0x812, 0x824, 0xc24, 0x825,

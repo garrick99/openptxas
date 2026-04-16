@@ -701,6 +701,33 @@ _CBANK_NTID_X = 0x360      # SM_120: blockDim.x at c[0][0x360]
 _CBANK_NTID_X_SM89 = 0x0   # SM_89:  blockDim.x at c[0][0x0]
 
 
+def _apply_pred_byte(instrs: list[SassInstr], instr: Instruction,
+                     ctx: 'ISelContext') -> list[SassInstr]:
+    """FORGE03: rewrite each emitted SassInstr to carry instr.pred / instr.neg.
+    The predicate byte lives in raw bytes[1] high nibble: bit3=neg,
+    bits[2:0]=pred index.  Pred=PT(7) emits unconditional (default).
+    Returns the (possibly rewritten) list.  Safe no-op if instr.pred is None."""
+    if instr.pred is None or ctx is None:
+        return instrs
+    try:
+        pd = ctx.ra.pred(instr.pred) if instr.pred in ctx.ra.pred_regs else 0
+    except Exception:
+        return instrs
+    neg = bool(getattr(instr, 'neg', False))
+    pred_byte = (pd & 0x07) | (0x08 if neg else 0x00)
+    out = []
+    for si in instrs:
+        raw = bytearray(si.raw)
+        # Only patch instructions with default predicate (high nibble 0x70 = PT, no neg)
+        if (raw[1] & 0xf0) == 0x70:
+            raw[1] = (raw[1] & 0x0F) | (pred_byte << 4)
+            new_comment = f'@{"!" if neg else ""}P{pd} ' + si.comment
+            out.append(SassInstr(bytes(raw), new_comment))
+        else:
+            out.append(si)
+    return out
+
+
 def _select_mov(instr: Instruction, ra: RegAlloc,
                 ctx: 'ISelContext' = None) -> list[SassInstr]:
     """mov.u32 or mov.u64 (register-register or special register read)."""
@@ -732,8 +759,8 @@ def _select_mov(instr: Instruction, ra: RegAlloc,
                 return [SassInstr(encode_ldc(d, 0, _CBANK_NTID_X),
                                   f'LDC R{d}, c[0][0x{_CBANK_NTID_X:x}]  // ntid.x')]
 
-        return [SassInstr(encode_s2r(d, sr),
-                          f'S2R R{d}, SR_{src.name}  // {dest.name} = {src.name}')]
+        return _apply_pred_byte([SassInstr(encode_s2r(d, sr),
+                          f'S2R R{d}, SR_{src.name}  // {dest.name} = {src.name}')], instr, ctx)
 
     if isinstance(src, ImmOp):
         if typ in ('u64', 's64', 'b64', 'f64'):
@@ -747,12 +774,20 @@ def _select_mov(instr: Instruction, ra: RegAlloc,
                 if not hasattr(ctx, '_zero_regs'):
                     ctx._zero_regs = set()
                 ctx._zero_regs.add(d_hi)
-            return [
+            return _apply_pred_byte([
                 SassInstr(encode_iadd3_imm32(d_lo, RZ, lo, RZ),
                           f'IADD3 R{d_lo}, RZ, 0x{lo:x}, RZ  // {dest.name}.lo = imm'),
                 SassInstr(encode_iadd3_imm32(d_hi, RZ, hi, RZ),
                           f'IADD3 R{d_hi}, RZ, 0x{hi:x}, RZ  // {dest.name}.hi = imm'),
-            ]
+            ], instr, ctx)
+        # FORGE03: 32-bit MOV from immediate (was: raise ISelError).
+        # Forge emits this for `@P mov.u32 %r1, 1024;` clamp patterns.
+        if typ in ('u32', 's32', 'b32') or typ is None:
+            d = ra.r32(dest.name)
+            imm_val = src.value & 0xFFFFFFFF
+            return _apply_pred_byte([SassInstr(
+                encode_iadd3_imm32(d, RZ, imm_val, RZ),
+                f'IADD3 R{d}, RZ, 0x{imm_val:x}, RZ  // mov.u32 imm')], instr, ctx)
         raise ISelError("MOV from immediate not yet supported in isel (use LDC for params)")
 
     if not isinstance(src, RegOp):
@@ -764,12 +799,12 @@ def _select_mov(instr: Instruction, ra: RegAlloc,
                 # Shared memory base = offset within shared space (always 0 for first decl)
                 d_lo = ra.lo(dest.name)
                 d_hi = d_lo + 1
-                return [
+                return _apply_pred_byte([
                     SassInstr(encode_iadd3_imm32(d_lo, RZ, smem_off, RZ),
                               f'IADD3 R{d_lo}, RZ, 0x{smem_off:x}, RZ  // smem base lo'),
                     SassInstr(encode_iadd3_imm32(d_hi, RZ, 0, RZ),
                               f'IADD3 R{d_hi}, RZ, 0, RZ  // smem base hi'),
-                ]
+                ], instr, ctx)
         raise ISelError(f"MOV src must be register: {src!r}")
 
     if typ in ('u64', 's64', 'b64', 'f64'):
@@ -785,12 +820,12 @@ def _select_mov(instr: Instruction, ra: RegAlloc,
         if d_hi != s_hi:
             instrs.append(SassInstr(encode_iadd3(d_hi, s_hi, RZ, RZ),
                                     f'MOV R{d_hi}, R{s_hi}  // {dest.name}.hi = {src.name}.hi'))
-        return instrs or [_nop(f'MOV {dest.name} = {src.name} (same reg, elided)')]
+        return _apply_pred_byte(instrs or [_nop(f'MOV {dest.name} = {src.name} (same reg, elided)')], instr, ctx)
     else:
         # 32-bit
         d = ra.r32(dest.name)
         s = ra.r32(src.name)
-        return [SassInstr(encode_iadd3(d, s, RZ, RZ), f'MOV R{d}, R{s}  // {dest.name} = {src.name}')]
+        return _apply_pred_byte([SassInstr(encode_iadd3(d, s, RZ, RZ), f'MOV R{d}, R{s}  // {dest.name} = {src.name}')], instr, ctx)
 
 
 def _select_shl_b64(instr: Instruction, ra: RegAlloc,
@@ -4337,6 +4372,10 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         is_f64  = 'f64' in instr.types
                         is_float = is_f64 or 'f32' in instr.types
                         cmp_name = next((t for t in instr.types if t in ('lt','le','gt','ge','eq','ne')), 'ge')
+                        # FORGE03: derive signedness from PTX type tag.  u8/u16/u32/u64
+                        # require unsigned ISETP (byte9 bit 0x02 = 0).  Default-signed
+                        # behavior was a latent bug that surfaced on values >= 2^31.
+                        _is_signed_setp = not any(t in ('u8','u16','u32','u64') for t in instr.types)
                         if is_f64:
                             # FP64 comparison: emit DSETP using register pairs.
                             # SM_120 DSETP only reliably supports unordered comparison
@@ -4568,7 +4607,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                     output.append(SassInstr(encode_iadd3_imm32(br, RZ, imm_val, RZ),
                                         f'IADD3 R{br}, RZ, 0x{imm_val:x}, RZ  // setp imm'))
                                 output.append(SassInstr(
-                                    encode_isetp(pd, ar, br, cmp=isetp_cmp),
+                                    encode_isetp(pd, ar, br, cmp=isetp_cmp, signed=_is_signed_setp),
                                     f'ISETP.{cmp_name.upper()}.U32.AND P{pd}, PT, R{ar}, R{br}, PT'))
                             elif isinstance(b, RegOp):
                                 b_param_off = ctx._reg_param_off.get(b.name) if ctx else None
@@ -4582,7 +4621,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                         br = ctx.ra.r32(b.name)
                                         emit_pd = pd
                                         output.append(SassInstr(
-                                            encode_isetp(emit_pd, ar, br, cmp=isetp_cmp),
+                                            encode_isetp(emit_pd, ar, br, cmp=isetp_cmp, signed=_is_signed_setp),
                                             f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, R{br}, PT  // vote-safe GPR'))
                                     else:
                                         emit_pd = pd
@@ -4596,7 +4635,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                     br = ctx.ra.r32(b.name)
                                     emit_pd = pd
                                     output.append(SassInstr(
-                                        encode_isetp(emit_pd, ar, br, cmp=isetp_cmp),
+                                        encode_isetp(emit_pd, ar, br, cmp=isetp_cmp, signed=_is_signed_setp),
                                         f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, R{br}, PT  // GPR path (no body LDCU.32)'))
                                 else:
                                     # No UR/param available for ISETP.UR. Use ISETP R-R
@@ -4607,7 +4646,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                     br = ctx.ra.r32(b.name)
                                     emit_pd = pd
                                     output.append(SassInstr(
-                                        encode_isetp(emit_pd, ar, br, cmp=isetp_cmp),
+                                        encode_isetp(emit_pd, ar, br, cmp=isetp_cmp, signed=_is_signed_setp),
                                         f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, R{br}, PT'))
                             elif isinstance(b, ImmOp):
                                 # Immediate src1: ptxas uses ISETP R-R (0x20c) with RZ for imm=0,
@@ -4624,14 +4663,14 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 # toxic interaction with VOTE on SM_120 (rule #23).
                                 from sass.encoding.sm_120_opcodes import encode_isetp_imm
                                 output.append(SassInstr(
-                                    encode_isetp_imm(emit_pd, ar, imm_val, cmp=isetp_cmp),
+                                    encode_isetp_imm(emit_pd, ar, imm_val, cmp=isetp_cmp, signed=_is_signed_setp),
                                     f'ISETP.{cmp_name.upper()}.IMM P{emit_pd}, R{ar}, {imm_val:#x}'))
                             else:
                                 # Non-register src1 (e.g. memory operand) — materialize into GPR first
                                 br = _materialize_imm(b, ctx, ctx.ra, output)
                                 emit_pd = pd
                                 output.append(SassInstr(
-                                    encode_isetp(emit_pd, ar, br, cmp=isetp_cmp),
+                                    encode_isetp(emit_pd, ar, br, cmp=isetp_cmp, signed=_is_signed_setp),
                                     f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, R{br}, PT  // setp non-reg src1'))
                     else:
                         # Non-register pred dest or src0 — invalid PTX or unusual operand form

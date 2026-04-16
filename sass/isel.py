@@ -1660,6 +1660,15 @@ def _try_atom_ur_imm_K1_template(instr, ctx, bb, instr_idx: int, atom_op: str,
         SR_TID_X (which implies `mov.u32 %r, %tid.x` was lowered)
       - no other UR-activation path has already fired
         (ctx._ur_activation_sr unset)
+      - **AT06-tighten**: address operand is a *simple* ld.param.u64
+        pointer — i.e. base in ctx._ur_params AND not modified via
+        GPR ops (not in ctx._gpr_written).  This excludes
+        r1_histogram8 (address computed via shl.b64+add.u64 from tid).
+      - **AT06-tighten**: the function (any bb) contains no `bra`
+        instruction.  This excludes w2_loop_atom_add (atom inside
+        loop body).  The 15-instruction template emits exactly one
+        ATOMG and would silently drop the loop's repeated atomic
+        semantics.
 
     On admit: sets ctx._ur_activation_sr and ctx._ur_activation_atom_imm=1
     so the pipeline dispatcher selects the imm_data_K1 JSON variant.
@@ -1667,8 +1676,8 @@ def _try_atom_ur_imm_K1_template(instr, ctx, bb, instr_idx: int, atom_op: str,
 
     Returns True iff admitted.  False ⇒ caller falls back to its
     existing generic atom path.  This is the ONLY hook for the K=1
-    shortcut; the looped, no-tid-guard, HFMA2-touching, and CAS atom
-    variants all return False here.
+    shortcut; the looped, no-tid-guard, HFMA2-touching, computed-
+    address, and CAS atom variants all return False here.
     """
     from sass.encoding.sm_120_opcodes import encode_atomg_xor_u32
     from ptx.ir import MemOp as _MemOp
@@ -1695,6 +1704,35 @@ def _try_atom_ur_imm_K1_template(instr, ctx, bb, instr_idx: int, atom_op: str,
     # Don't double-fire on a ctx that already has an SR activation.
     if hasattr(ctx, '_ur_activation_sr'):
         return False
+
+    # AT06-tighten: address must be a simple ld.param.u64 pointer.
+    # If the base was modified via GPR ops (e.g. add.u64 from shl.b64
+    # of tid), the template's hardcoded address path will compute the
+    # WRONG address — see r1_histogram8 GPU regression.
+    _xbn_check = _xa.base if _xa.base.startswith('%') else f'%{_xa.base}'
+    _ur_params = getattr(ctx, '_ur_params', {})
+    _gpr_written = getattr(ctx, '_gpr_written', set())
+    if _xbn_check not in _ur_params:
+        return False
+    if _xbn_check in _gpr_written:
+        return False
+
+    # AT06-tighten: reject loop bodies.  The 15-instruction template
+    # emits exactly one ATOMG; if the atom call sits inside a loop,
+    # the per-iteration repeated atomic semantics would be silently
+    # collapsed to a single atomic — see w2_loop_atom_add GPU regression.
+    # Detect loops by scanning the function for any `bra` op.
+    _fn = getattr(ctx, 'fn', None) or getattr(ctx, '_fn', None)
+    if _fn is not None:
+        for _bb in getattr(_fn, 'basic_blocks', []) or []:
+            for _i in getattr(_bb, 'instructions', []) or []:
+                if getattr(_i, 'op', '') == 'bra':
+                    return False
+    else:
+        # Fall back: scan the current bb only.
+        for _i in getattr(bb, 'instructions', []) or []:
+            if getattr(_i, 'op', '') == 'bra':
+                return False
 
     _xd = ctx.ra.r32(instr.dest.name) if isinstance(instr.dest, RegOp) else RZ
 

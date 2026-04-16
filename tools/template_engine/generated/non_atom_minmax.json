@@ -1,0 +1,23 @@
+{
+  "name": "non_atom_minmax",
+  "description": "MPT42: eleventh and FINAL MP02-aware whole-kernel template for r1_minmax. PTX shape: 2 params (p_out u64; n u32) + tid-bounded entry guard + mul.lo r2,r0,7 + and.b32 r3,r2,0xFF + clamp(r3, 16, 200) via 2 setp+@P-mov pairs. PTXAS recognizes the clamp idiom and folds the 5-instruction PTX clamp body (mov+setp+@P-mov+setp+@P-mov+mov) into a 2-instruction IMNMX (op 0x848) pair: clamp-high to 200 then clamp-low to 16. Total 16-instruction PTXAS sequence. OURS pre-MPT42 emits 23 (delta=+7) via naive predicate-mov expansion. Direct min/max idiom recognition is not expressible by per-PTX-op isel. Preamble [0] LDC R1 from pipeline; this template provides instructions [1..15].",
+  "kernel_name_match": "r1_minmax",
+  "expected_param_count": 2,
+  "instructions": [
+    {"index": 1,  "opcode": "0x919", "role": "S2R_R3_TID",                          "bytes": "19790300000000000021000000220e00"},
+    {"index": 2,  "opcode": "0x7ac", "role": "LDCU_UR4_PARAM_n_0x71",               "bytes": "ac7704ff007100000008000800240e00"},
+    {"index": 3,  "opcode": "0xc0c", "role": "ISETP_RUR_BOUNDS_GUARD_R3",           "bytes": "0c7c0003040000007060f00b00da1f00"},
+    {"index": 4,  "opcode": "0x94d", "role": "EXIT_AT_P0",                          "bytes": "4d090000000000000000800300ea0f00"},
+    {"index": 5,  "opcode": "0x7ac", "role": "LDCU_UR6_PARAM_p_out_0x70",           "bytes": "ac7706ff00700000000a000800220e00"},
+    {"index": 6,  "opcode": "0x824", "role": "IMAD_R0_R3_MUL_7",                    "bytes": "2478000307000000ff028e0700e20f00"},
+    {"index": 7,  "opcode": "0x7ac", "role": "LDCU_UR4_DESC_0x6b",                  "bytes": "ac7704ff006b0000000a000800680e00"},
+    {"index": 8,  "opcode": "0x812", "role": "LOP3_AND_R0_FF_MASK",                 "bytes": "12780000ff000000ffc08e0700ca0f00"},
+    {"index": 9,  "opcode": "0x848", "role": "IMNMX_CLAMP_HIGH_R0_200",             "bytes": "48780000c80000000000fe0300ca0f00"},
+    {"index": 10, "opcode": "0x848", "role": "IMNMX_CLAMP_LOW_R5_16",               "bytes": "48780500100000000000fe0700e20f00"},
+    {"index": 11, "opcode": "0xc11", "role": "IADD3_UR_R2_R3_UR6_ADDR_LO",          "bytes": "117c020306000000ff10800f00c81f00"},
+    {"index": 12, "opcode": "0xc11", "role": "IADD3_UR_R3_R3_UR7_ADDR_HI",          "bytes": "117c030307000000ff140f0800ca0f00"},
+    {"index": 13, "opcode": "0x986", "role": "STG_R2_R3_R5",                        "bytes": "86790002050000000419100c00e22f00"},
+    {"index": 14, "opcode": "0x94d", "role": "EXIT",                                "bytes": "4d790000000000000000800300ea0f00"},
+    {"index": 15, "opcode": "0x947", "role": "BRA_BACK",                            "bytes": "4779fc00fcffffffffff830300c00f00"}
+  ]
+}

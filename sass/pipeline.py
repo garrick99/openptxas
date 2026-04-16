@@ -1344,6 +1344,10 @@ def compile_function(fn: Function, verbose: bool = False,
         # 'TPL' prefix so the existing post-EXIT b9 / FG33 ctrl-byte
         # rewrite skips already cover it without further pipeline patches.
         ('k100_pred_arith',      2, 'non_atom_pred_arith.json',      'TPL/MPT01'),
+        # MPT05: second MP02-aware predicate-body template.  Same dispatch
+        # mechanism; covers k200_double_guard's distinct @P1 + @!P0
+        # predicate pattern.
+        ('k200_double_guard',    2, 'non_atom_double_guard.json',    'TPL/MPT05'),
     ]
     if (sm_version >= 120
             and not _ur_activation):  # never override an active atom-template kernel

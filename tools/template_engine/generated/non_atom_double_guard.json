@@ -1,0 +1,24 @@
+{
+  "name": "non_atom_double_guard",
+  "description": "MPT05: second MP02-aware whole-kernel template for k200_double_guard. PTX shape: 2 params (p_out u64; n u32) + tid-bounded entry guard + mul.lo.u32(r2, r0, 3) + setp.gt(r0, 16) + @P1 add r2,r2,50 + setp.lt(r0, 48) + @P2 add r2,r2,25 + addr chain + STG. PTXAS uses @P1 + @!P0 (LT lowered as !GE with P0 reuse). 17-instruction PTXAS sequence; instruction [0] (LDC R1 preamble) provided by pipeline.py; this template provides instructions [1..16].",
+  "kernel_name_match": "k200_double_guard",
+  "expected_param_count": 2,
+  "instructions": [
+    {"index": 1,  "opcode": "0x919", "role": "S2R_R0_TID",                     "bytes": "19790000000000000021000000220e00"},
+    {"index": 2,  "opcode": "0x7ac", "role": "LDCU_UR4_PARAM_n_0x71",          "bytes": "ac7704ff007100000008000800240e00"},
+    {"index": 3,  "opcode": "0xc0c", "role": "ISETP_RUR_BOUNDS_GUARD",         "bytes": "0c7c0000040000007060f00b00da1f00"},
+    {"index": 4,  "opcode": "0x94d", "role": "EXIT_AT_P0",                     "bytes": "4d090000000000000000800300ea0f00"},
+    {"index": 5,  "opcode": "0x7ac", "role": "LDCU_UR6_PARAM_p_out_0x70",      "bytes": "ac7706ff00700000000a000800220e00"},
+    {"index": 6,  "opcode": "0x80c", "role": "ISETP_IMM_GT_16_TO_P1",          "bytes": "0c780000100000007040f20300e20f04"},
+    {"index": 7,  "opcode": "0x80c", "role": "ISETP_IMM_GE_48_TO_P0_FOR_LT",   "bytes": "0c780000300000007060f00300e20f04"},
+    {"index": 8,  "opcode": "0x824", "role": "IMAD_I_R5_R0_TIMES_3",           "bytes": "2478050003000000ff028e0700e20f04"},
+    {"index": 9,  "opcode": "0x7ac", "role": "LDCU_UR4_DESC_0x6b",             "bytes": "ac7704ff006b0000000a000800740e00"},
+    {"index": 10, "opcode": "0x835", "role": "AT_P1_UIADD_R5_PLUS_50",         "bytes": "351805053200000000008e0700e20f00"},
+    {"index": 11, "opcode": "0xc11", "role": "IADD3_UR_R2_R0_UR6_ADDR_LO",     "bytes": "117c020006000000ff10820f00c81f00"},
+    {"index": 12, "opcode": "0x835", "role": "AT_NEG_P0_UIADD_R5_PLUS_25",     "bytes": "358805051900000000008e0700e20f00"},
+    {"index": 13, "opcode": "0xc11", "role": "IADD3_UR_R3_R0_UR7_ADDR_HI",     "bytes": "117c030007000000ff148f0800ca0f00"},
+    {"index": 14, "opcode": "0x986", "role": "STG_R2_R3_R5",                   "bytes": "86790002050000000419100c00e22f00"},
+    {"index": 15, "opcode": "0x94d", "role": "EXIT",                           "bytes": "4d790000000000000000800300ea0f00"},
+    {"index": 16, "opcode": "0x947", "role": "BRA_BACK",                       "bytes": "4779fc00fcffffffffff830300c00f00"}
+  ]
+}

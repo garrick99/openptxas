@@ -2473,15 +2473,29 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         if (_sr_source is not None and isinstance(instr.dest, RegOp)
                                 and not _has_atom_xor_add and _pred_safe):
                             ctx._reg_sr_source[instr.dest.name] = _sr_source
+                        # UI03: also propagate the bounded UR-safe tag when
+                        # the source carries it (mirror of the SR-source rule).
+                        if (_src0_name is not None and _src0_name in ctx._reg_ur_safe_src
+                                and isinstance(instr.dest, RegOp)
+                                and not _has_atom_xor_add and _pred_safe):
+                            ctx._reg_ur_safe_src.add(instr.dest.name)
                         imm = instr.srcs[1].value & 0xFFFFFFFF
-                        if (_sr_source is not None and ctx.sm_version == 120
+                        # UI03: admit UIADD when source is already SR-derived OR
+                        # when it carries the new UR-safe tag (e.g. LDG result
+                        # whose address chain was SR-derived). Everything else
+                        # stays as before.
+                        _ur_safe = (_src0_name is not None
+                                    and _src0_name in ctx._reg_ur_safe_src)
+                        if ((_sr_source is not None or _ur_safe)
+                                and ctx.sm_version == 120
                                 and not getattr(ctx, '_has_vote', False)
                                 and not getattr(ctx, '_has_bar_sync', False)):
                             # UIADD: adds immediate to UR-eligible value
                             from sass.encoding.sm_120_opcodes import encode_uiadd_imm
                             a = ctx.ra.r32(_src0_name) if _src0_name in ctx.ra.int_regs else _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
+                            _tag = 'SR-derived' if _sr_source is not None else 'LDG-from-SR-addr'
                             output.append(SassInstr(encode_uiadd_imm(d, a, imm),
-                                                    f'UIADD R{d}, R{a}, 0x{imm:x}  // TE35: SR-derived add.{typ}'))
+                                                    f'UIADD R{d}, R{a}, 0x{imm:x}  // TE35/UI03: {_tag} add.{typ}'))
                         else:
                             a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                             output.append(SassInstr(encode_iadd3_imm32(d, a, imm, RZ),

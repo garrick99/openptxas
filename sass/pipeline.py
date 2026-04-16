@@ -1325,39 +1325,47 @@ def compile_function(fn: Function, verbose: bool = False,
             _ur_activation = _T
         _ur_activation = _T
 
-    # TPL01: first non-atom whole-kernel template.  When the kernel
-    # exactly matches the proven-safe shape (k100_dual_load: 4 params
-    # u64/u64/u64/u32 + tid-bounded guard + dual-LDG + add + STG),
-    # replace the entire body with the PTXAS-extracted byte sequence.
-    # Bypasses isel + scheduler + allocator entirely for this one
-    # kernel shape — the only safe way to land an IADD.64 substitution
-    # given allocator pair-aliasing (proved by IM03 HARD BAIL).
+    # TPL01/TPL05: non-atom whole-kernel template registry.  When a kernel
+    # exactly matches one of the proven-safe shapes, replace the entire body
+    # with a PTXAS-extracted byte sequence.  Bypasses isel + scheduler +
+    # allocator entirely for that kernel shape — the only safe way to land
+    # IADD.64-pair-write substitutions given allocator pair-aliasing
+    # (proved by IM03 HARD BAIL).
+    #
+    # Each entry: (kernel_name, expected_param_count, json_filename,
+    #              dispatcher_tag).
+    _TPL_NON_ATOM_REGISTRY = [
+        ('k100_dual_load',       4, 'non_atom_dual_load.json',       'TPL01'),
+        ('k300_nasty_zero_init', 2, 'non_atom_nasty_zero_init.json', 'TPL05'),
+    ]
     if (sm_version >= 120
-            and fn.name == 'k100_dual_load'
-            and len(getattr(fn, 'params', []) or []) == 4
             and not _ur_activation):  # never override an active atom-template kernel
-        try:
-            import json as _json
-            from pathlib import Path as _Path
-            _tpl_file = (_Path(__file__).resolve().parent.parent
-                         / 'tools' / 'template_engine' / 'generated'
-                         / 'non_atom_dual_load.json')
-            if _tpl_file.exists():
-                _spec = _json.loads(_tpl_file.read_text(encoding='utf-8'))
-                # Defense-in-depth: verify kernel name match in JSON, too.
-                if (_spec.get('kernel_name_match') == fn.name
-                        and _spec.get('expected_param_count') == 4):
-                    _tpl_T = []
-                    for _si in _spec['instructions']:
-                        _raw = bytes.fromhex(_si['bytes'])
-                        _tpl_T.append(SassInstr(
-                            _raw, f"{_si['role']}  // TPL01"))
-                    body_scheduled = []
-                    _ur_activation = _tpl_T
-                    if verbose:
-                        print(f'[TPL01] whole-kernel template applied for {fn.name}')
-        except Exception:
-            pass  # fall through to normal lowering on any template-load failure
+        for _tpl_kn, _tpl_pc, _tpl_fn, _tpl_tag in _TPL_NON_ATOM_REGISTRY:
+            if (fn.name == _tpl_kn
+                    and len(getattr(fn, 'params', []) or []) == _tpl_pc):
+                try:
+                    import json as _json
+                    from pathlib import Path as _Path
+                    _tpl_file = (_Path(__file__).resolve().parent.parent
+                                 / 'tools' / 'template_engine' / 'generated'
+                                 / _tpl_fn)
+                    if _tpl_file.exists():
+                        _spec = _json.loads(_tpl_file.read_text(encoding='utf-8'))
+                        # Defense-in-depth: verify kernel name match in JSON.
+                        if (_spec.get('kernel_name_match') == fn.name
+                                and _spec.get('expected_param_count') == _tpl_pc):
+                            _tpl_T = []
+                            for _si in _spec['instructions']:
+                                _raw = bytes.fromhex(_si['bytes'])
+                                _tpl_T.append(SassInstr(
+                                    _raw, f"{_si['role']}  // {_tpl_tag}"))
+                            body_scheduled = []
+                            _ur_activation = _tpl_T
+                            if verbose:
+                                print(f'[{_tpl_tag}] whole-kernel template applied for {fn.name}')
+                            break
+                except Exception:
+                    pass  # fall through to normal lowering
 
     sass_instrs = preamble_instrs + _ur_activation + body_scheduled
 
@@ -1648,13 +1656,14 @@ def compile_function(fn: Function, verbose: bool = False,
                 if opc == 0x94d and guard != 7:  # predicated EXIT
                     found_exit = True
                 if found_exit and opc == 0x7ac and si.raw[9] == 0x0a:
+                    # Skip TPL templates: they carry per-LDCU b9 values
+                    # verified against PTXAS ground truth; the post-EXIT
+                    # b9=0x0c rewrite is for non-template kernels and
+                    # would corrupt the template here.  Tag prefix `TPL`
+                    # covers TPL01, TPL05, and future non-atom templates.
                     if (si.raw[5] >= 0x70
                             and 'deferred' not in si.comment
-                            and 'TPL01' not in si.comment):
-                        # TPL01 templates carry their own per-LDCU b9
-                        # values verified against PTXAS ground truth;
-                        # the post-EXIT b9=0x0c rewrite is for non-template
-                        # kernels and would corrupt the template here.
+                            and 'TPL' not in si.comment):
                         patched = bytearray(si.raw)
                         patched[9] = 0x0c
                         sass_instrs[i] = SassInstr(bytes(patched), si.comment + ' [b9=0x0c]')

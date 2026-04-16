@@ -682,6 +682,9 @@ def compile_function(fn: Function, verbose: bool = False,
         sm_version=sm_version,
     )
     ctx._addr_scratch_lo = _addr_scratch_base  # dedicated addr pair: R(base):R(base+1)
+    # IM02/IM03: helpers need access to the function for kernel-wide PTX scans
+    # (loop / atom / HFMA2 / SHF / multi-pred exclusion gates).
+    ctx.fn = fn
     # FG26 UR4 start is applied below, after _setp_only_params detection.
     # WB-7: aliased-base address-chain folding (analysis ran above
     # before allocate() so the dead vregs are excluded from int_regs).

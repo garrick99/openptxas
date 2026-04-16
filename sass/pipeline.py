@@ -289,6 +289,29 @@ def _if_convert(fn: Function) -> None:
                 return True
         return False
 
+    def _has_neg_sub(inst_list):
+        """FORGE07: skip if-conversion when the body contains sub.u32/s32.
+
+        OURS lowers `sub.u32 d, a, b` to `IADD3 d, a, -b, RZ` (encode_iadd3
+        with negate_src1=True, byte 7 = 0x80 negation flag).  When this
+        instruction is then patched with @!Pn, the resulting byte pattern
+        (byte 1 = 0x80+pred_idx, byte 7 = 0x80) has UNDEFINED behavior on
+        SM_120 — empirical evidence: PTXAS never emits this pattern (zero
+        kernels in 144-kernel workbench corpus); OURS workbench corpus
+        also never emitted it pre-FORGE07.  Hardware behavior in tests:
+        the @!P guard appears to be ignored, so the negated branch fires
+        unconditionally, corrupting results.
+
+        Workaround: skip if-conversion when bodies contain sub, leaving the
+        kernel as actual divergent BRA branches handled by the GPU's
+        warp scheduler.
+        """
+        for inst in inst_list:
+            if inst.op == 'sub' and inst.types and any(
+                    t in ('u32', 's32', 'u64', 's64') for t in inst.types):
+                return True
+        return False
+
     changed = True
     while changed:
         changed = False
@@ -504,7 +527,9 @@ def _if_convert(fn: Function) -> None:
                                         or _has_inner_predicates(false_body)
                                         or _overwrites_pred(true_body, pred_name)
                                         or _overwrites_pred(false_body, pred_name)
-                                        or _pred_from_float_setp(bb.instructions, pred_name)):
+                                        or _pred_from_float_setp(bb.instructions, pred_name)
+                                        or _has_neg_sub(true_body)
+                                        or _has_neg_sub(false_body)):
                                     continue
                                 guarded_true = _guard(true_body, pred_name, neg_bra)
                                 guarded_false = _guard(false_body, pred_name, not neg_bra)

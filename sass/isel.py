@@ -812,6 +812,11 @@ def _select_shl_b64(instr: Instruction, ra: RegAlloc,
     d_lo = ra.lo(dest.name); d_hi = d_lo + 1
     s_lo = ra.lo(src.name);  s_hi = s_lo + 1
 
+    # UI02: propagate UR-eligibility through shl.b64. A shifted SR-derived
+    # u64 address is still SR-derived (scaled offset, address-formation path).
+    if ctx is not None and src.name in ctx._reg_ur_safe_src:
+        ctx._reg_ur_safe_src.add(dest.name)
+
     # IMAD.WIDE fusion: if source was cvt.u64.u32, the hi word is zero.
     # Use IMAD.WIDE to compute both lo and hi in one instruction:
     #   (dest, dest+1) = src32 * (1<<K) + RZ
@@ -973,6 +978,16 @@ def _select_add_u64(instr: Instruction, ra: RegAlloc,
     dest = instr.dest
     a    = instr.srcs[0]
     b    = instr.srcs[1]
+    # UI02: propagate UR-eligibility through add.u64. An address formed by
+    # (param-pointer) + (SR-derived offset) is an SR-derived address for
+    # the purpose of LDG-result UR-safety. Admit when at least one source
+    # is already UR-safe-tagged; the other must be a RegOp (param or addr
+    # chain), not an arbitrary non-uniform value. ImmOp offsets keep the tag.
+    if (ctx is not None and isinstance(dest, RegOp)):
+        a_tag = isinstance(a, RegOp) and a.name in ctx._reg_ur_safe_src
+        b_tag = isinstance(b, RegOp) and b.name in ctx._reg_ur_safe_src
+        if a_tag or b_tag:
+            ctx._reg_ur_safe_src.add(dest.name)
     sm_ver = ctx.sm_version if ctx else 120
     # WB-10: skip self-add-zero (`add.u64 %X, %X, 0`) — used in PTX
     # as a "materialize to GPR" hint that's redundant when the param
@@ -1486,6 +1501,15 @@ def _select_ld_global(instr: Instruction, ra: RegAlloc,
         d = ra.r32(dest.name)
         result.append(SassInstr(encode_ldg_e(d, ur_desc, addr, width=32, imm_offset=total_offset),
                           f'LDG.E R{d}, desc[UR{ur_desc}][R{addr}.64{off_str}]'))
+    # UI02: tag the LDG destination as UR-safe iff the ADDRESS operand chain
+    # was tagged UR-safe. The VALUE at that address is not uniform, but the
+    # UR[dest]-side-effect of UIADD (0x835) is harmless when the SR-address
+    # provenance is known — PTXAS's ground truth shows it emits UIADD in
+    # exactly this "LDG-from-SR-address → add immediate" pattern.
+    if (ctx is not None and isinstance(instr.srcs[0], MemOp)
+            and instr.srcs[0].base.startswith('%')
+            and instr.srcs[0].base in ctx._reg_ur_safe_src):
+        ctx._reg_ur_safe_src.add(dest.name)
     return result
 
 
@@ -1865,6 +1889,13 @@ class ISelContext:
     _reg_param_off: dict[str, int] = field(default_factory=dict)
     # Map PTX register name → SR code (for S2UR in mad.lo)
     _reg_sr_source: dict[str, int] = field(default_factory=dict)
+    # UI02: set of PTX register names that are safe sources for UIADD (0x835).
+    # Populated by propagating "SR-derived" / "address derived from SR" through
+    # cvt.u64.u32, shl.b64, add.u64 (one-arg SR-derived), ld.global (address
+    # chain SR-derived). A register is in this set when the existing
+    # _reg_sr_source infrastructure already tags it, OR when the bounded
+    # UI02 rules add it. UIADD emission in UI03 reads this set.
+    _reg_ur_safe_src: set = field(default_factory=set)
     # Map PTX register name → UR index (u32 params loaded via LDCU.32 for ISETP R-UR)
     _ur_for_param:  dict[str, int] = field(default_factory=dict)
     # Set of PTX register names that have been written to GPR (overriding any UR value)
@@ -3639,6 +3670,14 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         # Only zero-extend from unsigned 32-bit; signed widening needs
                         # SHF.R.S32.HI (no encoder yet) for correct sign extension.
                         _is_32_src = any(t in ('u32','b32') for t in instr.types[1:])
+                        # UI02: propagate UR-eligibility through cvt.u64.u32.
+                        # An address chain originating from an SR-derived u32
+                        # widens to an SR-derived u64. This is the first link
+                        # in the LDG-address provenance chain.
+                        if (_is_64_dst and _is_32_src
+                                and (s.name in ctx._reg_sr_source
+                                     or s.name in ctx._reg_ur_safe_src)):
+                            ctx._reg_ur_safe_src.add(d.name)
                         if _is_64_dst and _is_32_src:
                             s_r = ctx.ra.r32(s.name)
                             # CSE: check if we already converted this source register

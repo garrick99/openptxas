@@ -816,22 +816,34 @@ def _select_shl_b64(instr: Instruction, ra: RegAlloc,
     # Use IMAD.WIDE to compute both lo and hi in one instruction:
     #   (dest, dest+1) = src32 * (1<<K) + RZ
     # This replaces MOV+MOV+IMAD.SHL+SHF with a single wide multiply.
+    #
+    # FG69: when the kernel has LDG (load from global), PTXAS uses
+    # IMAD.I + SHF.R.U32.HI instead of IMAD.WIDE.  Both compute the
+    # same 64-bit result; the SHF pair matches PTXAS encoding for
+    # the SHF_WIDENING family.
     if (ctx and k < 32 and k <= 7
             and hasattr(ctx, '_cvt_src_map') and src.name in ctx._cvt_src_map):
         src32 = ctx._cvt_src_map[src.name]
-        from sass.encoding.sm_120_opcodes import encode_imad_wide
         # Remove the dead MOV+MOV from cvt.u64.u32 (they're the last 1-2 instrs)
         if output is not None:
-            # Remove trailing MOV hi=0
             if output and 'cvt.64.32 hi=0' in output[-1].comment:
                 output.pop()
-            # Remove trailing MOV lo copy (if present)
             if output and 'cvt.64.32 lo' in output[-1].comment:
                 output.pop()
         if ctx:
             if not hasattr(ctx, '_widened_from_32'):
                 ctx._widened_from_32 = set()
             ctx._widened_from_32.add(dest.name)
+        # FG69: LDG kernels use IMAD.I + SHF.R.U32.HI
+        if getattr(ctx, '_has_ldg', False):
+            return [
+                SassInstr(encode_imad_shl_u32(d_lo, src32, k),
+                          f'IMAD.I R{d_lo}, R{src32}, {1<<k:#x}, RZ  // FG69: widen lo (LDG family)'),
+                SassInstr(encode_shf_r_u32_hi(d_hi, src32, 32 - k),
+                          f'SHF.R.U32.HI R{d_hi}, RZ, {32-k}, R{src32}  // FG69: widen hi'),
+            ]
+        # Non-LDG kernels: use IMAD.WIDE (handled by 0xc11 replacement later)
+        from sass.encoding.sm_120_opcodes import encode_imad_wide
         return [
             SassInstr(encode_imad_wide(d_lo, src32, 1 << k, RZ),
                       f'IMAD.WIDE R{d_lo}, R{src32}, {1<<k:#x}, RZ  // LEA: ({dest.name}.lo,hi) = {src.name} * {1<<k}'),

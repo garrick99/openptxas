@@ -898,6 +898,8 @@ def compile_function(fn: Function, verbose: bool = False,
         inst.op == 'bar' and 'sync' in inst.types
         for bb in fn.blocks for inst in bb.instructions
     )
+    # FG69: expose _has_ldg for isel SHF widening decision
+    ctx._has_ldg = _has_ldg
 
     body_instrs = select_function(fn, ctx)
 

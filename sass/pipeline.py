@@ -1340,6 +1340,10 @@ def compile_function(fn: Function, verbose: bool = False,
         ('r1_scatter_add',       2, 'non_atom_scatter_add.json',     'TPL09'),
         ('r1_running_xor',       2, 'non_atom_running_xor.json',     'TPL13'),
         ('r1_multi_stage',       2, 'non_atom_multi_stage.json',     'TPL17'),
+        # MPT01: first MP02-aware predicate-body template.  Tagged with
+        # 'TPL' prefix so the existing post-EXIT b9 / FG33 ctrl-byte
+        # rewrite skips already cover it without further pipeline patches.
+        ('k100_pred_arith',      2, 'non_atom_pred_arith.json',      'TPL/MPT01'),
     ]
     if (sm_version >= 120
             and not _ur_activation):  # never override an active atom-template kernel
@@ -2001,6 +2005,10 @@ def compile_function(fn: Function, verbose: bool = False,
                     _raw = _si.raw
                     _ropc = (struct.unpack_from('<Q', _raw, 0)[0]) & 0xFFF
                     if _ropc not in _ALU_OPCODES:
+                        continue
+                    # MPT01 / TPL templates carry verified-against-PTXAS
+                    # registers; skip FG29-C R0-normalization for them.
+                    if 'TPL' in _si.comment or 'MPT' in _si.comment:
                         continue
                     _patched = bytearray(_raw)
                     _changed = False

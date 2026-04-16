@@ -1371,6 +1371,12 @@ def compile_function(fn: Function, verbose: bool = False,
         # PTX setps to the same {P0,P2,P1,P2} pattern, with P0 reused
         # entry/gt-16 and P2 reused gt-8/gt-48; SEL.IMM folds gt-8 +1 add).
         ('w1_div_multi_guard',   2, 'non_atom_div_multi_guard.json', 'TPL/MPT26'),
+        # MPT30: eighth MP02-aware predicate-body template (w2_deep_pred,
+        # 5-setp/5-@P alternating PTX P1/P2 with thresholds 2/6/12/24/48;
+        # PTXAS reallocates to {P2,P0,P1,P0-reuse,P2-reuse} = 3 distinct
+        # slots with aggressive P0/P2 reuse, plus SEL.IMM folding the gt-2
+        # +1 add via predicate-mux and 4x@P-UIADD chain).
+        ('w2_deep_pred',         2, 'non_atom_deep_pred.json',       'TPL/MPT30'),
     ]
     if (sm_version >= 120
             and not _ur_activation):  # never override an active atom-template kernel

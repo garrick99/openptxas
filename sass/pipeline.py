@@ -1348,6 +1348,9 @@ def compile_function(fn: Function, verbose: bool = False,
         # mechanism; covers k200_double_guard's distinct @P1 + @!P0
         # predicate pattern.
         ('k200_double_guard',    2, 'non_atom_double_guard.json',    'TPL/MPT05'),
+        # MPT09: third MP02-aware predicate-body template (k300_pred3,
+        # 3-setp/3-@P with PTXAS's 3-distinct-predicate allocation).
+        ('k300_pred3',           2, 'non_atom_pred3.json',           'TPL/MPT09'),
     ]
     if (sm_version >= 120
             and not _ur_activation):  # never override an active atom-template kernel

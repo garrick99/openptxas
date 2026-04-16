@@ -1763,6 +1763,142 @@ def _try_atom_ur_imm_K1_template(instr, ctx, bb, instr_idx: int, atom_op: str,
     return True
 
 
+def _im_iadd64_admissible(instr, ctx, bb, instr_idx: int) -> bool:
+    """IM02: bounded predicate for the IADD3 → IADD.64 substitution
+    when emitting `add.u32 rd, rs1, rs2` (register-register, no immediate).
+
+    The substitution is byte-safe iff every condition holds:
+
+    1. PTX shape: `add.u32` (or s32) with srcs[0] and srcs[1] both RegOp,
+       dest is RegOp, no predicate guard on the add itself.
+
+    2. **HI-half is dead**: scanning forward in the same basic block from
+       the add, the dest register is consumed by exactly one STG-of-dest
+       reachable through only `cvt.u64.u32`, `shl.b64`, `add.u64`, or
+       `mul.lo.u32` (small address-compute chain) instructions.  No
+       other instruction may use the dest before that STG.  This
+       guarantees R+1 (the HI-half write IADD.64 produces) is never
+       observed.
+
+    3. **No HFMA2 / SHF contamination** in the kernel: PTX-level scan
+       of the function for `fma`, `shf`, `mad24`, etc. that would
+       trigger emission of opcodes prohibited by this run's scope.
+
+    4. **No atom contamination**: PTX has no `atom.` op.
+
+    5. **No loop**: PTX has no `bra` instruction in any basic block.
+
+    6. **No MP02 multi-pred presence**: PTX has at most ONE post-EXIT
+       `setp` outside the early-exit guard.  This excludes multi-pred
+       kernels even though MP02 keeps them GPU-correct, because their
+       isel path is sensitive to extra modifications.
+
+    Returns True iff all conditions hold; the caller is then licensed
+    to emit IADD.64 instead of IADD3.  False ⇒ keep IADD3 (default).
+
+    No emission change in IM02; IM03 wires this into the add.u32 isel.
+    """
+    # 1. Shape gate.
+    if instr.pred is not None:
+        return False
+    if not (isinstance(getattr(instr, 'dest', None), RegOp)
+            and len(instr.srcs) >= 2
+            and isinstance(instr.srcs[0], RegOp)
+            and isinstance(instr.srcs[1], RegOp)):
+        return False
+    _dest_name = instr.dest.name
+
+    # 2. HI-half dead via single-bb forward scan.
+    # Safe shape: every subsequent use of `dest` is either
+    #   (a) a 32-bit op (u32/s32/b32 type) reading dest as a 32-bit
+    #       value — never observes the HI-half R+1 corruption, OR
+    #   (b) a `cvt.u64.u32 dst, dest` widen — reads only the u32 lo, OR
+    #   (c) the terminal `st.global` data operand of dest.
+    # Non-dest-using ops are allowed unconditionally (cvt/shl/add.u64
+    # for the address chain, etc.).  Any pair-read of dest, or any op
+    # whose op type is not in the 32-bit / safe-cvt set, rejects.
+    _saw_dest_store = False
+    _bb_instrs = getattr(bb, 'instructions', []) or []
+    _safe_32bit_types = {'u32', 's32', 'b32'}
+    for _j in range(instr_idx + 1, len(_bb_instrs)):
+        _next = _bb_instrs[_j]
+        _nop = getattr(_next, 'op', '')
+        # Stop scan at branch/return.
+        if _nop in ('bra', 'ret', 'exit'):
+            break
+        # Check if _next reads _dest_name as a source.
+        _reads_dest = False
+        for _s in getattr(_next, 'srcs', []) or []:
+            if isinstance(_s, RegOp) and _s.name == _dest_name:
+                _reads_dest = True; break
+            from ptx.ir import MemOp as _MemOp
+            if isinstance(_s, _MemOp) and _s.base in (_dest_name, _dest_name.lstrip('%')):
+                _reads_dest = True; break
+        # st.global with dest as data operand → terminal, accept.
+        if _nop == 'st' and 'global' in getattr(_next, 'types', []):
+            if (len(_next.srcs) >= 2
+                    and isinstance(_next.srcs[1], RegOp)
+                    and _next.srcs[1].name == _dest_name):
+                _saw_dest_store = True
+                break
+            # st.global with dest as ADDRESS (pair-read) → reject.
+            from ptx.ir import MemOp as _MemOp2
+            if (len(_next.srcs) >= 1
+                    and isinstance(_next.srcs[0], _MemOp2)
+                    and _next.srcs[0].base in (_dest_name, _dest_name.lstrip('%'))):
+                return False
+            continue
+        # Skip ops that don't read dest.
+        if not _reads_dest:
+            continue
+        # `_next` reads dest.  Accept iff it reads as a 32-bit value.
+        _types = set(getattr(_next, 'types', []) or [])
+        if _types & _safe_32bit_types and not (_types & {'u64','s64','b64','f64'}):
+            # 32-bit op reading dest — HI-half R+1 not observed.
+            continue
+        # cvt.u64.u32 dst, dest reads dest as u32 lo — safe.
+        if _nop == 'cvt' and 'u32' in _types and 'u64' in _types:
+            continue
+        # Anything else reading dest → reject.
+        return False
+    if not _saw_dest_store:
+        return False
+
+    # 3-5. Kernel-level exclusions via PTX scan.
+    _fn = getattr(ctx, 'fn', None) or getattr(ctx, '_fn', None)
+    _all_bbs = []
+    if _fn is not None:
+        # Function exposes `blocks` (not `basic_blocks`) — see ptx/ir.py.
+        _all_bbs = getattr(_fn, 'blocks', None) or getattr(_fn, 'basic_blocks', None) or []
+    if not _all_bbs:
+        _all_bbs = [bb]
+    _setp_post_exit_count = 0
+    _saw_exit = False
+    for _bb in _all_bbs:
+        for _i in getattr(_bb, 'instructions', []) or []:
+            _iop = getattr(_i, 'op', '')
+            if _iop == 'bra':
+                return False  # loop
+            if _iop == 'atom':
+                return False  # atom contamination
+            if _iop == 'shf':
+                return False  # SHF contamination
+            if _iop == 'fma':
+                return False  # FMA → may lower to HFMA2
+            if _iop == 'mad':
+                return False  # MAD → IMAD coordination potentially HFMA2
+            # Track post-EXIT setp count for MP02 multi-pred exclusion.
+            if _iop == 'ret':
+                _saw_exit = True
+            if _iop == 'setp' and _saw_exit:
+                _setp_post_exit_count += 1
+                if _setp_post_exit_count > 0:
+                    # Any post-EXIT setp triggers MP02 exclusion (even one).
+                    return False
+
+    return True
+
+
 def _try_atom_ur_imm_K1_no_tid_guard_template(
         instr, ctx, bb, instr_idx: int, atom_op: str, output: list) -> bool:
     """AT10: atom-UR template for the K=1 immediate-data NO-tid-guard sibling.

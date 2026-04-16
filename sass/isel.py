@@ -1724,13 +1724,13 @@ def _try_atom_ur_imm_K1_template(instr, ctx, bb, instr_idx: int, atom_op: str,
     # Detect loops by scanning the function for any `bra` op.
     _fn = getattr(ctx, 'fn', None) or getattr(ctx, '_fn', None)
     if _fn is not None:
-        for _bb in getattr(_fn, 'basic_blocks', []) or []:
-            for _i in getattr(_bb, 'instructions', []) or []:
-                if getattr(_i, 'op', '') == 'bra':
-                    return False
+        # Function exposes `blocks` (not `basic_blocks`) — see ptx/ir.py.
+        _scan_bbs = (getattr(_fn, 'blocks', None)
+                     or getattr(_fn, 'basic_blocks', None) or [])
     else:
-        # Fall back: scan the current bb only.
-        for _i in getattr(bb, 'instructions', []) or []:
+        _scan_bbs = [bb]
+    for _bb in _scan_bbs:
+        for _i in getattr(_bb, 'instructions', []) or []:
             if getattr(_i, 'op', '') == 'bra':
                 return False
 
@@ -1967,12 +1967,13 @@ def _try_atom_ur_imm_K1_no_tid_guard_template(
     # No loops anywhere in the function.
     _fn = getattr(ctx, 'fn', None) or getattr(ctx, '_fn', None)
     if _fn is not None:
-        for _bb in getattr(_fn, 'basic_blocks', []) or []:
-            for _i in getattr(_bb, 'instructions', []) or []:
-                if getattr(_i, 'op', '') == 'bra':
-                    return False
+        # Function exposes `blocks` (not `basic_blocks`) — see ptx/ir.py.
+        _scan_bbs = (getattr(_fn, 'blocks', None)
+                     or getattr(_fn, 'basic_blocks', None) or [])
     else:
-        for _i in getattr(bb, 'instructions', []) or []:
+        _scan_bbs = [bb]
+    for _bb in _scan_bbs:
+        for _i in getattr(_bb, 'instructions', []) or []:
             if getattr(_i, 'op', '') == 'bra':
                 return False
 

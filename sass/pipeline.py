@@ -1365,6 +1365,12 @@ def compile_function(fn: Function, verbose: bool = False,
         # with P0 reused entry/gt-8 and P2 reused gt-4/gt-32, plus SEL.IMM
         # folding the first +1 add via predicate-mux).
         ('k200_pred_chain',      2, 'non_atom_pred_chain.json',      'TPL/MPT22'),
+        # MPT26: seventh MP02-aware predicate-body template (w1_div_multi_guard,
+        # 4-setp/4-@P alternating PTX P1/P2 with thresholds 8/16/32/48; PTXAS
+        # opcode-identical to MPT22 but reallocates name-alternating P1/P2
+        # PTX setps to the same {P0,P2,P1,P2} pattern, with P0 reused
+        # entry/gt-16 and P2 reused gt-8/gt-48; SEL.IMM folds gt-8 +1 add).
+        ('w1_div_multi_guard',   2, 'non_atom_div_multi_guard.json', 'TPL/MPT26'),
     ]
     if (sm_version >= 120
             and not _ur_activation):  # never override an active atom-template kernel

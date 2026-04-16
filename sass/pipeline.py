@@ -1926,13 +1926,19 @@ def compile_function(fn: Function, verbose: bool = False,
             -2: (0xea, 0x0f), -1: (0xc0, 0x0f),
         }
 
-        # Validate structure: preamble must be LDC S2R LDCU ISETP EXIT LDCU ALU LDCU
+        # Validate structure: preamble must be LDC S2R LDCU ISETP EXIT LDCU ...
+        # Two layouts accepted:
+        #   Original: ... LDCU ALU LDCU ... (LDCU at position 7)
+        #   FG52:     ... LDCU ISTP ALU LDCU ... (LDCU at position 8 after reorder)
         _preamble_opc = [0xb82, 0x919, 0x7ac, 0xc0c, 0x94d, 0x7ac]
         _postamble_opc = [0xc11, 0xc11, 0x986, 0x94d, 0x947]
+        _ldcu_at_7 = _fg31_n >= 14 and _fg31_opcodes[7] == 0x7ac
+        _ldcu_at_8 = (_fg31_n >= 15 and _fg31_opcodes[8] == 0x7ac
+                      and _fg31_opcodes[6] == 0x80c)  # ISTP.I at 6 (FG52 reorder)
         _fg33_ok = (_fg31_n >= 14
                     and _fg31_opcodes[:6] == _preamble_opc
                     and _fg31_opcodes[-5:] == _postamble_opc
-                    and _fg31_opcodes[7] == 0x7ac)  # LDCU at position 7
+                    and (_ldcu_at_7 or _ldcu_at_8))
 
         if _fg33_ok:
             _fg31_patched = 0
@@ -1940,30 +1946,30 @@ def compile_function(fn: Function, verbose: bool = False,
                 _si = sass_instrs[_fi]
                 _target = None
 
-                # Preamble positions (0-5 from table, 6 special-cased)
+                # Preamble positions (0-5 from table, 6+ layout-dependent)
                 if _fi in _FG33_PREAMBLE and _fi != 6:
                     _target = _FG33_PREAMBLE[_fi]
                 # Postamble positions (relative to end)
                 elif _fi - _fg31_n in _FG33_POSTAMBLE:
                     _target = _FG33_POSTAMBLE[_fi - _fg31_n]
-                # Position 6 (first body ALU): PTXAS sets rdep=2 (b15=0x04)
-                # when the body ALU region has 0 additional instructions
-                # (the only body ALU IS at position 6, feeding 0xc11 directly).
+                # FG52 layout: [6]=ISTP.I [7]=IMAD/UIADD [8]=LDCU
+                elif _ldcu_at_8 and _fi == 6:
+                    _target = (0xe2, 0x0f)  # ISTP.I: b15=0x04 set below
+                elif _ldcu_at_8 and _fi == 7:
+                    _target = (0xe2, 0x0f)  # IMAD/UIADD: b15=0x04 set below
+                elif _ldcu_at_8 and _fi == 8:
+                    _target = (0x76, 0x0e)  # LDCU after ISTP+IMAD
+                # Original layout: [6]=ALU [7]=LDCU
                 elif _fi == 6:
-                    _body_alu_count = _fg31_n - 5 - 8  # [8..n-6)
-                    if _body_alu_count <= 0:
-                        _target = (0xe2, 0x0f)  # will set b15=0x04 below
-                    else:
-                        _target = (0xe2, 0x0f)
-                # Position 7 (LDCU): depends on body ALU opcode at position 6
-                elif _fi == 7:
+                    _target = (0xe2, 0x0f)
+                elif _fi == 7 and _ldcu_at_7:
                     _alu0_opc = _fg31_opcodes[6]
-                    if _alu0_opc in (0x812, 0x212):  # LOP3 body
+                    if _alu0_opc in (0x812, 0x212):
                         _target = (0x66, 0x0e)
-                    else:  # IMAD/UIADD body
+                    else:
                         _target = (0x68, 0x0e)
                 # Body ALU (positions 8 to n-6)
-                elif 8 <= _fi < _fg31_n - 5:
+                elif (9 if _ldcu_at_8 else 8) <= _fi < _fg31_n - 5:
                     _is_last_body = (_fi == _fg31_n - 6)
                     _body_opc = _fg31_opcodes[_fi]
                     if _is_last_body:
@@ -1990,12 +1996,14 @@ def compile_function(fn: Function, verbose: bool = False,
 
                 if _target:
                     _b13, _b14 = _target
-                    # FG34: position 6 gets b15=0x04 when body has 0 extra
-                    # ALU instructions (short body: only UIADD/LOP3 at [6]
-                    # feeds 0xc11 directly via LDCU at [7]).
+                    # FG34/FG54: b15=0x04 (rdep=2) for specific positions.
+                    # Original layout: position 6 when body has <= 1 extra ALU.
+                    # FG52 layout: positions 6 AND 7 (ISTP + IMAD both get rdep=2).
                     _b15 = 0x00
                     _body_count = _fg31_n - 5 - 8
-                    if _fi == 6 and _body_count <= 1:
+                    if _ldcu_at_8 and _fi in (6, 7):
+                        _b15 = 0x04
+                    elif not _ldcu_at_8 and _fi == 6 and _body_count <= 1:
                         _b15 = 0x04
                     if _si.raw[13] != _b13 or _si.raw[14] != _b14 or _si.raw[15] != _b15:
                         _p = bytearray(_si.raw)

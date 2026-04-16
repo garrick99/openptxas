@@ -1339,6 +1339,7 @@ def compile_function(fn: Function, verbose: bool = False,
         ('k300_nasty_zero_init', 2, 'non_atom_nasty_zero_init.json', 'TPL05'),
         ('r1_scatter_add',       2, 'non_atom_scatter_add.json',     'TPL09'),
         ('r1_running_xor',       2, 'non_atom_running_xor.json',     'TPL13'),
+        ('r1_multi_stage',       2, 'non_atom_multi_stage.json',     'TPL17'),
     ]
     if (sm_version >= 120
             and not _ur_activation):  # never override an active atom-template kernel

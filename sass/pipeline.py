@@ -1773,6 +1773,49 @@ def compile_function(fn: Function, verbose: bool = False,
                     if verbose and _r4_to_r5:
                         print(f'[FG32] R4->R5 final-result rename: {_r4_to_r5} instrs')
 
+    # FG52: local ISTP/IMAD reorder in the post-EXIT body.
+    # PTXAS places ISTP.I before IMAD.I in the post-EXIT body when both
+    # read only the tid.x register (no mutual dependency).  Our scheduler
+    # places IMAD first.  Swap when the pattern [IMAD.I, LDCU, ISTP.I]
+    # appears immediately after the post-EXIT LDCU region.
+    if alloc.addr_pair_colocated and sm_version >= 120:
+        _fg52_opcodes = [((si.raw[0] | (si.raw[1] << 8)) & 0xFFF) for si in sass_instrs]
+        # Find post-EXIT body: first instruction after predicated EXIT
+        _post_exit = None
+        for _ri, _si in enumerate(sass_instrs):
+            _ropc = _fg52_opcodes[_ri]
+            if _ropc == 0x94d and ((_si.raw[1] >> 4) & 0xF) != 7:  # predicated EXIT
+                _post_exit = _ri + 1
+                break
+        if _post_exit is not None:
+            # Scan for the pattern: LDCU, {IMAD.I or UIADD}, LDCU, ISTP.I
+            # Starting after the first post-EXIT LDCU
+            _scan = _post_exit
+            # Skip initial LDCUs
+            while _scan < len(sass_instrs) and _fg52_opcodes[_scan] == 0x7ac:
+                _scan += 1
+            # Now check: [IMAD.I/UIADD, LDCU, ISTP.I] pattern
+            if (_scan + 2 < len(sass_instrs)
+                    and _fg52_opcodes[_scan] in (0x824, 0x835)  # IMAD.I or UIADD
+                    and _fg52_opcodes[_scan + 1] == 0x7ac        # LDCU
+                    and _fg52_opcodes[_scan + 2] == 0x80c):      # ISTP.I
+                # Rotate: [IMAD, LDCU, ISTP] -> [ISTP, IMAD, LDCU]
+                _a = sass_instrs[_scan]
+                _b = sass_instrs[_scan + 1]
+                _c = sass_instrs[_scan + 2]
+                sass_instrs[_scan] = _c
+                sass_instrs[_scan + 1] = _a
+                sass_instrs[_scan + 2] = _b
+                if verbose:
+                    print('[FG52] ISTP/IMAD reorder at [%d-%d]' % (_scan, _scan+2))
+                # Check for second ISTP.I right after (k200_double_guard pattern)
+                if (_scan + 3 < len(sass_instrs)
+                        and ((_fg52_opcodes[_scan + 3] == 0x80c)
+                             or (_scan + 4 < len(sass_instrs)
+                                 and _fg52_opcodes[_scan + 3] == 0x7ac
+                                 and _fg52_opcodes[_scan + 4] == 0x80c))):
+                    pass  # multi-setp handled by the same rotation
+
     # FG36: dedicated normalization for k300_nasty_shl_xor (long ALU region).
     # The standard FG29 R0-normalization can't handle this kernel because two
     # intermediates are consumed by the final instruction (liveness overlap).

@@ -26,7 +26,12 @@ class TestClassification:
         assert r.classification == DiffClass.BYTE_EXACT
 
     def test_structural_detected(self):
-        r = _diff("k100_atom_add")
+        # Pick a kernel that is reliably STRUCTURAL across the current
+        # backend.  k100_atom_add was STRUCTURAL pre-AT06 but is now
+        # BYTE_EXACT via the imm_data_K1 atom-UR template.  ilp_alu_addr
+        # remains a stable STRUCTURAL representative (IMAD->HFMA2 family
+        # is still deferred).
+        r = _diff("ilp_alu_addr")
         assert r.classification == DiffClass.STRUCTURAL
 
     def test_atom_xor_exact(self):

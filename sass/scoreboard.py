@@ -251,6 +251,9 @@ _OPCODES_ALU = {
     0x835,        # UIADD: uniform add (P3-3, dual GPR+UR write, no _OPCODE_META entry)
     0x886,        # UR pipeline init (P3-5, descriptor setup for 0x98e ATOMG)
     0x2bd,        # UR pipeline finalize (P3-5, descriptor finalize for 0x98e ATOMG)
+    0xd09,        # AT06 UR-pipeline data-routing op for atom.add K=1 imm_data variant
+                  # (template-only; never emitted by isel directly outside the
+                  # imm_data_K1 atom-UR template path)
     # Integer min/max & sign-extend & bitmask
     0x217,        # IMNMX (integer min/max)
     0x21a,        # SGXT (sign extend)

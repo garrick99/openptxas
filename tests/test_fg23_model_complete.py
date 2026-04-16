@@ -210,6 +210,9 @@ _LATENCY_INERT = {
     0x802,  # ULDC: uniform load (UR dest, no GPR latency)
     0x886,  # UR pipeline init (P3-7, no GPR latency for consumer)
     0x2bd,  # UR pipeline finalize (P3-7, no GPR latency for consumer)
+    0xd09,  # AT06 UR-pipeline data-routing op for atom.add K=1 imm_data
+            # variant; emitted only by the atom-UR template (never via isel),
+            # and consumes/produces UR state, not GPR latency.
     0x7b8, 0x7b9, 0x7ba, 0x7b0, 0x7b1, 0x7b2, 0x7b3,
     0x7bb, 0x7bc, 0x7bd, 0xab9,
     # FG-2.3 additions:

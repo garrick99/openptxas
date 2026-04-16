@@ -1209,13 +1209,23 @@ def compile_function(fn: Function, verbose: bool = False,
 
             if _family_file.exists():
                 _fam = _json.loads(_family_file.read_text(encoding='utf-8'))
-                # Select variant by ur_activation_add
+                # Select variant.  AT06 added the imm_data_K1 variant whose
+                # selector is `atom_imm == 1` (set when isel admits an
+                # ImmOp data atom with literal 1).  When _ur_activation_atom_imm
+                # is set, that variant takes priority over add/no-add SR variants.
+                _ur_act_imm = getattr(ctx, '_ur_activation_atom_imm', None)
                 _variant = None
                 for _v in _fam['variants']:
-                    if 'add != 0' in _v['selector'] and _ur_act_add != 0:
+                    if 'atom_imm == 1' in _v['selector'] and _ur_act_imm == 1:
                         _variant = _v; break
-                    if 'add == 0' in _v['selector'] and _ur_act_add == 0:
-                        _variant = _v; break
+                if _variant is None:
+                    for _v in _fam['variants']:
+                        if 'atom_imm' in _v['selector']:
+                            continue  # skip imm variants when not triggered
+                        if 'add != 0' in _v['selector'] and _ur_act_add != 0:
+                            _variant = _v; break
+                        if 'add == 0' in _v['selector'] and _ur_act_add == 0:
+                            _variant = _v; break
 
                 if _variant is not None:
                     # AT02: per-op byte overrides for the bounded atom-UR
@@ -1226,6 +1236,11 @@ def compile_function(fn: Function, verbose: bool = False,
                     # ground truth (k100_atom_xor/max/min).
                     _ur_act_op = getattr(ctx, '_ur_activation_atom_op', 'xor')
                     # (role, byte_offset, byte_length, value)
+                    # AT02 overrides apply to the atom.xor template variants
+                    # (direct_sr, tid_plus_constant).  AT06 adds the
+                    # imm_data_K1 variant which carries its own ATOMG bytes
+                    # by default (atom.add.u32 K=1 = b9/b10/b11 = e1/12/0c)
+                    # and is parameterized at byte_offset=9 length=3.
                     _AT02_OVERRIDES = {
                         'max': [
                             ('UMOV_UR5_UR0',                9, 2, bytes([0x40, 0x01])),
@@ -1235,6 +1250,10 @@ def compile_function(fn: Function, verbose: bool = False,
                             ('UMOV_UR5_UR0',                9, 2, bytes([0x00, 0x01])),
                             ('ATOMG_XOR_R0_R2_data5_desc_UR6', 10, 2, bytes([0x92, 0x0c])),
                         ],
+                        # imm_data_K1 variant uses its own role keys.  The
+                        # JSON default bytes are atom.add (K=1).  Future
+                        # ops (or/and/min/max with K=1) would add overrides
+                        # at role 'ATOMG_ADD_R0_R2_R5' here.
                     }
                     _overrides = _AT02_OVERRIDES.get(_ur_act_op, [])
                     _T = []

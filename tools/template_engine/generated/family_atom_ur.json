@@ -1,6 +1,6 @@
 {
   "name": "atom_ur",
-  "description": "Unified family for atom.global.{xor,min,max}.b32 with UR activation. Variant A: direct SR data. Variant B: SR + constant (UIADD).",
+  "description": "Unified family for atom.global.{xor,min,max,add}.{b32,u32} with UR activation. Variant A: direct SR data (xor/min/max). Variant B: SR + constant (UIADD-K). Variant C (AT06): atom.<op>.u32 with K=1 immediate data, tid-guarded — 15-instruction shortcut sequence.",
   "shared_prefix_count": 6,
   "variants": [
     {
@@ -287,6 +287,140 @@
         },
         {
           "index": 16,
+          "opcode": "0x947",
+          "role": "BRA",
+          "bytes": "4779fc00fcffffffffff830300c00f00",
+          "invariant": true,
+          "params": []
+        }
+      ]
+    },
+    {
+      "name": "imm_data_K1",
+      "selector": "atom_imm == 1",
+      "description": "AT06: atom.<add|min|max|or|and>.u32 with literal IMM=1 data and tid-bounded guard. 15-instruction PTXAS shortcut sequence; ATOMG operation field at [12] b9/b10/b11 is per-op.",
+      "instructions": [
+        {
+          "index": 0,
+          "opcode": "0xb82",
+          "role": "S2R_R1_PREAMBLE",
+          "bytes": "827b01ff00df00000008000000e20f00",
+          "invariant": true,
+          "params": []
+        },
+        {
+          "index": 1,
+          "opcode": "0x919",
+          "role": "S2R_R0_TID",
+          "bytes": "19790000000000000021000000220e00",
+          "invariant": true,
+          "params": []
+        },
+        {
+          "index": 2,
+          "opcode": "0x7ac",
+          "role": "LDCU_UR4_PARAM_0x71",
+          "bytes": "ac7704ff007100000008000800240e00",
+          "invariant": true,
+          "params": []
+        },
+        {
+          "index": 3,
+          "opcode": "0xc0c",
+          "role": "ISETP_RUR_BOUNDS",
+          "bytes": "0c7c0000040000007060f00b00da1f00",
+          "invariant": true,
+          "params": []
+        },
+        {
+          "index": 4,
+          "opcode": "0x94d",
+          "role": "EXIT",
+          "bytes": "4d090000000000000000800300ea0f00",
+          "invariant": true,
+          "params": []
+        },
+        {
+          "index": 5,
+          "opcode": "0x919",
+          "role": "S2R_R0_LANEID",
+          "bytes": "19790000000000000000000000220e00",
+          "invariant": true,
+          "params": []
+        },
+        {
+          "index": 6,
+          "opcode": "0x886",
+          "role": "UR_PIPE_INIT_R6",
+          "bytes": "867806000000000000018e0300e20f00",
+          "invariant": true,
+          "params": []
+        },
+        {
+          "index": 7,
+          "opcode": "0x7ac",
+          "role": "LDCU_UR4_DESC_0x6b",
+          "bytes": "ac7704ff006b0000000a000800620e00",
+          "invariant": true,
+          "params": []
+        },
+        {
+          "index": 8,
+          "opcode": "0xd09",
+          "role": "UR_PIPE_D09_R5_R6",
+          "bytes": "097d0500060000000000000800620e00",
+          "invariant": true,
+          "params": []
+        },
+        {
+          "index": 9,
+          "opcode": "0xb82",
+          "role": "LDC_R2_CBANK_0xe0",
+          "bytes": "827b02ff00e00000000a000000620e00",
+          "invariant": true,
+          "params": []
+        },
+        {
+          "index": 10,
+          "opcode": "0x2bd",
+          "role": "UR_PIPE_FINAL_R7_R6",
+          "bytes": "bd7207000600000000000e0800cc0f00",
+          "invariant": true,
+          "params": []
+        },
+        {
+          "index": 11,
+          "opcode": "0xc0c",
+          "role": "ISETP_RUR_FLUSH_R0_UR7",
+          "bytes": "0c7c0000070000007020f00b00da1f00",
+          "invariant": true,
+          "params": []
+        },
+        {
+          "index": 12,
+          "opcode": "0x98e",
+          "role": "ATOMG_ADD_R0_R2_R5",
+          "bytes": "8e0900020500000004e1120c00e22f00",
+          "invariant": false,
+          "params": [
+            {
+              "name": "atomg_op_b9_10_11",
+              "byte_offset": 9,
+              "byte_length": 3,
+              "description": "Per-op ATOMG operation field at bytes [9:12). Default 0xe1 0x12 0x0c is atom.add.u32 K=1."
+            }
+          ]
+        },
+        {
+          "index": 13,
+          "opcode": "0x94d",
+          "role": "EXIT",
+          "bytes": "4d790000000000000000800300ea0f00",
+          "invariant": true,
+          "params": []
+        },
+        {
+          "index": 14,
           "opcode": "0x947",
           "role": "BRA",
           "bytes": "4779fc00fcffffffffff830300c00f00",

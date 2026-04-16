@@ -598,6 +598,8 @@ _FORWARDING_SAFE_PAIRS: set[tuple[int, int]] = {
     (0xc11, 0x981),   # TE21: IADD3.R-UR → LDG.E (carry-chain addr → load)
     (0x812, 0x812),   # TE28: LOP3→LOP3 (13 PTXAS gap=0 instances)
     (0x812, 0x824),   # TE28: LOP3→IMAD (2 PTXAS gap=0 instances)
+    (0x812, 0x235),   # TPL13: LOP3.IMM → IADD.64 (PTXAS gap=0 in r1_running_xor template at [8]→[9])
+    (0x235, 0x812),   # TPL13: IADD.64 → LOP3.IMM (PTXAS gap=0 in r1_running_xor template at [9]→[10])
     (0xc11, 0xc11),   # TE21: IADD3.R-UR → IADD3.R-UR (lo → hi carry chain)
     (0xc11, 0x235),   # TE21: IADD3.R-UR → IADD.64
     (0xc02, 0x986),   # MOV.UR     → STG.E

@@ -1338,6 +1338,7 @@ def compile_function(fn: Function, verbose: bool = False,
         ('k100_dual_load',       4, 'non_atom_dual_load.json',       'TPL01'),
         ('k300_nasty_zero_init', 2, 'non_atom_nasty_zero_init.json', 'TPL05'),
         ('r1_scatter_add',       2, 'non_atom_scatter_add.json',     'TPL09'),
+        ('r1_running_xor',       2, 'non_atom_running_xor.json',     'TPL13'),
     ]
     if (sm_version >= 120
             and not _ur_activation):  # never override an active atom-template kernel
@@ -2317,6 +2318,11 @@ def compile_function(fn: Function, verbose: bool = False,
                         _b15 = 0x04
                     elif not _ldcu_at_8 and _fi == 6 and _body_count <= 1:
                         _b15 = 0x04
+                    # TPL templates carry their own per-instruction ctrl bytes
+                    # verified against PTXAS ground truth; skip FG33 rewrite
+                    # for them.  Same pattern as TPL01 / TPL05 b9-rewrite skip.
+                    if 'TPL' in _si.comment:
+                        continue
                     if _si.raw[13] != _b13 or _si.raw[14] != _b14 or _si.raw[15] != _b15:
                         _p = bytearray(_si.raw)
                         _p[13] = _b13; _p[14] = _b14; _p[15] = _b15

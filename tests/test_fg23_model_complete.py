@@ -218,6 +218,11 @@ _LATENCY_INERT = {
     # FG-2.3 additions:
     0x80c, 0x919, 0x91a, 0x945, 0x9af, 0x9c3, 0xb82, 0xf89, 0xfae,
     0x209, 0x229, 0x812, 0x835, 0xc11, 0xc12, 0xc25,
+    # MPT34: uncommon ALU helper op emitted ONLY by the k200_nested_pred
+    # whole-kernel template (verbatim PTXAS bytes); does not go through
+    # OpenPTXas's scheduler/scoreboard so PTXAS's own ctrl-byte scheduling
+    # is preserved and OpenPTXas's latency model never observes it.
+    0x81c,
 }
 
 

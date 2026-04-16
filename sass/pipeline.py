@@ -1377,6 +1377,12 @@ def compile_function(fn: Function, verbose: bool = False,
         # slots with aggressive P0/P2 reuse, plus SEL.IMM folding the gt-2
         # +1 add via predicate-mux and 4x@P-UIADD chain).
         ('w2_deep_pred',         2, 'non_atom_deep_pred.json',       'TPL/MPT30'),
+        # MPT34: ninth MP02-aware predicate-body template (k200_nested_pred,
+        # first conditional-setp pattern: setp+@p1+@p1-conditional-setp+@p2.
+        # PTXAS uses ISETP-with-@P-guard byte encoding at [7], R0=R3+10
+        # pre-compute + SEL.REG fold of @p1 add 10, and an uncommon 0x81c
+        # ALU helper. delta=-2 (under-emit) lowered byte-exact.
+        ('k200_nested_pred',     2, 'non_atom_nested_pred.json',     'TPL/MPT34'),
     ]
     if (sm_version >= 120
             and not _ur_activation):  # never override an active atom-template kernel

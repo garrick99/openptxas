@@ -1,0 +1,27 @@
+.version 9.0
+.target sm_120
+.address_size 64
+// FORGE09 minimal repro: 3 spans (a, b, c) + global tid + write back to a.
+.visible .entry rmin(
+    .param .u64 a, .param .u64 al, .param .u64 b, .param .u64 bl, .param .u64 c, .param .u64 cl, .param .u32 n)
+{
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<6>;
+    .reg .pred %p<1>;
+    ld.param.u64 %rd0, [a];
+    ld.param.u64 %rd1, [b];
+    ld.param.u64 %rd2, [c];
+    ld.param.u32 %r0, [n];
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mul.lo.u32 %r3, %r1, %r2;
+    mov.u32 %r1, %tid.x;
+    add.u32 %r2, %r3, %r1;
+    setp.lt.u32 %p0, %r2, %r0;
+    @!%p0 ret;
+    shl.b32 %r3, %r2, 2;
+    cvt.u64.u32 %rd3, %r3;
+    add.u64 %rd0, %rd0, %rd3;
+    st.global.u32 [%rd0], %r2;
+    ret;
+}

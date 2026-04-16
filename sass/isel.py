@@ -3121,7 +3121,49 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             add_other = add_src1
                         elif add_src1 == mul_dest_name:
                             add_other = add_src0
+                        # ALLOC-R11: post-allocation phys-reg-aware fusion guard.
+                        # The fusion aliases mul.dest and add.dest to the SAME
+                        # physical register.  After fusion, any subsequent
+                        # write to mul.dest also clobbers add.dest's slot.
+                        # Unsafe iff: after a later write to mul.dest, the
+                        # add.dest vreg is READ by some instruction WITHOUT
+                        # being overwritten first (i.e., the read would see
+                        # the corrupted alias instead of add.dest's value).
+                        # Forge memory-slice repro: `mul %r3,...; add %r2,...;
+                        # shl %r3, %r2, 2; st [...], %r2` — st reads %r2 after
+                        # shl rewrote %r3 (the alias).
                         if add_other is not None:
+                            _add_dest_name = _next.dest.name
+                            _fusion_safe = True
+                            for _li, _later in enumerate(bb.instructions[_instr_idx + _next_offset + 1:],
+                                                          start=_instr_idx + _next_offset + 1):
+                                if (hasattr(_later, 'dest') and _later.dest is not None
+                                        and isinstance(_later.dest, RegOp)
+                                        and _later.dest.name == mul_dest_name):
+                                    # mul_dest rewritten at index _li.
+                                    # Check if add.dest is later READ without
+                                    # intervening WRITE.
+                                    for _post in bb.instructions[_li + 1:]:
+                                        # First check: is add.dest written here?
+                                        # If yes, the alias-corruption is no longer
+                                        # observable (add.dest takes a fresh value).
+                                        if (hasattr(_post, 'dest') and _post.dest is not None
+                                                and isinstance(_post.dest, RegOp)
+                                                and _post.dest.name == _add_dest_name):
+                                            # add.dest is rewritten — safe from here on.
+                                            break
+                                        # Otherwise check if add.dest is read.
+                                        for _ps in _post.srcs:
+                                            if (isinstance(_ps, RegOp)
+                                                    and _ps.name == _add_dest_name):
+                                                _fusion_safe = False
+                                                break
+                                        if not _fusion_safe:
+                                            break
+                                    break
+                            if not _fusion_safe:
+                                _next = None
+                        if add_other is not None and _next is not None:
                             # FUSION: mul a*b + c → IMAD dest, a, b_ur, c
                             fused_dest = ctx.ra.r32(_next.dest.name)
                             mul_a = instr.srcs[0].name

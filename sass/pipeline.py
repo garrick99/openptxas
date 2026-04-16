@@ -1633,6 +1633,24 @@ def compile_function(fn: Function, verbose: bool = False,
                     # UIADD: rename src R3->R0 at b3
                     elif _ropc == 0x835 and _p[3] == 3:
                         _p[3] = 0; _changed = True
+                    # MP02: IADD3 R-R (0x210): rename src R3->R0.
+                    # Used by `mov.u32 %rN, %r0` which lowers to
+                    # IADD3 R_dest, R3, RZ, RZ. After FG56 R3→R0 rename of
+                    # S2R dest, the IADD3 must read the new R0 holding tid.x,
+                    # not the uninitialized R3. Covers b3, b4, and b8 sources
+                    # conservatively (IADD3 is a 3-input add; any position
+                    # that was pinned to R3 pre-rename must follow).
+                    elif _ropc == 0x210 and (_p[3] == 3 or _p[4] == 3 or _p[8] == 3):
+                        if _p[3] == 3: _p[3] = 0
+                        if _p[4] == 3: _p[4] = 0
+                        if _p[8] == 3: _p[8] = 0
+                        _changed = True
+                    # MP02: IADD3.IMM (0x810): rename src R3->R0 at b3 / b8
+                    # (b4-b7 are the 32-bit immediate).
+                    elif _ropc == 0x810 and (_p[3] == 3 or _p[8] == 3):
+                        if _p[3] == 3: _p[3] = 0
+                        if _p[8] == 3: _p[8] = 0
+                        _changed = True
                     # C11: rename src R3->R0 at b3 + fix b10 parity
                     elif _ropc == 0xc11 and _p[3] == 3:
                         _p[3] = 0
@@ -2105,6 +2123,26 @@ def compile_function(fn: Function, verbose: bool = False,
                     and _fg31_opcodes[:6] == _preamble_opc
                     and _fg31_opcodes[-5:] == _postamble_opc
                     and (_ldcu_at_7 or _ldcu_at_8))
+
+        # MP02: FG33's hardcoded ctrl template (rbar=0x01 on body ALU) wipes
+        # the scoreboard's rbar=0x03 wait on predicate producers.  For
+        # multi-predicate kernels (≥2 @Px-guarded body instructions), the
+        # ISETP→@P RAW hazard becomes observable: without the rbar=0x03 barrier,
+        # the second @P reads a stale predicate value from an earlier ISETP
+        # instead of the immediately-preceding one, producing wrong GPU results.
+        # Skip FG33 only when the body has ≥2 @Px-guarded instructions.
+        # Single-guard kernels (e.g. k100_guarded_store's one @%p1 add) remain
+        # eligible: the scoreboard's natural instruction spacing covers that
+        # hazard and FG33's template matches PTXAS byte-for-byte.
+        if _fg33_ok:
+            _mp02_pred_guard_count = sum(
+                1 for _pi in range(8, _fg31_n - 5)
+                if ((sass_instrs[_pi].raw[1] >> 4) & 0x7) != 0x7)
+            if _mp02_pred_guard_count >= 2:
+                _fg33_ok = False
+                if verbose:
+                    print(f'[MP02] FG33 skipped: {_mp02_pred_guard_count} '
+                          '@Px-guarded body ALU (predicate RAW needs scoreboard rbar)')
 
         if _fg33_ok:
             _fg31_patched = 0

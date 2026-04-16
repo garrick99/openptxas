@@ -1,0 +1,23 @@
+{
+  "name": "non_atom_setp_combo",
+  "description": "MPT13: fourth MP02-aware whole-kernel template for k100_setp_combo. PTX shape: 2 params (p_out u64; n u32) + tid-bounded entry guard + mov r2,0 + setp.lt P1,r0,16 + @P1 add r2,1 + setp.gt P2,r0,8 + @P2 add r2,2 + cvt+shl+add+STG. PTXAS shape (16 active instrs): uses S2R into R0 (no R3 alias), reuses R0 directly in entry guard and address compute. Uses SEL+@P-UIADD predicate-mux pattern: SEL R5,RZ,1,P? then @P UIADD R5+=2, mirroring MPT01's mux trick. ISETP allocates P0=gt-8, P1=lt-16 (does NOT preserve PTX p1/p2 names). Preamble [0] LDC R1 from pipeline; this template provides instructions [1..15].",
+  "kernel_name_match": "k100_setp_combo",
+  "expected_param_count": 2,
+  "instructions": [
+    {"index": 1,  "opcode": "0x919", "role": "S2R_R0_TID",                     "bytes": "19790000000000000021000000220e00"},
+    {"index": 2,  "opcode": "0x7ac", "role": "LDCU_UR4_PARAM_n_0x71",          "bytes": "ac7704ff007100000008000800240e00"},
+    {"index": 3,  "opcode": "0xc0c", "role": "ISETP_RUR_BOUNDS_GUARD_R0",      "bytes": "0c7c0000040000007060f00b00da1f00"},
+    {"index": 4,  "opcode": "0x94d", "role": "EXIT_AT_P0",                     "bytes": "4d090000000000000000800300ea0f00"},
+    {"index": 5,  "opcode": "0x7ac", "role": "LDCU_UR6_PARAM_p_out_0x70",      "bytes": "ac7706ff00700000000a000800220e00"},
+    {"index": 6,  "opcode": "0x80c", "role": "ISETP_IMM_GT_8_TO_P0",           "bytes": "0c780000080000007040f00300e20f04"},
+    {"index": 7,  "opcode": "0x80c", "role": "ISETP_IMM_LT_16_TO_P1",          "bytes": "0c780000100000007060f20300e20f00"},
+    {"index": 8,  "opcode": "0x7ac", "role": "LDCU_UR4_DESC_0x6b",             "bytes": "ac7704ff006b0000000a000800680e00"},
+    {"index": 9,  "opcode": "0x807", "role": "SEL_R5_RZ_IMM1_PRED_MUX",        "bytes": "077805ff010000000000800000ce0f00"},
+    {"index": 10, "opcode": "0x835", "role": "UIADD_AT_P0_R5_PLUS_2",          "bytes": "350805050200000000008e0700e20f00"},
+    {"index": 11, "opcode": "0xc11", "role": "IADD3_UR_R2_R0_UR6_ADDR_LO",     "bytes": "117c020006000000ff10820f00c81f00"},
+    {"index": 12, "opcode": "0xc11", "role": "IADD3_UR_R3_R0_UR7_ADDR_HI",     "bytes": "117c030007000000ff148f0800ca0f00"},
+    {"index": 13, "opcode": "0x986", "role": "STG_R2_R3_R5",                   "bytes": "86790002050000000419100c00e22f00"},
+    {"index": 14, "opcode": "0x94d", "role": "EXIT",                           "bytes": "4d790000000000000000800300ea0f00"},
+    {"index": 15, "opcode": "0x947", "role": "BRA_BACK",                       "bytes": "4779fc00fcffffffffff830300c00f00"}
+  ]
+}

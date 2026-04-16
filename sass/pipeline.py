@@ -1351,6 +1351,10 @@ def compile_function(fn: Function, verbose: bool = False,
         # MPT09: third MP02-aware predicate-body template (k300_pred3,
         # 3-setp/3-@P with PTXAS's 3-distinct-predicate allocation).
         ('k300_pred3',           2, 'non_atom_pred3.json',           'TPL/MPT09'),
+        # MPT13: fourth MP02-aware predicate-body template (k100_setp_combo,
+        # 2-setp/2-@P; PTXAS reuses TID register R0 directly and uses the
+        # MPT01-style SEL+@P-UIADD predicate-mux pattern with imm operands).
+        ('k100_setp_combo',      2, 'non_atom_setp_combo.json',      'TPL/MPT13'),
     ]
     if (sm_version >= 120
             and not _ur_activation):  # never override an active atom-template kernel

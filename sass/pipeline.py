@@ -1666,6 +1666,31 @@ def compile_function(fn: Function, verbose: bool = False,
         if verbose and _fg56b_count:
             print(f'[FG56b] R4->R5 body rename: {_fg56b_count} instrs')
 
+    # FG60: bounded predicate complement reuse for the 3 target kernels.
+    # When FG56 fired and the body has ISETP.IMM(LT, P1) followed by
+    # @P1 UIADD, rewrite to ISETP.IMM(GE, P0) + @!P0 UIADD.
+    # This matches PTXAS's convention of overwriting P0 with the complement.
+    if _fg56_fired:
+        for _ri in range(len(sass_instrs)):
+            _si = sass_instrs[_ri]
+            _ropc = (struct.unpack_from('<Q', _si.raw, 0)[0]) & 0xFFF
+            if _ropc == 0x80c:  # ISETP.IMM
+                _p = bytearray(_si.raw)
+                _cmp = (_p[9] >> 4) & 0xF
+                _pred_dest = (_p[10] >> 1) & 0x7
+                # Only rewrite LT/P1 to GE/P0
+                if _cmp == 1 and _pred_dest == 1:  # cmp=LT, dest=P1
+                    _p[9] = (6 << 4) | 0x00  # cmp=GE, unsigned (clear signed bit)
+                    _p[10] = (_p[10] & 0xF0) | 0  # pred_dest=P0 (clear bits 1-3)
+                    sass_instrs[_ri] = SassInstr(bytes(_p), _si.comment + ' [FG60:GE+P0]')
+            elif _ropc == 0x835:  # UIADD
+                _p = bytearray(_si.raw)
+                _guard = (_p[1] >> 4) & 0xF
+                # @P1 (guard=0x1) -> @!P0 (guard=0x8)
+                if _guard == 0x1:
+                    _p[1] = (_p[1] & 0x0F) | (0x8 << 4)
+                    sass_instrs[_ri] = SassInstr(bytes(_p), _si.comment + ' [FG60:@!P0]')
+
     # FG29-C: post-scheduling R0 normalization for MIXED kernels.
     # Rename body ALU temp registers {R4, R5, R6, ...} → R0 where PTXAS
     # uses R0 for the same role.  Only fires when:
@@ -2081,7 +2106,7 @@ def compile_function(fn: Function, verbose: bool = False,
                     _body_opc = _fg31_opcodes[_fi]
                     if _is_last_body:
                         # Last body ALU: 0xe40f for LOP3, 0xe20f for IMAD
-                        if _body_opc in (0x824, 0xc24):
+                        if _body_opc in (0x824, 0xc24, 0x835):  # IMAD or UIADD
                             _target = (0xe2, 0x0f)
                         else:
                             _target = (0xe4, 0x0f)

@@ -37,10 +37,10 @@ class TestSharedMemoryVerification:
         assert vr.match_ratio == 1.0
 
     def test_negative_control_divergent(self):
-        """A kernel from a divergent cluster should NOT be byte-exact."""
+        """k100_guarded_store is now BYTE_EXACT after FG50-61 convergence."""
         ours, ptxas = _compile_both("k100_guarded_store")
         vr = verify_against_template(ours, ptxas, "k100_guarded_store", 0, "predicated_store")
-        assert not vr.is_ctrl_only, "Expected functional divergence for this family"
+        assert vr.byte_match_count == vr.total_instructions, "Expected BYTE_EXACT after FG61"
 
     def test_ctrl_only_detection(self):
         """Verify ctrl_only_diffs counts correctly when only b13-b15 differ."""

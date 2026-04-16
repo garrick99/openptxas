@@ -1560,6 +1560,12 @@ def compile_function(fn: Function, verbose: bool = False,
                         sass_instrs[i] = SassInstr(bytes(patched), si.comment + ' [b9=0x0c]')
                         break
 
+    # FG65: HARD BAIL — HFMA2/FMUL.I substitution was too broad.
+    # Guard (_fg26_ur4_start) admits 106+ kernels, not just the 5 targets.
+    # Caused 12 BYTE_EXACT regressions + scheduling hazard violations.
+    # The HFMA2_FP_INT subsystem requires kernel-specific gating based
+    # on the exact opcode multiset diff, not just the FG26 flag.
+
     # FG56: bounded S2R R3->R0 rename for the 3 opcode-aligned MIXED kernels.
     # PTXAS assigns tid.x to R0.  Our allocator assigns R3 (ALLOC-SUBSYS-2
     # skips R0-R2).  This rename runs BEFORE FG29 so that R0 is marked

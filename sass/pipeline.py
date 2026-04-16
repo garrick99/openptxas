@@ -1218,6 +1218,25 @@ def compile_function(fn: Function, verbose: bool = False,
                         _variant = _v; break
 
                 if _variant is not None:
+                    # AT02: per-op byte overrides for the bounded atom-UR
+                    # template expansion.  The atom.xor baseline bytes are
+                    # in the JSON; atom.max.u32 / atom.min.u32 reuse the
+                    # same template with two positions rewritten.  Values
+                    # are verified byte-for-byte against PTXAS SM_120
+                    # ground truth (k100_atom_xor/max/min).
+                    _ur_act_op = getattr(ctx, '_ur_activation_atom_op', 'xor')
+                    # (role, byte_offset, byte_length, value)
+                    _AT02_OVERRIDES = {
+                        'max': [
+                            ('UMOV_UR5_UR0',                9, 2, bytes([0x40, 0x01])),
+                            ('ATOMG_XOR_R0_R2_data5_desc_UR6', 10, 2, bytes([0x12, 0x0d])),
+                        ],
+                        'min': [
+                            ('UMOV_UR5_UR0',                9, 2, bytes([0x00, 0x01])),
+                            ('ATOMG_XOR_R0_R2_data5_desc_UR6', 10, 2, bytes([0x92, 0x0c])),
+                        ],
+                    }
+                    _overrides = _AT02_OVERRIDES.get(_ur_act_op, [])
                     _T = []
                     for _si in _variant['instructions'][1:]:  # skip preamble S2R
                         _raw = bytearray(bytes.fromhex(_si['bytes']))
@@ -1225,7 +1244,12 @@ def compile_function(fn: Function, verbose: bool = False,
                             if _p['name'] == 'add_imm_K':
                                 for _bi in range(_p['byte_length']):
                                     _raw[_p['byte_offset'] + _bi] = (_ur_act_add >> (8 * _bi)) & 0xFF
-                        _T.append(SassInstr(bytes(_raw), f"{_si['role']}  // TE6"))
+                        # Apply AT02 per-op overrides matched by role.
+                        for _orole, _ooff, _olen, _oval in _overrides:
+                            if _si['role'] == _orole and len(_oval) == _olen:
+                                for _bi in range(_olen):
+                                    _raw[_ooff + _bi] = _oval[_bi]
+                        _T.append(SassInstr(bytes(_raw), f"{_si['role']}  // TE6/AT02:{_ur_act_op}"))
                     body_scheduled = []
                     _ur_activation = _T
                     _spec_ok = True

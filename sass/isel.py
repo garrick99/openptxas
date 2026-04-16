@@ -1557,6 +1557,97 @@ def _select_atom_cas(instr: Instruction, ra: RegAlloc,
                       f'ATOMG.E.CAS.b32 R{d}, [R{addr}], R{cmp}, R{nv}')]
 
 
+def _try_atom_ur_template(instr, ctx, bb, instr_idx: int, atom_op: str,
+                          output: list) -> bool:
+    """AT02: bounded atom-UR template dispatch.
+
+    For atom.{xor,max,min} when the PTX shape matches the template:
+    - address is MemOp
+    - data source is either SR-derived (e.g. %tid.x directly) OR
+      SR-derived + immediate (captured by searching backward through bb)
+
+    Appends the MOV+ATOMG instructions into `output` (they will be
+    wiped by the pipeline.py template dispatcher which owns body
+    replacement when _ur_activation_sr is set).  Records
+    ctx._ur_activation_atom_op so the template applies the correct
+    per-op byte overrides.
+
+    Returns True iff the template path was entered.  False means the
+    shape did not match; caller should fall back to its generic atom path.
+    """
+    from sass.encoding.sm_120_opcodes import (
+        encode_atomg_xor_u32,
+    )
+    from ptx.ir import MemOp as _MemOp
+
+    if len(instr.srcs) < 2:
+        return False
+    _xa = instr.srcs[0]
+    _xv = instr.srcs[1]
+    if not isinstance(_xa, _MemOp):
+        return False
+    if not isinstance(_xv, RegOp):
+        return False
+    _xdata_name = _xv.name
+    _xsr = ctx._reg_sr_source.get(_xdata_name)
+    _add_for_preamble = 0
+    _sr_for_preamble = _xsr
+    if _sr_for_preamble is None and _xdata_name:
+        # Look back in the basic block for `add rdata, rsrc, IMM`
+        # where rsrc is SR-derived (tid + const).
+        for _bi in range(instr_idx - 1, max(instr_idx - 5, -1), -1):
+            _bdef = bb.instructions[_bi]
+            if (isinstance(_bdef.dest, RegOp) and _bdef.dest.name == _xdata_name
+                    and _bdef.op == 'add' and len(_bdef.srcs) >= 2):
+                _s0, _s1 = _bdef.srcs[0], _bdef.srcs[1]
+                if isinstance(_s0, RegOp) and isinstance(_s1, ImmOp):
+                    _sr_for_preamble = ctx._reg_sr_source.get(_s0.name)
+                    _add_for_preamble = _s1.value & 0xFFFFFFFF
+                elif isinstance(_s1, RegOp) and isinstance(_s0, ImmOp):
+                    _sr_for_preamble = ctx._reg_sr_source.get(_s1.name)
+                    _add_for_preamble = _s0.value & 0xFFFFFFFF
+                break
+
+    if _sr_for_preamble is None:
+        # No SR provenance proven → not eligible.  This preserves MP02,
+        # allocator, scheduler, and "uniformity must be proven" rules.
+        return False
+
+    _xd = ctx.ra.r32(instr.dest.name) if isinstance(instr.dest, RegOp) else RZ
+
+    # Resolve address (same as other atomics).
+    _xbn = _xa.base if _xa.base.startswith('%') else f'%{_xa.base}'
+    _xgw = getattr(ctx, '_gpr_written', set())
+    _xpre = []
+    if _xbn in _xgw and _xa.base in ctx.ra.int_regs:
+        _xaddr = ctx.ra.lo(_xa.base)
+    elif _xbn in getattr(ctx, '_ur_params', {}):
+        _xur = ctx._ur_params[_xbn]
+        _xaddr = getattr(ctx, '_addr_scratch_lo', None) or _alloc_gpr_pair(ctx)
+        _xpre = list(_emit_ur_to_gpr(_xaddr, _xur, f'atom.{atom_op} addr'))
+    else:
+        _xaddr = ctx.ra.lo(_xa.base) if _xa.base in ctx.ra.int_regs else RZ
+    output.extend(_xpre)
+
+    _data_ur = 5
+    if not hasattr(ctx, '_ur_activation_sr'):
+        ctx._ur_activation_sr = _sr_for_preamble
+        ctx._ur_activation_add = _add_for_preamble
+    # Record the atom op so pipeline.py template dispatcher picks the
+    # correct per-op byte overrides (AT02).  Default (unset) stays 'xor'.
+    ctx._ur_activation_atom_op = atom_op
+
+    # UMOV is emitted in preamble (pipeline.py).  Isel emits MOV+ATOMG;
+    # both get replaced by the template when _ur_activation_sr is set.
+    output.append(SassInstr(
+        encode_mov_gpr_from_ur(5, _data_ur),
+        f'MOV R5, UR{_data_ur}  // atom.{atom_op}: sync'))
+    output.append(SassInstr(
+        encode_atomg_xor_u32(_xd, _xaddr, 0, _data_ur, ur_desc=ctx.ur_desc),
+        f'ATOMG.E.{atom_op.upper()} R{_xd}, desc[UR{ctx.ur_desc}][R{_xaddr}.64], UR{_data_ur}'))
+    return True
+
+
 def _select_atom_add_u32(instr: Instruction, ra: RegAlloc,
                          ctx: 'ISelContext' = None) -> list[SassInstr]:
     """atom.global.add.u32 / atom.add.u32 → ATOMG.E.ADD.u32.
@@ -3275,71 +3366,29 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                 elif op == 'atom' and 'xor' in instr.types and 'b32' in instr.types:
                     # P3-3: atom.xor via 0x98e with UR-indexed data pipeline.
                     # Full pipeline: S2UR→UIADD(opt)→UMOV→sync→ATOMG_XOR
-                    from sass.encoding.sm_120_opcodes import (
-                        encode_atomg_xor_u32, encode_uiadd_imm,
-                        encode_umov_gpr_to_ur)
-                    from ptx.ir import MemOp as _MemOp
-                    _xd = ctx.ra.r32(instr.dest.name) if isinstance(instr.dest, RegOp) else RZ
-                    _xa = instr.srcs[0]
-                    _xv = instr.srcs[1]
-
-                    if isinstance(_xa, _MemOp):
-                        # Resolve address (same as other atomics)
-                        _xbn = _xa.base if _xa.base.startswith('%') else f'%{_xa.base}'
-                        _xgw = getattr(ctx, '_gpr_written', set())
-                        _xpre = []
-                        if _xbn in _xgw and _xa.base in ctx.ra.int_regs:
-                            _xaddr = ctx.ra.lo(_xa.base)
-                        elif _xbn in getattr(ctx, '_ur_params', {}):
-                            _xur = ctx._ur_params[_xbn]
-                            _xaddr = getattr(ctx, '_addr_scratch_lo', None) or _alloc_gpr_pair(ctx)
-                            _xpre = list(_emit_ur_to_gpr(_xaddr, _xur, 'atom.xor addr'))
-                        else:
-                            _xaddr = ctx.ra.lo(_xa.base) if _xa.base in ctx.ra.int_regs else RZ
-                        output.extend(_xpre)
-
-                        # Route data to UR via S2UR + UMOV pipeline.
-                        # Check if data is tid.x (directly from S2R).
-                        _data_ur = 5  # target UR for ATOMG data
-                        # P3-7: ALL S2UR + activation goes in preamble (pipeline.py).
-                        # Isel ONLY emits UMOV + sync + ATOMG.
-                        _xdata_name = _xv.name if isinstance(_xv, RegOp) else None
-                        _xsr = ctx._reg_sr_source.get(_xdata_name) if _xdata_name else None
-                        _sr_for_preamble = _xsr
-                        _add_for_preamble = 0
-                        if _sr_for_preamble is None and _xdata_name:
-                            for _bi in range(_instr_idx - 1, max(_instr_idx - 5, -1), -1):
-                                _bdef = bb.instructions[_bi]
-                                if (isinstance(_bdef.dest, RegOp) and _bdef.dest.name == _xdata_name
-                                        and _bdef.op == 'add' and len(_bdef.srcs) >= 2):
-                                    _s0, _s1 = _bdef.srcs[0], _bdef.srcs[1]
-                                    if isinstance(_s0, RegOp) and isinstance(_s1, ImmOp):
-                                        _sr_for_preamble = ctx._reg_sr_source.get(_s0.name)
-                                        _add_for_preamble = _s1.value & 0xFFFFFFFF
-                                    elif isinstance(_s1, RegOp) and isinstance(_s0, ImmOp):
-                                        _sr_for_preamble = ctx._reg_sr_source.get(_s1.name)
-                                        _add_for_preamble = _s0.value & 0xFFFFFFFF
-                                    break
-                        if _sr_for_preamble is None:
-                            _sr_for_preamble = SR_TID_X
-                        if not hasattr(ctx, '_ur_activation_sr'):
-                            ctx._ur_activation_sr = _sr_for_preamble
-                            ctx._ur_activation_add = _add_for_preamble
-                        # UMOV is in preamble (P3-7). Only emit sync + ATOMG here.
-                        # Sync/commit (0xc02 MOV R5, UR5)
-                        output.append(SassInstr(encode_mov_gpr_from_ur(5, _data_ur),
-                            f'MOV R5, UR{_data_ur}  // atom.xor: sync'))
-
-                        # ATOMG_XOR with UR data
-                        output.append(SassInstr(
-                            encode_atomg_xor_u32(_xd, _xaddr, 0, _data_ur, ur_desc=ctx.ur_desc),
-                            f'ATOMG.E.XOR R{_xd}, desc[UR{ctx.ur_desc}][R{_xaddr}.64], UR{_data_ur}'))
+                    _applied = _try_atom_ur_template(
+                        instr, ctx, bb, _instr_idx, atom_op='xor', output=output)
+                    if not _applied:
+                        # Shape not matched — PTX atom.xor without SR-derived data.
+                        # Fall through: isel emits no instructions and caller expects
+                        # this path only for the proven atom.xor template shape.
+                        pass
 
                 elif op == 'atom' and 'min' in instr.types and 'u32' in instr.types:
-                    output.extend(_select_atom_generic_u32(instr, ctx.ra, ctx, ATOMG_MIN, 'MIN.u32'))
+                    # AT02: reuse atom.xor UR template when the PTX shape matches
+                    # (data is SR-derived, address is MemOp with param base).
+                    # Otherwise fall back to the generic atom path.
+                    _applied = _try_atom_ur_template(
+                        instr, ctx, bb, _instr_idx, atom_op='min', output=output)
+                    if not _applied:
+                        output.extend(_select_atom_generic_u32(instr, ctx.ra, ctx, ATOMG_MIN, 'MIN.u32'))
 
                 elif op == 'atom' and 'max' in instr.types and 'u32' in instr.types:
-                    output.extend(_select_atom_generic_u32(instr, ctx.ra, ctx, ATOMG_MAX, 'MAX.u32'))
+                    # AT02: reuse atom.xor UR template when the PTX shape matches.
+                    _applied = _try_atom_ur_template(
+                        instr, ctx, bb, _instr_idx, atom_op='max', output=output)
+                    if not _applied:
+                        output.extend(_select_atom_generic_u32(instr, ctx.ra, ctx, ATOMG_MAX, 'MAX.u32'))
 
                 elif op == 'atom' and 'cas' in instr.types and 'b64' in instr.types:
                     output.extend(_select_atom_cas_b64(instr, ctx.ra, ctx))

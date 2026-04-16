@@ -1625,9 +1625,17 @@ def compile_function(fn: Function, verbose: bool = False,
                     # UIADD: rename src R3->R0 at b3
                     elif _ropc == 0x835 and _p[3] == 3:
                         _p[3] = 0; _changed = True
-                    # C11: rename src R3->R0 at b3
+                    # C11: rename src R3->R0 at b3 + fix b10 parity
                     elif _ropc == 0xc11 and _p[3] == 3:
-                        _p[3] = 0; _changed = True
+                        _p[3] = 0
+                        # FG57: update b10 parity for even source (R0)
+                        # lo (b9=0x10): b10 0x80->0x82 (set bit 1)
+                        # hi (b9=0x14): b10 0x0f->0x8f (set bit 7)
+                        if _p[9] == 0x10 and _p[10] == 0x80:
+                            _p[10] = 0x82
+                        elif _p[9] == 0x14 and _p[10] == 0x0f:
+                            _p[10] = 0x8f
+                        _changed = True
                     if _changed:
                         sass_instrs[_ri] = SassInstr(bytes(_p), _si.comment + ' [FG56:R0]')
                         _fg56_count += 1

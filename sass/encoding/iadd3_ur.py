@@ -39,7 +39,8 @@ def encode_iadd3_ur_lo(dest: int, src_gpr: int, src_ur: int,
     # b5-b7 = 0
     raw[8] = 0xFF  # RZ (no third source)
     raw[9] = 0x10
-    raw[10] = 0x80
+    # FG57: b10 parity bit — even-numbered GPR sources set bit 1
+    raw[10] = 0x82 if (src_gpr & 1) == 0 else 0x80
     raw[11] = 0x0f
     raw[13] = b13
     raw[14] = b14
@@ -65,7 +66,8 @@ def encode_iadd3_ur_hi(dest: int, src_gpr: int, src_ur: int,
     # b5-b7 = 0
     raw[8] = 0xFF  # RZ
     raw[9] = 0x14
-    raw[10] = 0x0f
+    # FG57: b10 parity bit — even-numbered GPR sources set bit 7
+    raw[10] = 0x8f if (src_gpr & 1) == 0 else 0x0f
     raw[11] = 0x08
     raw[13] = b13
     raw[14] = b14

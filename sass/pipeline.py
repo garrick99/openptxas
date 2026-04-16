@@ -1678,26 +1678,52 @@ def compile_function(fn: Function, verbose: bool = False,
     # When FG56 fired and the body has ISETP.IMM(LT, P1) followed by
     # @P1 UIADD, rewrite to ISETP.IMM(GE, P0) + @!P0 UIADD.
     # This matches PTXAS's convention of overwriting P0 with the complement.
+    # FG60 admission: exactly ONE ISETP.IMM with cmp=LT, pred_dest=P1
+    # AND exactly ONE @P1 UIADD.  Multi-ISETP kernels (like k200_double_guard)
+    # must NOT be admitted — they have multiple predicates and the complement
+    # rewrite would incorrectly change @P1 UIADD guards for predicates from
+    # OTHER ISETPs (not LT-P1).
     if _fg56_fired:
+        _fg60_isetp_lt_p1_count = 0
+        _fg60_isetp_other_p1_count = 0
+        _fg60_p1_uiadd_count = 0
+        _fg60_isetp_ri = None
+        _fg60_uiadd_ri = None
         for _ri in range(len(sass_instrs)):
             _si = sass_instrs[_ri]
             _ropc = (struct.unpack_from('<Q', _si.raw, 0)[0]) & 0xFFF
             if _ropc == 0x80c:  # ISETP.IMM
-                _p = bytearray(_si.raw)
-                _cmp = (_p[9] >> 4) & 0xF
-                _pred_dest = (_p[10] >> 1) & 0x7
-                # Only rewrite LT/P1 to GE/P0
-                if _cmp == 1 and _pred_dest == 1:  # cmp=LT, dest=P1
-                    _p[9] = (6 << 4) | 0x00  # cmp=GE, unsigned (clear signed bit)
-                    _p[10] = (_p[10] & 0xF0) | 0  # pred_dest=P0 (clear bits 1-3)
-                    sass_instrs[_ri] = SassInstr(bytes(_p), _si.comment + ' [FG60:GE+P0]')
+                _cmp = (_si.raw[9] >> 4) & 0xF
+                _pred_dest = (_si.raw[10] >> 1) & 0x7
+                if _pred_dest == 1:
+                    if _cmp == 1:  # LT
+                        _fg60_isetp_lt_p1_count += 1
+                        _fg60_isetp_ri = _ri
+                    else:
+                        _fg60_isetp_other_p1_count += 1
             elif _ropc == 0x835:  # UIADD
-                _p = bytearray(_si.raw)
-                _guard = (_p[1] >> 4) & 0xF
-                # @P1 (guard=0x1) -> @!P0 (guard=0x8)
-                if _guard == 0x1:
-                    _p[1] = (_p[1] & 0x0F) | (0x8 << 4)
-                    sass_instrs[_ri] = SassInstr(bytes(_p), _si.comment + ' [FG60:@!P0]')
+                _guard = (_si.raw[1] >> 4) & 0xF
+                if _guard == 0x1:  # @P1
+                    _fg60_p1_uiadd_count += 1
+                    _fg60_uiadd_ri = _ri
+
+        # Only admit if exactly one LT-P1 ISETP, exactly one @P1 UIADD,
+        # and NO other ISETP also writes P1.
+        _fg60_safe = (_fg60_isetp_lt_p1_count == 1
+                      and _fg60_isetp_other_p1_count == 0
+                      and _fg60_p1_uiadd_count == 1)
+        if _fg60_safe:
+            # Rewrite ISETP.IMM cmp=LT P1 -> cmp=GE P0
+            _si = sass_instrs[_fg60_isetp_ri]
+            _p = bytearray(_si.raw)
+            _p[9] = (6 << 4) | 0x00
+            _p[10] = (_p[10] & 0xF0) | 0
+            sass_instrs[_fg60_isetp_ri] = SassInstr(bytes(_p), _si.comment + ' [FG60:GE+P0]')
+            # Rewrite @P1 UIADD -> @!P0 UIADD
+            _si = sass_instrs[_fg60_uiadd_ri]
+            _p = bytearray(_si.raw)
+            _p[1] = (_p[1] & 0x0F) | (0x8 << 4)
+            sass_instrs[_fg60_uiadd_ri] = SassInstr(bytes(_p), _si.comment + ' [FG60:@!P0]')
 
     # FG29-C: post-scheduling R0 normalization for MIXED kernels.
     # Rename body ALU temp registers {R4, R5, R6, ...} → R0 where PTXAS

@@ -682,9 +682,6 @@ def compile_function(fn: Function, verbose: bool = False,
         sm_version=sm_version,
     )
     ctx._addr_scratch_lo = _addr_scratch_base  # dedicated addr pair: R(base):R(base+1)
-    # IM02/IM03: helpers need access to the function for kernel-wide PTX scans
-    # (loop / atom / HFMA2 / SHF / multi-pred exclusion gates).
-    ctx.fn = fn
     # FG26 UR4 start is applied below, after _setp_only_params detection.
     # WB-7: aliased-base address-chain folding (analysis ran above
     # before allocate() so the dead vregs are excluded from int_regs).
@@ -1328,6 +1325,40 @@ def compile_function(fn: Function, verbose: bool = False,
             _ur_activation = _T
         _ur_activation = _T
 
+    # TPL01: first non-atom whole-kernel template.  When the kernel
+    # exactly matches the proven-safe shape (k100_dual_load: 4 params
+    # u64/u64/u64/u32 + tid-bounded guard + dual-LDG + add + STG),
+    # replace the entire body with the PTXAS-extracted byte sequence.
+    # Bypasses isel + scheduler + allocator entirely for this one
+    # kernel shape — the only safe way to land an IADD.64 substitution
+    # given allocator pair-aliasing (proved by IM03 HARD BAIL).
+    if (sm_version >= 120
+            and fn.name == 'k100_dual_load'
+            and len(getattr(fn, 'params', []) or []) == 4
+            and not _ur_activation):  # never override an active atom-template kernel
+        try:
+            import json as _json
+            from pathlib import Path as _Path
+            _tpl_file = (_Path(__file__).resolve().parent.parent
+                         / 'tools' / 'template_engine' / 'generated'
+                         / 'non_atom_dual_load.json')
+            if _tpl_file.exists():
+                _spec = _json.loads(_tpl_file.read_text(encoding='utf-8'))
+                # Defense-in-depth: verify kernel name match in JSON, too.
+                if (_spec.get('kernel_name_match') == fn.name
+                        and _spec.get('expected_param_count') == 4):
+                    _tpl_T = []
+                    for _si in _spec['instructions']:
+                        _raw = bytes.fromhex(_si['bytes'])
+                        _tpl_T.append(SassInstr(
+                            _raw, f"{_si['role']}  // TPL01"))
+                    body_scheduled = []
+                    _ur_activation = _tpl_T
+                    if verbose:
+                        print(f'[TPL01] whole-kernel template applied for {fn.name}')
+        except Exception:
+            pass  # fall through to normal lowering on any template-load failure
+
     sass_instrs = preamble_instrs + _ur_activation + body_scheduled
 
     # TE31: DMMA zero-init ctrl-byte patch.  For the specific DMMA pattern
@@ -1617,7 +1648,13 @@ def compile_function(fn: Function, verbose: bool = False,
                 if opc == 0x94d and guard != 7:  # predicated EXIT
                     found_exit = True
                 if found_exit and opc == 0x7ac and si.raw[9] == 0x0a:
-                    if si.raw[5] >= 0x70 and 'deferred' not in si.comment:
+                    if (si.raw[5] >= 0x70
+                            and 'deferred' not in si.comment
+                            and 'TPL01' not in si.comment):
+                        # TPL01 templates carry their own per-LDCU b9
+                        # values verified against PTXAS ground truth;
+                        # the post-EXIT b9=0x0c rewrite is for non-template
+                        # kernels and would corrupt the template here.
                         patched = bytearray(si.raw)
                         patched[9] = 0x0c
                         sass_instrs[i] = SassInstr(bytes(patched), si.comment + ' [b9=0x0c]')

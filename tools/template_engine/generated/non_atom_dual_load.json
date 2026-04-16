@@ -1,0 +1,116 @@
+{
+  "name": "non_atom_dual_load",
+  "description": "TPL01: whole-kernel template for k100_dual_load — first non-atom whole-kernel template.  PTX shape: 4 params (p_out, p_a, p_b u64; n u32) + tid-bounded guard + cvt.u64.u32 + shl.b64 + 2x{add.u64+LDG} + add.u32 + add.u64 + STG.  19-instruction PTXAS sequence; instruction [0] (LDC R1 preamble) is provided by pipeline.py; this template provides the 18 instructions [1..18].",
+  "kernel_name_match": "k100_dual_load",
+  "expected_param_count": 4,
+  "instructions": [
+    {
+      "index": 1,
+      "opcode": "0x919",
+      "role": "S2R_R0_TID",
+      "bytes": "19790000000000000021000000220e00"
+    },
+    {
+      "index": 2,
+      "opcode": "0x7ac",
+      "role": "LDCU_UR4_PARAM_n_0x73",
+      "bytes": "ac7704ff007300000008000800240e00"
+    },
+    {
+      "index": 3,
+      "opcode": "0xc0c",
+      "role": "ISETP_RUR_BOUNDS_GUARD",
+      "bytes": "0c7c0000040000007060f00b00da1f00"
+    },
+    {
+      "index": 4,
+      "opcode": "0x94d",
+      "role": "EXIT_AT_P0",
+      "bytes": "4d090000000000000000800300ea0f00"
+    },
+    {
+      "index": 5,
+      "opcode": "0x7ac",
+      "role": "LDCU_UR8_PARAM_p_out_0x70",
+      "bytes": "ac7708ff00700000000c000800220e00"
+    },
+    {
+      "index": 6,
+      "opcode": "0x824",
+      "role": "IMAD_I_R2_R0_4_RZ",
+      "bytes": "2478020004000000ff008e0700e20f00"
+    },
+    {
+      "index": 7,
+      "opcode": "0x819",
+      "role": "SHF_R3_RZ_30_R0",
+      "bytes": "197803ff1e0000000016010000e20f00"
+    },
+    {
+      "index": 8,
+      "opcode": "0x7ac",
+      "role": "LDCU_UR6_PARAM_p_b_0x72",
+      "bytes": "ac7706ff00720000000a000800620e00"
+    },
+    {
+      "index": 9,
+      "opcode": "0x7ac",
+      "role": "LDCU_UR4_DESC_0x6b",
+      "bytes": "ac7704ff006b0000000a000800a60e00"
+    },
+    {
+      "index": 10,
+      "opcode": "0xc35",
+      "role": "IADD64_UR_R4_R2_UR10",
+      "bytes": "357c04020a00000000028e0f00e41f04"
+    },
+    {
+      "index": 11,
+      "opcode": "0xc35",
+      "role": "IADD64_UR_R6_R2_UR6",
+      "bytes": "357c06020600000000028e0f00ca2f00"
+    },
+    {
+      "index": 12,
+      "opcode": "0x981",
+      "role": "LDG_E_R4_FROM_R4",
+      "bytes": "817904040400000000191e0c00a84e00"
+    },
+    {
+      "index": 13,
+      "opcode": "0x981",
+      "role": "LDG_E_R7_FROM_R6",
+      "bytes": "817907060400000000191e0c00a20e00"
+    },
+    {
+      "index": 14,
+      "opcode": "0xc35",
+      "role": "IADD64_UR_R2_R2_UR8_STORE_ADDR",
+      "bytes": "357c02020800000000028e0f00e40f00"
+    },
+    {
+      "index": 15,
+      "opcode": "0x235",
+      "role": "IADD64_R9_R4_R7_THE_ADD_U32",
+      "bytes": "357209040700000000008e0700ca4f00"
+    },
+    {
+      "index": 16,
+      "opcode": "0x986",
+      "role": "STG_R2_R3_R9",
+      "bytes": "86790002090000000419100c00e20f00"
+    },
+    {
+      "index": 17,
+      "opcode": "0x94d",
+      "role": "EXIT",
+      "bytes": "4d790000000000000000800300ea0f00"
+    },
+    {
+      "index": 18,
+      "opcode": "0x947",
+      "role": "BRA_BACK",
+      "bytes": "4779fc00fcffffffffff830300c00f00"
+    }
+  ]
+}

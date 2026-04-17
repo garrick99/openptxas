@@ -2775,15 +2775,20 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 # SM_89: use S2R directly into GPR (IMAD.WIDE R-R handles mul)
                                 pass  # fall through to _select_mov → S2R
                             elif getattr(ctx, '_multi_ctaid', False):
-                                # PTXAS-R01–R08: When the kernel uses multiple
-                                # CTAID axes (e.g. both ctaid.x and ctaid.y),
-                                # use S2R (GPR) instead of S2UR.  The S2UR path
-                                # only works when every consumer of the CTAID
-                                # vreg goes through the IMAD R-UR fusion; other
-                                # consumers (shl.b32, add.u32) call ra.r32() and
-                                # get an unwritten GPR.  S2R is what NVIDIA ptxas
-                                # emits for multi-dim kernels.
-                                pass  # fall through to _select_mov → S2R
+                                # PTXAS-R09: Multi-CTAID kernels use S2R into
+                                # a scratch GPR above the allocator's range.
+                                # This prevents the allocator from reusing the
+                                # register for intermediate computations, which
+                                # would create WAW hazards when the scheduler
+                                # hoists S2R to the preamble.
+                                sr_code = _SPECIAL_REGS[instr.srcs[0].name]
+                                sr_label = instr.srcs[0].name.lstrip('%').replace('.', '_').upper()
+                                gpr = ctx._next_gpr
+                                ctx._next_gpr += 1
+                                ctx.ra.int_regs[instr.dest.name] = gpr
+                                output.append(SassInstr(encode_s2r(gpr, sr_code),
+                                    f'S2R R{gpr}, SR_{sr_label}  // {instr.dest.name} (scratch GPR)'))
+                                continue
                             else:  # single CTAID axis: use S2UR (original path)
                                 # SM_120: Put ctaid into a fresh UR via S2UR so mad.lo can use IMAD R-UR.
                                 sr_code = _SPECIAL_REGS[instr.srcs[0].name]

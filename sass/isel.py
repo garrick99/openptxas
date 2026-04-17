@@ -2653,6 +2653,17 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
     """
     output: list[SassInstr] = []
 
+    # PTXAS-R01: Detect kernels with multiple CTAID axes so isel can
+    # fall back to S2R (GPR) instead of S2UR for ctaid.  Single-ctaid
+    # kernels continue to use S2UR + IMAD R-UR (the proven fast path).
+    _ctaid_axes = set()
+    for bb in fn.blocks:
+        for _i in bb.instructions:
+            if _i.op == 'mov' and _i.srcs and hasattr(_i.srcs[0], 'name'):
+                if _i.srcs[0].name in ('%ctaid.x', '%ctaid.y', '%ctaid.z'):
+                    _ctaid_axes.add(_i.srcs[0].name)
+    ctx._multi_ctaid = len(_ctaid_axes) > 1
+
     # Reorder blocks: move ret-only blocks to the end so they don't disrupt
     # BRA target offsets between jump sites and their targets.
     _ret_only = set()
@@ -2763,18 +2774,20 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             if ctx.sm_version == 89:
                                 # SM_89: use S2R directly into GPR (IMAD.WIDE R-R handles mul)
                                 pass  # fall through to _select_mov → S2R
-                            else:
+                            elif getattr(ctx, '_multi_ctaid', False):
+                                # PTXAS-R01–R08: When the kernel uses multiple
+                                # CTAID axes (e.g. both ctaid.x and ctaid.y),
+                                # use S2R (GPR) instead of S2UR.  The S2UR path
+                                # only works when every consumer of the CTAID
+                                # vreg goes through the IMAD R-UR fusion; other
+                                # consumers (shl.b32, add.u32) call ra.r32() and
+                                # get an unwritten GPR.  S2R is what NVIDIA ptxas
+                                # emits for multi-dim kernels.
+                                pass  # fall through to _select_mov → S2R
+                            else:  # single CTAID axis: use S2UR (original path)
                                 # SM_120: Put ctaid into a fresh UR via S2UR so mad.lo can use IMAD R-UR.
-                                # IMAD R-R (0x224) is not validated on SM_120; IMAD R-UR (0xc24)
-                                # is confirmed by ptxas. Must NOT use UR4 (reserved for mem
-                                # descriptor by pipeline.py) to avoid a WAR hazard where the
-                                # descriptor LDCU overwrites UR4 before IMAD finishes reading it.
                                 sr_code = _SPECIAL_REGS[instr.srcs[0].name]
                                 sr_label = instr.srcs[0].name.lstrip('%').replace('.', '_').upper()
-                                # SM_120 rule: S2UR for ctaid uses UR6 when UR
-                                # space is exhausted. UR4 holds the mem descriptor
-                                # and must not be clobbered. UR6 is safe: it's
-                                # consumed by IMAD immediately and not used again.
                                 _has_deferred = getattr(ctx, '_had_deferred_params', False)
                                 if ctx._next_ur >= 14 or _has_deferred:
                                     ur_ctaid = 6  # UR6 is safe (UR4 = mem desc)
@@ -2783,10 +2796,6 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 ctx._ur_for_param[instr.dest.name] = ur_ctaid
                                 output.append(SassInstr(encode_s2ur(ur_ctaid, sr_code),
                                                         f'S2UR UR{ur_ctaid}, SR_{sr_label}  // {instr.dest.name} = {instr.srcs[0].name.lstrip("%")}'))
-                                # S2UR latency: insert NOPs to ensure UR is ready
-                                # before IMAD reads it. Needed when UR4 is reused
-                                # (fewer pipeline slots than normal allocation).
-                                pass  # no S2UR NOPs
                                 continue
                     # HARD-FINISH-1: mov+@pred add → @pred IMAD coalescing.
                     # Pattern:

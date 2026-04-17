@@ -1437,17 +1437,18 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
                               f'LDC R{d}, c[0][0x{byte_off:x}]  // setp param')]
 
         # SM_120 rule #25: body LDC (0xb82) causes ERR715 in kernels
-        # with VOTE+LDG. ptxas loads scalar params via LDCU.64 instead.
+        # with VOTE+LDG or BAR.SYNC. Load in preamble instead.
         _has_vote_fn = getattr(ctx, '_has_vote', False) if ctx else False
+        _has_bar_fn = getattr(ctx, '_has_bar_sync', False) if ctx else False
 
-        if _has_vote_fn:
-            # VOTE present: load param in preamble (body LDC causes ERR715).
+        if _has_vote_fn or _has_bar_fn:
+            # Load param in preamble (body LDC causes ERR715).
             if ctx:
                 if not hasattr(ctx, '_preamble_ldcus'):
                     ctx._preamble_ldcus = []
                 ctx._preamble_ldcus.append(
                     SassInstr(encode_ldc(d, 0, byte_off),
-                              f'LDC R{d}, c[0][0x{byte_off:x}]  // preamble setp param'))
+                              f'LDC R{d}, c[0][0x{byte_off:x}]  // preamble param'))
             return []
         else:
             return [SassInstr(encode_ldc(d, 0, byte_off, ctrl=0x7f1),

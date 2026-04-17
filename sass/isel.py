@@ -3014,15 +3014,13 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     if isinstance(instr.srcs[1], ImmOp):
                         imm = instr.srcs[1].value & 0xFFFFFFFF
-                        lit_off = ctx._alloc_literal(imm)
-                        # KERNEL-100.1 bugfix: when d==a, loading the literal
-                        # into d clobbers the source before IADD3 reads it.
-                        # Use a scratch register for the literal in that case.
-                        lit_reg = d if d != a else _alloc_gpr(ctx)
-                        output.append(SassInstr(encode_ldc(lit_reg, 0, lit_off),
-                                                f'LDC R{lit_reg}, c[0][0x{lit_off:x}]  // sub imm={imm:#x}'))
-                        output.append(SassInstr(encode_iadd3(d, a, lit_reg, RZ, negate_src1=True),
-                                                f'IADD3 R{d}, R{a}, -R{lit_reg}, RZ  // sub.{typ} imm'))
+                        # PTXAS-R09: use inline negated immediate via IADD3
+                        # instead of literal pool + LDC.  The CUDA driver
+                        # zeroes the cbuf[0] literal region past params,
+                        # so LDC-loaded literals read 0 at runtime.
+                        neg_imm = (-imm) & 0xFFFFFFFF
+                        output.append(SassInstr(encode_iadd3_imm32(d, a, neg_imm, RZ),
+                                                f'IADD3 R{d}, R{a}, -{imm:#x}, RZ  // sub.{typ} imm'))
                     else:
                         b = ctx.ra.r32(instr.srcs[1].name)
                         output.append(SassInstr(encode_iadd3(d, a, b, RZ, negate_src1=True),

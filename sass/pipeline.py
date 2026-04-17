@@ -75,6 +75,7 @@ def _sink_param_loads(fn: Function) -> None:
     # block label) to before all entry-block initializations, creating an infinite
     # loop because the loop back-edge targets the hoisted position instead of the
     # true loop start.
+    _unsunk_pos = 0  # PTXAS-R09: tracks insertion point for unsunk params
     for inst, dest_name in to_sink:
         sunk = False
         for bb in fn.blocks[1:]:  # skip entry
@@ -103,7 +104,12 @@ def _sink_param_loads(fn: Function) -> None:
             # Insert at the START so it stays above any conditional BRA
             # that the entry block may contain.  Appending to the END
             # would place it AFTER the BRA, making it unreachable dead code.
-            keep.insert(0, inst)
+            # PTXAS-R09: use _unsunk_pos to preserve original PTX order.
+            # Without this, repeated insert(0) reverses the param loads,
+            # which breaks aliased vregs (e.g. %rd2 used for both inp_len
+            # and out — the LAST load in PTX order must win).
+            keep.insert(_unsunk_pos, inst)
+            _unsunk_pos += 1
 
     entry.instructions = keep
 
@@ -991,7 +997,15 @@ def compile_function(fn: Function, verbose: bool = False,
             opc = (si.raw[0] | (si.raw[1] << 8)) & 0xFFF
             is_ldcu = opc == 0x7ac
             is_pre_bar_ldc = opc == 0xb82 and si.raw[2] != 1 and bar_pos_orig and idx < bar_pos_orig
-            if idx >= s2r_pos and (is_ldcu or is_pre_bar_ldc):
+            # PTXAS-R09: Never hoist an instruction that carries a block
+            # label tag.  These are the first instructions of branch-target
+            # blocks; hoisting them to the preamble causes the BRA fixup to
+            # target the preamble instead of the block's semantic entry.
+            _is_label_tagged = any(
+                si.comment.startswith(f'// {lbl}:')
+                for lbl in ctx.label_map
+            )
+            if idx >= s2r_pos and (is_ldcu or is_pre_bar_ldc) and not _is_label_tagged:
                 hoist_indices.add(idx)
 
     # Build the final instruction list:

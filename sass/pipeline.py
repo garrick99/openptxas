@@ -1204,7 +1204,8 @@ def compile_function(fn: Function, verbose: bool = False,
     # Only assign scoreboard ctrl to body instructions (after preamble).
     n_preamble = len(preamble)
     preamble_instrs = list(reordered[:n_preamble])
-    body_scheduled = assign_ctrl(reordered[n_preamble:])
+    body_reordered = list(reordered[n_preamble:])
+    body_scheduled = assign_ctrl(list(reordered[n_preamble:]))
 
     # SM_120 rule #25: add LDCU.32 prelude for vote-kernel s32 params.
     # Body LDC (0xb82) is forbidden in vote kernels. Use LDCU.32 in the
@@ -1640,11 +1641,13 @@ def compile_function(fn: Function, verbose: bool = False,
                     old_raw[14] = 0x0f
                     old_raw[15] = 0x00
                 else:
-                    # Predicated BRA (any direction) or unconditional backward BRA.
-                    # Convert PT backward → @!P0: loop-back is only reached when
-                    # the loop-exit @P0 BRA was not taken, guaranteeing P0=0.
-                    if is_pt:
-                        old_raw[1] = 0x89  # @!P0
+                    # Predicated BRA or unconditional backward BRA.
+                    # PTXAS-R17: do NOT convert PT backward → @!P0.
+                    # The old assumption (P0=false at back-edge) is wrong
+                    # for while-loop back-edges where P0 was set true by
+                    # the loop condition check.  Keep @PT (0x79) for
+                    # unconditional backward BRAs.  NVIDIA ptxas also uses
+                    # @PT for loop back-edges.
                     total = (rel_offset // 16) * 4
                     b2  = total & 0xFF
                     b4  = ((total >> 8) << 2) & 0xFF

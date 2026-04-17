@@ -1623,8 +1623,32 @@ def compile_function(fn: Function, verbose: bool = False,
                 is_pt = (pred_nibble == 0x7)  # PT = unconditional
                 if is_pt and rel_offset > 0:
                     # Unconditional forward BRA: BRA.U !UP0.
-                    # offset_instrs counts from the *current* instruction.
-                    offset_instrs = rel_offset // 16 + 1
+                    # Hardware semantics: target = next_pc + offset_instrs * 16.
+                    #
+                    # FORGE61-64 (WRONG_BLOCK_SPLIT): a single PTX basic block
+                    # must map to exactly one canonical SASS entry.  The label
+                    # tag on the first emitted instruction of a block IS that
+                    # canonical entry.  For blocks whose first PTX instruction
+                    # is `bar.sync`, isel.py emits a BSYNC.RECONVERGENT (opcode
+                    # 0x941) preamble ahead of BAR.SYNC (to carry the label tag
+                    # for scoreboard/reconvergence accounting); for those blocks
+                    # we add `+1` so the branch lands on the real BAR.SYNC past
+                    # the BSYNC preamble.  For every other first instruction
+                    # (notably `setp`/ISETP for a merge block that recomputes
+                    # its guard predicate, e.g. if_merge_4 or while_cond_20),
+                    # there is NO BSYNC preamble and an unconditional `+1`
+                    # would skip the canonical entry, landing one instruction
+                    # past it and leaving incoming edges consuming a stale
+                    # predicate — the exact cause of the all-zero output on
+                    # the FORGE61-64 tiled-matmul slice.
+                    target_idx = actual_target_byte // 16
+                    _tgt_is_bsync = (
+                        0 <= target_idx < len(sass_instrs)
+                        and ((sass_instrs[target_idx].raw[0]
+                              | (sass_instrs[target_idx].raw[1] << 8)) & 0xFFF)
+                            == 0x941
+                    )
+                    offset_instrs = rel_offset // 16 + (1 if _tgt_is_bsync else 0)
                     old_raw[1]  = 0x75
                     old_raw[2]  = (offset_instrs * 4) & 0xFF
                     old_raw[3]  = 0x08

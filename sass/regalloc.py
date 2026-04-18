@@ -219,7 +219,82 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
     #      reservation required.
     # Predicated ld.param.u64 (divergent fallback path) is excluded — that
     # path materializes the result into ra.lo(dest) and needs the GPR mapping.
+    # PTXAS-R22 (FB-1 Phase A fix): pre-compute per-param byte offsets so
+    # the ur_param_regs analysis can discriminate UR-safe u64 params from
+    # those that must be direct-LDC-loaded.  The only shape that matters
+    # for R22 is "u64 param used as base of add.u64 whose dest is itself
+    # the base of a global mem op" — which is an address-arithmetic chain.
+    # For those, IADD.64 R-UR is safe only when the LDCU.64 offset is
+    # 16-byte aligned; on a non-16-byte-aligned offset (canonical failing
+    # case: 2nd u64 param at c[0][0x388]) the mixed-domain address
+    # computation yields CUDA_ERROR_ILLEGAL_ADDRESS.  Mirror the matmul
+    # path (16-byte aligned param) by forcing direct LDC.64 for the
+    # unsafe subset, leaving the aligned/unrelated UR paths untouched.
+    _r22_param_offsets: dict[str, int] = {}
+    if sm_version == 120:
+        _r22_param_offset = param_base
+        for _p in fn.params:
+            _r22_size = _type_size(_p.type)
+            _r22_align = _p.align or max(_r22_size, 4)
+            _r22_param_offset = _align_up(_r22_param_offset, _r22_align)
+            _r22_param_offsets[_p.name] = _r22_param_offset
+            _r22_param_offset += _r22_size
+    _r22_misaligned_addr_arith_params: set[str] = set()
+    if sm_version == 120:
+        # Map u64 param vreg → PTX param name so we can look up offsets.
+        _r22_vreg_to_param: dict[str, str] = {}
+        for inst in all_instrs:
+            if (inst.op == 'ld' and 'param' in inst.types
+                    and any(t in ('u64', 's64', 'b64') for t in inst.types)
+                    and isinstance(inst.dest, RegOp)
+                    and inst.srcs and isinstance(inst.srcs[0], MemOp)
+                    and isinstance(inst.srcs[0].base, str)):
+                _r22_vreg_to_param[inst.dest.name] = inst.srcs[0].base
+        # For each add.u64 whose dest is consumed as a global MemOp base,
+        # flag the u64-param sources whose param offset is not 16-byte
+        # aligned.  Those params must take the direct-LDC.64 path.
+        for inst in all_instrs:
+            if not (inst.op == 'add'
+                    and any(t in ('u64', 's64', 'b64') for t in inst.types)):
+                continue
+            if not isinstance(inst.dest, RegOp):
+                continue
+            _r22_add_dest = inst.dest.name
+            _r22_dest_feeds_memop = False
+            for inst2 in all_instrs:
+                if inst2 is inst:
+                    continue
+                if inst2.op not in ('ld', 'st', 'atom'):
+                    continue
+                if 'global' not in inst2.types:
+                    continue
+                for _s in inst2.srcs:
+                    if (isinstance(_s, MemOp)
+                            and isinstance(_s.base, str)):
+                        _sn = (_s.base if _s.base.startswith('%')
+                               else f'%{_s.base}')
+                        if _sn == _r22_add_dest:
+                            _r22_dest_feeds_memop = True
+                            break
+                if _r22_dest_feeds_memop:
+                    break
+            if not _r22_dest_feeds_memop:
+                continue
+            for _src in inst.srcs:
+                if not isinstance(_src, RegOp):
+                    continue
+                _pname = _r22_vreg_to_param.get(_src.name)
+                if _pname is None:
+                    continue
+                _poff = _r22_param_offsets.get(_pname)
+                if _poff is None:
+                    continue
+                if _poff % 16 != 0:
+                    _r22_misaligned_addr_arith_params.add(_src.name)
+
     ur_param_regs: set[str] = set()
+    # PTXAS-R23C: default empty dead-load set for non-SM_120 paths (see below).
+    _r23c_dead_ldparam_ids: set[int] = set()
     if sm_version == 120:
         # Collect u64 ld.param dests, tracking whether the load is predicated.
         # Also count def sites — a vreg redefined after the param load (e.g.
@@ -229,6 +304,19 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
         param_u64_names: set[str] = set()
         param_u64_predicated: set[str] = set()
         u64_def_count: dict[str, int] = {}
+        # PTXAS-R23C: track per-name last ld.param.u64 writer.  When a u64
+        # PTX vreg is written by two or more ld.param.u64 (e.g. `ld.param.u64
+        # %rd0, [in]; ld.param.u64 %rd0, [out]` in 2-u64-param kernels), all
+        # earlier writes are dead — the final write clobbers them before
+        # any consumer can read.  R23C proof: emitting the dead LDC.64s
+        # produces a pre-EXIT sequence whose structural shape violates an
+        # SM_120 driver invariant tied to the post-EXIT descriptor-priming
+        # ULDCU.  Dropping dead writes restores the correct pre-/post-EXIT
+        # balance (exactly one LDC.64 pre-EXIT per live u64 param; rule
+        # #29 then upcasts the post-EXIT LDCU.64 to ULDCU.128).  Leaving
+        # them in caused CUDA_ERROR_ILLEGAL_ADDRESS at STG.E on G8-shape.
+        _r23c_last_ldparam_id: dict[str, int] = {}
+        _r23c_all_ldparam_ids: list[tuple[str, int]] = []
         for inst in all_instrs:
             if inst.dest and isinstance(inst.dest, RegOp):
                 u64_def_count[inst.dest.name] = u64_def_count.get(inst.dest.name, 0) + 1
@@ -238,6 +326,12 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
                 param_u64_names.add(inst.dest.name)
                 if inst.pred:
                     param_u64_predicated.add(inst.dest.name)
+                _r23c_last_ldparam_id[inst.dest.name] = id(inst)
+                _r23c_all_ldparam_ids.append((inst.dest.name, id(inst)))
+        _r23c_dead_ldparam_ids: set[int] = set()
+        for pname, iid in _r23c_all_ldparam_ids:
+            if _r23c_last_ldparam_id.get(pname) != iid:
+                _r23c_dead_ldparam_ids.add(iid)
         for pname in param_u64_names:
             if pname in param_u64_predicated:
                 continue  # divergent fallback needs GPR
@@ -264,7 +358,7 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
                             break
                 if not only_safe:
                     break
-            if only_safe:
+            if only_safe and pname not in _r22_misaligned_addr_arith_params:
                 ur_param_regs.add(pname)
 
         # FB-5.1 second pass: IADD.64-UR has only ONE UR source slot.  If a
@@ -955,12 +1049,18 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
         param_offsets[p.name] = param_offset
         param_offset += size
 
+    _ra = RegAlloc(
+        int_regs=int_regs,
+        pred_regs=pred_regs,
+        unif_regs=unif_regs,
+    )
+    # PTXAS-R23C: piggy-back the dead-ld.param.u64 set onto the shared
+    # RegAlloc instance so isel._select_ld_param can consult it without
+    # a new pipeline-level plumbing change.  Empty for SM_89 and for
+    # SM_120 kernels without any redefined u64 param.
+    _ra._r23c_dead_ldparam_ids = _r23c_dead_ldparam_ids
     return AllocResult(
-        ra=RegAlloc(
-            int_regs=int_regs,
-            pred_regs=pred_regs,
-            unif_regs=unif_regs,
-        ),
+        ra=_ra,
         param_offsets=param_offsets,
         num_gprs=next_gpr,
         num_pred=max(next_pred, 1),

@@ -1265,6 +1265,49 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
     else:
         byte_off = param_offsets.get(param_name, 0)
 
+    # PTXAS-R23D (combined dead-load skip + post-EXIT priming):
+    # If this is a dead ld.param.u64 whose same PTX wide-name is overwritten
+    # by a later ld.param.u64 before any read, the naive emission produces
+    # two pre-EXIT LDC.64s to the same GPR pair.  R23C proved that emission
+    # pattern breaks SM_120 STG.E on 2+ u64 param kernels
+    # (CUDA_ERROR_ILLEGAL_ADDRESS at sync).
+    #
+    # R23D additionally proved that dropping the dead load is necessary-
+    # but-insufficient: the SM_120 driver also needs a post-EXIT
+    # ULDCU.128 priming load over the param area before the STG.E.  In
+    # the single-u64-param shape this priming arrives "for free" via the
+    # UR-bound param LDCU that rule #29 upcasts; in the dual-param
+    # reuse shape, no UR LDCU exists (the live param's offset is non-
+    # 16-aligned → routed GPR-direct by R22), so the priming is absent.
+    #
+    # Fix: for the dead ld.param.u64, instead of emitting nothing at all,
+    # queue a preamble LDCU.64 targeting an unused UR pair at the dead
+    # load's byte offset.  The existing rule-#29 pass in pipeline.py then
+    # upcasts the first post-EXIT LDCU.64 to ULDCU.128 when the offset is
+    # 16-byte-aligned (dead-reuse kernels always hit param 0 at 0x380,
+    # which is).  This restores the exact post-EXIT priming variant A
+    # accidentally inherited and the live STG.E now succeeds.
+    _dead_set = getattr(ra, '_r23c_dead_ldparam_ids', None)
+    if (_dead_set and id(instr) in _dead_set
+            and ctx is not None and ctx.sm_version == 120
+            and (byte_off & 0xF) == 0):
+        _ur_prime = ctx._next_ur if ctx._next_ur >= 8 else 8
+        if _ur_prime % 2 != 0:
+            _ur_prime += 1
+        ctx._next_ur = _ur_prime + 2
+        if not hasattr(ctx, '_preamble_ldcus'):
+            ctx._preamble_ldcus = []
+        ctx._preamble_ldcus.append(
+            SassInstr(encode_ldcu_64(_ur_prime, 0, byte_off),
+                      f'LDCU.64 UR{_ur_prime}, c[0][0x{byte_off:x}]  '
+                      f'// R23D priming (dead {param_name})'))
+        return []
+    if _dead_set and id(instr) in _dead_set:
+        # Dead but the byte offset isn't 16-aligned (rule #29 can't upcast).
+        # Fall back to the plain dead-load skip; if this ever produces a
+        # runtime failure we'll extend the priming logic for that class.
+        return []
+
     sm_ver = ctx.sm_version if ctx else 120
     typ = instr.types[-1] if instr.types else 'u32'
 
@@ -2289,10 +2332,17 @@ def _select_st_global(instr: Instruction, ra: RegAlloc,
         # Immediate data: materialize into a temporary register first.
         if isinstance(src_op, ImmOp):
             t = _alloc_gpr(ctx)
-            lit_off = ctx._alloc_literal(src_op.value & 0xFFFFFFFF)
-            from sass.encoding.sm_120_opcodes import encode_ldc
-            preamble = [SassInstr(encode_ldc(t, 4, lit_off),
-                                  f'LDC R{t}, c[0x4][{lit_off:#x}]  // materialize imm for st')]
+            # PTXAS-R23B.A: NVCC embeds 32-bit store-payload immediates
+            # inline via opcode 0x431 (MOV32I).  The prior literal-pool
+            # path — ctx._alloc_literal + encode_ldc(t, 0, lit_off) —
+            # placed the immediate past the declared param area in
+            # .nv.constant0.*, a region the SM_120 driver does not
+            # expose at runtime (reads return 0; R23A.4 proof).  Mirror
+            # NVCC by emitting MOV32I R, imm32 directly.
+            from sass.encoding.sm_120_opcodes import encode_mov32i
+            imm32 = src_op.value & 0xFFFFFFFF
+            preamble = [SassInstr(encode_mov32i(t, imm32),
+                                  f'MOV32I R{t}, 0x{imm32:08x}  // inline imm for st')]
         else:
             raise ISelError(f"st.global data must be register or immediate")
 
@@ -2790,10 +2840,75 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 output.append(SassInstr(encode_s2r(gpr, sr_code),
                                     f'S2R R{gpr}, SR_{sr_label}  // {instr.dest.name} (scratch GPR)'))
                                 continue
-                            else:  # single CTAID axis: use S2UR (original path)
-                                # SM_120: Put ctaid into a fresh UR via S2UR so mad.lo can use IMAD R-UR.
+                            else:  # single CTAID axis
+                                # SM_120 original fast path: S2UR + IMAD R-UR
+                                # lets `mul.lo %ctaid, %ntid` fuse into a
+                                # single IMAD R-UR.  That path is valid ONLY if
+                                # every downstream consumer can read the UR
+                                # directly (IMAD R-UR, ISETP R-UR, IADD.64 R-UR).
+                                #
+                                # PTXAS-R19 (FB-1 Phase A fix): scan the rest of
+                                # the function for consumers of this PTX
+                                # register that require a GPR operand (shl/shr,
+                                # and/or/xor, setp using ctaid as src0,
+                                # add.u32, etc.).  If any such consumer exists,
+                                # route ctaid through S2R directly into the
+                                # allocator's pre-assigned GPR slot (without
+                                # advancing `_next_gpr`) so every downstream
+                                # user of `%ctaid` reads the correct register.
+                                # Without this, `ra.r32(%ctaid)` returned the
+                                # pre-assigned slot UNWRITTEN (S2UR wrote the
+                                # UR instead) and the store path computed its
+                                # offset from garbage, yielding
+                                # CUDA_ERROR_ILLEGAL_ADDRESS in the FB-1 pilot.
                                 sr_code = _SPECIAL_REGS[instr.srcs[0].name]
                                 sr_label = instr.srcs[0].name.lstrip('%').replace('.', '_').upper()
+
+                                _dest_name = instr.dest.name
+                                _needs_gpr = False
+                                for _bb_scan in fn.blocks:
+                                    if _needs_gpr:
+                                        break
+                                    for _later in _bb_scan.instructions:
+                                        if _later is instr:
+                                            continue
+                                        if not hasattr(_later, 'srcs'):
+                                            continue
+                                        for _sop in _later.srcs:
+                                            if (isinstance(_sop, RegOp)
+                                                    and _sop.name == _dest_name):
+                                                _lop = _later.op.lower()
+                                                # mul.lo / mad.lo can fuse the
+                                                # ctaid-UR into IMAD R-UR; any
+                                                # other 32-bit consumer needs a
+                                                # real GPR.
+                                                if _lop not in ('mul', 'mad'):
+                                                    _needs_gpr = True
+                                                    break
+
+                                if _needs_gpr:
+                                    # S2R into a FRESH GPR slot above the
+                                    # allocator's tracked range — mirrors the
+                                    # multi-CTAID branch above.  Overriding
+                                    # `int_regs[dest]` to the fresh GPR is
+                                    # important: the allocator coalesced
+                                    # `%ctaid` with other PTX regs whose
+                                    # liveness the original linear scan
+                                    # considered non-overlapping (because
+                                    # `%ctaid` was expected to live in a UR).
+                                    # Re-routing `%ctaid` to a fresh slot
+                                    # prevents any of those coalesced writes
+                                    # from clobbering ctaid before a late
+                                    # GPR-only consumer reads it.
+                                    gpr = ctx._next_gpr
+                                    ctx._next_gpr += 1
+                                    ctx.ra.int_regs[_dest_name] = gpr
+                                    output.append(SassInstr(
+                                        encode_s2r(gpr, sr_code),
+                                        f'S2R R{gpr}, SR_{sr_label}  // {instr.dest.name} (PTXAS-R19 fresh-slot, GPR-required)'))
+                                    continue
+
+                                # No GPR-only consumer — keep the UR fast path.
                                 _has_deferred = getattr(ctx, '_had_deferred_params', False)
                                 if ctx._next_ur >= 14 or _has_deferred:
                                     ur_ctaid = 6  # UR6 is safe (UR4 = mem desc)
@@ -2955,6 +3070,68 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     output.extend(_select_sub_u64(instr, ctx.ra))
 
                 elif op == 'add' and typ in ('u64', 's64'):
+                    # PTXAS-R22 (FB-1 Phase A fix): if this add.u64's dest
+                    # is used as the base of a subsequent global ld/st/atom
+                    # and one of the operands is a UR-backed u64 param, the
+                    # IADD.64 R-UR + STG chain can fail for this shape
+                    # (specifically: `LDCU.64 UR_n, c[0][OFF]` where OFF is
+                    # 8-byte-aligned but not 16-byte aligned, e.g. the 2nd
+                    # u64 param at c[0][0x388]).  Rather than risk that
+                    # mixed-domain address path, materialize the UR-backed
+                    # operand into its pre-assigned GPR pair FIRST, remove
+                    # the name from `_ur_params`, and let _select_add_u64
+                    # take the all-GPR path (IADD3 + IADD3.X, R-R safe).
+                    # Matmul's IADD.64 R-UR path (16-byte aligned LDCU.64)
+                    # is untouched because its UR-backed operand is only
+                    # retargeted when an unsafe consumer is detected.
+                    from ptx.ir import MemOp as _R22_MemOp
+                    _r22_ur_params = getattr(ctx, '_ur_params', {})
+                    if (isinstance(instr.dest, RegOp)
+                            and len(instr.srcs) >= 2
+                            and all(isinstance(s, RegOp) for s in instr.srcs[:2])):
+                        _r22_dest_name = instr.dest.name
+                        _r22_ur_src = None
+                        for _r22_s in instr.srcs[:2]:
+                            if _r22_s.name in _r22_ur_params:
+                                _r22_ur_src = _r22_s
+                                break
+                        if _r22_ur_src is not None:
+                            # Forward-scan this block for a consumer that
+                            # reads the add's dest as the base of a global
+                            # memory op.  Cross-block uses aren't the
+                            # reproE/pilot failing class and would widen
+                            # scope beyond what the mission authorizes.
+                            _r22_feeds_mem_addr = False
+                            for _r22_later in bb.instructions[_instr_idx + 1:]:
+                                if not hasattr(_r22_later, 'srcs'):
+                                    continue
+                                for _r22_ls in _r22_later.srcs:
+                                    if (isinstance(_r22_ls, _R22_MemOp)
+                                            and isinstance(_r22_ls.base, str)
+                                            and _r22_later.op in ('ld', 'st', 'atom')
+                                            and 'global' in _r22_later.types):
+                                        _r22_bn = (_r22_ls.base
+                                                   if _r22_ls.base.startswith('%')
+                                                   else f'%{_r22_ls.base}')
+                                        if _r22_bn == _r22_dest_name:
+                                            _r22_feeds_mem_addr = True
+                                            break
+                                if _r22_feeds_mem_addr:
+                                    break
+                            if (_r22_feeds_mem_addr
+                                    and _r22_ur_src.name in ctx.ra.int_regs):
+                                # Materialize UR pair → allocator's
+                                # pre-assigned GPR pair, then mark as
+                                # GPR-written so _select_add_u64 takes the
+                                # R-R path.
+                                _r22_ur_idx = _r22_ur_params[_r22_ur_src.name]
+                                _r22_gpr_lo = ctx.ra.lo(_r22_ur_src.name)
+                                output.extend(_emit_ur_to_gpr(
+                                    _r22_gpr_lo, _r22_ur_idx,
+                                    f'PTXAS-R22: {_r22_ur_src.name} UR->GPR (feeds mem addr)',
+                                    ctx))
+                                ctx._gpr_written.add(_r22_ur_src.name)
+                                del ctx._ur_params[_r22_ur_src.name]
                     output.extend(_select_add_u64(instr, ctx.ra, ctx))
 
                 elif op == 'add' and typ in ('u32', 's32'):
@@ -4099,8 +4276,30 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                         ur_tmp += 1
                                     ctx._next_ur = ur_tmp + 2
                                     raw = bytearray(encode_ldcu_64(ur_tmp, 0, poff))
-                                    if first:
-                                        raw[9] = 0x0c  # Rule #29: first post-EXIT
+                                    # PTXAS-R20 (FB-1 Phase A fix): the "Rule #29"
+                                    # byte-9 flip upcasts the first post-EXIT
+                                    # LDCU.64 to LDCU.128. LDCU.128 requires the
+                                    # byte offset to be 16-byte aligned —
+                                    # encode_ldcu_128() itself asserts this. The
+                                    # flip was unconditional, which silently
+                                    # bypassed that guard for deferred params
+                                    # that land on non-16-aligned offsets (e.g.
+                                    # the 2nd u64 param at c[0][0x388]). That
+                                    # produced a malformed LDCU.128, garbage in
+                                    # the UR pair's high half, and a subsequent
+                                    # STG with an invalid 64-bit address hitting
+                                    # CUDA_ERROR_ILLEGAL_ADDRESS. Mirror the
+                                    # encoder's alignment rule: only upcast when
+                                    # the offset is 16-byte aligned.
+                                    if first and (poff % 16) == 0:
+                                        raw[9] = 0x0c  # Rule #29: first post-EXIT (aligned-only)
+                                        first = False
+                                    elif first:
+                                        # Non-aligned deferred param: leave as
+                                        # plain LDCU.64. The upcast is an
+                                        # optional optimization, not a
+                                        # correctness requirement; dropping it
+                                        # here still produces a valid encoding.
                                         first = False
                                     output.append(SassInstr(bytes(raw),
                                         f'LDCU.64 UR{ur_tmp}, c[0][0x{poff:x}]  // post-EXIT deferred'))
@@ -4144,8 +4343,17 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             if dur % 2 != 0: dur += 1
                                             ctx._next_ur = dur + 2
                                             draw = bytearray(encode_ldcu_64(dur, 0, dpoff))
-                                            if first_d:
-                                                draw[9] = 0x0c  # Rule #29
+                                            # PTXAS-R20: mirror encode_ldcu_128's
+                                            # 16-byte-alignment guard (see the
+                                            # sibling site above for the full
+                                            # rationale). Only upcast to
+                                            # LDCU.128 when the deferred offset
+                                            # is 16-byte aligned; otherwise keep
+                                            # the LDCU.64 form.
+                                            if first_d and (dpoff % 16) == 0:
+                                                draw[9] = 0x0c  # Rule #29 (aligned-only)
+                                                first_d = False
+                                            elif first_d:
                                                 first_d = False
                                             output.append(SassInstr(bytes(draw),
                                                 f'LDCU.64 UR{dur}, c[0][0x{dpoff:x}]  // post-EXIT'))

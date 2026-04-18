@@ -3284,6 +3284,49 @@ def encode_hfma2_zero(dest: int, ctrl: int = 0) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# MOV32I — 32-bit integer immediate to register (opcode 0x431, imm32 form)
+# ---------------------------------------------------------------------------
+# PTXAS-R23B.A: NVCC materializes 32-bit immediates for st.global payloads
+# via opcode 0x431 with the 32 immediate bits packed into b4..b7.  The
+# encoding shares its opcode with the HFMA2 zero-init idiom, but the
+# hardware semantics differ when b4..b7 is nonzero and the controlling
+# modifier bytes select the integer-move form: the destination register
+# receives the full 32-bit immediate, bit-exact.
+#
+# Ground truth (NVCC reproG4, empirically GPU-verified 0xAABBCCDD round-trip):
+#   MOV32I R7, 0xAABBCCDD
+#   lo=0xaabbccddff077431  hi=0x000fe4000000001ff
+#   bytes: 31 74 07 ff dd cc bb aa | ff 01 00 00 00 e4 0f 00
+#   b0=0x31 b1=0x74 (opcode 0x431)
+#   b2=dest b3=0xff(RZ) b4..b7=imm32 b8=0xff(RZ) b9=0x01 b12=0x00
+def encode_mov32i(dest: int, imm32: int, ctrl: int = 0) -> bytes:
+    """Encode MOV32I dest, imm32 — inline 32-bit immediate into GPR.
+
+    PTXAS-R23B.A: the literal-pool LDC path (ctx._alloc_literal +
+    encode_ldc(..., bank=0, lit_off>=param_area_end)) is not driver-
+    visible on SM_120 (the constant-bank region past the declared param
+    area returns zero at runtime).  NVCC avoids the pool entirely by
+    emitting this inline-imm32 form.  Mirror that strategy for u32
+    immediate store payloads; ctrl is patched by the scheduler.
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0], raw[1] = 0x31, 0x74
+    raw[2] = dest & 0xFF
+    raw[3] = 0xff
+    raw[4] = imm32 & 0xFF
+    raw[5] = (imm32 >> 8) & 0xFF
+    raw[6] = (imm32 >> 16) & 0xFF
+    raw[7] = (imm32 >> 24) & 0xFF
+    raw[8] = 0xff
+    raw[9] = 0x01
+    raw[13], raw[14], raw[15] = b13, b14, b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
 # IADD3 variants for Newton-Raphson division
 # ---------------------------------------------------------------------------
 # Several IADD3 encodings are needed for div.u32: large immediate, negated sources,

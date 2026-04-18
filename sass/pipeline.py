@@ -695,20 +695,18 @@ def compile_function(fn: Function, verbose: bool = False,
     # 0b. Sink ld.param from entry block to first-use block (reduces GPR pressure)
     _sink_param_loads(fn)
 
-    # PTXAS-R25.3: scalar-LDG → offset-form PTX canonicalization.
-    # Rule-#25 `_has_scalar_ldg` kernels (LDG from a raw ld.param.u64
-    # pointer with no intervening address arithmetic) crash the SM_120
-    # descriptor-LDG path with CUDA_ERROR_ILLEGAL_ADDRESS.  Every
-    # in-scope isel-level fix (R24, R24.1, R24.2, R25, R25.1, R25.2)
-    # failed because the structural invariant the hardware expects
-    # spans more surfaces than an isel/peephole patch can control.
-    # The already-working offset-form path (proven by the `kCandidate`
-    # reference kernel with explicit address arithmetic) is reliable.
-    # Canonicalize the scalar-LDG class into the same PTX shape as
-    # kCandidate BEFORE isel sees it: inject a per-lane zero-offset
-    # add.u64 chain and rewrite the LDG's address operand.
-    if sm_version == 120:
-        _canonicalize_scalar_ldg(fn)
+    # PTXAS-R29.1 (retire R25.3 scalar-LDG canonicalization in favor of
+    # ptxas-faithful direct LDC.64→LDG.E lowering).  ptxas ground truth
+    # (R28.3 proof on `dual_ldg` kernel) shows scalar-LDG lowers via
+    # `LDC.64 R_pair, c[0][param_off] → LDG.E desc[UR][R_pair.64]` —
+    # no `tid & 0` offset-arith chain.  R29.1 moves the fix into a
+    # coordinated classification: regalloc.py marks scalar-LDG-only
+    # u64 params in `direct_ldc_params`; the existing isel tiny-direct
+    # branch in `_select_ld_param` emits `LDC.64` straight into the
+    # allocated GPR pair; `_select_ld_global` takes the `gpr_written`
+    # branch and reads the already-loaded pair.  No UR preamble, no
+    # dual producer, no per-lane chain.  `_canonicalize_scalar_ldg`
+    # remains in the module as dead code for a rollback window.
 
     # FG39: consecutive shift merge.  When two shl.b32 instructions
     # operate in sequence (shl %B, %A, K1; shl %C, %B, K2) and %B is

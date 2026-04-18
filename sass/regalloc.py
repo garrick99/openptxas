@@ -506,6 +506,93 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
                 for _p in _eligible:
                     ur_param_regs.discard(_p)
 
+        # PTXAS-R29.1: scalar-LDG-only u64 params → direct_ldc_params.
+        # A u64 param whose ONLY consumer is a scalar `ld.global` (MemOp
+        # base with no offset arithmetic and no redefinition) gets the
+        # ptxas-faithful lowering: one `LDC.64 R_pair, c[0][param_off]`
+        # in the body that feeds `LDG.E desc[UR][R_pair.64]` directly.
+        # Without this classification, `_select_ld_param` queues a UR
+        # preamble `ULDCU.64` AND `_select_ld_global` attempts a body
+        # `IADD.64 R-RZ-UR` materialization — the latter crashes the
+        # SM_120 descriptor-LDG path (R23A.4 proof).  R25.3's PTX
+        # canonicalization workaround is retired in favor of this
+        # classification (see `_canonicalize_scalar_ldg` in pipeline.py,
+        # kept for backup but not invoked).  Mixed kernels (one scalar +
+        # one offset-form) only classify the scalar-LDG-base param,
+        # leaving offset-form vregs on their working path untouched.
+        for _pn in _u64_param_dests:
+            if _pn in direct_ldc_params:
+                continue  # already marked by tiny-kernel / atom path
+            only_scalar_ldg_base = True
+            has_any_use = False
+            for inst in all_instrs:
+                if (isinstance(inst.dest, RegOp)
+                        and inst.dest.name == _pn
+                        and inst.op != 'ld'):
+                    # Redefined by a non-ld op (e.g. add.u64, mul)
+                    only_scalar_ldg_base = False
+                    break
+                for src in inst.srcs:
+                    sn = (src.name if isinstance(src, RegOp) else
+                          (src.base if isinstance(src, MemOp)
+                           and isinstance(src.base, str) else None))
+                    if sn != _pn:
+                        continue
+                    has_any_use = True
+                    # Allowed: scalar ld.global with zero offset.
+                    if (isinstance(src, MemOp)
+                            and inst.op == 'ld'
+                            and 'global' in inst.types
+                            and src.offset == 0):
+                        continue
+                    only_scalar_ldg_base = False
+                    break
+                if not only_scalar_ldg_base:
+                    break
+            if has_any_use and only_scalar_ldg_base:
+                direct_ldc_params.add(_pn)
+                ur_param_regs.discard(_pn)
+
+        # PTXAS-R29.3: S2R live-range extension for direct-LDC.64 safety.
+        #
+        # R29.1 lowers scalar-LDG params via body `LDC.64 R_pair` that writes
+        # both halves of a GPR pair.  The SASS scheduler hoists `S2R R, %tid.x`
+        # (and peer special-reg S2Rs) to the top of the body to hide latency,
+        # so S2R's physical write EXECUTES BEFORE the LDC.64 even though PTX
+        # source order has the S2R defined LATER than the LDC.64 input vreg.
+        #
+        # Consequence: if the linear-scan allocator reuses the high half of
+        # an already-dead direct-LDC.64 pair as the S2R destination, then:
+        #   pos 1:  S2R  R3, SR_TID.X        // writes R3 = tid.x
+        #   pos 4:  LDC.64 R2:R3, c[0][...]  // OVERWRITES R3 with ptr_hi
+        #   pos 9:  ISETP.IMM R3, 0          // reads ptr_hi, not tid.x
+        # which is the G5 Family-B residual (see R29.2 bail notes).
+        #
+        # Fix: when direct-LDC.64 lowering is active for any pair in this
+        # kernel, extend `reg_first_def` of every S2R-destined single reg
+        # back to 0.  This accurately reflects the scheduler's hoisting and
+        # forces the linear scan to allocate S2R-dest single regs BEFORE any
+        # direct-LDC.64 pair, guaranteeing no overlap with a pair half.
+        # Scoped to direct_ldc_params-active kernels so pre-R29.1 register
+        # layouts are unchanged for all other kernels.
+        if direct_ldc_params:
+            _SPECIAL_SRC_NAMES = {
+                '%tid.x', '%tid.y', '%tid.z',
+                '%ctaid.x', '%ctaid.y', '%ctaid.z',
+                '%ntid.x', '%ntid.y', '%ntid.z',
+                '%nctaid.x', '%nctaid.y', '%nctaid.z',
+                '%laneid',
+            }
+            for inst in all_instrs:
+                if (inst.op == 'mov'
+                        and isinstance(inst.dest, RegOp)
+                        and inst.srcs
+                        and isinstance(inst.srcs[0], RegOp)
+                        and inst.srcs[0].name in _SPECIAL_SRC_NAMES):
+                    dname = inst.dest.name
+                    if dname in reg_first_def and reg_first_def[dname] > 0:
+                        reg_first_def[dname] = 0
+
     # SM_120: identify f64 param registers that will be loaded into UR via LDCU.64.
     # DFMA R-R-UR-UR handles them directly; no GPR needed.  Keeping these in UR
     # frees GPR slots so all accumulators fit in R0-R13 (avoiding R14+ restriction).

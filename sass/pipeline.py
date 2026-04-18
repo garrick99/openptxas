@@ -1377,6 +1377,24 @@ def compile_function(fn: Function, verbose: bool = False,
         by_key: dict[tuple, int] = {(d, b): j for j, d, b in ldcu64}
         replacements: dict[int, SassInstr] = {}
         paired: set[int] = set()
+        # PTXAS-R32': detect the first predicated EXIT boundary.  The HW
+        # scoreboard for a packed LDCU.128 posts only on the primary UR
+        # `d` — consumers reading the HIGH half (d+2, d+3) do not stall
+        # reliably for the pack when they sit in the post-EXIT body.
+        # When the HIGH-half UR has an `IADD.64 R-UR` (opc 0xc35)
+        # consumer AFTER a predicated `@!P0 EXIT`, the pack crosses the
+        # control-flow boundary without a reliable wait and the
+        # subsequent STG produces CUDA_ERROR_ILLEGAL_ADDRESS (the
+        # `k_2p_offset` repro writes to `out_ptr + garbage` post-EXIT).
+        # Keep the two LDCU.64s UNPACKED in that case so each arms its
+        # own scoreboard slot.  All other WB-8 packings remain intact.
+        _exit_idx_for_wb8 = None
+        for _ei, _si in enumerate(instrs):
+            _eopc = (_si.raw[0] | (_si.raw[1] << 8)) & 0xFFF
+            _eguard = (_si.raw[1] >> 4) & 0xF
+            if _eopc == 0x94d and _eguard != 0x7:
+                _exit_idx_for_wb8 = _ei
+                break
         for j, d, b in ldcu64:
             if j in paired:
                 continue
@@ -1385,6 +1403,19 @@ def compile_function(fn: Function, verbose: bool = False,
             partner_j = by_key.get((d + 2, b + 8))
             if partner_j is None or partner_j in paired:
                 continue
+            # R32' guard: scan for a post-EXIT consumer of the HIGH-half UR.
+            # Only the R-UR form of IADD.64 (opc 0xc35) reads UR in b4.
+            _high_ur_post_exit_consumer = False
+            if _exit_idx_for_wb8 is not None:
+                _high_ur = d + 2
+                for _ci in range(_exit_idx_for_wb8 + 1, len(instrs)):
+                    _csi = instrs[_ci]
+                    _copc = (_csi.raw[0] | (_csi.raw[1] << 8)) & 0xFFF
+                    if _copc == 0xc35 and _csi.raw[4] == _high_ur:
+                        _high_ur_post_exit_consumer = True
+                        break
+            if _high_ur_post_exit_consumer:
+                continue  # keep both LDCU.64s unpacked
             # Patch: flip byte[9] 0x0a -> 0x0c on the lower-offset LDCU.
             packed_raw = bytearray(instrs[j].raw)
             packed_raw[9] = 0x0c

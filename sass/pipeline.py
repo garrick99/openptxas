@@ -1561,14 +1561,27 @@ def compile_function(fn: Function, verbose: bool = False,
             if _i + 1 < len(reordered):
                 _r38_nxt = reordered[_i + 1]
                 _r38_nopc = (_r38_nxt.raw[0] | (_r38_nxt.raw[1] << 8)) & 0xFFF
-                # Narrow: IMAD.SHL.U32 (0x824) reading S2R dest at b3 (src0).
-                # This is the EXACT pattern proven unsafe in s2_fail and
-                # not present in any currently-passing kernel that lacks
-                # a natural gap between S2R CTAID and IMAD.SHL.
-                if _r38_nopc == 0x824 and _r38_nxt.raw[3] == _r38_dest:
+                # Narrow: post-EXIT S2R GPR consumer classes PROVEN sensitive.
+                # R38 probe (s2_fail): IMAD.SHL.U32 (0x824) consumer reading
+                # S2R dest at b3 produces stale read → CUDA_ERROR_ILLEGAL_ADDRESS.
+                # R39 extension probe confirmed the SAME hazard for two more
+                # opcodes that also read their first GPR operand at b3:
+                #   * 0x835 UIADD (SM_120 "SR-derived" add with imm32) — out=
+                #     garbage on `mov ctaid; add imm` (probe p2_add_imm FAIL
+                #     without gap, PASS with gap).
+                #   * 0x812 LOP3.LUT with imm32 — out=garbage on `mov ctaid;
+                #     or imm` (probe p4_or FAIL without gap, PASS with gap).
+                # All three share the encoding "b3 = src0 GPR reading the
+                # S2R dest immediately".  Non-SHL multiply paths (mul.lo)
+                # lower via S2UR (UR dest) + IMAD R-UR instead and do NOT
+                # hit the hazard.  Passing kernels (G4 etc.) have a natural
+                # gap instruction between S2R and consumer and are
+                # unaffected by this rule.
+                _R39_SENSITIVE_OPCODES = {0x824, 0x835, 0x812}
+                if _r38_nopc in _R39_SENSITIVE_OPCODES and _r38_nxt.raw[3] == _r38_dest:
                     _r38_patched.append(SassInstr(
                         _r38_encode_nop(),
-                        'NOP  // PTXAS-R38 post-EXIT S2R->IMAD.SHL gap'))
+                        'NOP  // PTXAS-R38/R39 post-EXIT S2R->ALU gap'))
     reordered = _r38_patched
 
     # The preamble (LDC R1) has hardcoded ctrl from ptxas.

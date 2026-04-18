@@ -2499,6 +2499,13 @@ def compile_function(fn: Function, verbose: bool = False,
                 0xb82: (),       # LDC: b2 is GPR dst but preamble
                 0x9c3: (),       # S2UR: no GPR
             }
+            # PTXAS-R50: opcodes whose b3 is a 64-bit pair base (addr_lo).
+            # The hi-half (base+1) is IMPLICITLY read but not at any byte
+            # position; FG29-C must treat it as an outside user too, or it
+            # will rename the hi-half to R0 and break the pair.  Observed:
+            # k200_load_pred_store LDG R6.64 — R6 is escape (b3), but R7
+            # was renamed to R0 because no explicit byte held R7.
+            _R50_B3_PAIR_OPCS = {0x981, 0x986}  # LDG.E, STG.E
             _outside_users = set()
             for _ri in range(len(sass_instrs)):
                 if _alu_start <= _ri < _alu_end:
@@ -2509,6 +2516,12 @@ def compile_function(fn: Function, verbose: bool = False,
                 for _bp in _gpr_pos:
                     if _raw[_bp] in _rename_candidates:
                         _outside_users.add(_raw[_bp])
+                # R50: for LDG/STG, b3 is a 64-bit addr pair base — hi-half
+                # at base+1 is implicitly live.  Mark as outside user too.
+                if _ropc in _R50_B3_PAIR_OPCS:
+                    _pair_hi = _raw[3] + 1
+                    if _pair_hi in _rename_candidates:
+                        _outside_users.add(_pair_hi)
             _rename_candidates -= _outside_users
 
             # Verify R0 is not used by any ALU instruction outside the

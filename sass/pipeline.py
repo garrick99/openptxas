@@ -1230,7 +1230,16 @@ def compile_function(fn: Function, verbose: bool = False,
     # LDCU.64 UR4 then overwrites p_out (illegal address).  Observed in all
     # 10 warp-intrinsic cluster kernels.  Fix: disable FG26 admission when
     # TE10 won't fire.
+    #
+    # PTXAS-R56: the same TE10 block applies to bar.sync kernels (isel's
+    # `ur_native_ok` also checks `has_bar`).  Detect bar.sync BEFORE FG26
+    # admission (ctx._has_bar_sync is set later, after FG26).
+    _r56_has_bar = any(
+        inst.op == 'bar' and 'sync' in inst.types
+        for bb in fn.blocks for inst in bb.instructions
+    )
     _fg26_te10_blocked = (_has_vote_shfl
+                          or _r56_has_bar
                           or getattr(ctx, '_has_bar_sync', False))
     if (alloc.addr_pair_colocated and _fg26_setp_ok
             and not _has_ctaid_ntid

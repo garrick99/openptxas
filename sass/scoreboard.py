@@ -1487,6 +1487,24 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
         # Most ALU instructions use misc = (counter & 0xF). Specific opcodes
         # have fixed overrides in _OPCODE_MISC (BAR=6, STS=1, LDS=2, etc.).
         misc = _OPCODE_MISC.get(opcode, misc_counter & 0xF)
+        # PTXAS-R23A.1 (FB-1 Phase A / Family A completion fix): the 5-bit
+        # `opex` field that the SM_120 instruction decoder reads for LDC
+        # is (wdep[0] << 4) | misc.  LDC's wdep is 0x31 (bit 0 set), so
+        # ctrl bit 4 is 1 and opex = 0x10 | misc.  `nvdisasm` and the
+        # runtime decoder both reject opex == 0x1d (i.e. misc == 0xd) for
+        # LDC with `Opclass 'ldc__RaRZ', undefined value 0x1d for table
+        # TABLES_opex_0`; empirically, opex 0x1d/0x1e/0x1f (misc
+        # 0xd/0xe/0xf, 13/14/15) are all undefined for this LDC class.
+        # ptxas's observed misc range for LDC (per the counter-model
+        # comment below) is 0..10 — a strict subset of the decoder's
+        # valid range.  Clamp misc to 0..7 for LDC whenever the counter
+        # would produce an invalid opex; this keeps the counter pattern
+        # for kernels where the counter was already < 8 (no change) and
+        # re-maps the overflow range 13-15 into 5-7 (valid, matches
+        # ptxas's observed range).  Only LDC is affected — LDCU, S2R,
+        # S2UR, ALU, etc. are untouched.
+        if opcode == 0xb82 and misc >= 0xd:
+            misc = misc & 0x7
         # ISETP misc: context-sensitive. Default misc=0 (from _OPCODE_MISC).
         # When within 3 instructions of VOTE (0x806), use counter-based misc
         # instead. ptxas uses counter-based misc for ISETP near VOTE.

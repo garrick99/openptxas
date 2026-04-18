@@ -1584,6 +1584,49 @@ def compile_function(fn: Function, verbose: bool = False,
                         'NOP  // PTXAS-R38/R39 post-EXIT S2R->ALU gap'))
     reordered = _r38_patched
 
+    # PTXAS-R48: post-ISETP predicate-handoff gap insertion.
+    #
+    # Proven hazard (R48 probe on k300_nasty_pred_xor after the FG56 LOP3
+    # src0 rename is applied, isolating tids 17..31 @P1 LOP3 failure):
+    #
+    #   ISETP.IMM P1, PT, R0, 0x10, PT                 (writes P1)
+    #   @P1 LOP3.LUT R5, R5, 0x55, RZ, 0x3c, !PT       (reads P1)
+    #
+    # On SM_120, the @P consumer reads a stale predicate when directly
+    # adjacent to the ISETP producer.  The R48 probe swept:
+    #   * NOP inserted between: PASS (all 32 tids correct)
+    #   * stall bump on producer (1,2,4,8,15,32): FAIL
+    #   * stall bump on consumer (1,2,4,8,15,32): FAIL
+    #   * wdep toggles on consumer (0x3e, 0x00): FAIL
+    #   * rbar[14:10] on consumer 0x02..0x07: PASS (acts as implicit gap
+    #     via wait on a never-set barrier; not a semantic scoreboard fix)
+    #
+    # The only true fix is a single-instruction gap between ISETP and an
+    # immediately-following instruction whose guard index matches the
+    # ISETP's pred-dest.  Ptxas naturally schedules an unrelated
+    # instruction in between, so this rule only fires when no natural
+    # gap exists.  Applies to all ISETP flavors (IMM, R-UR, R-R) and any
+    # @Pk consumer class (ALU, EXIT, etc.).
+    _R48_ISETP_OPCS = {0x80c, 0xc0c, 0x20c}
+    _r48_patched = []
+    for _i, _si in enumerate(reordered):
+        _r48_patched.append(_si)
+        _r48_opc = (_si.raw[0] | (_si.raw[1] << 8)) & 0xFFF
+        if _r48_opc not in _R48_ISETP_OPCS:
+            continue
+        if _i + 1 >= len(reordered):
+            continue
+        _r48_pred_dst = (_si.raw[10] >> 1) & 0x7
+        _r48_nxt = reordered[_i + 1]
+        _r48_nxt_guard = (_r48_nxt.raw[1] >> 4) & 0xF
+        _r48_nxt_idx = _r48_nxt_guard & 0x7
+        _r48_nxt_pred = _r48_nxt_idx != 0x7
+        if _r48_nxt_pred and _r48_nxt_idx == _r48_pred_dst:
+            _r48_patched.append(SassInstr(
+                _r38_encode_nop(),
+                'NOP  // PTXAS-R48 post-ISETP->@P gap'))
+    reordered = _r48_patched
+
     # The preamble (LDC R1) has hardcoded ctrl from ptxas.
     # Only assign scoreboard ctrl to body instructions (after preamble).
     n_preamble = len(preamble)
@@ -2266,6 +2309,13 @@ def compile_function(fn: Function, verbose: bool = False,
                         _p[3] = 0; _changed = True
                     # UIADD: rename src R3->R0 at b3
                     elif _ropc == 0x835 and _p[3] == 3:
+                        _p[3] = 0; _changed = True
+                    # PTXAS-R48: LOP3.LUT (0x812) src0 at b3.  `and/xor/or.b32`
+                    # forms lower to `LOP3.LUT Rd, R3, imm, RZ` reading tid.x;
+                    # after FG56 renames S2R R3->R0 the LOP3 must follow or the
+                    # AND/XOR reads uninitialized R3 (garbage).  Observed in
+                    # k300_nasty_pred_xor tids 0..16 before this rename.
+                    elif _ropc == 0x812 and _p[3] == 3:
                         _p[3] = 0; _changed = True
                     # MP02: IADD3 R-R (0x210): rename src R3->R0.
                     # Used by `mov.u32 %rN, %r0` which lowers to

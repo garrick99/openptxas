@@ -2359,6 +2359,16 @@ def compile_function(fn: Function, verbose: bool = False,
     # and STG data to R5.
     if _fg56_fired:
         _ALU_56 = {0x824, 0x835, 0x812, 0x212, 0x810, 0x210}
+        # PTXAS-R51: ISETP consumers of FG56b-renamed ALU dest.  When FG56b
+        # renames LOP3/IMAD dest R4->R5, the downstream ISETP reading that
+        # value at b3 must be renamed too, or the ISETP reads uninitialized
+        # R4 and produces a garbage predicate.  Observed: k100_early_exit
+        # `LOP3 R5, R0, 0x1 ; ISETP.EQ P1, R4, 0x0` — the ISETP.IMM was
+        # reading R4 while the LOP3 had moved to R5.  FG56 already renames
+        # ISETP.IMM(0x80c) and ISETP.R-UR(0xc0c) at b3 for the R3->R0
+        # rename; FG56b mirrors that exact rule for R4->R5.  b3-only: for
+        # 0x80c b4 is imm (not GPR) and for 0xc0c b4 is UR (not GPR).
+        _ISETP_56_SRC = {0x80c, 0xc0c}
         _fg56b_count = 0
         for _ri in range(len(sass_instrs)):
             _si = sass_instrs[_ri]
@@ -2367,6 +2377,8 @@ def compile_function(fn: Function, verbose: bool = False,
             _changed = False
             if _ropc in _ALU_56:
                 if _p[2] == 4: _p[2] = 5; _changed = True
+                if _p[3] == 4: _p[3] = 5; _changed = True
+            elif _ropc in _ISETP_56_SRC:
                 if _p[3] == 4: _p[3] = 5; _changed = True
             elif _ropc == 0x986:  # STG data at b4
                 if _p[4] == 4: _p[4] = 5; _changed = True

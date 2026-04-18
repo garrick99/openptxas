@@ -358,7 +358,15 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
                             break
                 if not only_safe:
                     break
-            if only_safe and pname not in _r22_misaligned_addr_arith_params:
+            # PTXAS-R31: force UR-route for params we renamed across a
+            # predicated EXIT (pipeline.py::_r31_rename_inplace_u64_redefine_
+            # across_exit).  These params have exactly one def (the
+            # `ld.param.u64`) and exactly one use as the src of an
+            # `add.u64` whose dest is a fresh vreg, so the UR-only path is
+            # safe and R22's misaligned-addr-arith exclusion does not apply.
+            _r31_force = getattr(fn, '_r31_force_ur_params', set())
+            if only_safe and (pname not in _r22_misaligned_addr_arith_params
+                              or pname in _r31_force):
                 ur_param_regs.add(pname)
 
         # FB-5.1 second pass: IADD.64-UR has only ONE UR source slot.  If a

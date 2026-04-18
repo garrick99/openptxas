@@ -141,6 +141,153 @@ def _canonicalize_scalar_ldg(fn: Function) -> None:
     return
 
 
+def _r31_rename_inplace_u64_redefine_across_exit(fn: Function) -> None:
+    """PTXAS-R31: split `add.u64 %rdN, %rdN, X` into a fresh-dest form when
+    `%rdN` is a u64 param AND the redefine is reached only after a
+    predicated control-flow instruction (``@!%p ret`` / ``@%p bra``).
+
+    R30 proof: the unsafe shape
+
+        ld.param.u64 %rdN, [p];
+        ... @!%p0 ret; ...
+        add.u64 %rdN, %rdN, X;
+        st.global.u32 [%rdN], ...;
+
+    forces regalloc to see ``%rdN`` as GPR-resident (u64 has >1 def), which
+    in turn routes isel's ``_select_ld_param`` into the "GPR direct" body
+    ``LDC.64 R_pair, c[0][param_off]`` branch (isel.py:1392).  That body
+    LDC.64 pre-EXIT + in-place ``IADD3`` post-EXIT + STG combination
+    produces CUDA_ERROR_ILLEGAL_ADDRESS on SM_120.  The safe shape,
+    proven by the ``offset_distinct_dest`` repro, routes ``%rdN``
+    through the UR path (preamble ``ULDCU.64`` + body ``IADD.64 R-UR``
+    into a fresh pair + STG via fresh pair).
+
+    The transform renames the redefine's dest to a fresh vreg and
+    rewrites every subsequent use of ``%rdN`` (sources and MemOp bases)
+    to the fresh vreg.  After the rename, ``%rdN`` has exactly one def
+    (the ``ld.param.u64``), so regalloc keeps it on the UR path.
+    """
+    from ptx.ir import RegOp, MemOp, TypeSpec, ScalarKind, RegDecl
+
+    # Collect u64 param destinations.
+    u64_param_dests: set[str] = set()
+    for bb in fn.blocks:
+        for inst in bb.instructions:
+            if (inst.op == 'ld' and 'param' in inst.types
+                    and 'u64' in inst.types
+                    and isinstance(inst.dest, RegOp)):
+                u64_param_dests.add(inst.dest.name)
+    if not u64_param_dests:
+        return
+
+    # Flatten all instructions in source order with block+index references.
+    flat: list[tuple[int, int]] = []
+    for bi, bb in enumerate(fn.blocks):
+        for ii in range(len(bb.instructions)):
+            flat.append((bi, ii))
+
+    def _at(k: int):
+        bi, ii = flat[k]
+        return fn.blocks[bi].instructions[ii]
+
+    added_decls: list[str] = []
+    rename_seq = [0]
+    # Params we've renamed — regalloc must force these onto the UR path.
+    force_ur: set[str] = set()
+
+    def _is_predicated_cf(inst) -> bool:
+        return inst.pred is not None and inst.op in ('ret', 'bra', 'exit')
+
+    def _is_inplace_u64_add(inst, pname: str) -> bool:
+        return (inst.op == 'add'
+                and any(t in ('u64', 's64', 'b64') for t in inst.types)
+                and isinstance(inst.dest, RegOp)
+                and inst.dest.name == pname
+                and len(inst.srcs) >= 1
+                and isinstance(inst.srcs[0], RegOp)
+                and inst.srcs[0].name == pname)
+
+    for pname in sorted(u64_param_dests):
+        # Find the param load position (first def) — flat index.
+        load_k = None
+        for k in range(len(flat)):
+            inst = _at(k)
+            if (inst.op == 'ld' and 'param' in inst.types
+                    and isinstance(inst.dest, RegOp)
+                    and inst.dest.name == pname):
+                load_k = k
+                break
+        if load_k is None:
+            continue
+
+        # Scan: require a predicated CF before the in-place redefine.
+        saw_pred_cf = False
+        redefine_k = None
+        for k in range(load_k + 1, len(flat)):
+            inst = _at(k)
+            if _is_predicated_cf(inst):
+                saw_pred_cf = True
+                continue
+            if _is_inplace_u64_add(inst, pname):
+                if saw_pred_cf:
+                    redefine_k = k
+                break  # any in-place redefine (pred_cf or not) terminates scan
+            # Any other writer of pname ends the scan — complex pattern.
+            if (isinstance(inst.dest, RegOp)
+                    and inst.dest.name == pname
+                    and inst.op != 'ld'):
+                break
+
+        if redefine_k is None:
+            continue
+
+        # Allocate a fresh vreg name.  Ends with a digit so RegDecl.names
+        # returns the exact name (see ir.py:188-193).
+        bare = pname.lstrip('%')
+        new_name = f'%__r31_{bare}_{rename_seq[0]}'
+        rename_seq[0] += 1
+        added_decls.append(new_name)
+        force_ur.add(pname)
+
+        # Rewrite redefine dest.
+        r_inst = _at(redefine_k)
+        r_inst.dest = RegOp(new_name)
+
+        # Rewrite every subsequent read of pname to new_name.
+        # Stop at a later writer of pname (unlikely after rename but guard).
+        for k in range(redefine_k + 1, len(flat)):
+            inst = _at(k)
+            if (isinstance(inst.dest, RegOp)
+                    and inst.dest.name == pname
+                    and inst.op != 'ld'):
+                break
+            new_srcs = []
+            for src in inst.srcs:
+                if isinstance(src, RegOp) and src.name == pname:
+                    new_srcs.append(RegOp(new_name))
+                elif isinstance(src, MemOp) and src.base == pname:
+                    new_srcs.append(MemOp(base=new_name, offset=src.offset))
+                else:
+                    new_srcs.append(src)
+            inst.srcs = new_srcs
+
+    # Declare the fresh vregs as .reg .u64 entries so regalloc sees them.
+    # Also record the SET of original u64 params we renamed across a predicated
+    # EXIT.  regalloc reads `fn._r31_force_ur_params` to OVERRIDE the R22
+    # misaligned-addr-arith exclusion: after the rename, these params have
+    # exactly one def (the `ld.param.u64`) and exactly one use as an
+    # `add.u64` src — the UR path (preamble `ULDCU.64` + body
+    # `IADD.64 R-UR`) is the proven-safe lowering per the R30 repro, so
+    # we must not let R22 push them back onto the GPR-direct-LDC.64 path.
+    if added_decls:
+        u64_type = TypeSpec(kind=ScalarKind.U, width=64)
+        for nm in added_decls:
+            bare = nm.lstrip('%')
+            fn.reg_decls.append(RegDecl(type=u64_type, name=bare, count=1))
+    if force_ur:
+        fn._r31_force_ur_params = force_ur
+
+
 def _sink_param_loads(fn: Function) -> None:
     """Sink ld.param instructions from the entry block to first-use blocks.
 
@@ -707,6 +854,20 @@ def compile_function(fn: Function, verbose: bool = False,
     # branch and reads the already-loaded pair.  No UR preamble, no
     # dual producer, no per-lane chain.  `_canonicalize_scalar_ldg`
     # remains in the module as dead code for a rollback window.
+
+    # PTXAS-R31: split in-place u64 param redefine across a predicated
+    # EXIT so the param stays param-only (UR-routed) and the redefine
+    # result lands in a fresh vreg.  R30 proof: when a u64 param is
+    # loaded by body `LDC.64 R_pair` (isel "GPR direct" branch fires
+    # because regalloc sees `u64_def_count > 1`) and then redefined
+    # in-place by `add.u64 %rdN, %rdN, X` AFTER a predicated `@!%p ret`
+    # or `@%p bra`, the STG that consumes %rdN reads an invalid address
+    # and produces CUDA_ERROR_ILLEGAL_ADDRESS.  The safe path exists
+    # (`offset_distinct_dest` passes): preamble `ULDCU.64` + body
+    # `IADD.64 R-UR` into a fresh pair + STG via fresh pair.  This
+    # transform turns the unsafe PTX shape into the safe one by
+    # renaming the redefine dest and all subsequent uses.
+    _r31_rename_inplace_u64_redefine_across_exit(fn)
 
     # FG39: consecutive shift merge.  When two shl.b32 instructions
     # operate in sequence (shl %B, %A, K1; shl %C, %B, K2) and %B is

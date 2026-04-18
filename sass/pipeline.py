@@ -2468,8 +2468,10 @@ def compile_function(fn: Function, verbose: bool = False,
                     continue
                 _alu_gprs_written.add(_raw[2])
                 _alu_gprs_read.add(_raw[3])
-                # Some ALU ops use b4 as GPR src (not UR)
-                if _ropc not in (0x835, 0x824, 0xc24, 0x810):
+                # Some ALU ops use b4 as GPR src (not UR / not imm).
+                # PTXAS-R49: LOP3.LUT imm32 (0x812) has imm at b4-b7 (imm low
+                # byte at b4), not a GPR — must be excluded here too.
+                if _ropc not in (0x835, 0x824, 0xc24, 0x810, 0x812):
                     _alu_gprs_read.add(_raw[4])
 
             # Target: regs written in ALU region that are NOT R0..R3 (preamble/addr)
@@ -2597,7 +2599,19 @@ def compile_function(fn: Function, verbose: bool = False,
                     # Rename src fields → R0 for body temps.
                     # b3 = src0, b4 = src1 for ALU ops with two GPR sources.
                     # EXCEPT reads of the conflict reg at its last-write position.
-                    for _sbp in (3, 4):
+                    # PTXAS-R49: b4 is an IMMEDIATE byte (not GPR) for ALU
+                    # opcodes that encode a literal inline — 0x810 IADD3.IMM32,
+                    # 0x812 LOP3.LUT.IMM32, 0x824 IMAD.SHL/.I (imm16 at b4-b5),
+                    # 0x835 UIADD.IMM32, and 0xc24 IMAD.R-UR (UR at b4).  Only
+                    # opcodes whose b4 is a true GPR src1 participate in the b4
+                    # rename.  Without this guard, LOP3.LUT imm=4 had its low
+                    # imm byte (0x04) matched as "R4" and zeroed, silently
+                    # turning `xor imm=0x4` into `xor imm=0x0` (observed in
+                    # k200_xor_reduce: 3rd chained XOR dropped its imm under
+                    # the alternating R0↔R5 regalloc produced by FG29-C).
+                    _R49_B4_IS_IMM = {0x810, 0x812, 0x824, 0x835, 0xc24}
+                    _rename_bytes = (3,) if _ropc in _R49_B4_IS_IMM else (3, 4)
+                    for _sbp in _rename_bytes:
                         _src = _patched[_sbp]
                         if _src in _all_body_regs and _src not in {0, 1, 2, 3, 255}:
                             if _src != _r0_conflict_reg:

@@ -1221,8 +1221,20 @@ def compile_function(fn: Function, verbose: bool = False,
         _fg26_pname = next(iter(_setp_only_params))
         _fg26_setp_cnt = ctx._setp_use_count.get(_fg26_pname, 0)
         _fg26_setp_ok = (_fg26_setp_cnt <= 1)
+    # PTXAS-R55: FG26 admission reserves UR4 for the setp param + descriptor
+    # reuse pattern.  That pattern requires TE10 (ISETP.R-UR) to fire so the
+    # setp param actually lands at UR4.  When the kernel uses vote/shfl/redux,
+    # TE10 is disabled (see isel.py `ur_native_ok` guard) and the setp param
+    # falls back to a GPR LDC — UR4 is no longer consumed by setp, so the
+    # u64 p_out preamble preload grabs UR4, and the descriptor's hardcoded
+    # LDCU.64 UR4 then overwrites p_out (illegal address).  Observed in all
+    # 10 warp-intrinsic cluster kernels.  Fix: disable FG26 admission when
+    # TE10 won't fire.
+    _fg26_te10_blocked = (_has_vote_shfl
+                          or getattr(ctx, '_has_bar_sync', False))
     if (alloc.addr_pair_colocated and _fg26_setp_ok
-            and not _has_ctaid_ntid):
+            and not _has_ctaid_ntid
+            and not _fg26_te10_blocked):
         ctx._next_ur = 4
         ctx._fg26_ur4_start = True
 

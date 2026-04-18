@@ -1520,6 +1520,57 @@ def compile_function(fn: Function, verbose: bool = False,
     # 4. Schedule: reorder for LDG latency, then assign ctrl via scoreboard
     raw_instrs = preamble + body_instrs
     reordered = schedule(raw_instrs)
+
+    # PTXAS-R38: post-EXIT S2R -> immediate IMAD.SHL.U32 gap insertion.
+    #
+    # Proven hazard (R38 probe on s2_fail, all 5 of 6 tested positions
+    # fail, only position between S2R and IMAD.SHL works):
+    #
+    #   @!P0 EXIT
+    #   S2R Rx, SR_CTAID_X
+    #   IMAD.SHL.U32 Ry, Rx, imm, RZ     <-- reads Rx written by S2R
+    #
+    # Even though scoreboard rbar=0x03 on the IMAD.SHL nominally covers
+    # the S2R's slot 0x31, SM_120 hardware does NOT reliably honor that
+    # dependency across a predicated EXIT — IMAD.SHL reads a stale Rx
+    # and produces garbage, which propagates into the pair-build /
+    # IADD.64 R-UR / STG chain as `out_ptr + garbage` and crashes with
+    # CUDA_ERROR_ILLEGAL_ADDRESS.  The probe confirmed:
+    #   * +0..+4 NOPs before IADD.64 R-UR: FAIL
+    #   * NOP before S2R CTAID: FAIL
+    #   * NOP after IMAD.SHL / after MOV lo / after MOV hi: FAIL
+    #   * NOP (or BSYNC/MEMBAR/WARPSYNC) BETWEEN S2R and IMAD.SHL: PASS
+    #
+    # Passing kernels (G4) already have a natural gap here (scheduler
+    # places a descriptor LDCU between S2R CTAID and IMAD.SHL in G4),
+    # so this rule only fires when no natural gap exists.  The
+    # inserted NOP goes through `assign_ctrl` normally on the next
+    # pass, so its ctrl word is consistent with the surrounding flow.
+    from sass.encoding.sm_120_opcodes import encode_nop as _r38_encode_nop
+    _r38_patched = []
+    _r38_seen_pexit = False
+    for _i, _si in enumerate(reordered):
+        _r38_patched.append(_si)
+        _r38_opc = (_si.raw[0] | (_si.raw[1] << 8)) & 0xFFF
+        _r38_guard = (_si.raw[1] >> 4) & 0xF
+        if _r38_opc == 0x94d and _r38_guard != 0x7:
+            _r38_seen_pexit = True
+            continue
+        if _r38_seen_pexit and _r38_opc == 0x919:
+            _r38_dest = _si.raw[2]
+            if _i + 1 < len(reordered):
+                _r38_nxt = reordered[_i + 1]
+                _r38_nopc = (_r38_nxt.raw[0] | (_r38_nxt.raw[1] << 8)) & 0xFFF
+                # Narrow: IMAD.SHL.U32 (0x824) reading S2R dest at b3 (src0).
+                # This is the EXACT pattern proven unsafe in s2_fail and
+                # not present in any currently-passing kernel that lacks
+                # a natural gap between S2R CTAID and IMAD.SHL.
+                if _r38_nopc == 0x824 and _r38_nxt.raw[3] == _r38_dest:
+                    _r38_patched.append(SassInstr(
+                        _r38_encode_nop(),
+                        'NOP  // PTXAS-R38 post-EXIT S2R->IMAD.SHL gap'))
+    reordered = _r38_patched
+
     # The preamble (LDC R1) has hardcoded ctrl from ptxas.
     # Only assign scoreboard ctrl to body instructions (after preamble).
     n_preamble = len(preamble)

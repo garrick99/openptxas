@@ -1783,12 +1783,33 @@ def compile_function(fn: Function, verbose: bool = False,
                     # b9=0x0c rewrite is for non-template kernels and
                     # would corrupt the template here.  Tag prefix `TPL`
                     # covers TPL01, TPL05, and future non-atom templates.
+                    #
+                    # PTXAS-R20 (FB-1 Phase A fix): the byte-9 flip upcasts
+                    # LDCU.64 -> LDCU.128.  LDCU.128 requires the byte
+                    # offset to be 16-byte aligned — encode_ldcu_128()
+                    # asserts this.  The post-EXIT rewrite must mirror the
+                    # encoder's alignment rule; applying it to an 8-byte-
+                    # aligned offset (e.g. the 2nd u64 param at 0x388)
+                    # produces a malformed LDCU.128, garbage UR high half,
+                    # invalid IADD.64 store address, and CUDA_ERROR_
+                    # ILLEGAL_ADDRESS on the subsequent STG.  Guard with
+                    # qword-index parity: raw[5] is byte_offset/8, so
+                    # byte_offset % 16 == 0 iff raw[5] is even.
                     if (si.raw[5] >= 0x70
+                            and (si.raw[5] & 1) == 0
                             and 'deferred' not in si.comment
                             and 'TPL' not in si.comment):
                         patched = bytearray(si.raw)
                         patched[9] = 0x0c
                         sass_instrs[i] = SassInstr(bytes(patched), si.comment + ' [b9=0x0c]')
+                        break
+                    elif si.raw[5] >= 0x70 and (si.raw[5] & 1) != 0:
+                        # Non-16-aligned deferred param: the old code would
+                        # have upcast this to an invalid LDCU.128.  Leave
+                        # it as a plain LDCU.64.  `break` preserves the
+                        # original "rewrite only the first post-EXIT LDCU"
+                        # shape so the alignment guard cannot accidentally
+                        # rewrite a later, differently-placed LDCU instead.
                         break
 
     # FG65: HARD BAIL — HFMA2/FMUL.I substitution was too broad.

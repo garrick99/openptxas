@@ -415,10 +415,22 @@ def _hoist_ldcu64(instrs: list[SassInstr]) -> list[SassInstr]:
             # TE26-B: family-aware LDCU.64 placement.
             # For STG-only kernels: move LDCU.64 to post-boundary (after EXIT),
             # matching PTXAS layout.  LDG/ATOMG kernels keep pre-boundary.
+            #
+            # PTXAS-R21 (FB-1 Phase A fix): the classifier must ALSO check
+            # pre_boundary for LDG/ATOMG.  If a pre-EXIT LDG consumes the
+            # UR4 descriptor that LDCU.64 writes, moving LDCU.64 past the
+            # EXIT creates a use-before-def of UR4 — the pre-EXIT LDG runs
+            # with an uninitialized descriptor and the kernel crashes with
+            # CUDA_ERROR_ILLEGAL_ADDRESS.  "STG-only" means truly no LDG/
+            # ATOMG anywhere in the function, not just no LDG in the
+            # post-EXIT region.
+            _LDG_ATOMG_OPCODES = {0x981, 0x98e, 0x9a8, 0x9ae, 0x3a9}
             _is_stg_only = (
                 any(_get_opcode(si.raw) == 0x986 for si in post_boundary)  # has STG
-                and not any(_get_opcode(si.raw) in (0x981, 0x98e, 0x9a8, 0x9ae, 0x3a9)
-                            for si in post_boundary)  # no LDG/ATOMG
+                and not any(_get_opcode(si.raw) in _LDG_ATOMG_OPCODES
+                            for si in post_boundary)  # no LDG/ATOMG in post
+                and not any(_get_opcode(si.raw) in _LDG_ATOMG_OPCODES
+                            for si in pre_boundary)   # and none in pre either (R21)
             )
             if _is_stg_only and post_boundary:
                 # TE29: STG-only LDCU.64 goes AFTER EXIT with body ALU

@@ -26,6 +26,121 @@ from cubin.emitter import emit_cubin, KernelDesc
 from ptx.ir import RegOp, Instruction
 
 
+def _canonicalize_scalar_ldg(fn: Function) -> None:
+    """PTXAS-R25.3: rewrite scalar-LDG (ld.global from a raw ld.param.u64
+    pointer with no intervening address arithmetic) into the
+    offset-form shape that the existing downstream lowering already
+    handles correctly.
+
+    For each matching LDG, insert a per-lane zero-offset address chain
+    and change the LDG's address operand to the chain's final register:
+
+        mov.u32     %_r25c_tid_N,  %tid.x
+        and.b32     %_r25c_and0_N, %_r25c_tid_N, 0
+        cvt.u64.u32 %_r25c_off_N,  %_r25c_and0_N
+        shl.b64     %_r25c_offs_N, %_r25c_off_N, 2
+        add.u64     %_r25c_addr_N, %<raw_param>, %_r25c_offs_N
+        ld.global.X %dest, [%_r25c_addr_N]
+
+    The per-lane source is `%tid.x`; `%tid & 0` yields 0 per-lane so
+    the effective address equals the raw param.  The `add.u64` makes
+    the resulting addr register classify as an offset register under
+    rule #25, bypassing the raw-pointer path in isel.  This matches
+    the PTX shape of `kCandidate` which is empirically proven to pass.
+    Narrow scope: fires only when the exact scalar-LDG class is
+    matched; other LDG forms (already-offset-arithmetic, ld.param with
+    u64_def_count>1 shapes, etc.) are untouched.
+    """
+    from ptx.ir import RegOp, ImmOp, MemOp, ScalarKind, TypeSpec, RegDecl
+
+    param_regs: set[str] = set()
+    offset_regs: set[str] = set()
+    for bb in fn.blocks:
+        for inst in bb.instructions:
+            if (inst.op == 'ld' and 'param' in inst.types
+                    and any(t in ('u64', 's64', 'b64') for t in inst.types)
+                    and isinstance(inst.dest, RegOp)):
+                param_regs.add(inst.dest.name)
+            if inst.op in ('add', 'mul', 'mad', 'cvt', 'shl') and isinstance(inst.dest, RegOp):
+                offset_regs.add(inst.dest.name)
+
+    if not param_regs:
+        return
+
+    def _is_scalar_ldg(inst: Instruction) -> bool:
+        if inst.op != 'ld' or 'global' not in inst.types:
+            return False
+        if not inst.srcs:
+            return False
+        s0 = inst.srcs[0]
+        if not isinstance(s0, MemOp):
+            return False
+        base = s0.base if s0.base.startswith('%') else f'%{s0.base}'
+        return base in param_regs and base not in offset_regs
+
+    counter = 0
+    transformed = False
+    for bb in fn.blocks:
+        new_instrs: list[Instruction] = []
+        for inst in bb.instructions:
+            if _is_scalar_ldg(inst):
+                k = counter
+                counter += 1
+                base = inst.srcs[0].base
+                if not base.startswith('%'):
+                    base = '%' + base
+                off_imm = inst.srcs[0].offset if isinstance(inst.srcs[0].offset, int) else 0
+                tid_name  = f'_r25c_tid_{k}'
+                and_name  = f'_r25c_and0_{k}'
+                off_name  = f'_r25c_off_{k}'
+                addr_name = f'_r25c_addr_{k}'
+                # Register decls: add once per name.
+                fn.reg_decls.append(RegDecl(TypeSpec(ScalarKind.B, 32), tid_name, 1))
+                fn.reg_decls.append(RegDecl(TypeSpec(ScalarKind.B, 32), and_name, 1))
+                fn.reg_decls.append(RegDecl(TypeSpec(ScalarKind.U, 64), off_name, 1))
+                fn.reg_decls.append(RegDecl(TypeSpec(ScalarKind.U, 64), addr_name, 1))
+                # RegDecl.names auto-appends '0' iff the base name does
+                # not already end in a digit; our `_r25c_<role>_<K>`
+                # names always end in a digit (K), so the RegOp name
+                # equals the RegDecl name with a '%' prefix.
+                tid_r  = RegOp(f'%{tid_name}')
+                and_r  = RegOp(f'%{and_name}')
+                off_r  = RegOp(f'%{off_name}')
+                addr_r = RegOp(f'%{addr_name}')
+                # mov.u32 %tid_r, %tid.x
+                new_instrs.append(Instruction(
+                    op='mov', types=['u32'], dest=tid_r,
+                    srcs=[RegOp('%tid.x')]))
+                # and.b32 %and_r, %tid_r, 0  (per-lane-computed zero)
+                new_instrs.append(Instruction(
+                    op='and', types=['b32'], dest=and_r,
+                    srcs=[tid_r, ImmOp(0)]))
+                # cvt.u64.u32 %off_r, %and_r  (zero-extend to u64)
+                new_instrs.append(Instruction(
+                    op='cvt', types=['u64', 'u32'], dest=off_r,
+                    srcs=[and_r]))
+                # add.u64 %addr_r, %<raw_param>, %off_r  (in_ptr + 0)
+                new_instrs.append(Instruction(
+                    op='add', types=['u64'], dest=addr_r,
+                    srcs=[RegOp(base), off_r]))
+                # Rewrite the LDG's address to use %addr_r.
+                new_srcs = list(inst.srcs)
+                new_srcs[0] = MemOp(base=addr_r.name, offset=off_imm)
+                new_instrs.append(Instruction(
+                    op=inst.op, types=list(inst.types), dest=inst.dest,
+                    srcs=new_srcs, pred=inst.pred, neg=inst.neg,
+                    mods=list(inst.mods)))
+                # The synthetic addr_r is now also an offset_reg — add
+                # so a later scalar-LDG in the same kernel (shouldn't
+                # happen, but belt-and-suspenders) sees it as such.
+                offset_regs.add(addr_r.name)
+                transformed = True
+            else:
+                new_instrs.append(inst)
+        bb.instructions = new_instrs
+    return
+
+
 def _sink_param_loads(fn: Function) -> None:
     """Sink ld.param instructions from the entry block to first-use blocks.
 
@@ -579,6 +694,21 @@ def compile_function(fn: Function, verbose: bool = False,
 
     # 0b. Sink ld.param from entry block to first-use block (reduces GPR pressure)
     _sink_param_loads(fn)
+
+    # PTXAS-R25.3: scalar-LDG → offset-form PTX canonicalization.
+    # Rule-#25 `_has_scalar_ldg` kernels (LDG from a raw ld.param.u64
+    # pointer with no intervening address arithmetic) crash the SM_120
+    # descriptor-LDG path with CUDA_ERROR_ILLEGAL_ADDRESS.  Every
+    # in-scope isel-level fix (R24, R24.1, R24.2, R25, R25.1, R25.2)
+    # failed because the structural invariant the hardware expects
+    # spans more surfaces than an isel/peephole patch can control.
+    # The already-working offset-form path (proven by the `kCandidate`
+    # reference kernel with explicit address arithmetic) is reliable.
+    # Canonicalize the scalar-LDG class into the same PTX shape as
+    # kCandidate BEFORE isel sees it: inject a per-lane zero-offset
+    # add.u64 chain and rewrite the LDG's address operand.
+    if sm_version == 120:
+        _canonicalize_scalar_ldg(fn)
 
     # FG39: consecutive shift merge.  When two shl.b32 instructions
     # operate in sequence (shl %B, %A, K1; shl %C, %B, K2) and %B is

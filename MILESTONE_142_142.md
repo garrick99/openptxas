@@ -14,7 +14,14 @@ Full `workbench.py` + `workbench_expanded.py` fixture set:
 - **Passing:** 142
 - **Failing:** 0
 
-Verified via `_r54/sweep2.py` (fresh CUDA context per kernel, N=32, 1 block).
+Verified via `scripts/corpus_sweep.py` (fresh CUDA context per kernel, N=32, 1 block).
+
+```
+$ python scripts/corpus_sweep.py
+[corpus_sweep] total=142 pass=142 fail=0
+```
+
+Exit status: `0` when all pass, `1` when any fail — suitable for CI gating.
 
 ---
 

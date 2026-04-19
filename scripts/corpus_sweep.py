@@ -20,44 +20,57 @@ from pathlib import Path
 
 _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
-sys.path.insert(0, str(_REPO / 'benchmarks'))
 import workbench_expanded as we
 import workbench as wb
 
 
-def _collect(mod, suffix_filter=None):
+def _ptx_fixture(name, ptx):
+    params = re.findall(r'\.param\s+\.([us]\d+|f\d+|b\d+)', ptx)
+    return {
+        'name': name,
+        'ptx': ptx,
+        'params': params,
+        'has_smem': '.shared' in ptx,
+        'has_bar': 'bar.sync' in ptx,
+    }
+
+
+def _collect_mod(mod):
     out = []
     for name in dir(mod):
-        if suffix_filter is not None:
-            if not suffix_filter(name):
-                continue
-        elif not (name.startswith('_') and name.isupper()):
+        if not (name.startswith('_') and name.isupper()):
             continue
         val = getattr(mod, name, None)
         if not (isinstance(val, str) and '.entry' in val and '.target sm_120' in val):
             continue
         m = re.search(r'\.entry\s+(\w+)', val)
-        if not m:
-            continue
-        params = re.findall(r'\.param\s+\.([us]\d+|f\d+|b\d+)', val)
-        out.append({
-            'name': m.group(1),
-            'ptx': val,
-            'params': params,
-            'has_smem': '.shared' in val,
-            'has_bar': 'bar.sync' in val,
-        })
+        if m:
+            out.append(_ptx_fixture(m.group(1), val))
     return out
 
 
+def _install_bench_util_shim():
+    # Stub `bench_util` so benchmark modules can be imported on runners
+    # without the CUDA driver.  The real bench_util does sys.exit(1) at
+    # import time when nvcuda.dll isn't loadable.  The sweep still needs
+    # nvcuda at run time, but in its per-kernel subprocesses — this shim
+    # only keeps the enumerate step from exiting during module import.
+    import types
+    shim = types.ModuleType('bench_util')
+    shim.CUDAContext = type('CUDAContext', (), {})
+    shim.compile_openptxas = lambda *a, **kw: None
+    shim.compile_ptxas = lambda *a, **kw: None
+    shim.print_header = lambda *a, **kw: None
+    shim.print_results = lambda *a, **kw: None
+    sys.modules['bench_util'] = shim
+
+
 def enumerate_fixtures():
-    """Collect every .entry sm_120 PTX source from:
-       * workbench.py + workbench_expanded.py (inline uppercase-prefixed fixtures)
-       * benchmarks/*_vs_nvidia.py (`*_PTX` module constants)
-    """
     out = []
-    out.extend(_collect(we))
-    out.extend(_collect(wb))
+    out.extend(_collect_mod(we))
+    out.extend(_collect_mod(wb))
+    _install_bench_util_shim()
+    sys.path.insert(0, str(_REPO / 'benchmarks'))
     for mname in ('saxpy_vs_nvidia', 'vecadd_vs_nvidia', 'memcpy_vs_nvidia',
                   'scale_vs_nvidia', 'stencil_vs_nvidia', 'relu_vs_nvidia',
                   'fmachain_vs_nvidia'):
@@ -65,7 +78,15 @@ def enumerate_fixtures():
             mod = __import__(mname)
         except Exception:
             continue
-        out.extend(_collect(mod, suffix_filter=lambda n: n.endswith('_PTX')))
+        for attr in dir(mod):
+            if not attr.endswith('_PTX'):
+                continue
+            val = getattr(mod, attr, None)
+            if not (isinstance(val, str) and '.entry' in val and '.target sm_120' in val):
+                continue
+            m = re.search(r'\.entry\s+(\w+)', val)
+            if m:
+                out.append(_ptx_fixture(m.group(1), val))
     seen = set(); uniq = []
     for f in out:
         if f['name'] in seen:

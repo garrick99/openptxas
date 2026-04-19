@@ -35,27 +35,24 @@ jobs:
         run: python scripts/corpus_compile_check.py
 
   # -------------------------------------------------------------------------
-  # Tier 2 — full GPU execution gate.  DORMANT until a self-hosted runner
-  # with the [self-hosted, gpu, sm_120] labels is actually registered.
-  # Triggers only on manual workflow_dispatch so it never silently queues
-  # on a missing runner and never spams maintainers with failure emails.
-  # See docs/CI.md for runner setup.  Once a runner is registered, flip
-  # the triggers below to match the compile-gate scope.
+  # Tier 2 — full GPU execution gate.  Runs on the self-hosted
+  # [self-hosted, gpu, sm_120] runner (RTX 5090, BigDaddy).  Runs on
+  # every push to main, on PRs labeled `gpu-check`, and on manual
+  # workflow_dispatch.  Does NOT block PRs from forks (self-hosted
+  # runners on public repos gate fork-PR workflows automatically).
   # -------------------------------------------------------------------------
   corpus-gpu:
     name: corpus-gpu (full execution, RTX 5090 / SM_120)
     runs-on: [self-hosted, gpu, sm_120]
-    if: ${{ github.event_name == 'workflow_dispatch' }}
+    needs: compile-gate
+    if: >-
+      ${{ github.event_name == 'push'
+          || github.event_name == 'workflow_dispatch'
+          || (github.event_name == 'pull_request'
+              && contains(github.event.pull_request.labels.*.name, 'gpu-check')) }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - name: set up python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - name: install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e .
       - name: corpus execution sweep
+        shell: bash
         run: python scripts/corpus_sweep.py

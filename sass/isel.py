@@ -861,15 +861,41 @@ def _select_shl_b64(instr: Instruction, ra: RegAlloc,
     # IMAD.I + SHF.R.U32.HI instead of IMAD.WIDE.  Both compute the
     # same 64-bit result; the SHF pair matches PTXAS encoding for
     # the SHF_WIDENING family.
+    # PTXAS-R62: original fold unconditionally popped output[-1] and
+    # output[-2] if the comments looked like cvt MOVs.  In kernels where
+    # the shl is not adjacent to its cvt (e.g. stencil — 5 cvts then 5 shls),
+    # the top of `output` is a DIFFERENT cvt's MOVs; popping them leaves
+    # that other cvt's dest uninitialized and the fold reads a stomped s_r.
+    # Observed: 2 of 5 stencil shl-folds silently corrupted LDG addresses
+    # (collapse to 0) → wrong math.
+    #
+    # Fix: only admit the fold when this cvt's MOVs are actually at the
+    # top of output (shl immediately follows its cvt, with no other
+    # instruction emitted in between).  Verify by checking output[-1]'s
+    # dest byte matches THIS cvt's expected dest hi (d_lo+1).  That is
+    # safe because:
+    #   * shl directly after its cvt: top-of-output IS this cvt's MOVs,
+    #     s_r has not been reassigned, fast path fires (unchanged).
+    #   * shl not adjacent: admission fails, we fall through to the plain
+    #     two-instruction shl path which reads ra.lo(src.name) — a stable
+    #     register holding the cvt's value via the preserved lo MOV.
+    _r62_fold_ok = False
     if (ctx and k < 32 and k <= 7
-            and hasattr(ctx, '_cvt_src_map') and src.name in ctx._cvt_src_map):
+            and hasattr(ctx, '_cvt_src_map') and src.name in ctx._cvt_src_map
+            and output is not None and output):
+        _r62_expected_hi_dest = ra.lo(src.name) + 1
+        _r62_expected_lo_dest = ra.lo(src.name)
+        _r62_top = output[-1]
+        if ('cvt.64.32 hi=0' in _r62_top.comment
+                and _r62_top.raw[2] == _r62_expected_hi_dest):
+            _r62_fold_ok = True
+    if _r62_fold_ok:
         src32 = ctx._cvt_src_map[src.name]
-        # Remove the dead MOV+MOV from cvt.u64.u32 (they're the last 1-2 instrs)
-        if output is not None:
-            if output and 'cvt.64.32 hi=0' in output[-1].comment:
-                output.pop()
-            if output and 'cvt.64.32 lo' in output[-1].comment:
-                output.pop()
+        # Pop the matched cvt MOVs (now verified to belong to this cvt)
+        output.pop()  # hi MOV
+        if output and 'cvt.64.32 lo' in output[-1].comment \
+                and output[-1].raw[2] == _r62_expected_lo_dest:
+            output.pop()  # lo MOV (only present when d_lo != s_r)
         if ctx:
             if not hasattr(ctx, '_widened_from_32'):
                 ctx._widened_from_32 = set()
@@ -890,12 +916,18 @@ def _select_shl_b64(instr: Instruction, ra: RegAlloc,
         ]
 
     if k < 32 and k <= 15:
-        # Use IMAD.SHL for lo (avoids SHF.L/SHF.R pipeline conflicts)
+        # PTXAS-R62: when this path runs from a cvt-preceded shl (in-place
+        # shl on a u64 register pair that aliases the cvt dest), s_lo has
+        # the scalar value from the cvt's lo MOV.  IMAD overwrites s_lo,
+        # so SHF must read it first.  For non-cvt in-place shl on an
+        # already-computed 64-bit pair this ordering is still correct
+        # (SHF reads {s_hi, s_lo}, IMAD then writes s_lo) — the hi and
+        # lo are written to distinct destinations so the order is safe.
         return [
-            SassInstr(encode_imad_shl_u32(d_lo, s_lo, k),
-                      f'IMAD.SHL.U32 R{d_lo}, R{s_lo}, {1<<k:#x}, RZ  // {dest.name}.lo = {src.name}.lo << {k}'),
             SassInstr(encode_shf_l_u64_hi(d_hi, s_lo, k, s_hi),
                       f'SHF.L.U64.HI R{d_hi}, R{s_lo}, 0x{k:x}, R{s_hi}  // {dest.name}.hi'),
+            SassInstr(encode_imad_shl_u32(d_lo, s_lo, k),
+                      f'IMAD.SHL.U32 R{d_lo}, R{s_lo}, {1<<k:#x}, RZ  // {dest.name}.lo = {src.name}.lo << {k}'),
         ]
     elif k < 32:
         return [

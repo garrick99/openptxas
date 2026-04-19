@@ -48,6 +48,16 @@ Any machine with an SM_120 GPU and the CUDA driver (>= 12.x) can serve as the Ti
 4. Ensure `nvcuda` is loadable (on Windows: `nvcuda.dll` on the PATH; on Linux: `libcuda.so`).
 5. Start the runner service. Confirm by triggering `workflow_dispatch` on the `corpus` workflow.
 
+## Known-fail allowlist
+
+`scripts/known_fail.txt` lists fixtures whose failures are known and
+tracked separately — they do not fail CI.  Any fixture outside the
+allowlist that fails triggers a regression alert; any fixture on the
+allowlist that unexpectedly starts passing also triggers an alert
+(the good-news path still demands a deliberate allowlist update).
+
+Currently tracked: `relu` (u64 UR-allocation structural work).
+
 ## Local equivalents
 
 Both gates are runnable directly:

@@ -2536,7 +2536,12 @@ def encode_atomg_u32(dest: int, addr_base: int, offset: int, data: int,
         ATOMG_ADD:  (0xf1, 0x1e, 0x08),
         ATOMG_MIN:  (0xf3, 0x9e, 0x08),  # S32: signed mode bits
         ATOMG_MAX:  (0xf3, 0x1e, 0x09),  # S32: signed mode bits
-        ATOMG_AND:  (0xf1, 0x1e, 0x14),
+        # PTXAS-R58: ATOMG_AND fixed to actual ptxas sm_120 ground truth.
+        # Historical probe gave (0xf1, 0x1e, 0x14), but nvdisasm rejects
+        # that combo as illegal at launch (sync=715).  Live ptxas emits
+        # hi=0x001ea2000a9ef104 for ATOMG.E.AND.STRONG.GPU — b10=0x9e,
+        # b11=0x0a.  Verified on minimal atom_and_min probe kernel.
+        ATOMG_AND:  (0xf1, 0x9e, 0x0a),
         ATOMG_OR:   (0xf1, 0x1e, 0x1c),
         ATOMG_EXCH: (0xf1, 0x1e, 0x0c),
         # ATOMG_XOR: not grounded. PTXAS uses 0x98e family with different descriptor model.

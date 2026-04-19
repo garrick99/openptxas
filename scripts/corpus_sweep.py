@@ -20,30 +20,52 @@ from pathlib import Path
 
 _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
+sys.path.insert(0, str(_REPO / 'benchmarks'))
 import workbench_expanded as we
 import workbench as wb
 
 
-def enumerate_fixtures():
+def _collect(mod, suffix_filter=None):
     out = []
-    for mod in (we, wb):
-        for name in dir(mod):
-            if not (name.startswith('_') and name.isupper()):
+    for name in dir(mod):
+        if suffix_filter is not None:
+            if not suffix_filter(name):
                 continue
-            val = getattr(mod, name)
-            if not (isinstance(val, str) and '.entry' in val and '.target sm_120' in val):
-                continue
-            m = re.search(r'\.entry\s+(\w+)', val)
-            if not m:
-                continue
-            params = re.findall(r'\.param\s+\.([us]\d+|f\d+|b\d+)', val)
-            out.append({
-                'name': m.group(1),
-                'ptx': val,
-                'params': params,
-                'has_smem': '.shared' in val,
-                'has_bar': 'bar.sync' in val,
-            })
+        elif not (name.startswith('_') and name.isupper()):
+            continue
+        val = getattr(mod, name, None)
+        if not (isinstance(val, str) and '.entry' in val and '.target sm_120' in val):
+            continue
+        m = re.search(r'\.entry\s+(\w+)', val)
+        if not m:
+            continue
+        params = re.findall(r'\.param\s+\.([us]\d+|f\d+|b\d+)', val)
+        out.append({
+            'name': m.group(1),
+            'ptx': val,
+            'params': params,
+            'has_smem': '.shared' in val,
+            'has_bar': 'bar.sync' in val,
+        })
+    return out
+
+
+def enumerate_fixtures():
+    """Collect every .entry sm_120 PTX source from:
+       * workbench.py + workbench_expanded.py (inline uppercase-prefixed fixtures)
+       * benchmarks/*_vs_nvidia.py (`*_PTX` module constants)
+    """
+    out = []
+    out.extend(_collect(we))
+    out.extend(_collect(wb))
+    for mname in ('saxpy_vs_nvidia', 'vecadd_vs_nvidia', 'memcpy_vs_nvidia',
+                  'scale_vs_nvidia', 'stencil_vs_nvidia', 'relu_vs_nvidia',
+                  'fmachain_vs_nvidia'):
+        try:
+            mod = __import__(mname)
+        except Exception:
+            continue
+        out.extend(_collect(mod, suffix_filter=lambda n: n.endswith('_PTX')))
     seen = set(); uniq = []
     for f in out:
         if f['name'] in seen:

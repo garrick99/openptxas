@@ -19,6 +19,7 @@ from pathlib import Path
 
 _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
+sys.path.insert(0, str(_REPO / 'benchmarks'))
 import workbench_expanded as we
 import workbench as wb
 from ptx.parser import parse
@@ -26,12 +27,38 @@ from sass.pipeline import compile_function
 
 
 def enumerate_fixtures():
+    """Enumerate every .entry sm_120 PTX source:
+       * workbench.py + workbench_expanded.py (inline fixtures)
+       * benchmarks/*_vs_nvidia.py (`*_PTX` module constants)
+    """
     out = []
+    # inline fixtures
     for mod in (we, wb):
         for name in dir(mod):
             if not (name.startswith('_') and name.isupper()):
                 continue
             val = getattr(mod, name)
+            if not (isinstance(val, str) and '.entry' in val
+                    and '.target sm_120' in val):
+                continue
+            m = re.search(r'\.entry\s+(\w+)', val)
+            if m:
+                out.append((m.group(1), val))
+    # benchmark PTX
+    bench_mods = [
+        'saxpy_vs_nvidia', 'vecadd_vs_nvidia', 'memcpy_vs_nvidia',
+        'scale_vs_nvidia', 'stencil_vs_nvidia', 'relu_vs_nvidia',
+        'fmachain_vs_nvidia',
+    ]
+    for mname in bench_mods:
+        try:
+            mod = __import__(mname)
+        except Exception:
+            continue
+        for attr in dir(mod):
+            if not attr.endswith('_PTX'):
+                continue
+            val = getattr(mod, attr, None)
             if not (isinstance(val, str) and '.entry' in val
                     and '.target sm_120' in val):
                 continue

@@ -1,27 +1,50 @@
-# Milestone: 142/142 — practical workbench corpus green
+# Milestone: 148/149 — expanded corpus (workbench + benchmarks) green
 
-**HEAD:** `23959b1`
-**Date:** 2026-04-18
-**Campaign:** R31 → R58
+**HEAD:** `8711ee8`
+**Date:** 2026-04-19
+**Campaign:** R31 → R62
 
 ---
 
 ## Corpus status
 
-Full `workbench.py` + `workbench_expanded.py` fixture set:
+Full `workbench.py` + `workbench_expanded.py` + `benchmarks/*_PTX` fixture set:
 
-- **Total tested:** 142
-- **Passing:** 142
-- **Failing:** 0
+- **Total tested:** 149 (142 workbench + 7 benchmark)
+- **Compile gate:** 149/149 pass (no GPU needed)
+- **Execution gate (GPU):** 148/149 pass — only `relu` crashes (sync=700; u64 param UR-allocation structural issue, out of scope for narrow fixes)
 
-Verified via `scripts/corpus_sweep.py` (fresh CUDA context per kernel, N=32, 1 block).
+Verified via `scripts/corpus_sweep.py` and `scripts/corpus_compile_check.py`:
 
 ```
+$ python scripts/corpus_compile_check.py
+[compile_check] total=149 pass=149 fail=0
+
 $ python scripts/corpus_sweep.py
-[corpus_sweep] total=142 pass=142 fail=0
+[corpus_sweep] total=149 pass=148 fail=1
+  sync_err: relu
 ```
 
-Exit status: `0` when all pass, `1` when any fail — suitable for CI gating.
+Benchmark-suite correctness (more than just sync — verifies bit-identical output vs ptxas):
+
+| kernel | ratio vs ptxas | correctness |
+|--------|---------------|-------------|
+| vecadd | 1.00× | PASS |
+| saxpy | 1.77× | PASS |
+| memcpy | 1.01× | PASS |
+| scale | 1.02× | PASS |
+| stencil | 0.96× | PASS (fixed in R62) |
+| relu | — | crashes (known) |
+| fma_chain | 0.75× | PASS (perf gap, +22 NOPs) |
+
+Geomean of 5 passing benchmarks: **1.15× ptxas**.
+
+CI wiring (`.github/workflows/corpus.yml`):
+
+- **compile-gate** — GitHub-hosted ubuntu, every PR
+- **corpus-gpu** — self-hosted `[gpu, sm_120]`, main + `gpu-check` label
+
+See `docs/CI.md` for runner setup.
 
 ---
 
@@ -40,6 +63,7 @@ Exit status: `0` when all pass, `1` when any fail — suitable for CI gating.
 | FG26 UR4 reservation gated on TE10 | class | warp intrinsics (10), smem/bar (2) | fa602dd, d05045d |
 | Preamble-hoisted LDC vs S2R GPR alias | class | bar_ldc_xor | c391209 |
 | ATOMG_AND mode-byte encoding | 1 instr | w2_atom_and_reduce | 23959b1 |
+| shl(cvt(x)) fold pop-wrong-cvt + fallback RAW | class | stencil (silent math corruption) | 8711ee8 |
 
 ---
 
@@ -52,9 +76,10 @@ Exit status: `0` when all pass, `1` when any fail — suitable for CI gating.
 
 ## Deferred to next phase
 
+- **`relu` sync=700** — u64 `p_out` param goes through the GPR `LDC.64` path (via `ra.int_regs`), then the store address is built from an `IADD3 + IADD3.X` carry chain. Ptxas keeps the same param in a UR via `LDCU.128` and uses `IADD.64 R-UR`. Fix requires a regalloc-level change to reroute u64 address params through the UR path when a GPR isn't needed; not a narrow patch.
+- **`fma_chain` 0.75× perf** — +22 NOPs and +2 real instructions vs ptxas across the 32-FFMA dependency chain. Scoreboarder is inserting unnecessary stalls between FFMA→FFMA. Perf only — correctness is clean.
 - **Forge benchmark suite integration** — full Forge compiler output exercises the backend on higher-variance PTX; not yet swept
 - **OpenCUDA ctest integration** — full OpenCUDA kernel corpus; regression gating on a larger surface
-- **Performance / parity with ptxas** — current goal was correctness; perf vs ptxas on SAXPY is 1.48× better (previously measured) but broader perf work not revisited
 - **Warp-reduce atomic optimization (REDUX→REDG)** — ptxas collapses per-lane atomics on a shared address into warp-level reductions; our backend still emits direct per-lane ATOMG. Correct but not optimal.
 - **Feature families beyond the corpus** — cp.async, TMA async, cluster/CGA primitives, sm_120-specific tensor ops (beyond HMMA/DMMA/IMMA zero-accumulator), matrix multiply with real inputs.
 

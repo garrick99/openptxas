@@ -63,23 +63,25 @@ DONE:
 
 
 def _get_cuda():
-    try:
-        cuda = ctypes.cdll.LoadLibrary('nvcuda.dll')
-        if cuda.cuInit(0) != 0:
+    for lib_name in ('nvcuda.dll', 'libcuda.so.1', 'libcuda.so'):
+        try:
+            cuda = ctypes.cdll.LoadLibrary(lib_name)
+            if cuda.cuInit(0) == 0:
+                return cuda
+        except OSError:
+            continue
+        except Exception:
             return None
-        return cuda
-    except Exception:
-        return None
+    return None
 
 
 _CUDA = _get_cuda()
-if _CUDA is None:
-    print("ERROR: nvcuda.dll not found")
-    sys.exit(1)
 
 
 class CUDAContext:
     def __init__(self):
+        if _CUDA is None:
+            raise RuntimeError("CUDA driver not found; run on a GPU host.")
         self.cuda = _CUDA
         self.ctx = ctypes.c_void_p()
         self.mod = ctypes.c_void_p()

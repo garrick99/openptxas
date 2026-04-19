@@ -49,27 +49,10 @@ def _collect_mod(mod):
     return out
 
 
-def _install_bench_util_shim():
-    # Stub `bench_util` so benchmark modules can be imported on runners
-    # without the CUDA driver.  The real bench_util does sys.exit(1) at
-    # import time when nvcuda.dll isn't loadable.  The sweep still needs
-    # nvcuda at run time, but in its per-kernel subprocesses — this shim
-    # only keeps the enumerate step from exiting during module import.
-    import types
-    shim = types.ModuleType('bench_util')
-    shim.CUDAContext = type('CUDAContext', (), {})
-    shim.compile_openptxas = lambda *a, **kw: None
-    shim.compile_ptxas = lambda *a, **kw: None
-    shim.print_header = lambda *a, **kw: None
-    shim.print_results = lambda *a, **kw: None
-    sys.modules['bench_util'] = shim
-
-
 def enumerate_fixtures():
     out = []
     out.extend(_collect_mod(we))
     out.extend(_collect_mod(wb))
-    _install_bench_util_shim()
     sys.path.insert(0, str(_REPO / 'benchmarks'))
     for mname in ('saxpy_vs_nvidia', 'vecadd_vs_nvidia', 'memcpy_vs_nvidia',
                   'scale_vs_nvidia', 'stencil_vs_nvidia', 'relu_vs_nvidia',

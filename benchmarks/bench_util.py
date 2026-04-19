@@ -12,23 +12,34 @@ from sass.pipeline import compile_ptx_source
 
 
 def _get_cuda():
-    try:
-        cuda = ctypes.cdll.LoadLibrary('nvcuda.dll')
-        if cuda.cuInit(0) != 0:
+    # Try Windows name first, then Linux/Unix name.  Returns None on any
+    # failure so import-time code in modules that `from bench_util import ...`
+    # doesn't crash on CPU-only runners (CI compile-gate).  Actual users —
+    # CUDAContext instances — raise a clear error if CUDA really is missing.
+    for lib_name in ('nvcuda.dll', 'libcuda.so.1', 'libcuda.so'):
+        try:
+            cuda = ctypes.cdll.LoadLibrary(lib_name)
+            if cuda.cuInit(0) == 0:
+                return cuda
+        except OSError:
+            continue
+        except Exception:
             return None
-        return cuda
-    except Exception:
-        return None
+    return None
 
 
 _CUDA = _get_cuda()
-if _CUDA is None:
-    print("ERROR: nvcuda.dll not found")
-    sys.exit(1)
 
 
 class CUDAContext:
     def __init__(self):
+        if _CUDA is None:
+            raise RuntimeError(
+                "CUDA driver not found: nvcuda.dll / libcuda.so are not "
+                "loadable.  bench_util was imported for PTX enumeration on "
+                "a CPU-only runner — create CUDAContext only when a GPU is "
+                "actually available."
+            )
         self.cuda = _CUDA
         self.ctx = ctypes.c_void_p()
         self.mod = ctypes.c_void_p()

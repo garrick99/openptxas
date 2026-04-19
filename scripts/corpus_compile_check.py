@@ -25,31 +25,16 @@ from ptx.parser import parse
 from sass.pipeline import compile_function
 
 
-def _install_bench_util_shim():
-    """Install a minimal stub for `bench_util` so benchmark modules can
-    be imported on CPU-only runners.  The real bench_util does
-    `sys.exit(1)` at import time when nvcuda.dll isn't loadable.  We
-    don't execute any benchmark (just read its `*_PTX` module constants),
-    so a no-op shim is sufficient.
-    """
-    import types
-    shim = types.ModuleType('bench_util')
-    shim.CUDAContext = type('CUDAContext', (), {})  # placeholder
-    shim.compile_openptxas = lambda *a, **kw: None
-    shim.compile_ptxas = lambda *a, **kw: None
-    shim.print_header = lambda *a, **kw: None
-    shim.print_results = lambda *a, **kw: None
-    sys.modules['bench_util'] = shim
-
-
 def enumerate_fixtures():
     """Enumerate every .entry sm_120 PTX source:
-       * workbench.py + workbench_expanded.py (via module import)
-       * benchmarks/*_vs_nvidia.py (imported after installing a bench_util
-         shim so CPU-only runners don't hit nvcuda.dll).
+       * workbench.py + workbench_expanded.py (inline fixtures)
+       * benchmarks/*_vs_nvidia.py (`*_PTX` module constants)
+
+    Safe to call on CPU-only CI runners: benchmarks/bench_util.py defers
+    its CUDA check to CUDAContext instantiation (the `*_PTX` constants
+    are plain strings).
     """
     out = []
-    # inline fixtures (safe to import)
     for mod in (we, wb):
         for name in dir(mod):
             if not (name.startswith('_') and name.isupper()):
@@ -61,13 +46,10 @@ def enumerate_fixtures():
             m = re.search(r'\.entry\s+(\w+)', val)
             if m:
                 out.append((m.group(1), val))
-    # benchmark PTX — stub bench_util, then import the modules
-    _install_bench_util_shim()
     sys.path.insert(0, str(_REPO / 'benchmarks'))
-    bench_mods = ['saxpy_vs_nvidia', 'vecadd_vs_nvidia', 'memcpy_vs_nvidia',
+    for mname in ('saxpy_vs_nvidia', 'vecadd_vs_nvidia', 'memcpy_vs_nvidia',
                   'scale_vs_nvidia', 'stencil_vs_nvidia', 'relu_vs_nvidia',
-                  'fmachain_vs_nvidia']
-    for mname in bench_mods:
+                  'fmachain_vs_nvidia'):
         try:
             mod = __import__(mname)
         except Exception as e:

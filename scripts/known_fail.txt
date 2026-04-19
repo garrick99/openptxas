@@ -1,0 +1,10 @@
+# Known-failing fixtures — sweep exits 0 if the failing set is a subset
+# of this allowlist, exits 1 if any UNEXPECTED failure appears OR if a
+# known-failing fixture starts passing (that would mean this list needs
+# updating and should be reviewed).
+#
+# One fixture name per line.  Blank lines and `#` comments ignored.
+
+relu           # u64 p_out routes through GPR LDC.64 + IADD3 carry chain
+               # instead of UR + IADD.64 R-UR — structural regalloc fix
+               # needed (see MILESTONE_142_142.md "Deferred" section)

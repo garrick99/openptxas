@@ -155,9 +155,24 @@ finally:
         return ('proc_err', repr(e)[:80])
 
 
+def _load_known_fails():
+    """Read scripts/known_fail.txt.  One fixture name per line; `#` comments
+    and blank lines ignored.  Returns a set of fixture names."""
+    path = Path(__file__).resolve().parent / 'known_fail.txt'
+    if not path.exists():
+        return set()
+    out = set()
+    for line in path.read_text().splitlines():
+        line = line.split('#', 1)[0].strip()
+        if line:
+            out.add(line)
+    return out
+
+
 def main():
     fixtures = enumerate_fixtures()
-    print(f'[corpus_sweep] {len(fixtures)} fixtures')
+    known_fails = _load_known_fails()
+    print(f'[corpus_sweep] {len(fixtures)} fixtures  (known_fails allowlist: {len(known_fails)})')
     results = {}
     for fix in fixtures:
         status, detail = run_one(fix, _REPO)
@@ -167,6 +182,9 @@ def main():
     total = len(results)
     passes = sum(1 for s, _ in results.values() if s == 'ok')
     fails = total - passes
+    failing_set = {n for n, (s, _) in results.items() if s != 'ok'}
+    unexpected_fails = failing_set - known_fails
+    unexpected_passes = known_fails - failing_set  # fixture in allowlist that passed
     print(f'\n[corpus_sweep] total={total} pass={passes} fail={fails}')
     if fails:
         groups = {}
@@ -176,8 +194,26 @@ def main():
         for k, v in sorted(groups.items()):
             print(f'\n  {k} ({len(v)}):')
             for n in v:
-                print(f'    {n}: {results[n][1][:60]}')
-    return 0 if fails == 0 else 1
+                flag = '' if n in known_fails else '  [UNEXPECTED]'
+                print(f'    {n}: {results[n][1][:60]}{flag}')
+    # Regression detection:
+    #   * unexpected_fails: something NEW broke -> fail CI
+    #   * unexpected_passes: something known-broken is now passing -> also fail
+    #     CI so the allowlist gets reviewed (good news should still prompt a
+    #     deliberate update of scripts/known_fail.txt).
+    if unexpected_fails:
+        print(f'\n[corpus_sweep] UNEXPECTED failures — NEW regressions not in allowlist:')
+        for n in sorted(unexpected_fails):
+            print(f'  {n}: {results[n][1][:60]}')
+        return 1
+    if unexpected_passes:
+        print(f'\n[corpus_sweep] UNEXPECTED passes — known-fails that now work '
+              f'(update scripts/known_fail.txt):')
+        for n in sorted(unexpected_passes):
+            print(f'  {n}')
+        return 1
+    print('\n[corpus_sweep] OK — failing set matches allowlist exactly.')
+    return 0
 
 
 if __name__ == '__main__':

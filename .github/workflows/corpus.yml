@@ -1,0 +1,65 @@
+name: corpus
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Tier 1 — compile-only gate.  Runs on every PR on GitHub-hosted Ubuntu
+  # runners.  No GPU; no CUDA driver needed.  Asserts every fixture
+  # compiles through compile_function without raising.
+  # -------------------------------------------------------------------------
+  compile-gate:
+    name: compile-gate (142 fixtures, CPU-only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: set up python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+      - name: corpus compile check
+        run: python scripts/corpus_compile_check.py
+
+  # -------------------------------------------------------------------------
+  # Tier 2 — full GPU execution gate.  Requires a self-hosted runner with
+  # an SM_120 device and the CUDA driver installed.  Runs the full
+  # scripts/corpus_sweep.py: fresh CUDA context per kernel, exit 0 on
+  # green / 1 on any failure.
+  #
+  # Setup: register a self-hosted runner with labels [self-hosted, gpu,
+  # sm_120].  See docs/CI.md for instructions.  This job is skipped when
+  # no matching runner is available.
+  # -------------------------------------------------------------------------
+  corpus-gpu:
+    name: corpus-gpu (142 fixtures, RTX 5090 / SM_120)
+    runs-on: [self-hosted, gpu, sm_120]
+    needs: compile-gate
+    timeout-minutes: 15
+    # Only run when a self-hosted runner is available (skip gracefully otherwise)
+    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'gpu-check') || github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: set up python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+      - name: corpus execution sweep
+        run: python scripts/corpus_sweep.py

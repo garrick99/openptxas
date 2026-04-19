@@ -1487,6 +1487,30 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
         if _has_vote_fn or _has_bar_fn:
             # Load param in preamble (body LDC causes ERR715).
             if ctx:
+                # PTXAS-R57: the allocator computed non-overlapping live
+                # ranges using PTX order, so it may reuse a physical
+                # register for two disjoint vregs.  When this u32 ld.param
+                # gets hoisted to the preamble, its live range is extended
+                # backward to program start — which creates a conflict
+                # with the S2R dest (another vreg sharing the same physical
+                # register).  In the final cubin:
+                #   LDC R3, c[p_mask]       (hoisted to preamble)
+                #   S2R R3, SR_TID.X        (body; clobbers p_mask)
+                #   ... body uses of R3 read tid, not p_mask ...
+                # Observed: bar_ldc_xor (p_mask at R3 ↔ tid at R3).
+                # Fix: if this param's physical reg equals a SR-derived
+                # register (S2R dest) that appears later in the body,
+                # reassign to a fresh register before emitting the LDC.
+                _r57_sr_regs = {
+                    ra.r32(_vr) for _vr, _src in
+                    getattr(ctx, '_reg_sr_source', {}).items()
+                    if _src and _vr in ra.int_regs
+                }
+                if d in _r57_sr_regs and d != 0:
+                    _r57_used = set(ra.int_regs.values())
+                    _r57_new = max(_r57_used) + 1
+                    ra.int_regs[dest.name] = _r57_new
+                    d = _r57_new
                 if not hasattr(ctx, '_preamble_ldcus'):
                     ctx._preamble_ldcus = []
                 ctx._preamble_ldcus.append(

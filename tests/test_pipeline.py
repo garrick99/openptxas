@@ -410,17 +410,20 @@ def test_bfi_b32_has_lop3():
 
 
 def test_bfi_b32_bakes_masks():
-    """.nv.constant0 contains both shifted_mask and ~shifted_mask for bfi."""
+    """Both shifted_mask and ~shifted_mask are baked into .text as inline
+    32-bit immediates (via LOP3 imm32 OR with RZ).  The prior literal-pool
+    path (.nv.constant0 offsets past the param area) silently returns 0 at
+    runtime on SM_120 per PTXAS-R23B.A; inline MUST be used."""
     results = compile_ptx_source(BFI_KERNEL)
     cubin = results["bfi_kernel"]
     elf = ELF64(cubin)
-    const0 = elf.section_data('.nv.constant0.bfi_kernel')
+    text = elf.section_data('.text.bfi_kernel')
     import struct as _s
     # start=4, count=8 → raw_mask=0xFF, shifted_mask=0xFF0, not_shifted_mask=0xFFFFF00F
     shifted_mask = 0xFF0
     not_shifted_mask = (~shifted_mask) & 0xFFFFFFFF
-    assert _s.pack('<I', shifted_mask) in const0, "shifted_mask not in constant bank"
-    assert _s.pack('<I', not_shifted_mask) in const0, "~shifted_mask not in constant bank"
+    assert _s.pack('<I', shifted_mask) in text, "shifted_mask not inlined in .text"
+    assert _s.pack('<I', not_shifted_mask) in text, "~shifted_mask not inlined in .text"
 
 
 # ---------------------------------------------------------------------------

@@ -6062,22 +6062,23 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     not_shifted_mask = (~shifted_mask) & 0xFFFFFFFF
                     t1 = _alloc_gpr(ctx)
                     t2 = _alloc_gpr(ctx)
-                    # t1 = (a << start) & shifted_mask
+                    # t1 = (a << start) & shifted_mask.  Materialize masks via
+                    # LOP3-imm32 OR with RZ (pure integer; HFMA2 zero-init
+                    # would canonicalize NaN/Inf fp16 halves in some masks).
+                    # PTXAS-R23B.A: literal-pool LDC returns 0 past param area.
                     output.append(SassInstr(
                         encode_shf_l_u32(t1, a, start),
                         f'SHF.L.U32 R{t1}, R{a}, 0x{start:x}, RZ  // bfi shift'))
-                    lit_sm = ctx._alloc_literal(shifted_mask)
                     output.append(SassInstr(
-                        encode_ldc(t2, 0, lit_sm),
-                        f'LDC R{t2}, c[0][0x{lit_sm:x}]  // bfi shifted_mask'))
+                        encode_lop3_imm32(t2, RZ, shifted_mask, RZ, LOP3_IMM_OR),
+                        f'LOP3.LUT R{t2}, RZ, 0x{shifted_mask:x}, RZ, 0xFC  // bfi shifted_mask'))
                     output.append(SassInstr(
                         encode_lop3(t1, t1, t2, RZ, LOP3_AND),
                         f'LOP3.LUT R{t1}, R{t1}, R{t2}, RZ, 0xC0  // bfi a&mask'))
                     # t2 = b & ~shifted_mask
-                    lit_nsm = ctx._alloc_literal(not_shifted_mask)
                     output.append(SassInstr(
-                        encode_ldc(t2, 0, lit_nsm),
-                        f'LDC R{t2}, c[0][0x{lit_nsm:x}]  // bfi ~shifted_mask'))
+                        encode_lop3_imm32(t2, RZ, not_shifted_mask, RZ, LOP3_IMM_OR),
+                        f'LOP3.LUT R{t2}, RZ, 0x{not_shifted_mask:x}, RZ, 0xFC  // bfi ~shifted_mask'))
                     output.append(SassInstr(
                         encode_lop3(t2, b, t2, RZ, LOP3_AND),
                         f'LOP3.LUT R{t2}, R{b}, R{t2}, RZ, 0xC0  // bfi b&~mask'))

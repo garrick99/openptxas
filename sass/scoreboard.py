@@ -1546,7 +1546,13 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
         # re-maps the overflow range 13-15 into 5-7 (valid, matches
         # ptxas's observed range).  Only LDC is affected — LDCU, S2R,
         # S2UR, ALU, etc. are untouched.
-        if opcode == 0xb82 and misc >= 0xd:
+        if opcode == 0xb82 and misc >= 0xb:
+            # ptxas's observed misc range for LDC is 0..10 (0xa).  Empirically,
+            # misc 0xc also produces an undefined opex at runtime (opex 0x1c
+            # causes LAUNCH_FAILED/719) — confirmed by clz_prmt/bfx minimal
+            # 0e6dcc8b on HEAD eea3523 (2026-04-20 patch_ldc_misc.py).  The
+            # earlier >= 0xd threshold missed 0xb/0xc.  Remap >= 0xb into 0..7
+            # via `& 0x7`, which stays within ptxas's observed safe range.
             misc = misc & 0x7
         # ISETP misc: context-sensitive. Default misc=0 (from _OPCODE_MISC).
         # When within 3 instructions of VOTE (0x806), use counter-based misc

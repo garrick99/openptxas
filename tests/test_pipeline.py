@@ -346,24 +346,30 @@ def test_bfe_u32_compiles():
 
 
 def test_bfe_u32_no_nop():
-    """bfe.u32 with constant immediates does not emit TODO NOP (0x918)."""
+    """bfe.u32 with constant immediates does not emit TODO NOP (0x918).
+    After the bfe.u32 emitter was simplified to emit a single LOP3.IMM
+    (opcode 0x812) performing AND-with-imm32 directly — matching ptxas'
+    and.b32 lowering — the prior two-step LDC + LOP3 R-R (0x212) pattern
+    is gone.  The mask step is now a single LOP3.IMM (0x812)."""
     results = compile_ptx_source(BFE_KERNEL)
     cubin = results["bfe_kernel"]
     elf = ELF64(cubin)
     text = elf.section_data('.text.bfe_kernel')
     opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
                for off in range(0, len(text), 16)]
-    # NOP opcode is 0x918; LDC is 0xb82; LOP3 is 0x212; SHF.R is 0x819
-    assert 0x212 in opcodes, "LOP3 (0x212) not found — bfe mask step missing"
+    assert 0x812 in opcodes, "LOP3.IMM (0x812) not found — bfe mask step missing"
 
 
 def test_bfe_u32_bakes_mask():
-    """.nv.constant0 contains the bfe mask (0xff) for an 8-bit extract."""
+    """bfe mask is baked into .text as a 32-bit immediate in LOP3.IMM.
+    The prior literal-pool path (.nv.constant0 offsets past the param area)
+    silently returns 0 at runtime on SM_120 per PTXAS-R23B.A; the new
+    emitter inlines the mask via LOP3.IMM."""
     results = compile_ptx_source(BFE_KERNEL)
     cubin = results["bfe_kernel"]
     elf = ELF64(cubin)
-    const0 = elf.section_data('.nv.constant0.bfe_kernel')
-    assert b'\xff\x00\x00\x00' in const0, "Mask 0xFF not found in constant bank"
+    text = elf.section_data('.text.bfe_kernel')
+    assert b'\xff\x00\x00\x00' in text, "Mask 0xFF not inlined in .text"
 
 
 # ---------------------------------------------------------------------------

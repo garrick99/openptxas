@@ -6004,27 +6004,23 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             encode_shf_r_u32_hi(d, a, start),
                             f'SHF.R.U32.HI R{d}, RZ, 0x{start:x}, R{a}  // bfe.u32 len={length}'))
                     elif start == 0:
-                        # Shift is 0 — just mask (LDC d=mask, LOP3 d=src&d)
-                        lit_off = ctx._alloc_literal(mask)
+                        # Single-instruction AND with imm32 — matches the
+                        # ptxas `and.b32 dst, src, imm` lowering.  The prior
+                        # two-step (materialize mask → LOP3 AND) interposed
+                        # a neutral ALU op between the LDG-chain source and
+                        # the final consumer, causing the scoreboard to drop
+                        # LDG transitive-dependency and emit rbar=0x03
+                        # instead of rbar=0x0b → consumer read stale value.
                         output.append(SassInstr(
-                            encode_ldc(d, 0, lit_off),
-                            f'LDC R{d}, c[0][0x{lit_off:x}]  // bfe.u32 mask=0x{mask:x}'))
-                        output.append(SassInstr(
-                            encode_lop3(d, a, d, RZ, LOP3_AND),
-                            f'LOP3.LUT R{d}, R{a}, R{d}, RZ, 0xC0  // bfe.u32 &mask'))
+                            encode_lop3_imm32(d, a, mask, RZ, LOP3_IMM_AND),
+                            f'LOP3.LUT R{d}, R{a}, 0x{mask:x}, RZ, 0xC0  // bfe.u32 &mask'))
                     else:
-                        # General: SHF shift into d, load mask into temp, AND
                         output.append(SassInstr(
                             encode_shf_r_u32_hi(d, a, start),
                             f'SHF.R.U32.HI R{d}, RZ, 0x{start:x}, R{a}  // bfe.u32 >>start'))
-                        lit_off = ctx._alloc_literal(mask)
-                        t = _alloc_gpr(ctx)
                         output.append(SassInstr(
-                            encode_ldc(t, 0, lit_off),
-                            f'LDC R{t}, c[0][0x{lit_off:x}]  // bfe.u32 mask=0x{mask:x}'))
-                        output.append(SassInstr(
-                            encode_lop3(d, d, t, RZ, LOP3_AND),
-                            f'LOP3.LUT R{d}, R{d}, R{t}, RZ, 0xC0  // bfe.u32 &mask'))
+                            encode_lop3_imm32(d, d, mask, RZ, LOP3_IMM_AND),
+                            f'LOP3.LUT R{d}, R{d}, 0x{mask:x}, RZ, 0xC0  // bfe.u32 &mask'))
 
                 elif op == 'bfe' and typ == 's32':
                     # bfe.s32 dest, src, pos, len: sign-extend bits [pos+len-1:pos]

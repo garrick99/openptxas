@@ -162,6 +162,18 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
             used_regs.add(name)
             if name not in reg_first_def:
                 reg_first_def[name] = idx
+            # Every write extends the live range through this instruction.
+            # Without this, a PTX vreg that is written after its last read
+            # (e.g. `bfe.s32 %r15, ...` whose result is dead) would have its
+            # physical register released before the linear scan reaches the
+            # dead write — a later vreg (e.g. %r16 that is still live) may
+            # then be assigned the same register, and the dead write clobbers
+            # it mid-life.  Observed on 08eda8ce bitmanip minimal: R4 held
+            # both %r16 (live through final PRMT) and %r15's dead-write from
+            # a bfe.s32, producing 28/32 divergence.  Extending last_use to
+            # include the latest write forces the register to stay reserved
+            # until all textual writes have been emitted.
+            reg_last_use[name] = max(reg_last_use.get(name, idx), idx)
         for src in inst.srcs:
             if isinstance(src, RegOp):
                 name = src.name

@@ -2370,7 +2370,9 @@ def encode_prmt(dest: int, src0: int, selector: int, src1: int,
     b13, b14, b15 = _ctrl_to_bytes(ctrl)
     raw = bytearray(16)
     raw[0]  = 0x16
-    raw[1]  = 0x74   # constant-selector variant (not 0x78 which is for SHF)
+    raw[1]  = 0x78   # ptxas-observed form on sm_120 (byte-diff clz_prmt 2026-04-20);
+                    # earlier 0x74 variant existed but produced wrong FLO input in
+                    # PRMT→FLO chains.  0x78 matches ptxas for all observed PRMT.
     raw[2]  = dest & 0xFF
     raw[3]  = src0 & 0xFF
     raw[4]  = selector & 0xFF

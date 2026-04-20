@@ -76,7 +76,10 @@ _OPCODE_META: dict[int, _OpMeta] = {
     0x308: _OpMeta('MUFU',       1, 0x3e, 1),  # MUFU (SFU: RCP, SQRT, SIN, COS, EX2, LG2)
     0x309: _OpMeta('POPC',       1, 0x31, 1),  # POPC (population count) — long-latency, LDC-class slot per ptxas
     0x301: _OpMeta('BREV',       1, 0x3e, 1),  # BREV (bit reverse)
-    0x300: _OpMeta('FLO',        1, 0x3e, 1),  # FLO (find leading one)
+    0x300: _OpMeta('FLO',        1, 0x31, 1),  # FLO/CLZ — long-latency, LDC-class slot per ptxas
+    0x816: _OpMeta('PRMT.IMM',   1, 0x3e, 6),  # PRMT imm-selector: needs 1-cycle gap before dependent consumer (FLO, etc.)
+    0x416: _OpMeta('PRMT.IMM.L', 1, 0x3e, 6),  # PRMT legacy imm-selector form — matches 0x816 behavior
+    0x216: _OpMeta('PRMT.REG',   1, 0x3e, 6),  # PRMT reg-selector
     0x820: _OpMeta('FMUL.IMM',   1, 0x3e, 1),  # FMUL with 32-bit float immediate
     0x823: _OpMeta('FFMA.IMM',   1, 0x00, 1),  # FFMA.IMM: wdep=0 (ptxas pattern)
     0x80a: _OpMeta('FSEL.STEP',  1, 0x3e, 5),  # Combined float compare+select (misc=5, ptxas-verified)
@@ -255,7 +258,8 @@ _OPCODES_ALU = {
     0x80c,        # ISETP IMM (32-bit immediate)
     0xc0c,        # ISETP R-UR
     # Permute / misc
-    0x416,        # PRMT (immediate selector, opc=0x416)
+    0x816,        # PRMT (immediate selector, opc=0x816, ptxas-verified sm_120)
+    0x416,        # PRMT (legacy imm-selector 0x416 — kept for backward compat)
     0x216,        # PRMT.REG (register selector, opc=0x216)
     0x589, 0xf89, 0x989,  # SHFL (reg-reg, reg-imm, imm-imm)
     # 0x806 VOTE removed from ALU — uses wdep=0x3F (see _wdep_for_opcode)
@@ -445,10 +449,16 @@ def _get_src_regs(raw: bytes) -> set[int]:
             if raw[3] < 255: regs.add(raw[3])
             if raw[4] < 255: regs.add(raw[4])
             if raw[8] < 255: regs.add(raw[8])
-        elif opcode in (0x207, 0x20b, 0xc0b, 0x416, 0x216):  # SEL/FSETP/FSETP-UR/PRMT/PRMT.REG: src0=b3, src1=b4
+        elif opcode in (0x207, 0x20b, 0xc0b):  # SEL/FSETP/FSETP-UR: src0=b3, src1=b4
             if raw[3] < 255: regs.add(raw[3])
             if raw[4] < 255: regs.add(raw[4])
-            if opcode == 0x216 and raw[8] < 255: regs.add(raw[8])  # PRMT.REG also reads b8
+        elif opcode in (0x816, 0x416):  # PRMT imm: src0=b3, selector in b4-b7 (imm), src1=b8
+            if raw[3] < 255: regs.add(raw[3])
+            if raw[8] < 255: regs.add(raw[8])
+        elif opcode == 0x216:  # PRMT.REG: src0=b3, sel_reg=b4, src1=b8
+            if raw[3] < 255: regs.add(raw[3])
+            if raw[4] < 255: regs.add(raw[4])
+            if raw[8] < 255: regs.add(raw[8])
         elif opcode == 0x235:  # IADD.64: src0=b3 pair, src1=b4 pair
             if raw[3] < 255: regs |= {raw[3], raw[3]+1}
             if raw[4] < 255: regs |= {raw[4], raw[4]+1}
@@ -1185,6 +1195,9 @@ def _wdep_for_opcode(opcode: int, raw: bytes = None) -> int:
         # prior content.  Observed: ours r16 = popc(r3) | (r3 & 0xF00) |
         # (r3 & 0x80000000) for input-dependent stale-bit patterns.
         return 0x31
+    if opcode == 0x300:  # FLO/CLZ — long-latency, same LDC-class as POPC.
+        # ptxas byte-diff confirms wdep=0x31 (2026-04-20 clz_bytediff.py).
+        return 0x31
     if opcode == 0x806:  # VOTE: ptxas uses wdep=0x3F (no ALU tracking)
         return 0x3f     # VOTE result availability is ensured by instruction ordering,
                         # not scoreboard. Using wdep=0x3E corrupts the ALU slot when
@@ -1279,6 +1292,14 @@ _OPCODE_MISC: dict[int, int] = {
     0x589: 2,   # SHFL R-R
     0xf89: 2,   # SHFL R-imm
     0x989: 2,   # SHFL imm-imm
+    # FLO/CLZ (0x300): wdep=0x31 → opex=0x10|misc.  Counter-based misc can hit
+    # 0xd/0xe/0xf → opex 0x1d/0x1e/0x1f which are undefined for this decoder
+    # class (same rule as LDC).  ptxas byte-diff (2026-04-20 clz_bytediff + clz_prmt
+    # minimal) shows misc=2 is constant across kernel positions.
+    0x300: 2,
+    0x816: 6,  # PRMT imm-selector (ptxas-observed form 2026-04-20): misc=6
+    0x416: 6,  # PRMT legacy imm-selector form: same misc
+    0x216: 6,  # PRMT reg-selector:  matched for consistency (probe pending)
 }
 
 # All opcodes recognised by assign_ctrl.  Unknown opcodes raise ValueError.

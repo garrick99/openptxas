@@ -111,6 +111,17 @@ _OPCODE_META: dict[int, _OpMeta] = {
     0x211: _OpMeta('LEA',      1, 0x3e, 1),  # LEA load effective address
     0x811: _OpMeta('LEA.IMM',  1, 0x3e, 1),  # LEA with immediate index
     0x217: _OpMeta('IMNMX',    1, 0x3e, 1),  # IMNMX integer min/max
+    0x248: _OpMeta('VIMNMX.RR',1, 0x3e, 1),  # VIMNMX R-R (3-operand integer min/max).
+                                             # Same ALU class + min_gpr_gap=1 as IMNMX.
+                                             # Was missing → gap enforcement skipped →
+                                             # VIMNMX reading a back-to-back-materialized
+                                             # immediate source (e.g. IADD3.IMM R9=7
+                                             # directly before VIMNMX R4=max(R5,R9))
+                                             # read R9 stale, returned the wrong operand
+                                             # for inputs where R5 < the materialized
+                                             # constant.  Observed in the fuzz-discovered
+                                             # popc+bfe+bfi+max+bfi minimal (7/32 wrong
+                                             # post-POPC-fix); all residuals had popc(input)<7.
     0x848: _OpMeta('IMNMX.IMM',1, 0x3e, 1),  # IMNMX integer min/max with immediate
                                               # (parallel to IMAD R-R 0x224 / R-imm 0x824).
                                               # Same ALU class as 0x217.  Emitted by PTXAS
@@ -475,6 +486,9 @@ def _get_src_regs(raw: bytes) -> set[int]:
             if raw[3] < 255: regs.add(raw[3])
             if raw[8] < 255: regs.add(raw[8])
         elif opcode == 0x20c:  # ISETP R-R: src0=b3, src1=b4
+            if raw[3] < 255: regs.add(raw[3])
+            if raw[4] < 255: regs.add(raw[4])
+        elif opcode == 0x248:  # VIMNMX R-R: src0=b3, src1=b4 (integer min/max 32-bit)
             if raw[3] < 255: regs.add(raw[3])
             if raw[4] < 255: regs.add(raw[4])
         elif opcode == 0x226:  # IDP.4A: src_a=b3, src_b=b4, src_c=b8

@@ -74,7 +74,7 @@ _OPCODE_META: dict[int, _OpMeta] = {
     0x221: _OpMeta('FADD',       1, 0x3e, 1),
     0x223: _OpMeta('FFMA',       0, 0x00, 1),  # FFMA: wdep=0 (ptxas pattern, pipeline handles ordering)
     0x308: _OpMeta('MUFU',       1, 0x3e, 1),  # MUFU (SFU: RCP, SQRT, SIN, COS, EX2, LG2)
-    0x309: _OpMeta('POPC',       1, 0x3e, 1),  # POPC (population count)
+    0x309: _OpMeta('POPC',       1, 0x31, 1),  # POPC (population count) — long-latency, LDC-class slot per ptxas
     0x301: _OpMeta('BREV',       1, 0x3e, 1),  # BREV (bit reverse)
     0x300: _OpMeta('FLO',        1, 0x3e, 1),  # FLO (find leading one)
     0x820: _OpMeta('FMUL.IMM',   1, 0x3e, 1),  # FMUL with 32-bit float immediate
@@ -1162,6 +1162,14 @@ def _wdep_for_opcode(opcode: int, raw: bytes = None) -> int:
         # SHFL has variable latency; consumers wait via rbar=0x03 for this slot.
         # Treating SHFL as wdep=0x3e (ALU in-order) was incorrect — consumers
         # read stale data because SHFL actually takes many cycles.
+        return 0x31
+    if opcode == 0x309:  # POPC — long-latency on SM_120; ptxas posts to LDC
+        # slot 0x31, NOT ALU slot 0x3e.  Consumer rbar must include bit 1
+        # (via _WDEP_TO_RBAR[0x31]=0x03) or the scoreboard treats POPC as
+        # in-order ALU and consumers read pre-retirement partial results —
+        # low 6 bits correct, upper bits still holding the input register's
+        # prior content.  Observed: ours r16 = popc(r3) | (r3 & 0xF00) |
+        # (r3 & 0x80000000) for input-dependent stale-bit patterns.
         return 0x31
     if opcode == 0x806:  # VOTE: ptxas uses wdep=0x3F (no ALU tracking)
         return 0x3f     # VOTE result availability is ensured by instruction ordering,

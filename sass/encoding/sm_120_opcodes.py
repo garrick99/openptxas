@@ -1711,7 +1711,16 @@ def encode_imad_r_imm(dest: int, src0: int, imm: int, src2: int,
     dest = src0 * imm + src2 (low 32 bits).
     Ground truth (ptxas sm_120): IMAD R5, R5, 0x7, RZ
       lo=0x0000000705057824  hi=0x000fc800078e02ff
-      b0=0x24 b1=0x78 (opcode 0x824), b2=dest, b3=src0, b4:b5=imm16, b8=src2.
+      b0=0x24 b1=0x78 (opcode 0x824), b2=dest, b3=src0, b4-b7=imm32, b8=src2.
+
+    Immediate field spans bytes 4..7 (full 32 bits).  ptxas uses this for
+    large immediates too — e.g. IMAD R7, R0, 0x7fffffff, RZ emitted as
+    bytes 24 78 07 00 ff ff ff 7f ff 02 8e 07 ...  Previously our encoder
+    only wrote the low 16 bits and zeroed b6/b7, forcing isel to fall
+    back to LDCU.32 + IMAD.R-UR for imm > 0xFFFF — that path reads from
+    the literal-pool zone which the driver zeroes past the declared
+    params (a627a96 / 1caed2da / 98c699fd class).  Writing the full
+    32-bit imm here lets isel use IMAD.IMM directly for any imm size.
     """
     if ctrl == 0:
         ctrl = _CTRL_DEFAULT
@@ -1721,10 +1730,11 @@ def encode_imad_r_imm(dest: int, src0: int, imm: int, src2: int,
     raw[1] = 0x78
     raw[2] = dest & 0xFF
     raw[3] = src0 & 0xFF
-    raw[4] = imm & 0xFF
-    raw[5] = (imm >> 8) & 0xFF
-    raw[6] = 0x00
-    raw[7] = 0x00
+    imm32 = imm & 0xFFFFFFFF
+    raw[4] = imm32 & 0xFF
+    raw[5] = (imm32 >> 8) & 0xFF
+    raw[6] = (imm32 >> 16) & 0xFF
+    raw[7] = (imm32 >> 24) & 0xFF
     raw[8] = src2 & 0xFF
     raw[9] = 0x02
     raw[10] = 0x8e

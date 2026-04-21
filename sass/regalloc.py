@@ -172,6 +172,76 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
                 used_regs.add(bname)
                 reg_last_use[bname] = idx
 
+    # === Dead-write redirection (narrow fix for the 0827506f-class clobber) ===
+    # When a PTX vreg is written multiple times and a particular write has
+    # no later read of that vreg (i.e., the write is dead), the emitted SASS
+    # instruction still writes to a physical register.  The linear-scan
+    # allocator freed the register at the last READ — between that point
+    # and this dead write, the slot may have been reassigned to another
+    # live vreg.  The dead write then clobbers that live vreg.
+    #
+    # Fix: redirect such writes to R255 (RZ) by rewriting the instruction's
+    # dest to a reserved sentinel vreg.  RZ discards writes, so the emitted
+    # instruction becomes a harmless no-op.
+    #
+    # Restrictions (why this is NARROW):
+    #   1. Only rewrite when the name has >= 2 writes.  A single-write dead
+    #      dest (e.g. QMMA tensor padding mov.b32 %r6,0 used to force a
+    #      4-aligned accumulator base) is intentional and must be left alone.
+    #   2. Only 32-bit scalar names.  64-bit pair / predicate / uniform
+    #      dests have different encoding paths.
+    #   3. Only rewrite writes whose index is strictly after the vreg's
+    #      last READ (reg_last_use[name] < idx).  Writes before or at the
+    #      last read are producing a live value.
+    _DEAD = '_DEAD_'
+    write_count: dict[str, int] = {}
+    for idx, inst in enumerate(all_instrs):
+        if inst.dest and isinstance(inst.dest, RegOp):
+            nm = inst.dest.name
+            if nm.startswith('%rd') or nm.startswith('%p') or nm.startswith('%ur'):
+                continue
+            write_count[nm] = write_count.get(nm, 0) + 1
+
+    dead_write_count = 0
+    for idx, inst in enumerate(all_instrs):
+        if not (inst.dest and isinstance(inst.dest, RegOp)):
+            continue
+        nm = inst.dest.name
+        if nm.startswith('%rd') or nm.startswith('%p') or nm.startswith('%ur'):
+            continue
+        if write_count.get(nm, 0) < 2:
+            continue
+        # Redirect only if no read of this name strictly after this write.
+        if reg_last_use.get(nm, -1) > idx:
+            continue
+        # At this point: multi-write vreg, this write has no later read → dead.
+        inst.dest = RegOp(name=_DEAD)
+        dead_write_count += 1
+
+    if dead_write_count > 0:
+        # Rebuild liveness tables after the rewrite so the linear scan does
+        # not reserve GPRs for names whose last writes were redirected away.
+        used_regs = set()
+        reg_first_def = {}
+        reg_last_use = {}
+        for idx, inst in enumerate(all_instrs):
+            if inst.dest and isinstance(inst.dest, RegOp):
+                nm = inst.dest.name
+                used_regs.add(nm)
+                if nm not in reg_first_def:
+                    reg_first_def[nm] = idx
+            for src in inst.srcs:
+                if isinstance(src, RegOp):
+                    nm = src.name
+                    used_regs.add(nm)
+                    reg_last_use[nm] = idx
+                if isinstance(src, MemOp) and src.base:
+                    bnm = src.base if src.base.startswith('%') else f'%{src.base}'
+                    used_regs.add(bnm)
+                    reg_last_use[bnm] = idx
+        # Sentinel → RZ.  The linear scan won't see _DEAD_ in reg_decls.
+        int_regs[_DEAD] = 255
+
     # Extend live ranges across loop back-edges.  The linear scan above records
     # only the last *forward* use; a register read every iteration of a loop is
     # live until the back-branch, not just until its last textual appearance.

@@ -4899,10 +4899,19 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             _INVERT = {'lt': 'ge', 'le': 'gt', 'eq': 'ne'}
                             _can_use_ur_direct = False
                             _can_use_imm_direct = False
-                            # ISETP.IMM (0x80c) supports all comparison codes directly.
-                            # No inversion needed for immediate operands on SM_120.
+                            # Previously we claimed ISETP.IMM supported all comparisons
+                            # directly.  Empirically wrong when the predicate feeds
+                            # VOTE.BALLOT (and probably similar warp-intrinsics that
+                            # receive P as a source).  On b24a5fa6 (vote*1, setp.lt
+                            # against IMM 16), ptxas emits ISETP.GE + VOTE.!P while
+                            # our compiler emitted ISETP.LT + VOTE.P; the IMM.LT form
+                            # produced wrong ballot results at full speed (32/32 diffs).
+                            # Keep IMM inversion off for normal setp-consumer patterns
+                            # (predicated branches / @P guards), but force inversion
+                            # when the predicate will be read by a VOTE / warp op.
+                            _has_vote = getattr(ctx, '_has_vote', False)
                             if (cmp_name in _INVERT and ctx.sm_version != 89
-                                    and isinstance(b, ImmOp)):
+                                    and isinstance(b, ImmOp) and not _has_vote):
                                 _can_use_imm_direct = True
                             if cmp_name in _INVERT and ctx.sm_version != 89 and not _can_use_ur_direct and not _can_use_imm_direct:
                                 cmp_name = _INVERT[cmp_name]

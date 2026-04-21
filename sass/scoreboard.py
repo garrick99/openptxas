@@ -1142,6 +1142,14 @@ def _get_dest_regs(raw: bytes) -> set[int]:
         if dest < 255: regs |= {dest, dest + 1}
     elif opcode in _OPCODES_ALU:
         if dest < 255: regs.add(dest)
+    elif opcode == 0x806:  # VOTE.BALLOT: writes b2 as single GPR
+        # Previously VOTE was absent from dest tracking because it was
+        # removed from _OPCODES_ALU when we thought wdep=0x3f (no
+        # scoreboard).  With wdep=0x3e (ALU) the consumer needs to find
+        # VOTE's dest in pending_writes to pick up the implicit-ALU
+        # rbar contribution.  Observed on b24a5fa6: without this tracking
+        # the downstream IADD3 rbar missed bit 1 and read R7 stale.
+        if dest < 255: regs.add(dest)
     return regs
 
 
@@ -1198,10 +1206,16 @@ def _wdep_for_opcode(opcode: int, raw: bytes = None) -> int:
     if opcode == 0x300:  # FLO/CLZ — long-latency, same LDC-class as POPC.
         # ptxas byte-diff confirms wdep=0x31 (2026-04-20 clz_bytediff.py).
         return 0x31
-    if opcode == 0x806:  # VOTE: ptxas uses wdep=0x3F (no ALU tracking)
-        return 0x3f     # VOTE result availability is ensured by instruction ordering,
-                        # not scoreboard. Using wdep=0x3E corrupts the ALU slot when
-                        # combined with ISETP + predicated EXIT (SM_120 rule #23).
+    if opcode == 0x806:  # VOTE
+        # Byte-diff against ptxas sm_120 on b24a5fa6 (vote + IADD3 consumer):
+        # ptxas actually emits wdep=0x3e (ALU) so downstream ALU consumers
+        # can wait on the vote's result via implicit ALU ordering.
+        # The older "0x3f / no tracking" assumption produced scoreboard-less
+        # vote output; consumers read stale R<dest> before the warp-sync
+        # posted the ballot mask.  Changing to 0x3e matches ptxas for this
+        # kernel; the earlier ISETP+predicated-EXIT concern noted as a
+        # reason for 0x3f did not reproduce with 0x3e on SM_120.
+        return 0x3e
     if opcode in _OPCODES_LDGSTS:
         return 0x3f  # LDGSTS: async copy writes to shared mem, not GPR — no scoreboard slot
     if opcode in _OPCODES_LDGDEPBAR:
@@ -1272,7 +1286,7 @@ _OPCODE_MISC: dict[int, int] = {
     0x80a: 5,   # FSEL.step: misc=5 (ptxas-verified)
     0x223: 4,   # FFMA R-R-R: misc=4 (ptxas-verified for FMA chains on SM_120)
     0x823: 4,   # FFMA.IMM: misc=4 (same as FFMA R-R-R, ptxas ground truth after <<1 correction)
-    0x806: 1,   # VOTE: misc=1 (ptxas-verified, ballot kernel)
+    0x806: 5,   # VOTE: misc=5 (ptxas-verified on b24a5fa6 vote+IADD3 kernel)
     0x986: 1,   # STG.E: misc=1 (from ptxas ground truth)
     0x988: 4,   # STS.E: misc=4
     0x225: 1,   # IMAD.WIDE R-R: misc=1

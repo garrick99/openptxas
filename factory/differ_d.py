@@ -53,12 +53,13 @@ class DifferDaemon(Daemon):
     # reset's ability to recover.  Exit cleanly; the supervisor will
     # spawn a fresh process (= fresh driver state).
     #
-    # Kept low (3) because on 2026-04-22 the old value of 20 kept launching
-    # into a dying WDDM driver for a full minute of nvlddmkm Event 13 floods
-    # before giving up; by then the system was unrecoverable.  On Linux/WSL2
-    # the driver is more resilient, but early-exit is still the right call —
-    # the first sync_err already means something is wrong.
-    POISON_THRESHOLD = 3
+    # Chosen via a WSL2 smoke test: POISON_THRESHOLD=3 tripped within 0.7s
+    # on legitimate gen_danger fault-prone programs (it's a 50/50 coin to
+    # see a 3-in-a-row danger streak under round-robin).  POISON_THRESHOLD=20
+    # (the original) let WDDM rot during the 2026-04-22 crash.  10 distinguishes
+    # an unlucky run of fault-prone generated PTX from driver-wide poisoning,
+    # and still catches real poisoning within a few seconds.
+    POISON_THRESHOLD = 10
 
     def tick(self) -> bool:
         row = db.claim_next(self.conn, 'differ_done')
@@ -71,6 +72,8 @@ class DifferDaemon(Daemon):
         # Compile both sides.
         cubin_ours, err_ours = compile_ours(ptx)
         cubin_theirs, err_theirs = compile_theirs(ptx)
+        out_ours = out_theirs = None
+        sync_o = sync_t = None
 
         # Early outs — compile errors short-circuit the launch.  Mark the
         # row, count the error, delete it (only divergences stay alive).
@@ -90,19 +93,49 @@ class DifferDaemon(Daemon):
         if err_theirs is not None:
             return _compile_early_out('compile_err_theirs', err_theirs)
 
-        # Launch both on GPU.
+        # Launch both on GPU.  CUDA LAUNCH_FAILED (719) poisons the whole
+        # process — cuCtxDestroy+Create in-process inherits the sticky
+        # error (verified by _wsl_reset_probe.sh on 2026-04-22).  The only
+        # recovery is to exit; supervisor respawns with a fresh process.
+        #
+        # Before exiting, we MUST mark the offending program as done —
+        # otherwise the next respawn claims the same poison-trigger from
+        # the top of the pending queue and we infinite-loop.
+        def _poison_exit(side: str, reset_err):
+            print(f'[differ] reset after {side} sync_err failed: {reset_err}; '
+                  f'flagging pid={pid} and exiting for respawn', flush=True)
+            try:
+                db.set_gate(self.conn, pid, 'differ_done',
+                            differ_state=f'sync_err_poison_{side}',
+                            differ_note=(f'{sync_o or ""}|{sync_t or ""}|'
+                                         f'reset_err={reset_err}')[:200])
+                db.record_difference(
+                    self.conn, pid, self.inputs,
+                    out_ours, out_theirs, None,
+                    str(sync_o) if sync_o else None,
+                    str(sync_t) if sync_t else None)
+                db.counter_add(self.conn, 'programs_differ_poison', 1)
+                self.conn.commit()
+            except Exception as db_err:
+                print(f'[differ] failed to flag poison trigger pid={pid}: '
+                      f'{db_err}', flush=True)
+            db.heartbeat(self.conn, self.NAME, 'reset_failed', 0)
+            sys.exit(2)
+
         out_ours, sync_o = self.runner.run_cubin(cubin_ours, self.inputs, N_THREADS)
         if sync_o:
             try:
                 self.runner.reset()
                 _jit_set_context(self.runner.ctx)
-            except Exception: pass
+            except Exception as e:
+                _poison_exit('ours', e)
         out_theirs, sync_t = self.runner.run_cubin(cubin_theirs, self.inputs, N_THREADS)
         if sync_t:
             try:
                 self.runner.reset()
                 _jit_set_context(self.runner.ctx)
-            except Exception: pass
+            except Exception as e:
+                _poison_exit('theirs', e)
 
         # Outcome
         if sync_o and sync_t:

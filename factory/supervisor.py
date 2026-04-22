@@ -38,9 +38,9 @@ def _launch(mod_name: str, extra_args):
         stdout=sys.stdout, stderr=sys.stderr)
 
 
-_POISON_EXIT = 2            # differ exits rc=2 when sync_err streak hits POISON_THRESHOLD
-_POISON_COOLDOWN_SEC = 30   # wait this long before respawning a poisoned daemon
-_RESTART_CAP = 5            # more than this many restarts in the window → give up
+_POISON_EXIT = 2            # differ exits rc=2 after sync_err the process can't recover from
+_POISON_COOLDOWN_SEC = 2    # brief pause for OS process teardown before respawn (WSL2)
+_RESTART_CAP = 10           # non-poison (unexpected) crashes per window before giving up
 _RESTART_WINDOW_SEC = 300
 
 
@@ -49,8 +49,8 @@ def run(seconds: float = None):
     if seconds is not None:
         extra = ['--seconds', str(seconds)]
     procs = {}
-    # Per-daemon restart history (deque of monotonic restart timestamps) and
-    # a "don't respawn before" timestamp for cooldown.
+    # Per-daemon restart history (only NON-poison crashes count) and a
+    # cooldown timestamp used to sequence the poison-exit → respawn cycle.
     restart_times = {name: [] for name, _ in _DAEMONS}
     respawn_at = {name: 0.0 for name, _ in _DAEMONS}
     disabled = set()
@@ -77,30 +77,39 @@ def run(seconds: float = None):
                     continue
                 if seconds is not None and now - started > seconds:
                     continue
-                if now < respawn_at[name]:
+                if respawn_at[name] > now:
                     continue
-                # Cull old restart history and enforce cap.
-                rt = [t for t in restart_times[name] if now - t < _RESTART_WINDOW_SEC]
-                if len(rt) >= _RESTART_CAP:
-                    print(f'[supervisor] {name} crashed {len(rt)} times in '
-                          f'{_RESTART_WINDOW_SEC}s; disabling', flush=True)
-                    disabled.add(name)
-                    continue
-                # Cooldown if the exit looks GPU-poisoned.
-                if rc == _POISON_EXIT:
+
+                # First observation of a poison exit: set cooldown, defer.
+                # Poison is an expected failure mode when the corpus contains
+                # fault-prone PTX (illegal-address store, bad shared-mem, etc.)
+                # so it does NOT count against the restart cap.
+                if rc == _POISON_EXIT and respawn_at[name] == 0.0:
                     respawn_at[name] = now + _POISON_COOLDOWN_SEC
-                    print(f'[supervisor] {name} exited rc={rc} (poisoned); '
-                          f'cooldown {_POISON_COOLDOWN_SEC}s before respawn',
-                          flush=True)
+                    print(f'[supervisor] {name} poisoned rc=2; cooldown '
+                          f'{_POISON_COOLDOWN_SEC}s', flush=True)
                     continue
-                rt.append(now)
-                restart_times[name] = rt
-                print(f'[supervisor] {name} exited rc={rc}; restart '
-                      f'({len(rt)}/{_RESTART_CAP} in window)', flush=True)
+
+                # Non-poison exits (rc != 2) go toward the restart cap.
+                if rc != _POISON_EXIT:
+                    rt = [t for t in restart_times[name]
+                          if now - t < _RESTART_WINDOW_SEC]
+                    rt.append(now)
+                    restart_times[name] = rt
+                    if len(rt) > _RESTART_CAP:
+                        print(f'[supervisor] {name} crashed {len(rt)}x '
+                              f'(rc={rc}) in {_RESTART_WINDOW_SEC}s; disabling',
+                              flush=True)
+                        disabled.add(name)
+                        continue
+
+                respawn_at[name] = 0.0
+                print(f'[supervisor] {name} exited rc={rc}; respawning',
+                      flush=True)
                 procs[name] = _launch(mod, extra)
             if seconds is not None and now - started > seconds + 5:
                 break
-            time.sleep(2.0)
+            time.sleep(1.0)
     finally:
         print('[supervisor] stopping all daemons')
         for name, p in procs.items():

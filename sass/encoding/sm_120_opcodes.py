@@ -3808,13 +3808,12 @@ def encode_imnmx_imm(dest: int, src0: int, imm: int,
     if ctrl == 0:
         ctrl = _CTRL_DEFAULT
     b13, b14, b15 = _ctrl_to_bytes(ctrl)
-    # Mode byte 9 encoding (ground-truth-verified on sm_120):
-    #   max.u32 → 0x01,  min.u32 → 0x03
-    #   max.s32 → 0x00,  min.s32 → 0x02
-    if is_unsigned:
-        b9 = 0x01 if is_max else 0x03
-    else:
-        b9 = 0x00 if is_max else 0x02
+    # Mode bytes (ground-truth-verified against ptxas sm_120):
+    #   b9  = 0x00 unsigned,   0x01 signed
+    #   b11 = 0x07 max,        0x03 min
+    #   (orthogonal — the two fields are independent)
+    b9  = 0x00 if is_unsigned else 0x01
+    b11 = 0x07 if is_max      else 0x03
     raw = bytearray(16)
     raw[0] = 0x48
     raw[1] = 0x78
@@ -3828,7 +3827,7 @@ def encode_imnmx_imm(dest: int, src0: int, imm: int,
     raw[8] = 0x00
     raw[9] = b9
     raw[10] = 0xfe
-    raw[11] = 0x07
+    raw[11] = b11
     raw[12] = 0x00
     raw[13] = b13
     raw[14] = b14

@@ -2500,6 +2500,11 @@ class ISelContext:
     # Base offset is set by the pipeline after regalloc (after the param area ends).
     _const_pool_base: int = 0
     _const_pool:      dict[int, int] = field(default_factory=dict)
+    # Pool-zero fix: when True, lower mul.lo imm > 0xFFFF via IMAD.IMM + NOP
+    # (inline 32-bit immediate) instead of LDCU.32 + IMAD.R-UR.  Avoids the
+    # driver-zeroed cbuf[0] region.  Off by default for test-baseline
+    # compatibility; enabled by the fuzzer path.
+    _aggressive_imad_imm: bool = False
     # Next available scratch GPR (for isel-internal temporaries, e.g. bfe mask)
     # Initialized from alloc.num_gprs by the pipeline; may grow during isel.
     # SM_120 HARDWARE LIMIT: Without proper merc 0x5a metadata, the GPU only
@@ -3537,6 +3542,33 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         # Immediate multiplier: use IMAD.SHL.U32 if power-of-2 and ≤15,
                         # else try IMAD R-imm (16-bit immediate, opcode 0x824),
                         # else load into UR via literal pool and use IMAD R-UR.
+                        # Helper for the large-imm fallback: pool-zero class
+                        # when using the LDCU path, so gate on aggressive mode.
+                        def _emit_large_imm_mul():
+                            from sass.encoding.sm_120_opcodes import encode_imad_r_imm
+                            if getattr(ctx, '_aggressive_imad_imm', False):
+                                # Inline 32-bit immediate + 2 NOPs.  The LDCU
+                                # path introduces a cbuf-load latency that the
+                                # downstream consumer implicitly waits on;
+                                # IMAD.IMM has no such stall, so we insert
+                                # explicit NOPs to preserve the LDG-retirement
+                                # window (see known_residuals.md "pool-zero +
+                                # LDG-race interaction").  One NOP is enough
+                                # for simple chains; two covers the tighter
+                                # LDG→ALU→mul→ALU-reading-LDG-result pattern
+                                # observed on 7f2d64e9 / 8bf14c45.
+                                output.append(SassInstr(encode_imad_r_imm(d, a, imm, RZ),
+                                    f'IMAD R{d}, R{a}, 0x{imm:x}, RZ  // mul.lo imm (inline)'))
+                                output.append(_nop('NOP after large-imm IMAD #1 (LDG-race gap)'))
+                                output.append(_nop('NOP after large-imm IMAD #2 (LDG-race gap)'))
+                            else:
+                                lit_off = ctx._alloc_literal(imm)
+                                ur_tmp = ctx._next_ur; ctx._next_ur += 1
+                                output.append(SassInstr(encode_ldcu_32(ur_tmp, 0, lit_off),
+                                    f'LDCU.32 UR{ur_tmp}, c[0][0x{lit_off:x}]  // mul.lo imm'))
+                                output.append(SassInstr(encode_imad_ur(d, a, ur_tmp, RZ),
+                                    f'IMAD R{d}, R{a}, UR{ur_tmp}, RZ  // mul.lo imm'))
+
                         if imm > 0 and (imm & (imm - 1)) == 0:
                             # Power of two: IMAD.SHL.U32 dest, src, imm, RZ
                             shift = imm.bit_length() - 1
@@ -3548,24 +3580,14 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 output.append(SassInstr(encode_imad_r_imm(d, a, imm, RZ),
                                     f'IMAD R{d}, R{a}, 0x{imm:x}, RZ  // mul.lo imm'))
                             else:
-                                lit_off = ctx._alloc_literal(imm)
-                                ur_tmp = ctx._next_ur; ctx._next_ur += 1
-                                output.append(SassInstr(encode_ldcu_32(ur_tmp, 0, lit_off),
-                                    f'LDCU.32 UR{ur_tmp}, c[0][0x{lit_off:x}]  // mul.lo imm'))
-                                output.append(SassInstr(encode_imad_ur(d, a, ur_tmp, RZ),
-                                    f'IMAD R{d}, R{a}, UR{ur_tmp}, RZ  // mul.lo imm'))
+                                _emit_large_imm_mul()
                         elif imm <= 0xFFFF:
                             # 16-bit immediate: use IMAD R-imm directly (ptxas pattern).
                             from sass.encoding.sm_120_opcodes import encode_imad_r_imm
                             output.append(SassInstr(encode_imad_r_imm(d, a, imm, RZ),
                                 f'IMAD R{d}, R{a}, 0x{imm:x}, RZ  // mul.lo imm'))
                         else:
-                            lit_off = ctx._alloc_literal(imm)
-                            ur_tmp = ctx._next_ur; ctx._next_ur += 1
-                            output.append(SassInstr(encode_ldcu_32(ur_tmp, 0, lit_off),
-                                f'LDCU.32 UR{ur_tmp}, c[0][0x{lit_off:x}]  // mul.lo imm'))
-                            output.append(SassInstr(encode_imad_ur(d, a, ur_tmp, RZ),
-                                f'IMAD R{d}, R{a}, UR{ur_tmp}, RZ  // mul.lo imm'))
+                            _emit_large_imm_mul()
                         continue
                     b = ctx.ra.r32(instr.srcs[1].name)
                     # Check if either source lives in a UR (ctaid.x via S2UR)

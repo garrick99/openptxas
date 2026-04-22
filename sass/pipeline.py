@@ -1028,6 +1028,7 @@ def compile_function(fn: Function, verbose: bool = False,
         _next_gpr=_addr_scratch_base,  # scratch allocated on demand, not pre-reserved
         _next_pred=alloc.num_pred,
         sm_version=sm_version,
+        _aggressive_imad_imm=enable_dce,  # fuzzer path uses IMAD.IMM+NOP for large imm
     )
     ctx._addr_scratch_lo = _addr_scratch_base  # dedicated addr pair: R(base):R(base+1)
     # FG26 UR4 start is applied below, after _setp_only_params detection.

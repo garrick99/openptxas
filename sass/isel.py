@@ -5202,23 +5202,35 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         output.append(SassInstr(bytes(raw_pmov),
                             f'@{"!" if neg else ""}P{pd} MOV R{d}, R{true_reg}  // selp true'))
 
-                elif op == 'min' and typ in ('u32', 's32'):
+                elif op in ('min', 'max') and typ in ('u32', 's32'):
+                    # Prefer IMNMX.IMM (opcode 0x848) when one source is an
+                    # immediate — matches ptxas and avoids a temp register
+                    # materialization + subsequent WAW hazard from VIMNMX.RR
+                    # reusing an LDG destination register.
                     d = ctx.ra.r32(instr.dest.name)
-                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
-                    b = _materialize_imm(instr.srcs[1], ctx, ctx.ra, output)
                     is_signed = typ == 's32'
-                    enc = encode_vimnmx_s32 if is_signed else encode_vimnmx_u32
-                    output.append(SassInstr(enc(d, a, b, is_max=False),
-                        f'VIMNMX.{"S" if is_signed else "U"}32 R{d}, R{a}, R{b}, PT  // min.{typ}'))
-
-                elif op == 'max' and typ in ('u32', 's32'):
-                    d = ctx.ra.r32(instr.dest.name)
-                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
-                    b = _materialize_imm(instr.srcs[1], ctx, ctx.ra, output)
-                    is_signed = typ == 's32'
-                    enc = encode_vimnmx_s32 if is_signed else encode_vimnmx_u32
-                    output.append(SassInstr(enc(d, a, b, is_max=True),
-                        f'VIMNMX.{"S" if is_signed else "U"}32 R{d}, R{a}, R{b}, !PT  // max.{typ}'))
+                    is_max = op == 'max'
+                    s0, s1 = instr.srcs[0], instr.srcs[1]
+                    # Look for an immediate source — max/min commute, so either order works
+                    imm_val = None; reg_src = None
+                    if isinstance(s0, ImmOp) and not isinstance(s1, ImmOp):
+                        imm_val = s0.value; reg_src = s1
+                    elif isinstance(s1, ImmOp) and not isinstance(s0, ImmOp):
+                        imm_val = s1.value; reg_src = s0
+                    if imm_val is not None:
+                        from sass.encoding.sm_120_opcodes import encode_imnmx_imm
+                        a = _materialize_imm(reg_src, ctx, ctx.ra, output)
+                        output.append(SassInstr(
+                            encode_imnmx_imm(d, a, imm_val,
+                                              is_max=is_max, is_unsigned=not is_signed),
+                            f'IMNMX.{"S" if is_signed else "U"}32.IMM R{d}, R{a}, 0x{imm_val:x}  // {op}.{typ}'))
+                    else:
+                        a = _materialize_imm(s0, ctx, ctx.ra, output)
+                        b = _materialize_imm(s1, ctx, ctx.ra, output)
+                        enc = encode_vimnmx_s32 if is_signed else encode_vimnmx_u32
+                        predicate = '!PT' if is_max else 'PT'
+                        output.append(SassInstr(enc(d, a, b, is_max=is_max),
+                            f'VIMNMX.{"S" if is_signed else "U"}32 R{d}, R{a}, R{b}, {predicate}  // {op}.{typ}'))
 
                 elif op == 'sad' and typ in ('u32', 's32'):
                     # sad.u32 d, a, b, c  →  d = |a - b| + c

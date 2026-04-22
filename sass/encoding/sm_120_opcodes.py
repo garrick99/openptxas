@@ -3786,6 +3786,56 @@ def encode_lea_imm(dest: int, base: int, imm: int, scale: int = 0,
 # b2=dest, b3=src0, b4=src1, b9=mode (signed/unsigned + min/max)
 # Encoding inferred from VIMNMX patterns and the opcode family.
 
+def encode_imnmx_imm(dest: int, src0: int, imm: int,
+                     is_max: bool = False, is_unsigned: bool = False,
+                     ctrl: int = 0) -> bytes:
+    """Encode IMNMX.IMM: integer min/max with inline 32-bit immediate.
+
+    Opcode 0x848 (byte0=0x48 byte1=0x78).  Ground truth from ptxas on
+    SM_120 for `max.u32 R7, R4, 16`:
+      bytes: 48 78 07 04 10 00 00 00 00 01 fe 07 00 [ctrl]
+      byte 2 = dest, byte 3 = src0 reg, bytes 4..7 = 32-bit immediate,
+      byte 9 = mode (bit 0 = unsigned(0)/signed(1); unsigned max=0x01),
+              0x01 is max.u32; min.u32 = 0x03; max.s32 = 0x00; min.s32 = 0x02
+
+    Args:
+        dest:        Destination register.
+        src0:        Source register A.
+        imm:         32-bit immediate (second operand).
+        is_max:      True for max, False for min.
+        is_unsigned: True for unsigned comparison.
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    # Mode byte 9 encoding (ground-truth-verified on sm_120):
+    #   max.u32 → 0x01,  min.u32 → 0x03
+    #   max.s32 → 0x00,  min.s32 → 0x02
+    if is_unsigned:
+        b9 = 0x01 if is_max else 0x03
+    else:
+        b9 = 0x00 if is_max else 0x02
+    raw = bytearray(16)
+    raw[0] = 0x48
+    raw[1] = 0x78
+    raw[2] = dest & 0xFF
+    raw[3] = src0 & 0xFF
+    imm32 = imm & 0xFFFFFFFF
+    raw[4] = imm32 & 0xFF
+    raw[5] = (imm32 >> 8) & 0xFF
+    raw[6] = (imm32 >> 16) & 0xFF
+    raw[7] = (imm32 >> 24) & 0xFF
+    raw[8] = 0x00
+    raw[9] = b9
+    raw[10] = 0xfe
+    raw[11] = 0x07
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
 def encode_imnmx(dest: int, src0: int, src1: int,
                  is_max: bool = False, is_unsigned: bool = False,
                  ctrl: int = 0) -> bytes:

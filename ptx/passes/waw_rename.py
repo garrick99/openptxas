@@ -69,8 +69,7 @@ def _substitute_reads(inst, old: str, new: str):
                 # Replace via dataclass-style copy; assume MemOp has a 'base' field.
                 inst.srcs[i] = MemOp(
                     base=new_base,
-                    offset=getattr(s, 'offset', 0),
-                    space=getattr(s, 'space', None))
+                    offset=getattr(s, 'offset', 0))
     if inst.pred == old:
         inst.pred = new
 

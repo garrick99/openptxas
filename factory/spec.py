@@ -39,6 +39,9 @@ def _s32(x: int) -> int:
     x &= 0xFFFFFFFF
     return x - 0x100000000 if x & 0x80000000 else x
 def _u64(x: int) -> int: return x & 0xFFFFFFFFFFFFFFFF
+def _s64(x: int) -> int:
+    x &= 0xFFFFFFFFFFFFFFFF
+    return x - 0x10000000000000000 if x & 0x8000000000000000 else x
 
 
 def _parse_reg(tok: str):
@@ -124,6 +127,60 @@ def _binop(op: str, a: int, b: int) -> int:
     if op == 'sub.sat.s32':
         return _sat_s32(_s32(a) - _s32(b))
     raise Unsupported(op)
+
+
+def _binop_u64(op: str, a: int, b: int) -> int:
+    """Evaluate a binary opcode on two u64 values."""
+    if op == 'add.u64' or op == 'add.s64':
+        return _u64(a + b)
+    if op == 'sub.u64' or op == 'sub.s64':
+        return _u64(a - b)
+    if op == 'mul.lo.u64' or op == 'mul.lo.s64':
+        return _u64(a * b)
+    if op == 'and.b64':
+        return _u64(a & b)
+    if op == 'or.b64':
+        return _u64(a | b)
+    if op == 'xor.b64':
+        return _u64(a ^ b)
+    if op == 'min.u64':
+        return min(_u64(a), _u64(b))
+    if op == 'max.u64':
+        return max(_u64(a), _u64(b))
+    if op == 'min.s64':
+        return _u64(min(_s64(a), _s64(b)))
+    if op == 'max.s64':
+        return _u64(max(_s64(a), _s64(b)))
+    if op == 'shl.b64':
+        n = _u32(b) & 0x3F
+        return _u64(a << n)
+    if op == 'shr.u64':
+        n = _u32(b) & 0x3F
+        return _u64(_u64(a) >> n)
+    if op == 'shr.s64':
+        n = _u32(b) & 0x3F
+        return _u64(_s64(a) >> n)
+    raise Unsupported(op)
+
+
+_U64_BINOPS = frozenset((
+    'add.u64','add.s64','sub.u64','sub.s64',
+    'mul.lo.u64','mul.lo.s64',
+    'and.b64','or.b64','xor.b64',
+    'min.u64','max.u64','min.s64','max.s64',
+    'shl.b64','shr.u64','shr.s64',
+))
+
+
+def _clz_b32(a: int) -> int:
+    """Count leading zeros of a 32-bit value.  clz(0) == 32."""
+    a = _u32(a)
+    if a == 0: return 32
+    n = 0
+    for i in range(31, -1, -1):
+        if (a >> i) & 1: break
+        n += 1
+    return n
 
 
 def _sat_s32(x: int) -> int:
@@ -289,12 +346,30 @@ def simulate(ptx: str, inputs: bytes) -> bytes:
                 a = state.get(operands[1], 0) if ka == 'r' else va
                 b = state.get(operands[2], 0) if kb == 'r' else vb
                 if ptype in ('u32', 'b32'):
-                    base = {'eq': _u32(a)==_u32(b), 'ne': _u32(a)!=_u32(b),
-                             'lt': _u32(a)<_u32(b), 'le': _u32(a)<=_u32(b),
-                             'gt': _u32(a)>_u32(b), 'ge': _u32(a)>=_u32(b),
+                    ua, ub = _u32(a), _u32(b)
+                    # hi/lo/hs/ls are the unsigned carry-based names
+                    # (equivalent to gt/lt/ge/le on unsigned compare).
+                    base = {'eq': ua==ub, 'ne': ua!=ub,
+                             'lt': ua<ub, 'le': ua<=ub,
+                             'gt': ua>ub, 'ge': ua>=ub,
+                             'lo': ua<ub, 'ls': ua<=ub,
+                             'hi': ua>ub, 'hs': ua>=ub,
                              }.get(cmp_, None)
                 elif ptype == 's32':
                     base = _setp_cmp(cmp_, a, b)
+                elif ptype in ('u64', 'b64'):
+                    ua, ub = _u64(a), _u64(b)
+                    base = {'eq': ua==ub, 'ne': ua!=ub,
+                             'lt': ua<ub, 'le': ua<=ub,
+                             'gt': ua>ub, 'ge': ua>=ub,
+                             'lo': ua<ub, 'ls': ua<=ub,
+                             'hi': ua>ub, 'hs': ua>=ub,
+                             }.get(cmp_, None)
+                elif ptype == 's64':
+                    sa, sb = _s64(a), _s64(b)
+                    base = {'eq': sa==sb, 'ne': sa!=sb,
+                             'lt': sa<sb, 'le': sa<=sb,
+                             'gt': sa>sb, 'ge': sa>=sb}.get(cmp_, None)
                 else:
                     raise Unsupported(op)
                 if base is None: raise Unsupported(op)
@@ -406,39 +481,169 @@ def simulate(ptx: str, inputs: bytes) -> bytes:
                 d = operands[0]
                 ka, va = _parse_reg(operands[1])
                 kb, vb = _parse_reg(operands[2])
-                a = state.get(operands[1], 0) if ka == 'r' else va
-                b = state.get(operands[2], 0) if kb == 'r' else vb
+                a = state.get(operands[1], 0) if ka in ('r','rd') else va
+                b = state.get(operands[2], 0) if kb in ('r','rd') else vb
                 state[d] = _binop(op, a, b)
                 continue
 
+            # 64-bit binary ALU — operands live in %rd registers.  State dict
+            # treats %r as u32 and %rd as u64; no separate tables needed.
+            if op in _U64_BINOPS:
+                if len(operands) != 3:
+                    raise Unsupported(op)
+                d = operands[0]
+                ka, va = _parse_reg(operands[1])
+                kb, vb = _parse_reg(operands[2])
+                a = state.get(operands[1], 0) if ka in ('r','rd') else va
+                b = state.get(operands[2], 0) if kb in ('r','rd') else vb
+                state[d] = _binop_u64(op, a, b)
+                continue
+
+            # add.cc / addc — 32-bit extended-precision adds.  We model the
+            # carry flag in state['__CC__']; the fuzz kernels chain these
+            # only within a single thread so the flag is per-lane.
+            if op in ('add.cc.u32', 'add.cc.s32'):
+                if len(operands) != 3: raise Unsupported(op)
+                d = operands[0]
+                ka, va = _parse_reg(operands[1])
+                kb, vb = _parse_reg(operands[2])
+                a = _u32(state.get(operands[1], 0) if ka == 'r' else va)
+                b = _u32(state.get(operands[2], 0) if kb == 'r' else vb)
+                s = a + b
+                state[d] = _u32(s)
+                state['__CC__'] = 1 if s > 0xFFFFFFFF else 0
+                continue
+            if op in ('addc.u32', 'addc.cc.u32', 'addc.s32', 'addc.cc.s32'):
+                if len(operands) != 3: raise Unsupported(op)
+                d = operands[0]
+                ka, va = _parse_reg(operands[1])
+                kb, vb = _parse_reg(operands[2])
+                a = _u32(state.get(operands[1], 0) if ka == 'r' else va)
+                b = _u32(state.get(operands[2], 0) if kb == 'r' else vb)
+                c = state.get('__CC__', 0)
+                s = a + b + c
+                state[d] = _u32(s)
+                if op.startswith('addc.cc.'):
+                    state['__CC__'] = 1 if s > 0xFFFFFFFF else 0
+                continue
+
+            # Unary: clz.b32
+            if op == 'clz.b32':
+                if len(operands) != 2: raise Unsupported(op)
+                d = operands[0]
+                ka, va = _parse_reg(operands[1])
+                a = state.get(operands[1], 0) if ka == 'r' else va
+                state[d] = _clz_b32(a)
+                continue
+
+            # popc.b32 — population count
+            if op == 'popc.b32':
+                if len(operands) != 2: raise Unsupported(op)
+                d = operands[0]
+                ka, va = _parse_reg(operands[1])
+                a = _u32(state.get(operands[1], 0) if ka == 'r' else va)
+                state[d] = bin(a).count('1')
+                continue
+
+            # prmt.b32 d, a, b, c  (default "sel" mode) — permute bytes.
+            # Low 16 bits of c form 4x 4-bit selectors; each picks one of 8
+            # bytes from concat(b:a) = bytes 0..3 of a then 0..3 of b.
+            # High bit of each selector forces sign-replication of the
+            # picked byte (0x00 or 0xFF).  .f4e/.b4e/.rc8/.ecl/.ecr/.rc16
+            # variants are not emitted by our generators; leave unsupported.
+            if op == 'prmt.b32':
+                if len(operands) != 4: raise Unsupported(op)
+                d = operands[0]
+                ka, va = _parse_reg(operands[1])
+                kb, vb = _parse_reg(operands[2])
+                kc, vc = _parse_reg(operands[3])
+                a = _u32(state.get(operands[1], 0) if ka == 'r' else va)
+                b = _u32(state.get(operands[2], 0) if kb == 'r' else vb)
+                c = _u32(state.get(operands[3], 0) if kc == 'r' else vc)
+                src = [a & 0xFF, (a >> 8) & 0xFF, (a >> 16) & 0xFF, (a >> 24) & 0xFF,
+                       b & 0xFF, (b >> 8) & 0xFF, (b >> 16) & 0xFF, (b >> 24) & 0xFF]
+                r = 0
+                for i in range(4):
+                    sel = (c >> (i * 4)) & 0xF
+                    byt = src[sel & 7]
+                    if sel & 8:
+                        byt = 0xFF if (byt & 0x80) else 0x00
+                    r |= byt << (i * 8)
+                state[d] = _u32(r)
+                continue
+
+            # brev.b32 — bit reverse
+            if op == 'brev.b32':
+                if len(operands) != 2: raise Unsupported(op)
+                d = operands[0]
+                ka, va = _parse_reg(operands[1])
+                a = _u32(state.get(operands[1], 0) if ka == 'r' else va)
+                r = 0
+                for i in range(32):
+                    r = (r << 1) | ((a >> i) & 1)
+                state[d] = r
+                continue
+
+            # neg.{s32,s64} d, a  => d = -a (two's complement)
+            if op in ('neg.s32', 'neg.s64'):
+                if len(operands) != 2: raise Unsupported(op)
+                d = operands[0]
+                ka, va = _parse_reg(operands[1])
+                a = state.get(operands[1], 0) if ka in ('r','rd') else va
+                if op == 'neg.s32':
+                    state[d] = _u32(-_s32(a))
+                else:
+                    state[d] = _u64(-_s64(a))
+                continue
+
+            # not.{b32,b64} d, a
+            if op in ('not.b32', 'not.b64'):
+                if len(operands) != 2: raise Unsupported(op)
+                d = operands[0]
+                ka, va = _parse_reg(operands[1])
+                a = state.get(operands[1], 0) if ka in ('r','rd') else va
+                if op == 'not.b32':
+                    state[d] = _u32(~a)
+                else:
+                    state[d] = _u64(~a)
+                continue
+
             if op.startswith('cvt.'):
-                # cvt.<dst>.<src> d, a   — only handle identity-width and truncation
+                # cvt.<dst>.<src> d, a  — integer zext / sext / truncate.
+                # Skip rounding modes (cvt.rn.f32.u32 etc.) — not in the
+                # integer generators.
                 parts = op.split('.')
                 if len(parts) != 3:
                     raise Unsupported(op)
                 dst_t, src_t = parts[1], parts[2]
-                if dst_t not in ('u32','s32','u16','s16','u8','s8','b32') or \
-                   src_t not in ('u32','s32','u16','s16','u8','s8','b32'):
+                widths = {'u8':8,'s8':8,'u16':16,'s16':16,
+                           'u32':32,'s32':32,'b32':32,
+                           'u64':64,'s64':64,'b64':64}
+                if dst_t not in widths or src_t not in widths:
                     raise Unsupported(op)
                 if len(operands) != 2: raise Unsupported(op)
                 ka, va = _parse_reg(operands[1])
-                a = state.get(operands[1], 0) if ka == 'r' else va
-                width = {'u8':8,'s8':8,'u16':16,'s16':16,
-                          'u32':32,'s32':32,'b32':32}
-                sw = width[src_t]; dw = width[dst_t]
-                if sw < 32:
+                a = state.get(operands[1], 0) if ka in ('r','rd') else va
+                sw = widths[src_t]; dw = widths[dst_t]
+                # Interpret source according to its signedness.
+                if sw < 64:
                     mask = (1 << sw) - 1
                     a &= mask
                     if src_t.startswith('s') and a & (1 << (sw-1)):
                         a -= (1 << sw)
-                if dw < 32:
+                else:
+                    if src_t.startswith('s') and a & (1 << 63):
+                        a -= (1 << 64)
+                # Write the dest with width-appropriate mask.
+                if dw <= 32:
                     mask = (1 << dw) - 1
                     v = a & mask
-                    if dst_t.startswith('s') and v & (1 << (dw-1)):
+                    if dst_t.startswith('s') and dw < 32 and v & (1 << (dw-1)):
                         v -= (1 << dw)
                     state[operands[0]] = _u32(v)
                 else:
-                    state[operands[0]] = _u32(a)
+                    # 64-bit dest: write into %rd
+                    state[operands[0]] = _u64(a & 0xFFFFFFFFFFFFFFFF)
                 continue
 
             # Anything else: bail

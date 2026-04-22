@@ -4634,19 +4634,38 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                                         f'LDC R{t}, c[0][0x{lit_off:x}]  // 0xFF mask'))
                                 _emit_lop3(output, ctx, d_r, a_r, t, RZ, LOP3_AND, f'LOP3.AND R{d_r}, R{a_r}, R{t}, RZ  // cvt.{_dst_t}.{_src_t}')
                             elif _dst_t in ('u16', 's16', 'b16') and _src_t in _32B:
-                                # Truncate to 16 bits: AND with 0xFFFF
+                                # Truncate to 16 bits via LOP3.IMM with inline 0xFFFF
+                                # mask.  The previous literal-pool path routed the
+                                # 0xFFFF mask through cbuf[0][lit_off] which the
+                                # driver zeroes on SM_120 — LOP3.AND with 0 = 0,
+                                # so every cvt-narrow returned 0 regardless of input
+                                # (CVT_CHAIN bug class).
                                 d_r = ctx.ra.r32(d.name)
                                 a_r = ctx.ra.r32(s.name)
-                                lit_off = ctx._alloc_literal(0xFFFF)
-                                t = _alloc_gpr(ctx)
-                                output.append(SassInstr(encode_ldc(t, 0, lit_off),
-                                                        f'LDC R{t}, c[0][0x{lit_off:x}]  // 0xFFFF mask'))
-                                _emit_lop3(output, ctx, d_r, a_r, t, RZ, LOP3_AND, f'LOP3.AND R{d_r}, R{a_r}, R{t}, RZ  // cvt.{_dst_t}.{_src_t}')
+                                # LOP3_IMM_AND and encode_lop3_imm32 are
+                                # already imported at module top (line ~93).
+                                output.append(SassInstr(
+                                    encode_lop3_imm32(d_r, a_r, 0xFFFF, RZ, LOP3_IMM_AND),
+                                    f'LOP3.AND R{d_r}, R{a_r}, 0xFFFF, RZ  // cvt.{_dst_t}.{_src_t}'))
                             elif _dst_t in _32B and _src_t in ('u8', 's8', 'b8', 'u16', 's16', 'b16'):
-                                # Widening from narrow: just copy (narrow stored as u32, already zero-extended)
+                                # Widening from narrow.  For SIGNED narrow sources
+                                # we must sign-extend; BFE_SEXT does exactly that.
+                                # For unsigned/bit sources, just MOV (narrow bits
+                                # are assumed to already be in a 32-bit GPR with
+                                # zero upper bits — ptxas convention).
                                 d_r = ctx.ra.r32(d.name)
                                 a_r = ctx.ra.r32(s.name)
-                                if d_r != a_r:
+                                _is_signed = _src_t.startswith('s')
+                                _src_bits = 8 if _src_t.endswith('8') else 16
+                                if _is_signed:
+                                    # BFE_SEXT dest, src, length  (sign-extend low
+                                    # `length` bits).  This is the widening form
+                                    # of cvt.s32.s16 / cvt.s32.s8.  encode_bfe_sext
+                                    # is already imported at module top.
+                                    output.append(SassInstr(
+                                        encode_bfe_sext(d_r, a_r, _src_bits),
+                                        f'BFE_SEXT R{d_r}, R{a_r}, {_src_bits}  // cvt.{_dst_t}.{_src_t}'))
+                                elif d_r != a_r:
                                     output.append(SassInstr(encode_iadd3(d_r, a_r, RZ, RZ),
                                                             f'MOV R{d_r}, R{a_r}  // cvt.{_dst_t}.{_src_t}'))
                             elif _dst_t in _32B and _src_t in _32B:

@@ -858,10 +858,19 @@ def compile_function(fn: Function, verbose: bool = False,
         live write, causing a hardware hazard that zeroes the live
         write's result (SHIFT_BOUNDARY and SIGN_FLIP_CHAIN clusters).
     """
-    # 0.  Optional dead-code elimination at the PTX-IR level.
+    # 0.  Optional pre-regalloc PTX-IR passes (factory/fuzzer path only).
     if enable_dce:
         from ptx.passes.dce import run_function as _dce_run_function
+        from ptx.passes.waw_rename import run_function as _waw_run_function
+        # DCE first — removes trivially-dead writes, which may turn some
+        # multi-write vregs into single-write (no rename needed after).
         _dce_run_function(fn)
+        # WAW-rename splits remaining multi-write vregs into fresh names
+        # so regalloc allocates distinct physical GPRs for each write.
+        # Closes the SHIFT_BOUNDARY/OTHER cluster cases where DCE can't
+        # help because the first write's value flows (transitively)
+        # into the reader of the second write.
+        _waw_run_function(fn)
 
     # 0a. If-conversion: convert short if-else diamonds to predicated instructions,
     # matching ptxas behaviour for divergent branches on SM_120.

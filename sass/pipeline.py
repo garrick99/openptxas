@@ -843,13 +843,26 @@ def _if_convert(fn: Function) -> None:
 
 
 def compile_function(fn: Function, verbose: bool = False,
-                     ptxas_meta: dict = None, sm_version: int = 120) -> bytes:
+                     ptxas_meta: dict = None, sm_version: int = 120,
+                     enable_dce: bool = False) -> bytes:
     """
     Compile a single PTX function/kernel to a cubin.
 
     Returns raw cubin bytes ready for cuModuleLoad.
     ptxas_meta: optional {'capmerc': bytes, 'merc_info': bytes} from ptxas.
+    enable_dce: when True, run dead-code elimination on the PTX IR first.
+        Defaults to False to preserve existing test baselines (many tests
+        assert on specific emit patterns that DCE would prune).  The
+        fuzzer/factory path enables it because regalloc will otherwise
+        reuse a physical register across a dead write and a subsequent
+        live write, causing a hardware hazard that zeroes the live
+        write's result (SHIFT_BOUNDARY and SIGN_FLIP_CHAIN clusters).
     """
+    # 0.  Optional dead-code elimination at the PTX-IR level.
+    if enable_dce:
+        from ptx.passes.dce import run_function as _dce_run_function
+        _dce_run_function(fn)
+
     # 0a. If-conversion: convert short if-else diamonds to predicated instructions,
     # matching ptxas behaviour for divergent branches on SM_120.
     _if_convert(fn)

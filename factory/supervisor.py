@@ -38,11 +38,22 @@ def _launch(mod_name: str, extra_args):
         stdout=sys.stdout, stderr=sys.stderr)
 
 
+_POISON_EXIT = 2            # differ exits rc=2 when sync_err streak hits POISON_THRESHOLD
+_POISON_COOLDOWN_SEC = 30   # wait this long before respawning a poisoned daemon
+_RESTART_CAP = 5            # more than this many restarts in the window → give up
+_RESTART_WINDOW_SEC = 300
+
+
 def run(seconds: float = None):
     extra = []
     if seconds is not None:
         extra = ['--seconds', str(seconds)]
     procs = {}
+    # Per-daemon restart history (deque of monotonic restart timestamps) and
+    # a "don't respawn before" timestamp for cooldown.
+    restart_times = {name: [] for name, _ in _DAEMONS}
+    respawn_at = {name: 0.0 for name, _ in _DAEMONS}
+    disabled = set()
     for name, mod in _DAEMONS:
         print(f'[supervisor] launching {name}')
         procs[name] = _launch(mod, extra)
@@ -56,16 +67,38 @@ def run(seconds: float = None):
     started = time.time()
     try:
         while not stopped:
-            # Restart any that died (unless we're winding down)
+            now = time.time()
             for name, mod in _DAEMONS:
+                if name in disabled:
+                    continue
                 p = procs[name]
                 rc = p.poll()
-                if rc is not None:
-                    if seconds is not None and time.time() - started > seconds:
-                        continue
-                    print(f'[supervisor] {name} exited rc={rc}; restarting')
-                    procs[name] = _launch(mod, extra)
-            if seconds is not None and time.time() - started > seconds + 5:
+                if rc is None:
+                    continue
+                if seconds is not None and now - started > seconds:
+                    continue
+                if now < respawn_at[name]:
+                    continue
+                # Cull old restart history and enforce cap.
+                rt = [t for t in restart_times[name] if now - t < _RESTART_WINDOW_SEC]
+                if len(rt) >= _RESTART_CAP:
+                    print(f'[supervisor] {name} crashed {len(rt)} times in '
+                          f'{_RESTART_WINDOW_SEC}s; disabling', flush=True)
+                    disabled.add(name)
+                    continue
+                # Cooldown if the exit looks GPU-poisoned.
+                if rc == _POISON_EXIT:
+                    respawn_at[name] = now + _POISON_COOLDOWN_SEC
+                    print(f'[supervisor] {name} exited rc={rc} (poisoned); '
+                          f'cooldown {_POISON_COOLDOWN_SEC}s before respawn',
+                          flush=True)
+                    continue
+                rt.append(now)
+                restart_times[name] = rt
+                print(f'[supervisor] {name} exited rc={rc}; restart '
+                      f'({len(rt)}/{_RESTART_CAP} in window)', flush=True)
+                procs[name] = _launch(mod, extra)
+            if seconds is not None and now - started > seconds + 5:
                 break
             time.sleep(2.0)
     finally:

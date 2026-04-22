@@ -52,7 +52,13 @@ class DifferDaemon(Daemon):
     # side), assume the driver's per-process state is poisoned beyond
     # reset's ability to recover.  Exit cleanly; the supervisor will
     # spawn a fresh process (= fresh driver state).
-    POISON_THRESHOLD = 20
+    #
+    # Kept low (3) because on 2026-04-22 the old value of 20 kept launching
+    # into a dying WDDM driver for a full minute of nvlddmkm Event 13 floods
+    # before giving up; by then the system was unrecoverable.  On Linux/WSL2
+    # the driver is more resilient, but early-exit is still the right call —
+    # the first sync_err already means something is wrong.
+    POISON_THRESHOLD = 3
 
     def tick(self) -> bool:
         row = db.claim_next(self.conn, 'differ_done')

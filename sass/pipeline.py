@@ -844,7 +844,8 @@ def _if_convert(fn: Function) -> None:
 
 def compile_function(fn: Function, verbose: bool = False,
                      ptxas_meta: dict = None, sm_version: int = 120,
-                     enable_dce: bool = False) -> bytes:
+                     enable_dce: bool = False,
+                     error_on_unimplemented: bool = False) -> bytes:
     """
     Compile a single PTX function/kernel to a cubin.
 
@@ -1040,6 +1041,7 @@ def compile_function(fn: Function, verbose: bool = False,
         _next_pred=alloc.num_pred,
         sm_version=sm_version,
         _aggressive_imad_imm=enable_dce,  # fuzzer path uses IMAD.IMM+NOP for large imm
+        _error_on_unimplemented=error_on_unimplemented,
     )
     ctx._addr_scratch_lo = _addr_scratch_base  # dedicated addr pair: R(base):R(base+1)
     # FG26 UR4 start is applied below, after _setp_only_params detection.

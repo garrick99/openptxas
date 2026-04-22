@@ -2522,6 +2522,13 @@ class ISelContext:
     sm_version: int = 120
     # Whether the kernel contains VOTE instructions (for SM_120 rule #25)
     _has_vote: bool = False
+    # When True, the unimplemented-PTX fallback raises NotImplementedError
+    # instead of emitting a NOP placeholder.  Fail-closed for fuzzer/factory
+    # paths: silent NOP substitution has produced a stream of 'theirs_correct'
+    # miscompiles (add.cc/addc and siblings) that were really just "we don't
+    # support this" — the differ should see compile_err_ours, not garbage
+    # output.  Default off for corpus compatibility.
+    _error_on_unimplemented: bool = False
 
     def _alloc_literal(self, value: int) -> int:
         """Return the c[0] byte offset for a 32-bit literal constant.
@@ -6164,12 +6171,17 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     output.extend(_select_sust(instr, ctx))
 
                 else:
-                    # Unrecognized PTX instruction — emit NOP placeholder
+                    # Unrecognized PTX instruction.
+                    msg = (f'unimplemented PTX instruction: {instr.op} '
+                           f'{".".join(instr.types)} {instr.mods}')
+                    if getattr(ctx, '_error_on_unimplemented', False):
+                        # Fail-closed: raise so the caller sees a real compile
+                        # error instead of a silent NOP that produces garbage
+                        # at runtime.  Fuzzer/factory path sets this.
+                        raise NotImplementedError(msg)
                     import sys as _sys
-                    print(f'WARNING: unimplemented PTX instruction: {instr.op} '
-                          f'{".".join(instr.types)} {instr.mods}', file=_sys.stderr)
-                    output.append(_nop(f'WARNING: unimplemented PTX instruction: {instr.op} '
-                                       f'{".".join(instr.types)} {instr.mods}'))
+                    print(f'WARNING: {msg}', file=_sys.stderr)
+                    output.append(_nop(f'WARNING: {msg}'))
 
             except ISelError as e:
                 # Emit NOP with error comment rather than crashing

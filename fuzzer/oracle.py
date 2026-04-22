@@ -53,9 +53,13 @@ def compile_ours(ptx: str):
         # vary family signatures; without DCE, regalloc reuses a physical
         # reg across dead+live writes and the hardware zeroes the live
         # value (SHIFT_BOUNDARY / SIGN_FLIP_CHAIN bug classes).
+        # error_on_unimplemented: fail-closed on unsupported PTX so the
+        # differ classifies it as compile_err_ours instead of silently
+        # NOPing the op and producing a 'theirs_correct' miscompile.
         cubin = compile_function(parse(ptx).functions[0],
                                   verbose=False, sm_version=120,
-                                  enable_dce=True)
+                                  enable_dce=True,
+                                  error_on_unimplemented=True)
         return cubin, None
     except Exception as e:
         return None, f'{type(e).__name__}: {e}'

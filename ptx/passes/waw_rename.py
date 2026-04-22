@@ -29,7 +29,7 @@ between the two writes.
 """
 from __future__ import annotations
 
-from ..ir import Function, Module, RegOp, MemOp
+from ..ir import Function, Module, RegOp, MemOp, RegDecl
 
 
 def _uses_of(inst) -> set[str]:
@@ -75,6 +75,24 @@ def _substitute_reads(inst, old: str, new: str):
         inst.pred = new
 
 
+def _type_of_reg(fn: Function, name: str):
+    """Return the TypeSpec of a declared register, or None."""
+    for rd in fn.reg_decls:
+        if name in rd.names:
+            return rd.type
+    return None
+
+
+def _add_reg_decl(fn: Function, new_name: str, old_name: str):
+    """Register a freshly-created vreg with the function's reg_decls so
+    regalloc sees it during allocation."""
+    typ = _type_of_reg(fn, old_name)
+    if typ is None:
+        return
+    # Use a count=1 direct-name declaration so `.names` returns [new_name].
+    fn.reg_decls.append(RegDecl(type=typ, name=new_name.lstrip('%'), count=1))
+
+
 def run_function(fn: Function) -> int:
     """Split multi-write vregs.  Returns number of renames applied."""
     # Collect all instructions in order, noting which basic block.
@@ -114,6 +132,10 @@ def run_function(fn: Function) -> int:
             # Rename this write's dest
             target = all_insts[write_idx]
             target.dest = RegOp(name=new_name)
+
+            # Register the new vreg with the function's declarations so
+            # regalloc allocates a phys GPR for it.
+            _add_reg_decl(fn, new_name, name)
 
             # Rewrite all reads of `name` from this point forward, up until
             # the next write of `name` (exclusive).  Find next write index.

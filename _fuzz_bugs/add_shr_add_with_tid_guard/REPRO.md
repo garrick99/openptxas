@@ -105,6 +105,35 @@ Candidate approaches:
 Option (a) is most faithful to ptxas but requires careful label-map
 surgery. Option (c) is the smallest diff.
 
+### Attempted option (c), REVERTED 2026-04-22
+
+Implemented in `sass/pipeline.py` gated on `_fg26_ur4_start && not
+has_bar_in_body && not _skip_ur4 && predicated_exit_present` — insert
+a second `LDCU.64 UR4, c[0][0x358]` right after the `@Px EXIT`, with
+label_map / _bra_fixups adjusted for the +1 instruction.
+
+Result on the minimal repro: **works** — OURS and THEIRS byte-
+identical for the 32-lane canonical input. Corpus health: **144/144
+GPU PASS preserved**, BYTE_EXACT count unchanged at 50, but 16
+CTRL_ONLY kernels moved to STRUCTURAL (extra instruction counted as
+a structural divergence from ptxas).
+
+Factory 60s smoke, however, regressed: 15 divergences → **48** (+33
+new `theirs_correct` programs). These are random-fuzz kernels that
+previously produced correct output and now miscompile with the reload
+in place. Mechanism suspected: the inserted LDCU shifts the
+misc-counter progression for the rest of the body, moving downstream
+ALU ops into scoreboard misc-values that interact badly with specific
+RAW chains the simpler corpus kernels don't exercise.
+
+Net regression on the fuzz surface — reverted.
+
+Next attempt should probably be **option (a)** (move + slot-counter
+reset). Preserving the single-LDCU structure ptxas uses avoids
+perturbing misc-counter alignment on kernels that already compile
+correctly. The label_map surgery is the cost; it should be scoped
+narrowly to labels in the (mem_desc_orig_pos, exit_pos] range.
+
 ## Regression test
 
 Once fixed: `PTX_FILE=_fuzz_bugs/add_shr_add_with_tid_guard/minimal.ptx

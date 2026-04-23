@@ -1,0 +1,30 @@
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry fuzz(.param .u64 p_in, .param .u64 p_out, .param .u32 n) {
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<8>;
+    .reg .pred %p<6>;
+    mov.u32 %r0, %tid.x;
+    ld.param.u64 %rd0, [p_in];
+    cvt.u64.u32 %rd1, %r0;
+    shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    ld.global.u32 %r3, [%rd2];
+    shfl.sync.up.b32 %r11, %r0, 1, 0x1f, -1;
+    xor.b32 %r19, %r0, %r11;
+    shfl.sync.idx.b32 %r12, %r19, 0, 0x1f, -1;
+    or.b32 %r10, %r0, %r0;
+    min.u32 %r19, %r11, %r0;
+    shfl.sync.bfly.b32 %r10, %r0, 4, 0x1f, -1;
+    xor.b32 %r13, %r12, %r19;
+    shfl.sync.down.b32 %r9, %r10, 4, 0x1f, -1;
+    shfl.sync.up.b32 %r6, %r19, 2, 0x1f, -1;
+    setp.lt.u32 %p2, %r3, %r0;
+    vote.sync.ballot.b32 %r14, %p2, -1;
+    ld.param.u64 %rd3, [p_out];
+    add.u64 %rd4, %rd3, %rd1;
+    st.global.u32 [%rd4], %r14;
+    ret;
+}

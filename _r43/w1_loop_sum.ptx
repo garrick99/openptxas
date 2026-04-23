@@ -1,0 +1,22 @@
+
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry w1_loop_sum(.param .u64 p_out, .param .u32 n) {
+    .reg .u32 %r<8>; .reg .u64 %rd<3>; .reg .pred %p0, %p1;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    // sum = 0; for i in 0..7: sum += tid
+    mov.u32 %r2, 0;
+    mov.u32 %r3, 0;
+LOOP:
+    add.u32 %r2, %r2, %r0;
+    add.u32 %r3, %r3, 1;
+    setp.lt.u32 %p1, %r3, 8;
+    @%p1 bra LOOP;
+    cvt.u64.u32 %rd1, %r0; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r2;
+    ret;
+}

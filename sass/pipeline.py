@@ -1416,6 +1416,7 @@ def compile_function(fn: Function, verbose: bool = False,
             for bra_idx, target_label in ctx._bra_fixups
         ]
 
+
     # WB-8: LDCU.128 param packing.
     #
     # Replace pairs of LDCU.64 instructions whose:

@@ -1,0 +1,36 @@
+.version 9.0
+.target sm_120
+.address_size 64
+
+.visible .entry fuzz(.param .u64 p_in, .param .u64 p_out, .param .u32 n) {
+    .reg .b32 %r<32>;
+    .reg .b64 %rd<16>;
+    .reg .pred %p<8>;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n];
+    setp.ge.u32 %p0, %r0, %r1;
+    @%p0 ret;
+    ld.param.u64 %rd0, [p_in];
+    cvt.u64.u32 %rd1, %r0;
+    shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    ld.global.u32 %r3, [%rd2];
+    cvt.u64.u32 %rd14, %r3;
+    shl.b64 %rd9, %rd14, 16;
+    max.s32 %r9, %r3, 8;
+    shr.s32 %r23, %r9, 0;
+    mad.lo.s32 %r8, %r23, %r23, %r23;
+    cvt.s64.s32 %rd6, %r23;
+    xor.b32 %r12, %r9, %r23;
+    min.s32 %r19, %r9, %r23;
+    shr.u32 %r23, %r23, 15;
+    max.u32 %r24, %r12, 2;
+    or.b32 %r4, %r9, %r3;
+    shr.s64 %rd7, %rd6, 32;
+    cvt.s32.s64 %r16, %rd6;
+    shr.u32 %r12, %r4, 15;
+    ld.param.u64 %rd3, [p_out];
+    add.u64 %rd4, %rd3, %rd1;
+    st.global.u32 [%rd4], %r12;
+    ret;
+}

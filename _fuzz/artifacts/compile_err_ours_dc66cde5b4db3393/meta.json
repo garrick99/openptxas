@@ -1,0 +1,8 @@
+{
+  "seed": 748759254,
+  "family": "alu_int",
+  "err": "AssertionError: k=79 out of range (SHF shift amount)",
+  "hits": 1,
+  "first_seen": 1776783406,
+  "last_seen": 1776783406
+}

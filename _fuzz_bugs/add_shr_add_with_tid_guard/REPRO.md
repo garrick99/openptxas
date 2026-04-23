@@ -134,6 +134,69 @@ perturbing misc-counter alignment on kernels that already compile
 correctly. The label_map surgery is the cost; it should be scoped
 narrowly to labels in the (mem_desc_orig_pos, exit_pos] range.
 
+### Attempted option (a), DOES NOT FIX THE REPRO
+
+Implemented as a pop+insert that relocates the mem-desc `LDCU.64 UR4`
+from s2r_pos to right after the `@Px EXIT`, with `label_map` and
+`_bra_fixups` shifted for instructions in the (mem_desc, exit] range.
+
+SASS post-move looks correct by inspection — moved LDCU.64 gets
+`wdep=0x35` (scoreboard's `@Px EXIT` handling resets `_ldcu_slot_counter`,
+so the post-EXIT LDCU.64 gets the descriptor slot fresh). The pre-EXIT
+LDCU.64 for p_in also gets slot `0x35` (as the first overall LDCU.64),
+so slot 0x35 has dual posters — but LDG/STG consumers should wait for
+both to drain, which is correct-and-slow.
+
+**But**: 32/32 lanes come back unwritten on the sentinel test. The
+store doesn't fire. The working option (c) attempt (which keeps the
+preamble mem-desc AND adds a reload) works on the same SASS, so
+something in having-exactly-one-LDCU-64-UR4 is structurally different
+from having-two.
+
+Leading hypothesis: when the preamble LDCU.64 is absent, UR5 (the
+high half of the mem-desc pair) is undefined between S2R and the
+moved LDCU.64. The `LDCU UR4, n` between them writes only UR4 (low),
+so nothing sets UR5 before the move point. Even though the moved
+LDCU.64 does set UR5 later, there may be a scoreboard-tracking gap
+where UR5's prior-undefined state propagates into some latched
+dependency the rbar on later consumers doesn't cover. The dual-LDCU
+arrangement of option (c) initializes UR5 early and keeps the
+invariant that "UR5 always holds mem_desc_hi once the preamble
+completes" unbroken.
+
+### Attempted option (c) narrowed, REGRESSION PERSISTS
+
+Added a narrowing gate to option (c): only insert the post-EXIT
+reload when the body actually contains `LDCU UR4` (the 32-bit load
+that performs the clobber). Hypothesis: maybe some FG26-admitted
+kernels don't actually have n live in UR4 at runtime, and the
+unconditional reload was breaking them.
+
+Narrowed fix: minimal repro still passes (0/32 unwritten), fuzz smoke
+still regresses by the same +33 programs. So the regression isn't
+caused by irrelevant kernels — it's the same LDCU-UR4-in-body kernel
+shape that the fix targets, producing now-different output.
+
+### Remaining options
+
+The fix probably can't live at "insert after EXIT" — the scoreboard
+perturbation is too broad. Real fix likely needs one of:
+
+1. **UR allocator**: when FG26 admits AND the body will have a post-
+   EXIT `desc[UR4]` memory op, allocate `n` to a different UR (UR6+)
+   so UR4 is never clobbered. Costs BYTE_EXACT parity with ptxas on
+   those kernels but avoids the clobber entirely.
+2. **LDCU slot assignment**: when the mem-desc LDCU.64 and p_in
+   LDCU.64 both pre-date the EXIT, force p_in to slot `0x31`/`0x33`
+   instead of `0x35` (break the rotation rule for this pattern).
+   Would require `_wdep_for_opcode` awareness of whether the current
+   LDCU.64 is the "canonical descriptor" vs a "param".
+3. **Study ptxas's exact emission path** for this family — ptxas
+   gets it right with a single LDCU.64 mem-desc post-EXIT, so the
+   scoreboard interaction must work. Comparing the full ctrl-byte
+   sequence ptxas emits vs what OpenPTXas emits in option (a) should
+   identify the missing scoreboard bit.
+
 ## Regression test
 
 Once fixed: `PTX_FILE=_fuzz_bugs/add_shr_add_with_tid_guard/minimal.ptx

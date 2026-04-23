@@ -281,34 +281,140 @@ def _bfi_b32(a: int, b: int, pos: int, length: int) -> int:
     return _u32((_u32(b) & ~mask) | ((_u32(a) << pos) & mask))
 
 
+def _exec_shfl(op: str, operands: list, states: list,
+                preds_per_lane: list, pred_reg, neg_pred, n: int) -> None:
+    """Handle shfl.sync.{bfly,up,down,idx}.b32 across the warp.
+
+    PTX: ``shfl.sync.<mode>.b32 d, a, b, c, membermask`` —
+
+    - ``d``, ``a``: 32-bit registers (dest / source-value)
+    - ``b``: shift/mask/index operand (register or imm)
+    - ``c``: clamp + segmentation.  Low 5 bits = clamp; we treat higher
+      bits as "full warp" for now (our fuzz kernels pass 0x1f).
+    - ``membermask``: active lane bitmask; ignored here (assume all active).
+
+    ``d[L] := a[src_lane]`` when the source lane is valid for the mode,
+    else ``d[L] := a[L]`` (no exchange).  The predicate-output variant
+    ``d|%p`` raises Unsupported; we don't emit kernels that need it yet.
+    """
+    if len(operands) != 5:
+        raise Unsupported(op + '  (expected d, a, b, c, mask)')
+    parts = op.split('.')
+    if len(parts) != 4 or parts[1] != 'sync' or parts[3] != 'b32':
+        raise Unsupported(op)
+    mode = parts[2]
+    if mode not in ('bfly', 'up', 'down', 'idx'):
+        raise Unsupported(op)
+
+    d_reg = operands[0]
+    if '|' in d_reg:
+        raise Unsupported(op + '  (predicate-output form)')
+    a_tok, b_tok, c_tok = operands[1], operands[2], operands[3]
+
+    def _eval_in(tok: str, lane: int) -> int:
+        k, v = _parse_reg(tok)
+        if k in ('r', 'rd'): return _u32(states[lane].get(tok, 0))
+        return _u32(v)
+
+    # Snapshot source values BEFORE any writes — a warp-wide shfl reads
+    # every lane's pre-shuffle ``a`` simultaneously.
+    a_vals = [_eval_in(a_tok, L) for L in range(n)]
+
+    for L in range(n):
+        # Honor per-lane predication (same semantics as other ops).
+        if pred_reg is not None:
+            pv = preds_per_lane[L].get(pred_reg, False)
+            if neg_pred == '!': pv = not pv
+            if not pv: continue
+        b = _eval_in(b_tok, L) & 0x1F
+        c = _eval_in(c_tok, L)
+        clamp = c & 0x1F
+        if mode == 'bfly':
+            src = L ^ b
+            valid = src < n
+        elif mode == 'up':
+            src = L - b
+            # Lane L reads from L-b only if (L-b) >= clamp_lo derived from c;
+            # for canonical c=0x1f, clamp_lo = 0 → src >= 0 is the test.
+            valid = src >= 0
+        elif mode == 'down':
+            src = L + b
+            # For canonical c=0x1f, clamp_hi = 31 → src <= 31 is the test.
+            valid = src < n and src <= clamp
+        else:  # idx
+            src = b
+            valid = src < n
+        states[L][d_reg] = a_vals[src] if valid else a_vals[L]
+
+
 def simulate(ptx: str, inputs: bytes) -> bytes:
     """Run the body on each of the 32 input u32 words; return 128 output bytes.
+
+    Line-outer loop so warp-level ops (shfl.sync) can read every lane's
+    register snapshot at the instant they execute.  Per-lane ops are
+    dispatched in the inner loop and mutate their lane's state dict.
 
     Raises Unsupported if any body instruction is outside the handled subset.
     """
     body, out_reg = _split_body(ptx)
     n = len(inputs) // 4
     out = bytearray(n * 4)
+    states = [{'%r3': struct.unpack_from('<I', inputs, lane*4)[0],
+                '%rz': 0, '%rZ': 0} for lane in range(n)]
+    preds_per_lane = [{} for _ in range(n)]
 
-    for lane in range(n):
-        r3 = struct.unpack_from('<I', inputs, lane*4)[0]
-        state = {'%r3': r3, '%rz': 0, '%rZ': 0}
-        preds = {}
-        for line in body:
-            s = line.strip()
-            if not s or s.startswith('//'):
-                continue
-            m = _INSTR_RE.match(s)
-            if not m:
-                continue
-            neg_pred, pred_reg, op, args = m.group(1), m.group(2), m.group(3), m.group(4)
-            # Predication: skip if predicate not satisfied
+    for line in body:
+        s = line.strip()
+        if not s or s.startswith('//'):
+            continue
+        m = _INSTR_RE.match(s)
+        if not m:
+            continue
+        neg_pred, pred_reg, op, args = m.group(1), m.group(2), m.group(3), m.group(4)
+        operands = [x.strip() for x in args.split(',')]
+
+        # Warp-level op — reads pre-shuffle state across all lanes.
+        if op.startswith('shfl.sync.'):
+            _exec_shfl(op, operands, states, preds_per_lane, pred_reg, neg_pred, n)
+            continue
+
+        # vote.sync.ballot.b32 d, pred_src, mask —
+        # Each lane's d gets the same 32-bit mask where bit L = pred[L].
+        # Inactive (membermask) lanes and predicated-off lanes contribute 0.
+        if op == 'vote.sync.ballot.b32':
+            if len(operands) != 3: raise Unsupported(op)
+            d_reg = operands[0]
+            pred_src = operands[1].lstrip('!')
+            pred_neg = operands[1].startswith('!')
+            # Build the mask by reading each lane's predicate value.
+            mask = 0
+            for L in range(n):
+                pv = preds_per_lane[L].get(pred_src, False)
+                if pred_neg: pv = not pv
+                # Honor outer predication (@%pX vote.sync...): only lanes
+                # where the guard is TRUE contribute.
+                if pred_reg is not None:
+                    g = preds_per_lane[L].get(pred_reg, False)
+                    if neg_pred == '!': g = not g
+                    if not g: continue
+                if pv: mask |= (1 << L)
+            # Write to all active lanes; skip predicated-off lanes' dest.
+            for L in range(n):
+                if pred_reg is not None:
+                    g = preds_per_lane[L].get(pred_reg, False)
+                    if neg_pred == '!': g = not g
+                    if not g: continue
+                states[L][d_reg] = _u32(mask)
+            continue
+
+        for lane in range(n):
+            state = states[lane]
+            preds = preds_per_lane[lane]
+            # Predication: skip if predicate not satisfied for this lane.
             if pred_reg is not None:
                 pv = preds.get(pred_reg, False)
                 if neg_pred == '!': pv = not pv
                 if not pv: continue
-            # Split args by commas
-            operands = [x.strip() for x in args.split(',')]
 
             if op in ('mov.u32', 'mov.b32'):
                 d = operands[0]
@@ -649,5 +755,7 @@ def simulate(ptx: str, inputs: bytes) -> bytes:
             # Anything else: bail
             raise Unsupported(op)
 
-        struct.pack_into('<I', out, lane*4, _u32(state.get(out_reg, 0)))
+    # All lines evaluated — emit each lane's output register.
+    for lane in range(n):
+        struct.pack_into('<I', out, lane*4, _u32(states[lane].get(out_reg, 0)))
     return bytes(out)

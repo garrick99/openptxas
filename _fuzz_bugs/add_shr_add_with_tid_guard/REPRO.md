@@ -208,6 +208,37 @@ this kernel shape.  Next step: extend the regalloc to route p_out
 to an LDCU.64 when `addr_pair_colocated && !_fg26_ur4_start`
 (symmetric preamble loads for both address-pair params).
 
+### RESOLVED (2026-04-23): R22 WB-8 exemption
+
+Root cause of the secondary stride-8 bug: PTXAS-R22 in `regalloc.py`
+forced misaligned u64 params (c[0][0x388], not 16-byte aligned)
+into `direct_ldc_params` fallback — emitting body `LDC.64 R4, c[0][0x388]`
+instead of preamble `LDCU.64 UR10`.  Consumer `IADD3 R2 = R4 + R2`
+then raced the LDC.64 scoreboard, reading R4's stale pre-LDC value
+(`p_in + tid*4` from the earlier LDG address) and producing
+stride-8 writes to `p_in + tid*8`.
+
+R22 was originally added to defend against an alleged IADD.64 R-UR
+ILLEGAL_ADDRESS for misaligned LDCU.64 + UR address arithmetic.
+But GPU-verified on RTX 5090 with our WB-8 pipeline, the defense is
+over-conservative: when the misaligned param has an aligned u64
+partner 8 bytes below (canonical case: `in` at 0x380 + `out` at
+0x388), both can stay UR-bound and produce correct hardware
+behavior.  ptxas itself uses this path (LDCU.128 from 0x380 or
+paired LDCU.64s), confirming the shape is sound.
+
+**Fix** (`sass/regalloc.py`, PTXAS-R22 WB-8 exemption): skip
+`_r22_misaligned_addr_arith_params` addition for misaligned offsets
+that have an aligned u64 partner at (offset - 8).  The param stays
+UR-bound, preamble emits LDCU.64 UR10, address arithmetic uses
+`IADD.64 R-UR` (opcode 0xc35) — same shape ptxas uses.  The
+matching test `test_misaligned_u64_param_feeds_addr_arith_routes_to_ldc64`
+updated to accept either LDCU.64 or LDC.64 for the misaligned slot
+(both functionally correct post-exemption).
+
+Validation: minimal.ptx 32/32 lanes correct, openptxas 795 pytest
+pass (same 2 pre-existing failures), opencuda 88/88 GPU E2E pass.
+
 ### Remaining options
 
 The fix probably can't live at "insert after EXIT" — the scoreboard

@@ -360,7 +360,29 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
                 if _poff is None:
                     continue
                 if _poff % 16 != 0:
-                    _r22_misaligned_addr_arith_params.add(_src.name)
+                    # PTXAS-R22 WB-8 exemption: if this misaligned param has
+                    # an aligned u64 partner at (_poff - 8) (i.e. they form
+                    # an adjacent pair with the lower offset 16-byte aligned),
+                    # WB-8 packing will coalesce their LDCU.64s into a single
+                    # LDCU.128 at the aligned base offset.  The hardware load
+                    # then comes from an aligned address and R22's
+                    # ILLEGAL_ADDRESS concern does not apply.  Leaving the
+                    # param UR-bound is therefore safe AND avoids the LDC.64
+                    # scoreboard race that fired with the LDC direct fallback
+                    # (observed: _fuzz_bugs/add_shr_add_with_tid_guard —
+                    # STG address read R4 before LDC.64 completed, producing
+                    # p_in + tid*8 stride-8 writes instead of p_out + tid*4).
+                    _partner_off = _poff - 8
+                    _has_aligned_partner = (
+                        _partner_off >= 0
+                        and _partner_off % 16 == 0
+                        and any(
+                            _off == _partner_off
+                            for _off in _r22_param_offsets.values()
+                        )
+                    )
+                    if not _has_aligned_partner:
+                        _r22_misaligned_addr_arith_params.add(_src.name)
 
     ur_param_regs: set[str] = set()
     # PTXAS-R23C: default empty dead-load set for non-SM_120 paths (see below).

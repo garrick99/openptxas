@@ -236,7 +236,22 @@ MUL_RR_KERNEL = """\
 
 
 def test_mul_rr_compiles():
-    """mul.lo with two computed GPRs compiles to IMAD.WIDE (0x225) — 0x2a4 is broken on SM_120."""
+    """mul.lo with two computed GPRs compiles via IMAD R-R-R (0x224).
+
+    History: the isel used to route mul.lo R-R through IMAD.WIDE + MOV
+    under the assumption that all R-R IMADs were broken on SM_120.
+    That was only true for 0x2a4 (encode_imad_rr); 0x224 (encode_imad,
+    R-R-R multiply-add) is ptxas-proven correct and produces the
+    32-bit low-half product in one instruction.  The two-instruction
+    WIDE+MOV sequence miscompiled fuzzer divergence 48b8e19c
+    (`R4*R7(=0)` → MOV → `R6*R5(=0)` → MOV → min.s32): the final
+    min returned 64 instead of 0 despite every intermediate being
+    mathematically zero.
+
+    Required shape now: 0x224 (IMAD) present, 0x2a4 (broken) absent.
+    0x225 (IMAD.WIDE) is NOT required for mul.lo R-R — still used
+    for mul.wide and the mul.lo + cvt.u64.u32 fusion peephole.
+    """
     results = compile_ptx_source(MUL_RR_KERNEL)
     cubin = results["mul_rr"]
     assert cubin[:4] == b'\x7fELF'
@@ -244,7 +259,7 @@ def test_mul_rr_compiles():
     text = elf.section_data('.text.mul_rr')
     opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
                for off in range(0, len(text), 16)]
-    assert 0x225 in opcodes, "IMAD.WIDE (0x225) not found — mul.lo R-R needs WIDE fallback"
+    assert 0x224 in opcodes, "IMAD (0x224) not found — mul.lo R-R lowering regressed"
     assert 0x2a4 not in opcodes, "IMAD.RR (0x2a4) found — this opcode is broken on SM_120"
 
 

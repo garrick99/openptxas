@@ -3645,20 +3645,24 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         output.append(SassInstr(encode_imad_ur(d, b, ur_tmp, RZ),
                             f'IMAD R{d}, R{b}, UR{ur_tmp}, RZ  // mul.lo.{typ}'))
                     else:
-                        # IMAD R-R (0x2a4) is BROKEN on SM_120 but IMAD.WIDE R-R
-                        # (0x225) works. Use WIDE to get the full 64-bit product,
-                        # then take only the low 32 bits (dest register).
-                        # IMAD.WIDE writes dest AND dest+1, so allocate a scratch
-                        # for the high word to avoid clobbering live registers.
-                        t = _alloc_gpr(ctx)
-                        if t % 2 != 0:
-                            t = _alloc_gpr(ctx)  # even-align for pair
-                        _alloc_gpr(ctx)  # reserve t+1
-                        output.append(SassInstr(encode_imad_wide_rr(t, a, b, RZ),
-                            f'IMAD.WIDE R{t}, R{a}, R{b}, RZ  // mul.lo.{typ} R-R via WIDE'))
-                        if t != d:
-                            output.append(SassInstr(encode_mov(d, t),
-                                f'MOV R{d}, R{t}  // mul.lo result'))
+                        # IMAD R-R-R (0x224) is the ptxas-faithful mul.lo lowering
+                        # on SM_120.  The variant at 0x2a4 (encode_imad_rr) is
+                        # broken — tested and reverted previously — but 0x224
+                        # works and produces the correct 32-bit low-half product
+                        # in one instruction, matching ptxas ground truth
+                        # (mul.lo.s32 R-R → IMAD R, R, R, RZ / opcode 0x224).
+                        #
+                        # Historical note: this path used to fall back to
+                        # IMAD.WIDE + MOV via `encode_imad_wide_rr(t, a, b, RZ)`
+                        # plus `MOV R{d}, R{t}`.  That two-instruction sequence
+                        # miscompiled fuzzer divergence 48b8e19c
+                        # (mul chain `R4*R7(=0)` → MOV → `R6*R5(=0)` → MOV →
+                        # min.s32(R7, 64)): the final min returned 64 instead
+                        # of 0 despite every intermediate being mathematically
+                        # zero.  Switching to the single-instruction 0x224
+                        # form matches ptxas exactly and produces 0.
+                        output.append(SassInstr(encode_imad(d, a, b, RZ),
+                            f'IMAD R{d}, R{a}, R{b}, RZ  // mul.lo.{typ} R-R'))
 
                 elif op == 'mul' and 'lo' in instr.types and typ in ('u64', 's64', 'b64'):
                     # mul.lo.u64 d, a, b = lower 64 bits of a * b

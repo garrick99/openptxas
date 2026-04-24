@@ -1,86 +1,136 @@
 # OpenPTXas
 
-**Open-source PTX assembler. Real cubins. Real GPU. Correct output.**
+**Open-source PTX assembler. Real cubins. Real GPU. GPU-verified.**
 
 Compiles PTX into executable cubins for **SM_120 Blackwell** GPUs. Full pipeline: parse, register allocate, instruction select, schedule, scoreboard, ELF emit, GPU execute.
 
-**No ptxas. No nvcc. Just Python.**
+**No ptxas. No nvcc. Pure Python.**
 
-## The Proof
+## What's Proven
 
-PTX compiled to working SM_120 cubins using only open-source Python tools.
+GPU-verified on RTX 5090 (Blackwell SM_120), zero ptxas fallback anywhere in the pipeline:
 
-**386 tests. Zero failures. Zero xfails.** GPU-verified on RTX 5090:
+| Signal | Number |
+|--------|-------:|
+| Pytest (parser, isel, scoreboard, encoders, codegen, regressions) | **904 / 904 pass** |
+| 144-kernel frontier (byte-classified vs ptxas 13.0) | **50 BYTE_EXACT / 78 STRUCTURAL / 16 MIXED** |
+| 7-kernel benchmark suite (all correctness-verified) | **geomean 1.017× vs ptxas**, SAXPY **1.71×** |
+| Pair with [OpenCUDA](https://github.com/garrick99/opencuda) (CUDA C → PTX) GPU E2E | **88 / 88 pass** |
+| SASS encoder coverage | **183 encoders / 108 unique SM_120 opcodes** |
 
-| Category | Tests | What it covers |
-|----------|------:|----------------|
-| Transcendentals | 7 | sin, cos, ex2, lg2, rsqrt, rcp, sqrt |
-| Arithmetic | 8 | SAXPY, dot product, mul.hi, mul.wide, div.u32, neg/abs, u64 add |
-| Comparison | 4 | setp 6-way s32, fsetp lt/gt, int min/max, float min/max |
-| Memory | 5 | warp reduce (shfl), atomics (or/min/max), 5-pointer deferred params |
-| Control flow | 3 | divergent branch, vote.ballot, predicated store |
-| Conversion | 3 | cvt u32/f32 roundtrip, f16/f32, div.approx |
-| Bitwise | 2 | brev/popc/clz/bfind chain, XOR |
-| FP64 | 1 | dmul + dadd chain |
-| Hazard rules | 15 | LDCU latency, ALU RAW, ISETP-BRA gap, scoreboard barriers |
-| Integration | 51 | Phase 1-6, CVT encoders, bugfix regressions, TMA, fsetp pred |
-| Non-GPU | 287 | Encoders, parser, pipeline, scoreboard, regalloc, roundtrip |
+"STRUCTURAL" means valid SASS that differs in instruction layout from ptxas (e.g. we pack LDCU.128 where ptxas uses two LDCU.64s). "MIXED" is where OURS and ptxas both produce correct SASS with a mix of register-only and control-byte-only byte diffs. Every kernel in all three buckets produces correct GPU output.
 
-SAXPY: **1.48x faster** than ptxas. All benchmarks at parity or better.
+## Benchmarks (RTX 5090, SM_120)
 
-### With [OpenCUDA](https://github.com/garrick99/opencuda): full CUDA C pipeline
+| Kernel | OpenPTXas | NVIDIA ptxas | Ratio | Status |
+|--------|----------:|-------------:|------:|--------|
+| vecadd | 1625.7 GB/s | 1624.9 GB/s | 1.00× | PASS |
+| **saxpy** | **1685.4 GB/s** | **985.9 GB/s** | **1.71×** | PASS |
+| memcpy | 1519.7 GB/s | 1517.8 GB/s | 1.00× | PASS |
+| scale | 1773.9 GB/s | 1814.9 GB/s | 0.98× | PASS |
+| stencil | 1578.3 GB/s | 1668.4 GB/s | 0.95× | PASS |
+| relu | 1801.3 GB/s | 1837.2 GB/s | 0.98× | PASS |
+| fma_chain | 10396 GFLOPS | 14346 GFLOPS | 0.72× | PASS |
+
+Geomean: **1.017×** of ptxas across 7 kernels. All outputs byte-correct against ptxas reference.
+
+`fma_chain` is our one known-behind kernel (documented single-instruction gap in `vecadd_large`-class scoreboard modeling, deferred to WB-11B).
+
+## The Full Stack
 
 ```
-CUDA C source (.cu)
-    |  OpenCUDA (Python)
-    v
-PTX assembly
-    |  OpenPTXas (Python)
-    v
+Forge (.fg)                      ← formally-verified systems language
+   │
+   │  Z3 proof discharge + C99/CUDA C emission
+   ▼
+CUDA C (.cu)
+   │
+   │  OpenCUDA — CUDA C → PTX (Python compiler)
+   ▼
+PTX (.ptx)
+   │
+   │  OpenPTXas — PTX → SASS → cubin (Python assembler)
+   ▼
 SM_120 cubin (ELF binary)
-    |  cuModuleLoad + cuLaunchKernel
-    v
-RTX 5090 GPU --> correct results
+   │
+   │  cuModuleLoad + cuLaunchKernel
+   ▼
+RTX 5090 GPU — correct output, matching hand-written CUDA
 ```
 
-No NVIDIA compiler involved at any stage.
+No NVIDIA compiler is invoked at any stage. The Forge → OpenCUDA → OpenPTXas toolchain has landed tiled matmul, 2D stencil, tiled convolution, warp-shuffle reductions, and multi-block atomics — all with Z3-discharged proofs and GPU-verified correctness on RTX 5090.
+
+## Differential Fuzzer
+
+`openptxas/fuzzer/` is a grammar-based differential fuzzer. It emits random well-typed PTX, compiles through both OpenPTXas and ptxas, runs both on GPU, and flags divergences. Three families:
+
+| Family | Focus | Divergence rate (fresh 1-min campaign) |
+|--------|-------|---------------------------------------:|
+| `alu_int` | integer ALU, carry chains, shifts, mul.wide | ~10% |
+| `bitmanip` | bfe, bfi, popc, clz, brev, prmt | ~12% |
+| `warp` | shfl, vote, ballot | ~18% |
+
+The fuzzer is **self-filtering**: a strengthened well-formedness check in both the generator and oracle rejects PTX with undefined-register reads, so every flagged divergence is a real miscompile (OpenPTXas-side or ptxas-side), not noise. Closed miscompiles in recent campaigns:
+
+- `vote.sync.{any,all}.pred` with predicate-destination (was `KeyError` in isel)
+- `bfi.b32` with `c + len > 32` (spec-unspecified; now matches ptxas's pass-through)
+- `shl.b64` with `K ≥ 64` after IR constant-folding of chained shifts
+- `mul.lo R-R` via single IMAD (0x224) instead of IMAD.WIDE + MOV
+- `mul.lo + cvt.u64` 8-bit immediate truncation in IMAD.WIDE peephole
+- UIADD (0x835) narrowed to `_sr_source`-only (was admitting unsafe LDG-address-derived shapes)
+- `sub.f32` / `setp.gt.f32` operand-order inversion (FADD negate-flag misnomer)
+- Multi-ret basic block miscompile (`_sink_param_loads` placing `ld.param.u64` after trailing `bra`)
+- UR4 clobber (FG26 admission + R22 WB-8 exemption chain, 4-attempt saga documented in `_fuzz_bugs/add_shr_add_with_tid_guard/REPRO.md`)
+- Predicate allocation now uses linear-scan liveness: dead predicates post-`@P EXIT` are correctly reused, matching ptxas
+
+Every fix is committed with a reproducer and GPU-verified before landing.
 
 ## ptxas Gets It Wrong
 
-On RTX 5090, NVIDIA's ptxas 13.0 miscompiles a PTX subtract pattern:
+Differential testing found a miscompile in **NVIDIA's own ptxas 13.0** on RTX 5090:
 
 ```
 Kernel:   (x << 8) - (x >> 56)
 Input:    0x0123456789ABCDEF
 
-ptxas 13.0    0x23456789ABCDEF01  WRONG
-OpenPTXas     0x23456789ABCDEEFF  CORRECT
+ptxas 13.0    0x23456789ABCDEF01   WRONG
+OpenPTXas     0x23456789ABCDEEFF   CORRECT
 ```
 
-Verified over 500,000 iterations. Same kernel, same GPU, same input.
+Verified over 500,000 iterations. Same kernel, same GPU, same input. Reproducer + NVIDIA dossier in `_nvidia_bugs/`.
+
+Additional ptxas bugs surfaced by the stack (dossiered, pre-disclosure):
+- `bfe.s32` out-of-range shift constant fold
+- LOP3 + SHF commutator bug
+- Hypervisor IOMMU BSOD chain (system-crash-class, not submitted)
 
 ## Quick Start
 
 ```bash
 git clone https://github.com/garrick99/openptxas
 cd openptxas
-python demo.py                      # compile + run vector_add on GPU
-python tests/run_all.py             # 386 tests (GPU-isolated)
-pytest tests/ -x -q                 # non-GPU tests only
+python demo.py                                   # compile + run vector_add on GPU
+python benchmarks/run_all.py                     # benchmark vs ptxas
+python scripts/health.py --frontier-only         # classify 144 kernels
+python workbench.py status                       # leaderboard
+python workbench.py kdiff --kernel reduce_sum    # side-by-side SASS diff vs ptxas
+python -m fuzzer.loop run --families alu_int --minutes 1  # differential fuzz
 ```
+
+Pure Python 3.11+. No external dependencies beyond NVIDIA driver (for execution) and optional `ptxas` (for differential comparison).
 
 ## What's Inside
 
-| Stage | Description |
-|-------|-------------|
-| **Parser** | Recursive descent PTX parser to IR |
-| **RegAlloc** | Linear scan with liveness, safe eviction |
-| **ISel** | PTX to SASS instruction selection (183 encoders, 108 unique opcodes) |
-| **Scheduler** | LDG latency hiding, LDCU.64 hoisting |
-| **Scoreboard** | Automated rbar/wdep/misc generation (bitmask-based) |
-| **Emitter** | Full ELF cubin with .nv.info, .nv.capmerc, .nv.merc |
-
-Pure Python 3.11+. No dependencies.
+| Stage | File | Description |
+|-------|------|-------------|
+| Parser | `ptx/parser.py` | Recursive descent PTX → IR |
+| Regalloc | `sass/regalloc.py` | Linear-scan liveness with safe eviction, predicate reuse |
+| Isel | `sass/isel.py` | PTX → SASS selection, 183 encoders, 108 unique opcodes |
+| Scheduler | `sass/schedule.py` | LDG latency hiding, LDCU.64 hoisting |
+| Scoreboard | `sass/scoreboard.py` | Automated rbar/wdep/misc generation (bitmask-based) |
+| Emitter | `sass/pipeline.py` | Full ELF cubin with `.nv.info`, `.nv.capmerc`, `.nv.merc` |
+| Workbench | `workbench.py` | CLI dashboard: run, status, show, kdiff, explore, history, diff |
+| Fuzzer | `fuzzer/` | Grammar-based differential fuzz with well-formedness filter |
 
 ## SM_120 Blackwell Discoveries
 
@@ -88,55 +138,64 @@ Reverse-engineered during development. Not documented publicly elsewhere:
 
 | Discovery | Detail |
 |-----------|--------|
-| **rbar is a bitmask** | OR-combine barrier waits: bit1=LDC, bit2=LDS, bit3=LDG |
-| **IMAD R-R (0x2a4) broken** | Produces garbage. Use IMAD.WIDE (0x225) or IMAD R-UR (0xc24) |
-| **ISETP corrupts FSETP** | Both R-R and R-UR variants clobber subsequent FSETP output |
+| **rbar is a bitmask** | OR-combine barrier waits: bit 1 = LDC, bit 2 = LDS, bit 3 = LDG |
+| **IMAD R-R-R (0x224) works, (0x2a4) broken** | The `encode_imad_rr` (0x2a4) variant silently produces wrong results; (0x224) R-R-R is ptxas-verified |
+| **ISETP corrupts FSETP state** | Both R-R and R-UR variants clobber subsequent FSETP output |
 | **FSEL.step (0x80a)** | Combined float compare+select avoids ISETP/FSETP interaction |
-| **S2R is asynchronous** | Requires wdep=0x31 scoreboard tracking |
+| **S2R is asynchronous** | Requires `wdep=0x31` scoreboard tracking |
 | **SM_120 uses predicated execution** | No BRA-based warp divergence; ptxas if-converts everything |
-| **Capmerc DRM system** | 0x5a universal ptxas signature authenticates register metadata |
-| **Literal pool broken** | Driver doesn't init .nv.constant0 beyond params; all immediates inline |
-| **LDG shares single scoreboard slot** | All LDG instructions use wdep=0x35; slot 0x37 has no rbar bit |
+| **Capmerc DRM signature** | 0x5a universal ptxas signature authenticates register metadata |
+| **Literal pool is broken** | Driver doesn't init `.nv.constant0` beyond params; all immediates must inline |
+| **LDG shares one scoreboard slot** | All LDG instructions use `wdep=0x35`; slot 0x37 has no rbar bit |
 | **BAR.SYNC resets scoreboard state** | Pending writes must be cleared after barrier; stale deps corrupt post-barrier LDC |
 | **DADD/DMUL/DFMA use b1=0x72** | The b1=0x7e/0x7c forms (from decode_sass.py) silently produce wrong results |
 | **LOP3 reads 3 source registers** | b3, b4, b8 all tracked for dependency; missing b4/b8 causes stale-data hazards |
 | **DADD src1 at b8, not b4** | Unlike DMUL/DFMA, DADD places second operand at byte 8 |
 | **UR cache leaks across launches** | Uniform register bank retains stale values across cuModuleLoad; ~20+ loads corrupt LDCU.64 |
-| **SEL barrier race** | SEL predicate read shares ALU wdep slot; intermediate ALU clears barrier before pred ready |
+| **SEL barrier race** | SEL predicate read shares ALU wdep slot; intermediate ALU can clear barrier before pred ready |
 | **FMNMX pred encoding** | b10=0x80 (not 0xfe); b11=0x03 for min (PT), 0x07 for max (!PT) |
+| **UIADD (0x835) dual-write** | Writes both R[dest] and UR[dest] simultaneously; only safe when source is ctaid/ntid SR-derived |
+| **`bfi.b32` spec ambiguity** | For `c + len > 32`, ptxas passes `b` through unchanged (unspecified per spec) |
+| **IMAD.WIDE imm is 8 bits** | `encode_imad_wide` b4 silently masks to 8 bits; larger multipliers must use another path |
 
-## Instruction Coverage (108 unique opcodes, 183 encoders)
+## Instruction Coverage
 
-All encoders byte-verified against ptxas 13.0 on SM_120. 99 GPU-verified on RTX 5090.
+108 unique SM_120 opcodes, 183 encoders. All byte-verified against ptxas 13.0; 99 GPU-verified on RTX 5090.
 
 | Category | Instructions |
 |----------|-------------|
 | Integer | IADD3, IMAD, IMAD.WIDE, IMAD.SHL, IADD.64, IABS, LEA, IMNMX, IDP (dp4a) |
 | Float | FADD, FMUL, FFMA, FSEL.step, FMNMX, FSWZADD, DADD, DMUL, DFMA, DSETP |
 | Transcendentals | MUFU (RCP, SQRT, RSQ, SIN, COS, EX2, LG2) |
-| Shifts/Bits | SHF (L/R, U32/U64/S32, HI/LO, const/var), LOP3, POPC, BREV, FLO, BMSK, SGXT, PRMT |
+| Shifts / Bits | SHF (L/R, U32/U64/S32, HI/LO, const/var), LOP3, POPC, BREV, FLO, BMSK, SGXT, PRMT |
 | Comparison | ISETP (6 modes), FSETP (8 modes), DSETP (unordered), VIMNMX |
-| Memory | LDG/STG (32/64-bit), LDS/STS, LDC/LDCU, LDSM |
+| Memory | LDG / STG (32/64-bit), LDS / STS, LDC / LDCU (32/64/128), LDSM |
 | Atomics | ATOMG (ADD, MIN, MAX, EXCH, CAS.32, CAS.64, ADD.F32) |
 | Async copy | LDGSTS (cp.async), LDGDEPBAR, DEPBAR.LE |
 | TMA | UBLKCP (bulk copy), UTMALDG (tensor 1D/2D), UTMASTG, UTMACMDFLUSH |
 | Mbarrier | SYNCS.EXCH (init), SYNCS.ARRIVE, SYNCS.TRYWAIT |
-| Warp | SHFL (4 modes), VOTE (BALLOT/ALL/ANY), REDUX (SUM/MIN/MAX), MATCH (ANY/ALL), NANOSLEEP |
+| Warp | SHFL (4 modes), VOTE (BALLOT / ALL / ANY — with pred or GPR dest), REDUX (SUM / MIN / MAX), MATCH (ANY / ALL), NANOSLEEP |
 | Texture | TEX, TLD.LZ, TLD4, TXQ, SULD, SUST |
-| Type convert | I2F (u32/s32), F2I (u32/s32), F2F (f32↔f64), F2FP (f16↔f32), I2IP |
+| Type convert | I2F (u32/s32), F2I (u32/s32), F2F (f32 ↔ f64), F2FP (f16 ↔ f32), I2IP |
 | Predicates | P2R, R2P, PLOP3 |
-| Uniform | UMOV, UIADD3, UISETP, USEL, UFSETP, UFMUL, ULEA |
-| Cluster | UCGABAR (arrive/wait), MEMBAR.ALL.GPU |
+| Uniform | UMOV, UIADD (0x835), UIADD3, UISETP, USEL, UFSETP, UFMUL, ULEA |
+| Cluster | UCGABAR (arrive / wait), MEMBAR.ALL.GPU |
 | Control | MOV, NOP, EXIT, BRA, BRA.U, CALL.REL, RET.REL, S2R, S2UR, ELECT |
 | Barriers | BAR.SYNC, BAR.RED.OR, ERRBAR, CGAERRBAR, B2R, CCTL |
-| Tensor cores | HMMA (BF16/TF32), IMMA (INT8), DMMA (FP64), QMMA (FP8 E4M3/E5M2) |
-| Capmerc/DRM | Fully automatic from SASS, 0x5a universal signature confirmed |
+| Tensor cores | HMMA (BF16 / TF32), IMMA (INT8), DMMA (FP64), QMMA (FP8 E4M3 / E5M2) |
+| Capmerc / DRM | Fully automatic from SASS, 0x5a universal signature confirmed |
 
 ## Requirements
 
 - Python 3.11+
 - NVIDIA GPU + CUDA driver (for execution)
-- NVIDIA ptxas (optional, for validation only)
+- NVIDIA ptxas (optional, for differential validation and fuzzing only)
+
+## Design
+
+No dependencies. No plugins. One Python package. Everything is readable source — parser, regalloc, isel, scheduler, scoreboard, encoders, emitter. No C extensions, no LLVM, no MLIR.
+
+Every instruction encoder has a byte-exact ground-truth comment pinned from ptxas 13.0 output. Every scoreboard opcode has its misc/wdep/rbar documented with kernel-level provenance. Every architectural discovery has a reproducer.
 
 ## License
 

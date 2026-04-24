@@ -3246,7 +3246,20 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         # stays as before.
                         _ur_safe = (_src0_name is not None
                                     and _src0_name in ctx._reg_ur_safe_src)
-                        if ((_sr_source is not None or _ur_safe)
+                        # UIADD (0x835) writes BOTH R[dest] and UR[dest]
+                        # simultaneously.  Per the encoder's ground-truth
+                        # note, ptxas only emits it on a *specific* shape
+                        # where the source is SR-derived (ctaid/ntid) and
+                        # preceded by the R38/R39 NOP gap.  The UI03
+                        # _ur_safe tag broadened admission to include
+                        # LDG results reached through an SR-derived
+                        # address chain — but fuzzer divergence 1bd4ed97
+                        # proved that case unsafe: UIADD R5, R6, 0x7 on
+                        # a tid-derived LDG output produced garbage and
+                        # the stored r21*r5 became r21*19 (constant 19
+                        # across all lanes).  Narrow UIADD admission
+                        # back to pure _sr_source only.
+                        if (_sr_source is not None
                                 and ctx.sm_version == 120
                                 and not getattr(ctx, '_has_vote', False)
                                 and not getattr(ctx, '_has_bar_sync', False)):

@@ -3546,7 +3546,16 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                     and isinstance(_ni.srcs[0], RegOp)
                                     and _ni.srcs[0].name == instr.dest.name):
                                 _next_cvt = _ni
-                        if _next_cvt is not None and imm > 0 and imm <= 0xFFFF:
+                        # IMAD.WIDE encodes the multiplier as 8 bits only
+                        # (b4 of the instruction).  encode_imad_wide masks
+                        # with & 0xFF, so passing imm > 0xFF silently
+                        # truncates — e.g. 256 & 0xFF = 0 produces
+                        # `IMAD.WIDE R, R, 0x0, RZ` which multiplies by
+                        # zero.  Gate the fusion on the 8-bit range.
+                        # Fuzzer divergence 033db108 reproduced this:
+                        # `mul.lo.s32 %r16, %r3, 256; cvt.s64.s32 ...`
+                        # OURS wrote (r3 * 0) instead of (r3 * 256).
+                        if _next_cvt is not None and 0 < imm <= 0xFF:
                             # Fuse: emit IMAD.WIDE Rd_lo, src, imm, RZ
                             d_lo = ctx.ra.lo(_next_cvt.dest.name)
                             output.append(SassInstr(

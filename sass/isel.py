@@ -936,14 +936,25 @@ def _select_shl_b64(instr: Instruction, ra: RegAlloc,
             SassInstr(encode_shf_l_u64_hi(d_hi, s_lo, k, s_hi),
                       f'SHF.L.U64.HI R{d_hi}, R{s_lo}, 0x{k:x}, R{s_hi}  // {dest.name}.hi'),
         ]
-    else:
-        # K >= 32: result.hi = src.lo << (K-32), result.lo = 0
+    elif k < 64:
+        # 32 <= K < 64: result.hi = src.lo << (K-32), result.lo = 0
         k32 = k - 32
         return [
             SassInstr(encode_iadd3(d_lo, RZ, RZ, RZ),
                       f'MOV R{d_lo}, RZ  // shl.b64 lo = 0 (K>={k})'),
             SassInstr(encode_shf_l_u32(d_hi, s_lo, k32),
                       f'SHF.L.U32 R{d_hi}, R{s_lo}, 0x{k32:x}, RZ  // shl.b64 hi'),
+        ]
+    else:
+        # K >= 64: shift by 64+ on a 64-bit value produces 0.  Both
+        # halves are zero.  (The IR optimizer can fold chained shifts
+        # like `shl(shl(x, 4), 62)` into a single shl(x, 66), so k
+        # reaches this branch from fuzzer-generated patterns.)
+        return [
+            SassInstr(encode_iadd3(d_lo, RZ, RZ, RZ),
+                      f'MOV R{d_lo}, RZ  // shl.b64 lo = 0 (K={k} >= 64)'),
+            SassInstr(encode_iadd3(d_hi, RZ, RZ, RZ),
+                      f'MOV R{d_hi}, RZ  // shl.b64 hi = 0 (K={k} >= 64)'),
         ]
 
 

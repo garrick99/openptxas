@@ -6151,11 +6151,25 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     # bfi.b32 d, a, b, start, len
                     #   d = (b & ~shifted_mask) | ((a << start) & shifted_mask)
                     # Requires constant start and len (most common case).
+                    #
+                    # PTX spec: if start + len > 32, the result is unspecified.
+                    # Empirically (GPU-verified) ptxas returns b unchanged for
+                    # the OOR case (it folds the entire bfi to a pass-through).
+                    # Match that behavior — copy b to d — so OURS and ptxas
+                    # agree on the unspecified-range shape.  Fuzzer bitmanip
+                    # generated these OOR patterns (e.g. c=23, d=32 ⇒ c+d=55)
+                    # and divergence was a spec-edge-case artifact, not a
+                    # real miscompile of well-formed PTX.
                     d  = ctx.ra.r32(instr.dest.name)
                     a  = ctx.ra.r32(instr.srcs[0].name) if isinstance(instr.srcs[0], RegOp) else RZ
                     b  = ctx.ra.r32(instr.srcs[1].name) if isinstance(instr.srcs[1], RegOp) else RZ
                     start = instr.srcs[2].value if len(instr.srcs) > 2 and isinstance(instr.srcs[2], ImmOp) else 0
                     count = instr.srcs[3].value if len(instr.srcs) > 3 and isinstance(instr.srcs[3], ImmOp) else 32
+                    if start + count > 32:
+                        output.append(SassInstr(
+                            encode_mov(d, b),
+                            f'MOV R{d}, R{b}  // bfi OOR (c+d>32) — ptxas passes b through'))
+                        continue
                     raw_mask  = (1 << count) - 1 if count < 32 else 0xFFFFFFFF
                     shifted_mask     = (raw_mask << start) & 0xFFFFFFFF
                     not_shifted_mask = (~shifted_mask) & 0xFFFFFFFF

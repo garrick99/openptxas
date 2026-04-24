@@ -1256,31 +1256,19 @@ def compile_function(fn: Function, verbose: bool = False,
     _fg26_te10_blocked = (_has_vote_shfl
                           or _r56_has_bar
                           or getattr(ctx, '_has_bar_sync', False))
-    # PTXAS-R57: @Px ret guard + FG26 = UR4 clobber.  When the kernel
-    # has a predicated ret/exit guard and FG26 would put the setp
-    # param in UR4, the preamble LDCU.64 UR4 (mem desc) has already
-    # landed before the body's `LDCU UR4, <param>` overwrites it.
-    # Body memory ops that read `desc[UR4]` after the exit see
-    # the param value instead of the mem desc → illegal address,
-    # every lane writes zero (repro:
-    # `_fuzz_bugs/add_shr_add_with_tid_guard/minimal.ptx`).
-    # ptxas avoids this by emitting the mem-desc LDCU.64 AFTER the
-    # @Px EXIT, but our preamble insertion is pinned pre-body, and
-    # relocating it post-exit breaks the LDCU slot-rotation scoreboard
-    # invariant (see REPRO.md for both prior attempts).  Structurally
-    # avoid the clobber by refusing FG26 admission under this shape —
-    # the setp param falls back to UR6, UR4 stays on mem desc.
-    # Cost: some kernels lose BYTE_EXACT parity with ptxas (they become
-    # STRUCTURAL) but stay functionally correct.
-    _fg26_pred_ret_blocked = any(
-        getattr(inst, 'op', None) == 'ret'
-        and getattr(inst, 'pred', None) is not None
-        for bb in fn.blocks for inst in bb.instructions
-    )
+    # PTXAS-R57 (original): refused FG26 admission when the kernel had
+    # any @Px ret guard, because an earlier partial fix for the UR4
+    # clobber sat on that gate.  That gate is now redundant — the real
+    # fix lives in regalloc.py as the R22 WB-8 exemption (commit
+    # 75a4a054f5), which routes both u64 address-pair params through
+    # UR-bound LDCU when they form an aligned pair (so the descriptor
+    # LDCU.64 UR4 never clashes with a body `LDCU UR4, setp_param`).
+    # Removing the gate lets FG26 admit on kernels with @Px ret that
+    # don't actually trigger the clobber, matching ptxas's UR4-reuse
+    # layout on ~16 MIXED kernels and restoring BYTE_EXACT candidacy.
     if (alloc.addr_pair_colocated and _fg26_setp_ok
             and not _has_ctaid_ntid
-            and not _fg26_te10_blocked
-            and not _fg26_pred_ret_blocked):
+            and not _fg26_te10_blocked):
         ctx._next_ur = 4
         ctx._fg26_ur4_start = True
 
@@ -1681,6 +1669,35 @@ def compile_function(fn: Function, verbose: bool = False,
     # gap exists.  Applies to all ISETP flavors (IMM, R-UR, R-R) and any
     # @Pk consumer class (ALU, EXIT, etc.).
     _R48_ISETP_OPCS = {0x80c, 0xc0c, 0x20c}
+    # R48-skip: ptxas emits `ISETP → @P EXIT` back-to-back (no NOP) on
+    # kernels that only STORE after the EXIT — no post-EXIT LDG/LDS reads
+    # scoreboard-sensitive state.  On those, OURS's NOP becomes pure
+    # ctrl-byte noise vs ptxas (13 CTRL_ONLY kernels in the k100/k200/k300
+    # frontier).  On kernels that DO have a post-EXIT global/shared load
+    # (e.g. opencuda test_i2f's `LDG → I2FP → STG` tail), the NOP is
+    # required — skipping it makes I2FP read stale LDG scoreboard state
+    # and output garbage.
+    #
+    # Pre-scan the body AFTER any predicated EXIT: if a 0x981 (LDG.E) or
+    # 0x984 (LDS) appears, keep the NOP.  Otherwise skip it for positive-
+    # pred EXIT (@P0 EXIT, not @!P0 EXIT).
+    _EXIT_OPC = 0x94d
+    _BRA_OPC  = 0x947
+    _LDG_OPC  = 0x981
+    _LDS_OPC  = 0x984
+    _ATOM_OPC = 0x3a9  # ATOMG.CAS family — also scoreboard-sensitive
+    _has_post_exit_load = False
+    _seen_exit = False
+    for _sc_si in reordered:
+        _sc_opc = (_sc_si.raw[0] | (_sc_si.raw[1] << 8)) & 0xFFF
+        if not _seen_exit and _sc_opc == _EXIT_OPC:
+            _sc_guard = (_sc_si.raw[1] >> 4) & 0xF
+            if (_sc_guard & 0x7) != 0x7:  # predicated EXIT
+                _seen_exit = True
+                continue
+        if _seen_exit and _sc_opc in (_LDG_OPC, _LDS_OPC, _ATOM_OPC):
+            _has_post_exit_load = True
+            break
     _r48_patched = []
     for _i, _si in enumerate(reordered):
         _r48_patched.append(_si)
@@ -1691,9 +1708,19 @@ def compile_function(fn: Function, verbose: bool = False,
             continue
         _r48_pred_dst = (_si.raw[10] >> 1) & 0x7
         _r48_nxt = reordered[_i + 1]
+        _r48_nxt_opc = (_r48_nxt.raw[0] | (_r48_nxt.raw[1] << 8)) & 0xFFF
         _r48_nxt_guard = (_r48_nxt.raw[1] >> 4) & 0xF
         _r48_nxt_idx = _r48_nxt_guard & 0x7
         _r48_nxt_pred = _r48_nxt_idx != 0x7
+        _r48_nxt_neg = (_r48_nxt_guard & 0x8) != 0
+        # Skip NOP for positive-pred EXIT/BRA consumers WHEN no post-EXIT
+        # load appears in the body.
+        if (_r48_nxt_opc in (_EXIT_OPC, _BRA_OPC)
+                and _r48_nxt_pred
+                and _r48_nxt_idx == _r48_pred_dst
+                and not _r48_nxt_neg
+                and not _has_post_exit_load):
+            continue
         if _r48_nxt_pred and _r48_nxt_idx == _r48_pred_dst:
             _r48_patched.append(SassInstr(
                 _r38_encode_nop(),

@@ -13,7 +13,7 @@ GPU-verified on RTX 5090 (Blackwell SM_120), zero ptxas fallback anywhere in the
 | Signal | Number |
 |--------|-------:|
 | Pytest (parser, isel, scoreboard, encoders, codegen, regressions) | **904 / 904 pass** |
-| 144-kernel frontier (byte-classified vs ptxas 13.0) | **50 BYTE_EXACT / 78 STRUCTURAL / 16 MIXED** |
+| 144-kernel frontier (byte-classified vs ptxas 13.0) | **63 BYTE_EXACT / 78 STRUCTURAL / 3 MIXED** |
 | 7-kernel benchmark suite (all correctness-verified) | **geomean 1.06× vs ptxas**, SAXPY **1.72×** |
 | Pair with [OpenCUDA](https://github.com/garrick99/opencuda) (CUDA C → PTX) GPU E2E | **88 / 88 pass** |
 | SASS encoder coverage | **183 encoders / 108 unique SM_120 opcodes** |

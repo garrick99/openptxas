@@ -177,6 +177,37 @@ still regresses by the same +33 programs. So the regression isn't
 caused by irrelevant kernels — it's the same LDCU-UR4-in-body kernel
 shape that the fix targets, producing now-different output.
 
+### Attempted option (1) — FG26 disable under @Px ret (2026-04-23)
+
+Added `_fg26_pred_ret_blocked` gate to FG26 admission in
+`sass/pipeline.py`: when the kernel has any predicated `ret`
+instruction, FG26 is disabled so the setp param lands at UR6
+instead of UR4.  UR4 stays on mem desc; no clobber.
+
+SASS post-fix: UR4 correctly holds mem desc through the body.  LDG
+loads the right values. But the **store still lands at the wrong
+address with stride 8**: all lanes write to `p_in + tid*8` instead
+of `p_out + tid*4`.
+
+Secondary bug exposed: `/*0120*/ LDC.64 R4, c[0x388]` (loading p_out
+into GPR) is followed by `/*0130*/ IADD3 R2 = R4 + R2` whose rbar=0x03
+*should* wait for the LDC scoreboard slot, but IADD3 observes R4's
+pre-LDC value (which happens to be `p_in + tid*4` from the earlier
+LDG address computation at /*00b0*/ `IADD.64 R4, R2, UR8`). The
+stride-8 result is exactly `LDG_addr + tid*4 = p_in + tid*4 + tid*4`.
+
+So the FG26 fix is *correct* (UR4 clobber gone), but our post-EXIT
+`LDC.64 R4, c[0x388]` emission for p_out races its consumer.  ptxas
+sidesteps this entirely by packing p_in + p_out into an LDCU.128
+and using UR10 for the store address (no LDC.64 → GPR at all).
+
+Net: FG26 gate is left in place (it narrows the bug class and
+doesn't regress any tests — 795 pass, same 2 pre-existing failures),
+but the minimal repro still fails until p_out is also UR-bound in
+this kernel shape.  Next step: extend the regalloc to route p_out
+to an LDCU.64 when `addr_pair_colocated && !_fg26_ur4_start`
+(symmetric preamble loads for both address-pair params).
+
 ### Remaining options
 
 The fix probably can't live at "insert after EXIT" — the scoreboard

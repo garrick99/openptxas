@@ -1256,9 +1256,31 @@ def compile_function(fn: Function, verbose: bool = False,
     _fg26_te10_blocked = (_has_vote_shfl
                           or _r56_has_bar
                           or getattr(ctx, '_has_bar_sync', False))
+    # PTXAS-R57: @Px ret guard + FG26 = UR4 clobber.  When the kernel
+    # has a predicated ret/exit guard and FG26 would put the setp
+    # param in UR4, the preamble LDCU.64 UR4 (mem desc) has already
+    # landed before the body's `LDCU UR4, <param>` overwrites it.
+    # Body memory ops that read `desc[UR4]` after the exit see
+    # the param value instead of the mem desc → illegal address,
+    # every lane writes zero (repro:
+    # `_fuzz_bugs/add_shr_add_with_tid_guard/minimal.ptx`).
+    # ptxas avoids this by emitting the mem-desc LDCU.64 AFTER the
+    # @Px EXIT, but our preamble insertion is pinned pre-body, and
+    # relocating it post-exit breaks the LDCU slot-rotation scoreboard
+    # invariant (see REPRO.md for both prior attempts).  Structurally
+    # avoid the clobber by refusing FG26 admission under this shape —
+    # the setp param falls back to UR6, UR4 stays on mem desc.
+    # Cost: some kernels lose BYTE_EXACT parity with ptxas (they become
+    # STRUCTURAL) but stay functionally correct.
+    _fg26_pred_ret_blocked = any(
+        getattr(inst, 'op', None) == 'ret'
+        and getattr(inst, 'pred', None) is not None
+        for bb in fn.blocks for inst in bb.instructions
+    )
     if (alloc.addr_pair_colocated and _fg26_setp_ok
             and not _has_ctaid_ntid
-            and not _fg26_te10_blocked):
+            and not _fg26_te10_blocked
+            and not _fg26_pred_ret_blocked):
         ctx._next_ur = 4
         ctx._fg26_ur4_start = True
 

@@ -1,0 +1,48 @@
+.version 9.0
+.target sm_120
+.address_size 64
+
+// Minimal repro of a multi-ret basic block bug.
+// Each arm of the diamond ends in ret; there is no shared merge block.
+// ptxas compiles this correctly and GPU executes it.  OpenPTXas lowers
+// the same PTX but a sync_err=700 (ILLEGAL_ADDRESS) fires at launch.
+
+.visible .entry cond_test(
+    .param .u64 out, .param .u64 a, .param .f32 threshold, .param .s32 n)
+{
+    .reg .f32 %f<2>;
+    .reg .b32 %r<6>;
+    .reg .b64 %rd<3>;
+    .reg .pred %p<1>;
+
+    ld.param.u64 %rd0, [out];
+    ld.param.u64 %rd1, [a];
+    ld.param.f32 %f0, [threshold];
+    ld.param.s32 %r0, [n];
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mul.lo.u32 %r4, %r2, %r3;
+    add.u32 %r5, %r1, %r4;
+    setp.lt.s32 %p0, %r5, %r0;
+    @!%p0 ret;
+    cvt.u64.u32 %rd2, %r5;
+    shl.b64 %rd2, %rd2, 2;
+    add.u64 %rd1, %rd1, %rd2;
+    ld.global.f32 %f1, [%rd1];
+    setp.gt.f32 %p0, %f1, %f0;
+    @%p0 bra if_true_5;
+    bra if_false_6;
+if_true_5:
+    add.u64 %rd0, %rd0, %rd2;
+    ld.global.f32 %f0, [%rd1];
+    mul.f32 %f1, %f0, 0f40000000;
+    st.global.f32 [%rd0], %f1;
+    ret;
+if_false_6:
+    add.u64 %rd0, %rd0, %rd2;
+    ld.global.f32 %f0, [%rd1];
+    mul.f32 %f1, %f0, 0f3F000000;
+    st.global.f32 [%rd0], %f1;
+    ret;
+}

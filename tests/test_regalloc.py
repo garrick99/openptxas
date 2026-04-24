@@ -47,22 +47,33 @@ MIXED_PTX = """\
 def test_alloc_basic():
     """64-bit regs get pairs starting at R2, no coalescing.
 
-    FB-5.1: %rd0 (in_ptr) and %rd5 (out_ptr) are u64 ld.param vregs whose
-    only consumers are global memory MemOp.base loads/stores, so they are
-    classified as UR-bound and skipped from int_regs entirely.  The first
-    real GPR allocation is %rd1 (the LDG result).
+    FB-5.1 + PTXAS-R29.1 layering:
+      * %rd0 is the base of a *scalar* ld.global with zero offset.  R29.1
+        reclassifies such u64 params as ``direct_ldc_params`` — the body
+        emits ``LDC.64 R_pair`` straight into a GPR pair, which feeds
+        ``LDG.E desc[UR][R_pair.64]``.  So %rd0 DOES get a GPR
+        allocation (the LDC.64 target), and it also appears in
+        ``direct_ldc_params``.
+      * %rd5 is the base of a st.global (not ld.global) — R29.1's
+        ld-only filter doesn't apply.  FB-5.1's broader UR-bound
+        classification applies instead: st.global MemOp base is safe
+        for UR, so %rd5 is UR-bound and skipped from int_regs.
     """
     mod = parse(PROBE_PTX)
     fn = mod.functions[0]
     result = allocate(fn)
 
-    # %rd0 / %rd5 are UR-bound and have no GPR mapping
-    assert "%rd0" not in result.ra.int_regs
-    assert "%rd5" not in result.ra.int_regs
+    # %rd0: R29.1 direct_ldc_params — gets a GPR AND is in the set
+    assert "%rd0" in result.ra.int_regs
+    assert "%rd0" in result.direct_ldc_params
 
-    # %rd1 (first real allocation) lands at R2 (lo), R3 (hi)
-    assert result.ra.lo("%rd1") == 2
-    assert result.ra.hi("%rd1") == 3
+    # %rd5: UR-bound (st.global base, not R29.1 ld-only) — skipped from int_regs
+    assert "%rd5" not in result.ra.int_regs
+    assert "%rd5" not in result.direct_ldc_params
+
+    # %rd0 is allocated first (R2, R3 as the LDC.64 target pair)
+    assert result.ra.lo("%rd0") == 2
+    assert result.ra.hi("%rd0") == 3
 
 
 def test_alloc_param_offsets():

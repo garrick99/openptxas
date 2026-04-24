@@ -171,6 +171,16 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
                 bname = src.base if src.base.startswith('%') else f'%{src.base}'
                 used_regs.add(bname)
                 reg_last_use[bname] = idx
+        # Predicate-guard uses: `@%pN` or `@!%pN` on an instruction's
+        # pred field. These aren't in inst.srcs, so the above loop
+        # misses them — but they ARE real uses of the predicate vreg
+        # and must participate in liveness tracking so the pred
+        # allocator can reuse dead slots post-EXIT.
+        if inst.pred:
+            _pn = inst.pred.lstrip('@').lstrip('!')
+            if _pn.startswith('%'):
+                used_regs.add(_pn)
+                reg_last_use[_pn] = idx
 
     # === Dead-write redirection (narrow fix for the 0827506f-class clobber) ===
     # When a PTX vreg is written multiple times and a particular write has
@@ -270,13 +280,42 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
     next_pred = 0
     next_ur = 4
 
-    # Predicate allocation (simple sequential)
-    for rd in fn.reg_decls:
-        if rd.type.kind == ScalarKind.PRED:
-            for name in rd.names:
-                if name in used_regs:
-                    pred_regs[name] = next_pred
-                    next_pred += 1
+    # Predicate allocation — linear scan over liveness ranges so that
+    # predicates whose last use ends before a new predicate's first
+    # definition can share a physical slot.  Matches ptxas's pattern
+    # where `@Pn EXIT` (or `@Pn ret`) ends Pn's live range and the
+    # next setp reuses the same slot.
+    pred_names = [
+        name
+        for rd in fn.reg_decls
+        if rd.type.kind == ScalarKind.PRED
+        for name in rd.names
+        if name in used_regs
+    ]
+    # Sort by first definition (predicates with no def are kept in
+    # declaration order at the end so they don't steal low slots).
+    pred_names.sort(key=lambda n: reg_first_def.get(n, 10**9))
+    pred_free: list[int] = []  # free-list, lowest first
+    pred_active: list[tuple[int, str, int]] = []  # (last_use, name, phys_id)
+    for name in pred_names:
+        first = reg_first_def.get(name, 0)
+        # Release any active predicate whose last use ended strictly
+        # before this name's first definition.
+        still_active: list[tuple[int, str, int]] = []
+        for last, aname, phys in pred_active:
+            if last < first:
+                pred_free.append(phys)
+            else:
+                still_active.append((last, aname, phys))
+        pred_active = still_active
+        if pred_free:
+            pred_free.sort()
+            phys = pred_free.pop(0)
+        else:
+            phys = next_pred
+            next_pred += 1
+        pred_regs[name] = phys
+        pred_active.append((reg_last_use.get(name, first), name, phys))
 
     # SM_120: identify u64 param registers that will be loaded into UR via LDCU.64
     # and never require a GPR pair.  Two consumer classes qualify (FB-5.1):

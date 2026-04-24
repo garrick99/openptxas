@@ -5684,9 +5684,21 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             f'SHFL R{d}, R{a}, 0x{lane:x}, 0x{clamp:x}  // shfl.sync'))
 
                 elif op == 'vote':
-                    # PTX: vote.sync.ballot.b32 %rD, <pred>, <mask>
-                    # <pred> can be a predicate register (%p0..%p7) or immediate 0/1
-                    d = ctx.ra.r32(instr.dest.name)
+                    # PTX variants:
+                    #   vote.sync.ballot.b32 Rd, Ps, mask     — GPR dest, bitfield
+                    #   vote.sync.any.pred   Pd, Ps, mask     — predicate dest, any-lane
+                    #   vote.sync.all.pred   Pd, Ps, mask     — predicate dest, all-lanes
+                    # Pred-dest variants lowered via ballot + ISETP because
+                    # the direct VOTE.ANY/ALL-with-pred-dest opcode has a
+                    # pred_dest encoding we haven't enumerated for every P
+                    # slot.  The ballot+ISETP form uses only verified
+                    # encoders and maps cleanly:
+                    #   any.pred Pd, Ps → ballot(Ps) != 0
+                    #   all.pred Pd, Ps → ballot(!Ps) == 0  (== no lane has !Ps)
+                    _is_pred_dest = (isinstance(instr.dest, RegOp)
+                                     and instr.dest.name.startswith('%p'))
+                    _all_mode = ('all' in instr.types)
+
                     pred_num = 7   # default PT (always true)
                     pred_neg = False
                     if len(instr.srcs) >= 1:
@@ -5694,28 +5706,44 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         if isinstance(s0, RegOp):
                             if s0.name in ctx.ra.pred_regs:
                                 pred_num = ctx.ra.pred(s0.name) & 0x07
-                                # If the producing setp was inverted (e.g.
-                                # setp.lt → ISETP.GE with negated semantics),
-                                # the predicate value is logically inverted.
                                 if (hasattr(ctx, '_negated_preds')
                                         and pred_num in ctx._negated_preds):
                                     pred_neg = True
                             else:
                                 pred_num = 7
                         elif isinstance(s0, ImmOp):
-                            # imm 1 → PT (always true); imm 0 → !PT (always false)
                             if s0.value == 0:
-                                pred_num = 7
-                                pred_neg = True
+                                pred_num = 7; pred_neg = True
                             else:
-                                pred_num = 7
-                                pred_neg = False
+                                pred_num = 7; pred_neg = False
+
+                    # For all.pred, we ballot the *negation* of the source
+                    # (ballot(!Ps) == 0 iff every lane has Ps true).
+                    if _all_mode and _is_pred_dest:
+                        pred_neg = not pred_neg
+
                     pred_label = 'PT' if pred_num == 7 else f'P{pred_num}'
-                    if pred_neg:
-                        pred_label = '!' + pred_label
-                    output.append(SassInstr(
-                        encode_vote_ballot(d, pred_src=pred_num, neg=pred_neg),
-                        f'VOTE.ANY R{d}, PT, {pred_label}  // vote.sync.ballot'))
+                    disp_label = ('!' + pred_label) if pred_neg else pred_label
+
+                    if _is_pred_dest:
+                        # Ballot into a scratch GPR, then ISETP against RZ.
+                        r_tmp = _alloc_gpr(ctx)
+                        output.append(SassInstr(
+                            encode_vote_ballot(r_tmp, pred_src=pred_num, neg=pred_neg),
+                            f'VOTE.ANY R{r_tmp}, PT, {disp_label}  // vote.sync.{"all" if _all_mode else "any"}.pred step 1'))
+                        pd = ctx.ra.pred(instr.dest.name)
+                        cmp_op = ISETP_EQ if _all_mode else ISETP_NE
+                        cmp_lbl = 'EQ' if _all_mode else 'NE'
+                        output.append(SassInstr(
+                            encode_isetp(pd, r_tmp, RZ, cmp_op),
+                            f'ISETP.{cmp_lbl} P{pd}, R{r_tmp}, RZ  // vote.sync.{"all" if _all_mode else "any"}.pred step 2'))
+                        if hasattr(ctx, '_negated_preds'):
+                            ctx._negated_preds.discard(pd)
+                    else:
+                        d = ctx.ra.r32(instr.dest.name)
+                        output.append(SassInstr(
+                            encode_vote_ballot(d, pred_src=pred_num, neg=pred_neg),
+                            f'VOTE.ANY R{d}, PT, {disp_label}  // vote.sync.ballot'))
 
                 elif op == 'div' and typ == 'u32':
                     # Unsigned 32-bit division via Newton-Raphson reciprocal.

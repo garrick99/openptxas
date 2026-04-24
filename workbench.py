@@ -21,13 +21,19 @@ The workbench:
 
 Subcommands
 -----------
-  run       run a kernel or suite (current behavior)
-  list      list catalog and suites
-  show      kernel detail (stub — WB-12.2)
-  status    current leaderboard (stub — WB-12.1)
-  dump      side-by-side SASS dump (stub — WB-12.3)
-  history   metric history walk (stub — WB-12.4)
-  diff      diff two artifacts (stub — WB-12.5)
+  run          run a kernel or suite
+  list         list catalog and suites
+  status       snapshot of the latest suite_all artifact
+  show         drill into a single kernel record
+  dump         raw passthrough of a suite_all artifact
+  history      trend display across suite_all artifacts
+  diff         compare two suite_all artifacts
+  forge        forge-backed kernel runs (Forge → OpenPTXas → GPU)
+  explore      enumerate every kernel with last-known bucket + metrics
+  kdiff        one-shot compile + side-by-side SASS diff OURS vs PTXAS
+  leaderboard  alias for `status`
+
+WB-12.0..12.5 are live; 12.6+ = Forge backend, explore, kdiff (above).
 
 WB-0 is intentionally narrow: hardcoded catalog, no kernel editor, no
 GUI, no AI, no plugin system.  Each catalog entry just points at a PTX
@@ -3953,18 +3959,24 @@ def _cmd_forge_list(args):
 # forge_* artifacts for Forge-backed kernels.
 
 def _find_latest_kernel_record(results_dir: Path, kernel: str) -> dict | None:
-    """Find the most recent artifact that contains metrics for `kernel`.
+    """Find the most recent metrics for `kernel`, plus its last known
+    bucket from any compare-bearing artifact.
 
-    Search order (newest first):
-      1) per-kernel *_<kernel>.json single-kernel artifacts
-      2) *_suite_all.json artifacts whose kernels[] list includes the name
-    Returns a dict with fields {'bucket','regs','sass_total','sass_non_nop',
-    'source','timestamp'} or None.
+    The metrics come from the newest artifact (single-kernel or
+    suite_all or forge_run) that mentions this kernel.  The bucket is
+    pulled from the newest artifact that actually compared against
+    ptxas — single-kernel runs without --compare produce
+    NO_COMPARE on their own, which shadows real classifications from
+    prior suite_all runs.  We prefer the real bucket when available.
+
+    Returns a dict with fields {'bucket','regs','sass_total',
+    'sass_non_nop','source','timestamp'} or None.
     """
     if not results_dir.exists():
         return None
-    # Gather candidate files sorted by filename timestamp (newest first).
     candidates = sorted(results_dir.glob("*.json"), reverse=True)
+    metrics_record: dict | None = None
+    fallback_bucket: str | None = None
     for p in candidates:
         name = p.name
         try:
@@ -3974,28 +3986,9 @@ def _find_latest_kernel_record(results_dir: Path, kernel: str) -> dict | None:
         # Case 1: single-kernel artifact (schema WB-0)
         if data.get("kernel") == kernel:
             ours = data.get("ours") or {}
-            deltas = data.get("deltas") or {}
-            return {
-                "bucket":       data.get("bucket", "?"),
-                "regs":         ours.get("regs"),
-                "sass_total":   ours.get("sass_total"),
-                "sass_non_nop": ours.get("sass_non_nop"),
-                "source":       name,
-                "timestamp":    data.get("timestamp", ""),
-            }
-        # Case 2: suite_all artifact
-        if "kernels" in data and "ranking" in data:
-            for rec in data.get("kernels", []):
-                if rec.get("kernel") != kernel:
-                    continue
-                # Find bucket from ranking
-                bucket = "?"
-                for b, members in data.get("ranking", {}).items():
-                    if kernel in members:
-                        bucket = b
-                        break
-                ours = rec.get("ours") or {}
-                return {
+            bucket = data.get("bucket") or classify_kernel(data)
+            if metrics_record is None:
+                metrics_record = {
                     "bucket":       bucket,
                     "regs":         ours.get("regs"),
                     "sass_total":   ours.get("sass_total"),
@@ -4003,18 +3996,60 @@ def _find_latest_kernel_record(results_dir: Path, kernel: str) -> dict | None:
                     "source":       name,
                     "timestamp":    data.get("timestamp", ""),
                 }
+            if fallback_bucket is None and bucket and bucket != "NO_COMPARE":
+                fallback_bucket = bucket
+                break
+            continue
+        # Case 2: suite_all artifact
+        if "kernels" in data and "ranking" in data:
+            matched_rec = None
+            for rec in data.get("kernels", []):
+                if rec.get("kernel") == kernel:
+                    matched_rec = rec
+                    break
+            if matched_rec is None:
+                continue
+            bucket = "?"
+            for b, members in data.get("ranking", {}).items():
+                if kernel in members:
+                    bucket = b
+                    break
+            ours = matched_rec.get("ours") or {}
+            if metrics_record is None:
+                metrics_record = {
+                    "bucket":       bucket,
+                    "regs":         ours.get("regs"),
+                    "sass_total":   ours.get("sass_total"),
+                    "sass_non_nop": ours.get("sass_non_nop"),
+                    "source":       name,
+                    "timestamp":    data.get("timestamp", ""),
+                }
+            if fallback_bucket is None and bucket not in ("?", "NO_COMPARE"):
+                fallback_bucket = bucket
+                break
+            continue
         # Case 3: forge_run artifact
         if data.get("schema") == _FORGE_SCHEMA_VERSION and data.get("target") == kernel:
             ours = data.get("ours") or {}
-            return {
-                "bucket":       data.get("bucket", "NO_COMPARE"),
-                "regs":         ours.get("regs"),
-                "sass_total":   ours.get("sass_total"),
-                "sass_non_nop": ours.get("sass_non_nop"),
-                "source":       name,
-                "timestamp":    data.get("timestamp", ""),
-            }
-    return None
+            bucket = data.get("bucket", "NO_COMPARE")
+            if metrics_record is None:
+                metrics_record = {
+                    "bucket":       bucket,
+                    "regs":         ours.get("regs"),
+                    "sass_total":   ours.get("sass_total"),
+                    "sass_non_nop": ours.get("sass_non_nop"),
+                    "source":       name,
+                    "timestamp":    data.get("timestamp", ""),
+                }
+            if fallback_bucket is None and bucket and bucket != "NO_COMPARE":
+                fallback_bucket = bucket
+                break
+            continue
+    if metrics_record is None:
+        return None
+    if fallback_bucket and metrics_record.get("bucket") in (None, "?", "NO_COMPARE"):
+        metrics_record["bucket"] = fallback_bucket
+    return metrics_record
 
 
 def _cmd_explore(args):
@@ -4182,15 +4217,22 @@ def _cmd_kdiff(args):
 
 
 def _num_gprs(cubin: bytes, symbol: str) -> int | None:
-    """Best-effort GPR count for a kernel in a cubin via the pipeline's
-    helper (`analyze_cubin` returns it for OpenPTXas cubins but not for
-    PTXAS ones — in which case we fall back to scanning the text).
+    """GPR footprint for a kernel: the highest GPR index referenced in
+    the emitted SASS, plus one.  Matches what ``cubin_metrics`` (and
+    therefore the artifact's ``ours.regs`` field) reports.
+
+    Historical note: this used to return ``analyze_cubin().num_gprs``,
+    which reads byte 8 of the capmerc section.  That byte is NOT the
+    GPR count — for SM_120 the layout is different — and it coincided
+    with ``sass_non_nop`` on reduce_sum by pure accident (45 == 45)
+    making ``workbench kdiff`` show wrong register counts that
+    disagreed with ``workbench show``.  Using ``cubin_metrics`` keeps
+    kdiff and show consistent.
     """
     try:
-        info = analyze_cubin(cubin, kernel_name=symbol)
+        return cubin_metrics(cubin).get("regs")
     except Exception:
         return None
-    return info.get("num_gprs")
 
 
 def main():

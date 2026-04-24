@@ -14,7 +14,7 @@ GPU-verified on RTX 5090 (Blackwell SM_120), zero ptxas fallback anywhere in the
 |--------|-------:|
 | Pytest (parser, isel, scoreboard, encoders, codegen, regressions) | **904 / 904 pass** |
 | 144-kernel frontier (byte-classified vs ptxas 13.0) | **50 BYTE_EXACT / 78 STRUCTURAL / 16 MIXED** |
-| 7-kernel benchmark suite (all correctness-verified) | **geomean 1.017× vs ptxas**, SAXPY **1.71×** |
+| 7-kernel benchmark suite (all correctness-verified) | **geomean 1.06× vs ptxas**, SAXPY **1.72×** |
 | Pair with [OpenCUDA](https://github.com/garrick99/opencuda) (CUDA C → PTX) GPU E2E | **88 / 88 pass** |
 | SASS encoder coverage | **183 encoders / 108 unique SM_120 opcodes** |
 
@@ -24,17 +24,15 @@ GPU-verified on RTX 5090 (Blackwell SM_120), zero ptxas fallback anywhere in the
 
 | Kernel | OpenPTXas | NVIDIA ptxas | Ratio | Status |
 |--------|----------:|-------------:|------:|--------|
-| vecadd | 1625.7 GB/s | 1624.9 GB/s | 1.00× | PASS |
-| **saxpy** | **1685.4 GB/s** | **985.9 GB/s** | **1.71×** | PASS |
-| memcpy | 1519.7 GB/s | 1517.8 GB/s | 1.00× | PASS |
-| scale | 1773.9 GB/s | 1814.9 GB/s | 0.98× | PASS |
-| stencil | 1578.3 GB/s | 1668.4 GB/s | 0.95× | PASS |
-| relu | 1801.3 GB/s | 1837.2 GB/s | 0.98× | PASS |
-| fma_chain | 10396 GFLOPS | 14346 GFLOPS | 0.72× | PASS |
+| vecadd | 1626.3 GB/s | 1626.1 GB/s | 1.00× | PASS |
+| **saxpy** | **1723.9 GB/s** | **1000.9 GB/s** | **1.72×** | PASS |
+| memcpy | 1518.0 GB/s | 1516.9 GB/s | 1.00× | PASS |
+| scale | 1746.9 GB/s | 1746.5 GB/s | 1.00× | PASS |
+| stencil | 1599.0 GB/s | 1644.8 GB/s | 0.97× | PASS |
+| relu | 1744.4 GB/s | 1803.6 GB/s | 0.97× | PASS |
+| fma_chain | 13712 GFLOPS | 14352 GFLOPS | 0.96× | PASS |
 
-Geomean: **1.017×** of ptxas across 7 kernels. All outputs byte-correct against ptxas reference.
-
-`fma_chain` is our one known-behind kernel (documented single-instruction gap in `vecadd_large`-class scoreboard modeling, deferred to WB-11B).
+Geomean: **1.06×** of ptxas across 7 kernels. All outputs byte-correct against ptxas reference.
 
 ## The Full Stack
 

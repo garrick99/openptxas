@@ -81,7 +81,7 @@ _OPCODE_META: dict[int, _OpMeta] = {
     0x416: _OpMeta('PRMT.IMM.L', 1, 0x3e, 6),  # PRMT legacy imm-selector form — matches 0x816 behavior
     0x216: _OpMeta('PRMT.REG',   1, 0x3e, 6),  # PRMT reg-selector
     0x820: _OpMeta('FMUL.IMM',   1, 0x3e, 1),  # FMUL with 32-bit float immediate
-    0x823: _OpMeta('FFMA.IMM',   1, 0x00, 1),  # FFMA.IMM: wdep=0 (ptxas pattern)
+    0x823: _OpMeta('FFMA.IMM',   0, 0x00, 1),  # FFMA.IMM: wdep=0, min_gpr_gap=0 (matches plain FFMA; ptxas emits back-to-back with no NOPs)
     0x80a: _OpMeta('FSEL.STEP',  1, 0x3e, 5),  # Combined float compare+select (misc=5, ptxas-verified)
     0x235: _OpMeta('IADD.64',    1, 0x3e, 1),
     0xc35: _OpMeta('IADD.64-UR', 1, 0x3e, 5),  # misc=5 per hardware bisect 2026-03-25

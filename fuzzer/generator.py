@@ -58,7 +58,15 @@ def _pick(rnd, xs):
 
 
 def generate(seed: int, n_instrs: int = 14) -> tuple[str, int]:
-    """Produce one PTX source.  Returns (ptx_text, final_b32_reg_index)."""
+    """Produce one PTX source.  Returns (ptx_text, final_b32_reg_index).
+
+    live32 / live64 track registers that are UNCONDITIONALLY defined.
+    Registers defined only under a predicate (via @Pn prefix) are NOT
+    added to the live sets — reads of them from outside the guard would
+    return garbage on false-predicate lanes, producing spurious
+    OURS-vs-ptxas divergences that come from register-coloring disagreement
+    on undefined values, not real compiler bugs.
+    """
     rnd = random.Random(seed)
     live32 = [_LOAD_REG]
     live64 = []
@@ -67,13 +75,27 @@ def generate(seed: int, n_instrs: int = 14) -> tuple[str, int]:
     body: list[str] = []
     last_b32 = _LOAD_REG
 
-    def prefix():
+    def prefix() -> tuple[str, bool]:
+        """Return (prefix_str, is_predicated).  Callers use is_predicated
+        to decide whether adding dst to live32/live64 is safe: predicated
+        writes may not fire on every lane, so dst stays 'unsafe to read'
+        unless it was already unconditionally defined before."""
         nonlocal pending_pred
         if pending_pred is None:
-            return ''
+            return '', False
         pn, neg = pending_pred
         pending_pred = None
-        return f'@{"!" if neg else ""}%p{pn} '
+        return f'@{"!" if neg else ""}%p{pn} ', True
+
+    def _maybe_add_live32(dst: int, is_pred: bool):
+        """Add dst to live32 unless the write was predicated and dst was
+        not already unconditionally live."""
+        if not is_pred and dst not in live32:
+            live32.append(dst)
+
+    def _maybe_add_live64(dst: int, is_pred: bool):
+        if not is_pred and dst not in live64:
+            live64.append(dst)
 
     for _ in range(n_instrs):
         cat = rnd.random()
@@ -82,56 +104,63 @@ def generate(seed: int, n_instrs: int = 14) -> tuple[str, int]:
             op = _pick(rnd, _BIN_B32)
             dst = _pick(rnd, _REG_B32)
             a, b = _pick(rnd, live32), _pick(rnd, live32)
-            body.append(f'    {prefix()}{op} %r{dst}, %r{a}, %r{b};')
-            if dst not in live32: live32.append(dst)
-            last_b32 = dst
+            pfx, is_pred = prefix()
+            body.append(f'    {pfx}{op} %r{dst}, %r{a}, %r{b};')
+            _maybe_add_live32(dst, is_pred)
+            if not is_pred or dst in live32: last_b32 = dst
 
         elif cat < 0.42:  # b32 reg-imm
             op = _pick(rnd, _BIN_B32)
             dst = _pick(rnd, _REG_B32)
             a = _pick(rnd, live32)
             imm = _pick(rnd, _IMM32)
-            body.append(f'    {prefix()}{op} %r{dst}, %r{a}, {imm};')
-            if dst not in live32: live32.append(dst)
-            last_b32 = dst
+            pfx, is_pred = prefix()
+            body.append(f'    {pfx}{op} %r{dst}, %r{a}, {imm};')
+            _maybe_add_live32(dst, is_pred)
+            if not is_pred or dst in live32: last_b32 = dst
 
         elif cat < 0.52:  # b32 shift by constant
             op = _pick(rnd, _SHIFT_B32)
             dst = _pick(rnd, _REG_B32)
             a = _pick(rnd, live32)
             k = _pick(rnd, _SHIFT32)
-            body.append(f'    {prefix()}{op} %r{dst}, %r{a}, {k};')
-            if dst not in live32: live32.append(dst)
-            last_b32 = dst
+            pfx, is_pred = prefix()
+            body.append(f'    {pfx}{op} %r{dst}, %r{a}, {k};')
+            _maybe_add_live32(dst, is_pred)
+            if not is_pred or dst in live32: last_b32 = dst
 
         elif cat < 0.58:  # mad (3-op multiply-add)
             op = _pick(rnd, _MAD)
             dst = _pick(rnd, _REG_B32)
             a, b, c = _pick(rnd, live32), _pick(rnd, live32), _pick(rnd, live32)
-            body.append(f'    {prefix()}{op} %r{dst}, %r{a}, %r{b}, %r{c};')
-            if dst not in live32: live32.append(dst)
-            last_b32 = dst
+            pfx, is_pred = prefix()
+            body.append(f'    {pfx}{op} %r{dst}, %r{a}, %r{b}, %r{c};')
+            _maybe_add_live32(dst, is_pred)
+            if not is_pred or dst in live32: last_b32 = dst
 
         elif cat < 0.64:  # mul.wide (b32 x b32 -> b64) — classic signed-ext bug site
             op = _pick(rnd, _MULW)
             dst = _pick(rnd, _REG_B64)
             a, b = _pick(rnd, live32), _pick(rnd, live32)
-            body.append(f'    {prefix()}{op} %rd{dst}, %r{a}, %r{b};')
-            if dst not in live64: live64.append(dst)
+            pfx, is_pred = prefix()
+            body.append(f'    {pfx}{op} %rd{dst}, %r{a}, %r{b};')
+            _maybe_add_live64(dst, is_pred)
 
         elif cat < 0.72:  # b64 binary (bootstrap via cvt if live64 empty)
             if not live64:
                 d = _pick(rnd, _REG_B64)
                 src = _pick(rnd, live32)
                 cop = _pick(rnd, ['cvt.u64.u32', 'cvt.s64.s32'])
-                body.append(f'    {prefix()}{cop} %rd{d}, %r{src};')
-                live64.append(d)
+                pfx, is_pred = prefix()
+                body.append(f'    {pfx}{cop} %rd{d}, %r{src};')
+                _maybe_add_live64(d, is_pred)
             else:
                 op = _pick(rnd, _BIN_B64)
                 dst = _pick(rnd, _REG_B64)
                 a, b = _pick(rnd, live64), _pick(rnd, live64)
-                body.append(f'    {prefix()}{op} %rd{dst}, %rd{a}, %rd{b};')
-                if dst not in live64: live64.append(dst)
+                pfx, is_pred = prefix()
+                body.append(f'    {pfx}{op} %rd{dst}, %rd{a}, %rd{b};')
+                _maybe_add_live64(dst, is_pred)
 
         elif cat < 0.78:  # b64 shift
             if live64:
@@ -139,8 +168,9 @@ def generate(seed: int, n_instrs: int = 14) -> tuple[str, int]:
                 dst = _pick(rnd, _REG_B64)
                 a = _pick(rnd, live64)
                 k = _pick(rnd, _SHIFT64)
-                body.append(f'    {prefix()}{op} %rd{dst}, %rd{a}, {k};')
-                if dst not in live64: live64.append(dst)
+                pfx, is_pred = prefix()
+                body.append(f'    {pfx}{op} %rd{dst}, %rd{a}, {k};')
+                _maybe_add_live64(dst, is_pred)
 
         elif cat < 0.88:  # cvt bridge
             if live64 and rnd.random() < 0.5:
@@ -148,16 +178,18 @@ def generate(seed: int, n_instrs: int = 14) -> tuple[str, int]:
                 dst = _pick(rnd, _REG_B32)
                 src = _pick(rnd, live64)
                 cop = _pick(rnd, ['cvt.u32.u64', 'cvt.s32.s64'])
-                body.append(f'    {prefix()}{cop} %r{dst}, %rd{src};')
-                if dst not in live32: live32.append(dst)
-                last_b32 = dst
+                pfx, is_pred = prefix()
+                body.append(f'    {pfx}{cop} %r{dst}, %rd{src};')
+                _maybe_add_live32(dst, is_pred)
+                if not is_pred or dst in live32: last_b32 = dst
             else:
                 # 32 -> 64 widening (sign- or zero-extend)
                 dst = _pick(rnd, _REG_B64)
                 src = _pick(rnd, live32)
                 cop = _pick(rnd, ['cvt.u64.u32', 'cvt.s64.s32'])
-                body.append(f'    {prefix()}{cop} %rd{dst}, %r{src};')
-                if dst not in live64: live64.append(dst)
+                pfx, is_pred = prefix()
+                body.append(f'    {pfx}{cop} %rd{dst}, %r{src};')
+                _maybe_add_live64(dst, is_pred)
 
         elif cat < 0.95:  # setp -> predicate (don't predicate setp itself)
             pending_pred = None
@@ -184,9 +216,10 @@ def generate(seed: int, n_instrs: int = 14) -> tuple[str, int]:
                 dst = _pick(rnd, _REG_B32)
                 a, b = _pick(rnd, live32), _pick(rnd, live32)
                 pn = _pick(rnd, preds_set)
-                body.append(f'    {prefix()}selp.b32 %r{dst}, %r{a}, %r{b}, %p{pn};')
-                if dst not in live32: live32.append(dst)
-                last_b32 = dst
+                pfx, is_pred = prefix()
+                body.append(f'    {pfx}selp.b32 %r{dst}, %r{a}, %r{b}, %p{pn};')
+                _maybe_add_live32(dst, is_pred)
+                if not is_pred or dst in live32: last_b32 = dst
 
     # If we ended with a live64 result and never narrowed to b32, insert
     # a final cvt so the store has something to read.

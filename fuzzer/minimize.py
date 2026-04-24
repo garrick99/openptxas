@@ -25,10 +25,14 @@ from fuzzer.oracle import (
 
 
 _REG_RE = re.compile(r'%r\d+|%rd\d+')
+_PRED_RE = re.compile(r'%p\d+')
 
 # Registers defined by the fuzz kernel's prologue (before the body).
 _PROLOGUE_DEFINED = frozenset(
     ['%r0', '%r1', '%r3', '%rd0', '%rd1', '%rd2'])
+
+# Predicates defined by the prologue (only %p0 for the bounds guard).
+_PROLOGUE_PRED = frozenset(['%p0'])
 
 
 def _store_src_reg(ptx: str) -> str | None:
@@ -89,18 +93,74 @@ def _reaching_defs(body_lines: list[str]) -> set[str]:
 
 
 def _is_well_formed(ptx: str) -> bool:
-    """Reject kernels whose store reads a register not guaranteed-defined.
-    Both compilers happily emit code for use-before-def; outputs then
-    depend on register allocation and mean nothing — a spurious
-    'divergence' the minimizer must not chase."""
+    """Reject kernels with ANY use-before-def of a register or predicate.
+
+    The store source has to be reaching-def (old check), but we also
+    require that every individual instruction's source registers AND
+    predicate guard are already defined when it executes.  Reads of
+    undefined registers — even in dead code — produce
+    implementation-defined SASS (the register allocator's choice of
+    physical reg bleeds into runtime state and can interact with the
+    scoreboard), which shows up as spurious divergence between OURS
+    and ptxas.  Those aren't bugs in either compiler, just reads of
+    garbage from whatever happened to be in the coloring slot.
+    """
     parts = _split_body(ptx)
     if parts is None:
         return True
     _, body, _ = parts
+    defined = set(_PROLOGUE_DEFINED)
+    pred_defined = set(_PROLOGUE_PRED)
+    for ln in body:
+        s = ln.strip()
+        if not s:
+            continue
+        # Predicate guard check: any `@%pN` / `@!%pN` prefix requires
+        # %pN to be defined already.
+        if s.startswith('@'):
+            tok = s.split(None, 1)[0]  # '@%p1' or '@!%p1'
+            pn = tok.lstrip('@').lstrip('!')
+            if pn not in pred_defined:
+                return False
+            parts2 = s.split(None, 1)
+            s = parts2[1] if len(parts2) > 1 else ''
+        toks = s.split(None, 1)
+        if len(toks) < 2:
+            continue
+        op = toks[0]
+        rhs = toks[1]
+        parsed = _parse_instr(ln)
+        if parsed is None:
+            # st.* / setp.* / other non-gpr-dest ops.  All %r/%rd
+            # tokens must be defined; setp writes a predicate.
+            if op.startswith('st.') or op.startswith('setp.'):
+                for r in _REG_RE.findall(rhs):
+                    if r not in defined:
+                        return False
+                if op.startswith('setp.'):
+                    # setp dest is the first %pN in rhs.
+                    m = _PRED_RE.search(rhs)
+                    if m:
+                        pred_defined.add(m.group(0))
+            continue
+        dst, srcs, predicated = parsed
+        srcs_ok = all(r in defined for r in srcs)
+        # Also check predicate sources (e.g. selp reads %pN).
+        for pn in _PRED_RE.findall(rhs):
+            if pn not in pred_defined:
+                return False
+        if not srcs_ok:
+            return False
+        if predicated:
+            # Predicated write keeps dst's prior state.
+            pass
+        else:
+            defined.add(dst)
+    # Final check — the store's source register must be defined.
     reg = _store_src_reg(ptx)
     if reg is None:
         return True
-    return reg in _reaching_defs(body)
+    return reg in defined
 
 
 def _still_diverges(ptx: str, runner: CudaRunner, input_bytes: bytes) -> bool:

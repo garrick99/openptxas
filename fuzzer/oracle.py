@@ -213,6 +213,15 @@ def test_ptx(ptx: str, seed: int, runner: CudaRunner, input_bytes: bytes,
         return 'sync_err_theirs', new
 
     if out_ours != out_theirs:
+        # Filter spurious divergences where the kernel reads an undefined
+        # register.  Both compilers allocate registers independently and
+        # undef reads pick up whatever physical reg was last written —
+        # OURS and ptxas can disagree on coloring, producing "different"
+        # outputs that are both valid unspecified results.  These are
+        # fuzzer noise, not real miscompiles.
+        from fuzzer.minimize import _is_well_formed
+        if not _is_well_formed(ptx):
+            return 'spurious_divergence', False
         new = _save_artifact('divergence', ptx, ours, theirs, input_bytes,
                               out_ours, out_theirs, base_meta)
         return 'divergence', new

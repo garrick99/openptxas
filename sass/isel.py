@@ -3832,8 +3832,8 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     d = ctx.ra.r32(instr.dest.name)
                     a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     b = _materialize_imm(instr.srcs[1], ctx, ctx.ra, output)
-                    output.append(SassInstr(encode_fadd(d, b, a, negate_src0=True),
-                                            f'FADD R{d}, -R{b}, R{a}  // sub.f32'))
+                    output.append(SassInstr(encode_fadd(d, a, b, negate_src1=True),
+                                            f'FADD R{d}, R{a}, -R{b}  // sub.f32'))
 
                 elif op == 'mul' and typ == 'f32':
                     d = ctx.ra.r32(instr.dest.name)
@@ -4899,10 +4899,12 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 tmp_r = _alloc_gpr(ctx)
                                 if isinstance(b, RegOp) and threshold is None:
                                     # Reg-reg: FSUB + FSEL.step + ISETP.NE
+                                    # setp.cmp.f32 p, a, b  →  diff = a - b,
+                                    # then FSEL.step.<cmp> on (diff vs 0).
                                     diff_r = _alloc_gpr(ctx)
                                     output.append(SassInstr(
-                                        encode_fadd(diff_r, br, ar, negate_src0=True),
-                                        f'FADD R{diff_r}, -R{br}, R{ar}  // fsub for cmp'))
+                                        encode_fadd(diff_r, ar, br, negate_src1=True),
+                                        f'FADD R{diff_r}, R{ar}, -R{br}  // fsub for cmp'))
                                     output.append(SassInstr(
                                         encode_fsel_step(tmp_r, diff_r, 0, fsel_c),
                                         f'FSEL.step R{tmp_r}, R{diff_r}, 0x0, {cmp_name.upper()}'))

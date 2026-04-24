@@ -49,7 +49,47 @@ ptxas -arch=sm_120 minimal.ptx -o /tmp/k_theirs.cubin
 python3 -c 'from sass.pipeline import compile_function; ...'
 ```
 
-## Workaround
+## Fix (2026-04-22)
+
+Two bugs were triggered by this PTX shape; both are now fixed.
+
+**Bug 1 — `_sink_param_loads` dead-code emission** (`sass/pipeline.py`).
+`_sink_param_loads` looks for `ld.param.u64` whose dest register is
+unused inside the entry block and tries to sink it into the first
+labeled block that consumes it.  Loads that can't be sunk (dest lives
+only in labeled blocks we conservatively skip as possible loop
+headers) were appended to the end of the entry block — which placed
+them *after* the trailing `bra`/`ret` instructions in a kernel like
+`cond_test`, making the subsequent LDC.64 land in dead code.  Readers
+in the diamond arms then used an uninitialised R-pair → ILLEGAL_ADDRESS.
+Fixed by leaving unsunk loads at their *original* PTX position (track
+original indices, filter only sunk ones when rewriting the block).
+
+**Bug 2 — FADD operand-order inversion in `sub.f32` / `setp.cmp.f32`**
+(`sass/encoding/sm_120_opcodes.py`, `sass/isel.py`).
+`encode_fadd`'s `negate_src0` parameter was misnamed: the b7=0x80 flag
+actually negates `src1` (byte 4 = the second displayed operand), not
+`src0` — consistent with `encode_iadd3` / `encode_iadd64`.  Two call
+sites had their args in the wrong order on the assumption the
+parameter name was correct:
+
+- `sub.f32 d, a, b` computed `b - a` instead of `a - b` (GPU-verified
+  `sub.f32(5, 3) = -2.0` pre-fix).  Untested before now — no PTX test
+  checked the FP subtraction value end-to-end.
+- `setp.cmp.f32 p, a, b` (reg-reg path) computed `(b - a) cmp 0`, so
+  the resulting predicate was the inverse of the PTX spec.  Typically
+  dormant because OpenCUDA's `if_convert_diamonds` lowers the common
+  load-mul-store diamond through FSETP+FSEL (a separate code path), but
+  exposed by any multi-ret kernel whose guard falls through the
+  reg-reg setp path (e.g. `minimal.ptx`).
+
+Fix: rename `negate_src0` → `negate_src1` (kept `negate_src0=` alias
+for backward compat — `neg.f32` uses it with src0=RZ so it still
+produces `-a` correctly) and swap the operand order at the two broken
+call sites.  GPU-verified on minimal.ptx: all 8 lanes produce the
+ptxas-matching result, no sync_err.
+
+## Workaround (pre-fix)
 
 Keep OpenCUDA codegen emitting the classic "bra merge_label; merge_label: ret"
 tail instead of collapsing it to inline `ret`. The OpenCUDA pass

@@ -317,17 +317,24 @@ def _sink_param_loads(fn: Function) -> None:
             elif hasattr(src, 'base') and isinstance(src.base, str):
                 entry_uses.add(src.base)
 
-    to_sink = []  # (instruction, dest_name)
-    keep = []
-    for inst in entry.instructions:
+    # Record each sinkable load with its original position.  On sink
+    # success we drop it from entry; on failure we leave it where it
+    # was (the original PTX position).  The previous "append on
+    # failure" strategy put the load AFTER any trailing `bra`/`ret`
+    # instructions, making it unreachable (observed: cond_test with
+    # both arms of the diamond in labeled blocks — u64 %rd0 param
+    # landed after the two `bra`s, the subsequent LDC.64 emission
+    # was placed in dead code, and post-branch blocks read R_pair
+    # uninitialized → sync_err=700 at launch;
+    # _fuzz_bugs/multi_ret_blocks/).
+    sinkable: list[tuple[int, object, str]] = []  # (orig_idx, inst, dest_name)
+    for idx, inst in enumerate(entry.instructions):
         if (inst.op == 'ld' and 'param' in inst.types and 'u64' in inst.types
                 and isinstance(inst.dest, RegOp)
-                and inst.dest.name not in entry_uses):  # NOT used in entry block
-            to_sink.append((inst, inst.dest.name))
-        else:
-            keep.append(inst)
+                and inst.dest.name not in entry_uses):
+            sinkable.append((idx, inst, inst.dest.name))
 
-    if not to_sink:
+    if not sinkable:
         return
 
     # For each sinkable ld.param, find the first block that uses the dest register.
@@ -337,8 +344,8 @@ def _sink_param_loads(fn: Function) -> None:
     # block label) to before all entry-block initializations, creating an infinite
     # loop because the loop back-edge targets the hoisted position instead of the
     # true loop start.
-    _unsunk_pos = 0  # PTXAS-R09: tracks insertion point for unsunk params
-    for inst, dest_name in to_sink:
+    sunk_indices: set[int] = set()
+    for orig_idx, inst, dest_name in sinkable:
         sunk = False
         for bb in fn.blocks[1:]:  # skip entry
             if bb.label is not None:
@@ -361,34 +368,15 @@ def _sink_param_loads(fn: Function) -> None:
             if sunk:
                 break
 
-        if not sunk:
-            # Dest never used in other blocks (all consumers were in labeled
-            # blocks, which we conservatively skip as potential loop headers).
-            # Keep the load in entry at its ORIGINAL PTX position — appending
-            # to the end rather than inserting at the start.
-            #
-            # PTXAS-R52: the original insert(0) strategy pulled the u64 load
-            # above the u32 setp LDCU.32, inverting the UR allocation order
-            # under FG26 (which reserves UR4 for the setp param + descriptor
-            # reuse).  When the u64 grabbed UR4:UR5 first, the descriptor's
-            # later LDCU.64 UR4 overwrote p_out, causing illegal addresses
-            # (observed: w1_div_if_else sync=700).  Appending preserves the
-            # original ordering so TE10 still claims UR4 for the setp param
-            # before any u64 preamble preload runs.
-            #
-            # Aliased-vreg order (PTXAS-R09 concern): the to_sink list is
-            # built in entry-traversal order, so appending in that order
-            # also preserves "last PTX load wins" for same-named dests.
-            #
-            # Entry BRA concern: we only reach this branch when dest was NOT
-            # found in entry_uses, i.e., the load has no consumer in entry.
-            # Placing it after a predicated EXIT is therefore safe — any
-            # thread that exited doesn't need the value, and threads that
-            # continue execute the load before reaching the labeled consumer
-            # block.
-            keep.append(inst)
+        if sunk:
+            sunk_indices.add(orig_idx)
+        # else: leave the load at its original position (do nothing)
 
-    entry.instructions = keep
+    if sunk_indices:
+        entry.instructions = [
+            inst for i, inst in enumerate(entry.instructions)
+            if i not in sunk_indices
+        ]
 
     # Second pass: within each block, move sunk ld.param to just before
     # its first consumer (not at the block start). Exception: if the param

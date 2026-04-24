@@ -1377,14 +1377,30 @@ def encode_stg_e_64_direct(addr: int, data: int, ctrl: int = 0) -> bytes:
 # ---------------------------------------------------------------------------
 
 def encode_fadd(dest: int, src0: int, src1: int,
-                negate_src0: bool = False, abs_src0: bool = False,
-                ctrl: int = 0) -> bytes:
-    """Encode FADD dest, [+-|]src0, src1 (FP32 add/subtract).
-    negate_src0: b7 bit 7 = negate src0. abs_src0: b9 bit 1 = absolute src0.
-    ptxas ground truth: neg uses b7=0x80, abs uses b9=0x02."""
+                negate_src1: bool = False, abs_src0: bool = False,
+                ctrl: int = 0,
+                negate_src0: bool = False) -> bytes:
+    """Encode FADD dest, src0, [+-|]src1 (FP32 add/subtract).
+
+    Disassembly form: ``FADD Rd, Rs0, Rs1`` — src0 is the left source,
+    src1 the right source.  Hardware computes ``dest = src0 + src1``
+    (or ``src0 - src1`` when negate_src1 is set).
+
+    negate_src1: b7 bit 7 = negate src1.  Matches encode_iadd3 /
+        encode_iadd64 convention.
+    abs_src0:    b9 bit 1 = absolute value of src0.
+
+    Ground truth ptxas: neg flag uses b7=0x80, abs flag uses b9=0x02.
+
+    Historical note: the `negate_src0` keyword is accepted for backwards
+    compatibility with older callers that were written against a
+    misnamed parameter — it sets the same bit (byte-4 = src1 negate),
+    so legacy calls like neg.f32 (`encode_fadd(d, RZ, a, negate_src0=True)`
+    → RZ - a = -a) remain correct. New code should use negate_src1.
+    """
     if ctrl == 0:
         ctrl = _CTRL_DEFAULT
-    b7 = 0x80 if negate_src0 else 0x00
+    b7 = 0x80 if (negate_src1 or negate_src0) else 0x00
     b9 = 0x02 if abs_src0 else 0x00
     raw = bytearray(_build(0x21, 0x72,
                   b2=dest, b3=src0, b4=src1,

@@ -3002,11 +3002,47 @@ def compile_function(fn: Function, verbose: bool = False,
             _mp02_pred_guard_count = sum(
                 1 for _pi in range(8, _fg31_n - 5)
                 if ((sass_instrs[_pi].raw[1] >> 4) & 0x7) != 0x7)
-            if _mp02_pred_guard_count >= 2:
+            # MP02-EXT: catch back-to-back early-exit pairs.
+            # k100_early_exit, ilp_pred_alu, k300_nasty_pred_xor share a
+            # pattern where the kernel emits two `ISETP Pdst ; @Pdst <consumer>`
+            # sequences (or `ISETP Pdst ; ... ; @Pdst LEA Pdst`).  FG33's
+            # hardcoded ctrl template (rbar=0x01 on body ALU) wipes the
+            # rbar=0x03 barrier that the second @Pdst read requires; the
+            # consumer reads stale predicate from the first ISETP and the
+            # kernel produces wrong output.
+            #
+            # Detect it narrowly: count "ISETP Pdst followed within 2
+            # instructions by a @Pdst consumer" pairs.  ≥2 such pairs ->
+            # skip FG33.  Kernels with a single such pair (k100_guarded_store)
+            # or with multiple ISETPs whose consumers aren't immediate
+            # @Pdst (e.g. range-reduction sin/cos with intervening ALU
+            # before the @Px consumer) keep FG33 admission and stay
+            # BYTE_EXACT.
+            _ISETP_OPCS = {0x80c, 0xc0c, 0x20c, 0x70c}
+            _mp02_imm_pair_count = 0
+            for _pi in range(_fg31_n):
+                _opc = (sass_instrs[_pi].raw[0]
+                        | (sass_instrs[_pi].raw[1] << 8)) & 0xFFF
+                if _opc not in _ISETP_OPCS:
+                    continue
+                _pdst = (sass_instrs[_pi].raw[10] >> 1) & 0x7
+                if _pdst == 0x7:  # PT
+                    continue
+                # Look for the @Pdst consumer within the next 2 slots.
+                for _qi in range(_pi + 1, min(_pi + 3, _fg31_n)):
+                    _q_guard = (sass_instrs[_qi].raw[1] >> 4) & 0xF
+                    _q_idx = _q_guard & 0x7
+                    if _q_idx != 0x7 and _q_idx == _pdst:
+                        _mp02_imm_pair_count += 1
+                        break
+
+            if _mp02_pred_guard_count >= 2 or _mp02_imm_pair_count >= 2:
                 _fg33_ok = False
                 if verbose:
-                    print(f'[MP02] FG33 skipped: {_mp02_pred_guard_count} '
-                          '@Px-guarded body ALU (predicate RAW needs scoreboard rbar)')
+                    print(f'[MP02] FG33 skipped: '
+                          f'{_mp02_pred_guard_count} @Px-guarded body ALU, '
+                          f'{_mp02_imm_pair_count} ISETP→@P close-pairs '
+                          '(predicate RAW needs scoreboard rbar)')
 
         if _fg33_ok:
             _fg31_patched = 0

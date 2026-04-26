@@ -1256,19 +1256,56 @@ def compile_function(fn: Function, verbose: bool = False,
     _fg26_te10_blocked = (_has_vote_shfl
                           or _r56_has_bar
                           or getattr(ctx, '_has_bar_sync', False))
-    # PTXAS-R57 (original): refused FG26 admission when the kernel had
-    # any @Px ret guard, because an earlier partial fix for the UR4
-    # clobber sat on that gate.  That gate is now redundant — the real
-    # fix lives in regalloc.py as the R22 WB-8 exemption (commit
-    # 75a4a054f5), which routes both u64 address-pair params through
-    # UR-bound LDCU when they form an aligned pair (so the descriptor
-    # LDCU.64 UR4 never clashes with a body `LDCU UR4, setp_param`).
-    # Removing the gate lets FG26 admit on kernels with @Px ret that
-    # don't actually trigger the clobber, matching ptxas's UR4-reuse
-    # layout on ~16 MIXED kernels and restoring BYTE_EXACT candidacy.
+    # PTXAS-R57 (targeted): @Px ret guard + FG26 + LOOP = UR4 clobber.
+    # FG26 sets _next_ur = 4 so params start landing in UR4.  The R22
+    # WB-8 exemption (regalloc.py, commit 75a4a054f5) routes u64
+    # address-pair params away from UR4, but not u32 scalar params --
+    # which means a kernel whose first param is a u32 scalar gets the
+    # scalar loaded into UR4 via `LDCU UR4, c[0x0][...]`, clobbering
+    # the global memory descriptor that the preamble already loaded
+    # there.  Subsequent `STG.E desc[UR4][...]` instructions then
+    # dereference a descriptor whose bytes have been overwritten with
+    # the scalar value -- on RTX 5090 this manifests as an SM deadlock
+    # (verified on w2_div_loop with byte-identical cubins on BigDaddy
+    # and GreenDragon).
+    #
+    # The narrow fix: when FG26 would admit AND the kernel has both
+    # @Px ret and a backward branch (loop back-edge -- the signature
+    # of a divergent loop kernel that the R22 WB-8 fix doesn't fully
+    # cover), start the param ladder at UR6 instead of UR4.  UR4 is
+    # left holding the descriptor undisturbed; the rest of the FG26
+    # path (UR-bound LDCUs, _fg26_ur4_start flag for downstream
+    # consumers in pipeline.py / isel.py) still applies.
+    _fg26_has_pred_ret = any(
+        getattr(inst, 'op', None) == 'ret'
+        and getattr(inst, 'pred', None) is not None
+        for bb in fn.blocks for inst in bb.instructions
+    )
+    _fg26_has_backward_bra = False
+    if _fg26_has_pred_ret:
+        _fg26_seen_labels = set()
+        for _fg26_bb in fn.blocks:
+            if getattr(_fg26_bb, 'label', None) is not None:
+                _fg26_seen_labels.add(_fg26_bb.label)
+            for _fg26_inst in _fg26_bb.instructions:
+                if getattr(_fg26_inst, 'op', None) != 'bra':
+                    continue
+                _fg26_tgt = None
+                for _fg26_s in _fg26_inst.srcs:
+                    _fg26_tgt = (getattr(_fg26_s, 'name', None)
+                                 or (_fg26_s if isinstance(_fg26_s, str) else None))
+                    if _fg26_tgt is not None:
+                        break
+                if _fg26_tgt is not None and _fg26_tgt in _fg26_seen_labels:
+                    _fg26_has_backward_bra = True
+                    break
+            if _fg26_has_backward_bra:
+                break
+    _fg26_pred_ret_blocked = _fg26_has_pred_ret and _fg26_has_backward_bra
     if (alloc.addr_pair_colocated and _fg26_setp_ok
             and not _has_ctaid_ntid
-            and not _fg26_te10_blocked):
+            and not _fg26_te10_blocked
+            and not _fg26_pred_ret_blocked):
         ctx._next_ur = 4
         ctx._fg26_ur4_start = True
 

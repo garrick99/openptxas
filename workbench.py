@@ -3906,6 +3906,44 @@ def write_forge_kernel_json(result: dict, commits: dict,
     return out_path
 
 
+def _cmd_stress(args):
+    """Drive stress_runner.stress_loop with the workbench's catalog as the
+    source of kernels to exercise.  See `stress_runner.py` for details."""
+    import stress_runner
+
+    if args.kernels:
+        names = [n.strip() for n in args.kernels.split(",") if n.strip()]
+    else:
+        # Default: all PTX-backed kernels.  Forge kernels added only with
+        # --include-forge to avoid mandatory WSL dependency.
+        names = list(KERNELS.keys())
+        if args.include_forge:
+            for n in _FORGE_KERNELS.keys():
+                if n not in names:
+                    names.append(n)
+
+    duration_s = args.minutes * 60.0 if args.minutes else None
+    if duration_s is None and args.passes is None:
+        # Default to a single full pass if neither bound is given.
+        args.passes = 1
+
+    out_dir = Path(args.out_dir)
+
+    summary = stress_runner.stress_loop(
+        wb=sys.modules[__name__],
+        kernel_names=names,
+        out_dir=out_dir,
+        duration_s=duration_s,
+        max_passes=args.passes,
+        include_forge=args.include_forge,
+        bail_on_fail=args.bail_on_fail,
+        telemetry_interval_s=args.telemetry_interval,
+        per_kernel_timeout_s=args.per_kernel_timeout,
+    )
+
+    return 0 if summary["verdict"] == "CLEAN" else 1
+
+
 def _cmd_forge_run(args):
     """FG-1.1: workbench forge run --target <name> [--compare ptxas] ..."""
     if args.repeat < 1:
@@ -4427,6 +4465,42 @@ def main():
     p_kdiff.add_argument("--kernel", required=True,
                          help=f"one of: {', '.join(sorted(KERNELS))}")
 
+    # ---- stress: single-machine GPU correctness loop ----
+    p_stress = sub.add_parser(
+        "stress",
+        help="loop catalogued kernels and watch for status flips (hardware oracle)",
+        description="Single-machine GPU stress + correctness loop.  Iterates "
+                    "the catalogued kernels in serial and watches for kernels "
+                    "that PASS in pass 1 but FAIL in a later pass -- the "
+                    "signature of marginal hardware.  Records nvidia-smi "
+                    "telemetry alongside (ECC, temps, clocks, power, throttle "
+                    "reasons) so anomalies can be correlated with environmental "
+                    "events.  Defaults to serial single-worker per machine "
+                    "guidance.",
+    )
+    p_stress.add_argument("--minutes", type=float, default=None,
+                          help="run for N minutes (default: until --passes hit)")
+    p_stress.add_argument("--passes", type=int, default=None,
+                          help="run for N full passes over the kernel list "
+                               "(default: until --minutes elapses)")
+    p_stress.add_argument("--kernels", default=None,
+                          help="comma-separated kernel names (default: all PTX-backed)")
+    p_stress.add_argument("--include-forge", action="store_true",
+                          help="also include Forge-backed targets in the loop "
+                               "(slower; requires WSL Forge build)")
+    p_stress.add_argument("--bail-on-fail", action="store_true",
+                          help="stop on first status flip (default: keep "
+                               "running to count flips)")
+    p_stress.add_argument("--out-dir", default=str(ROOT / "stress_runs"),
+                          help="directory for stress logs (default: stress_runs/)")
+    p_stress.add_argument("--telemetry-interval", type=int, default=1,
+                          help="nvidia-smi sampling interval in seconds (default: 1)")
+    p_stress.add_argument("--per-kernel-timeout", type=float, default=10.0,
+                          help="per-kernel watchdog timeout in seconds; "
+                               "kernels that exceed this are recorded as "
+                               "RUNTIME (timeout) and the loop continues "
+                               "(default: 10.0)")
+
     # ---- FG-2 B3: leaderboard (alias for status) ----
     p_lb = sub.add_parser(
         "leaderboard",
@@ -4498,6 +4572,8 @@ def main():
         # FG-2 B3: leaderboard is a thin alias over status, so it
         # replays the same saved suite_all artifact.
         return _cmd_status(args)
+    if args.cmd == "stress":
+        return _cmd_stress(args)
     p.error(f"unknown subcommand: {args.cmd}")
 
 

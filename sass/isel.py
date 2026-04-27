@@ -1418,8 +1418,24 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
             # UR4+5 for descriptor, UR6+7 reserved. Params start at UR8.
             # FG26: when address pair is co-located, the setp param used
             # UR4 (now dead), so the u64 param can take UR6:UR7 directly.
+            #
+            # Bug 6 (2026-04-27): FG26's THEORY was setp param at UR4 +
+            # u64 param at UR6. In practice ld.param is processed in PTX
+            # order, so u64 params (declared first) get allocated FIRST.
+            # If we let the u64 param take UR4, it collides with the
+            # descriptor LDCU.64 (cbuf 0x358) which canonically writes
+            # UR4:UR5 — descriptor overwrites the param, then later
+            # consumers of UR4 reading "param.out" actually read the
+            # descriptor bytes, producing illegal addresses
+            # (CUDA error 700). Repro: tests/test_fsetp_negated_pred_regression.py.
+            # Under FG26, snap u64 params to UR6 (skip UR4:UR5 for the
+            # descriptor); the setp param can still use UR4 if its TE10
+            # path runs first or the address-pair regalloc reaches it.
             if ctx._next_ur < 8 and not getattr(ctx, '_fg26_ur4_start', False):
                 ctx._next_ur = 8
+            elif (getattr(ctx, '_fg26_ur4_start', False)
+                  and ctx._next_ur < 6):
+                ctx._next_ur = 6
             # Safety: predicated ld.param.u64 is in a divergent path (if-converted).
             # The deferred LDCU.64 would execute unconditionally (warp-wide) but
             # the consumer is predicated — UR/GPR conflicts across paths.

@@ -59,3 +59,6 @@ Thumbs.db
 _fuzz/
 stress_runs/
 _pytest_*.sh
+
+# Python egg-info — regenerated on every pip install -e
+*.egg-info/

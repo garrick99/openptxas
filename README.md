@@ -20,6 +20,7 @@ OpenPTXas is the back of a fully open-source GPU toolchain:
 - **[Forge](https://github.com/garrick99/forge)** — formally-verified systems language (optional front-end)
 - **[OpenCUDA](https://github.com/garrick99/opencuda)** — CUDA C → PTX, pure Python
 - **OpenPTXas** (this repo) — PTX → SM_120 cubin, pure Python
+- **[forge-workbench](https://github.com/garrick99/forge-workbench)** — cross-stack CLI cockpit (run / compare / benchmark / classify across all four projects above)
 - **[VortexSTARK](https://github.com/garrick99/VortexSTARK)** — production user via the Forge front-end (9 forge-emitted kernels in the prover)
 
 No NVIDIA compiler is invoked at any stage of the toolchain.
@@ -130,9 +131,10 @@ cd openptxas
 python demo.py                                   # compile + run vector_add on GPU
 python benchmarks/run_all.py                     # benchmark vs ptxas
 python scripts/health.py --frontier-only         # classify 144 kernels
-python workbench.py status                       # leaderboard
-python workbench.py kdiff --kernel reduce_sum    # side-by-side SASS diff vs ptxas
 python -m fuzzer.loop run --families alu_int --minutes 1  # differential fuzz
+
+# CLI dashboard (run / compare / benchmark / classify) lives in forge-workbench:
+pip install -e ../forge-workbench && workbench list
 ```
 
 Pure Python 3.11+. No external dependencies beyond NVIDIA driver (for execution) and optional `ptxas` (for differential comparison).
@@ -147,8 +149,9 @@ Pure Python 3.11+. No external dependencies beyond NVIDIA driver (for execution)
 | Scheduler | `sass/schedule.py` | LDG latency hiding, LDCU.64 hoisting |
 | Scoreboard | `sass/scoreboard.py` | Automated rbar/wdep/misc generation (bitmask-based) |
 | Emitter | `sass/pipeline.py` | Full ELF cubin with `.nv.info`, `.nv.capmerc`, `.nv.merc` |
-| Workbench | `workbench.py` | CLI dashboard: run, status, show, kdiff, explore, history, diff |
 | Fuzzer | `fuzzer/` | Grammar-based differential fuzz with well-formedness filter |
+
+The CLI dashboard (run / status / show / kdiff / explore / history / diff / stress) used to live here as `workbench.py`; it now ships as a stand-alone package — see [forge-workbench](https://github.com/garrick99/forge-workbench).
 
 ## SM_120 Blackwell Discoveries
 

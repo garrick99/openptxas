@@ -1,5 +1,0 @@
-cubin
-ptx
-sass
-tests
-tools

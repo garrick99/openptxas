@@ -6,6 +6,24 @@ Compiles PTX into executable cubins for **SM_120 Blackwell** GPUs. Full pipeline
 
 **No ptxas. No nvcc. Pure Python.**
 
+## What is this?
+
+A pure-Python implementation of NVIDIA's PTX assembler. Take any PTX source, get back an executable SM_120 cubin (ELF binary) that the CUDA driver loads via `cuModuleLoadData` and runs directly on a Blackwell GPU. Reverse-engineered from byte-exact ptxas 13.0 output across 108 unique SM_120 opcodes.
+
+OpenPTXas is the back of a fully open-source GPU toolchain:
+
+```
+[Forge (.fg)]  ──►  [OpenCUDA]  ──►  PTX  ──►  OpenPTXas  ──►  cubin  ──►  GPU
+                                                ↑ this repo    PTX → SASS → ELF
+```
+
+- **[Forge](https://github.com/garrick99/forge)** — formally-verified systems language (optional front-end)
+- **[OpenCUDA](https://github.com/garrick99/opencuda)** — CUDA C → PTX, pure Python
+- **OpenPTXas** (this repo) — PTX → SM_120 cubin, pure Python
+- **[VortexSTARK](https://github.com/garrick99/VortexSTARK)** — production user via the Forge front-end (9 forge-emitted kernels in the prover)
+
+No NVIDIA compiler is invoked at any stage of the toolchain.
+
 ## What's Proven
 
 GPU-verified on RTX 5090 (Blackwell SM_120), zero ptxas fallback anywhere in the pipeline:
@@ -17,6 +35,8 @@ GPU-verified on RTX 5090 (Blackwell SM_120), zero ptxas fallback anywhere in the
 | 7-kernel benchmark suite (all correctness-verified) | **geomean 1.06× vs ptxas**, SAXPY **1.72×** |
 | Pair with [OpenCUDA](https://github.com/garrick99/opencuda) (CUDA C → PTX) GPU E2E | **88 / 88 pass** |
 | SASS encoder coverage | **183 encoders / 108 unique SM_120 opcodes** |
+
+The 904 pytest count breaks down as: 787 non-GPU (parser / regalloc / isel / encoder / scheduler / scoreboard regressions, run as one batch), 89 GPU (`test_gpu_*.py` files run one-at-a-time to avoid CUDA UR cache pollution), and 28 misc (`test_capmerc_gen.py`, `test_bugfix_benchmark.py`, `test_fg40_harness.py`).
 
 "STRUCTURAL" means valid SASS that differs in instruction layout from ptxas (e.g. we pack LDCU.128 where ptxas uses two LDCU.64s). "MIXED" is where OURS and ptxas both produce correct SASS with a mix of register-only and control-byte-only byte diffs. Every kernel in all three buckets produces correct GPU output.
 

@@ -54,3 +54,8 @@ tmp/
 # OS junk
 .DS_Store
 Thumbs.db
+
+# Local scratch (fuzzer artifacts, stress-run logs, ad-hoc test runners)
+_fuzz/
+stress_runs/
+_pytest_*.sh

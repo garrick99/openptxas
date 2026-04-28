@@ -874,6 +874,7 @@ def compile_function(fn: Function, verbose: bool = False,
     # and body-size budgets to avoid regressions.
     from ptx.passes.unroll              import run_function as _unroll_run
     from ptx.passes.load_cse             import run_function as _load_cse_run
+    from ptx.passes.trivial_fold        import run_function as _trivial_fold_run
     from ptx.passes.imm_add_fold        import run_function as _imm_add_fold_run
     from ptx.passes.repeated_add_reduce import run_function as _repeated_add_reduce_run
     _unroll_run(fn)
@@ -882,6 +883,12 @@ def compile_function(fn: Function, verbose: bool = False,
     # so reduce can collapse the resulting `add %r2, %r2, %r4` × N
     # into a single mad.lo.
     _load_cse_run(fn)
+    # Trivial algebraic folds — turns `add/xor/or %r,%a,0` → `mov %r,%a`,
+    # `mul.lo %r,%a,0` → `mov %r,0`, `mul.lo %r,%a,1` → `mov %r,%a`,
+    # etc. These show up after the unroll's per-iteration counter
+    # constant-propagation (e.g. `xor %r2, %r2, 0` from iter 0 of an
+    # xor-loop with counter starting at 0).
+    _trivial_fold_run(fn)
     _imm_add_fold_run(fn)
     _repeated_add_reduce_run(fn)
 

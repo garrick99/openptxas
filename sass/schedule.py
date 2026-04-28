@@ -622,10 +622,19 @@ def _enforce_gpr_latency(instrs: list[SassInstr]) -> list[SassInstr]:
             # TE27/28: skip NOP for PTXAS-proven forwarding-safe pairs.
             # Each pair has explicit PTXAS evidence (gap=0 instances).
             # Added one at a time, each verified with zero regressions.
+            #
+            # NB: `workbench hazard-scan` surfaces *candidates* — pairs
+            # where ptxas runs gap=0 in many kernels.  But evidence from
+            # one kernel doesn't generalize: the surrounding dataflow
+            # determines whether the gap is actually safe.  Tested
+            # 2026-04-28: adding (0xc35, 0x986) and (0xc35, 0x981)
+            # broke qmma_zero (real RAW dep masked by stall=1 in our
+            # IADD.64-UR but not by the same in the ptxas evidence
+            # kernels).  Promotions need per-kernel ptxas verification.
             _SCHED_FORWARDING_SAFE = {
-                (0xc11, 0x986),  # TE27: 0xc11→STG (31 PTXAS instances)
-                (0x812, 0x812),  # TE28: LOP3→LOP3 (13 PTXAS instances)
-                (0x812, 0x824),  # TE28: LOP3→IMAD (2 PTXAS instances)
+                (0xc11, 0x986),  # TE27: IADD3.UR -> STG.E (31 PTXAS instances)
+                (0x812, 0x812),  # TE28: LOP3 -> LOP3 (13 PTXAS instances)
+                (0x812, 0x824),  # TE28: LOP3 -> IMAD (2 PTXAS instances)
             }
             if (opc_i, opc_j) in _SCHED_FORWARDING_SAFE:
                 i += 1

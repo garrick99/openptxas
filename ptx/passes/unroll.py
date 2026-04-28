@@ -234,14 +234,17 @@ def _try_unroll(fn: Function, idx: int) -> bool:
     # The induction counter must only be referenced by its own
     # increment (already validated) and the setp test. If any other
     # body instruction reads or writes %ctr, the per-iteration value
-    # of %ctr is observable inside the body — and unrolling without
-    # constant-propagation of the counter values would clone the body
-    # N times with the same %ctr register, leaving downstream ops
-    # unable to fold (e.g. `mul %r4, %r0, %r3` × N stays N×; ptxas
-    # would have substituted iteration-specific constants for %r3).
-    # Surfaced via suite_all regression on w1_loop_mul_acc / xor /
-    # shift / countdown (artifact 20260427_192528).
-    body_excl_incr = body[:-1]  # body[-1] is the counter increment
+    # of %ctr is observable inside the body. Const-propagation across
+    # unroll iterations IS implemented (see clone loop below — it
+    # substitutes %ctr → ImmOp(init + i*step) per iteration), but
+    # currently the downstream fold passes can only collapse
+    # `add %r,%r,IMM` chains, not 3-operand `add %r,%a,IMM` shapes
+    # that show up when the counter is a body source. Until a
+    # 3-operand add chain reducer lands (`add %r,%a,K_i; add %r2,%r2,%r`
+    # × N → `mad.lo %r2, %a, N, %r2 + Σ K_i`), keep this gate strict.
+    # Surfaced via suite_all regression on w1_loop_countdown
+    # (artifact 20260427_194215).
+    body_excl_incr = body[:-1]
     for inst in body_excl_incr:
         if inst.dest is not None and isinstance(inst.dest, RegOp) and inst.dest.name == ctr_name:
             return False
@@ -249,16 +252,14 @@ def _try_unroll(fn: Function, idx: int) -> bool:
             if isinstance(src, RegOp) and src.name == ctr_name:
                 return False
 
-    # Pure-add gating: every body instruction (apart from the counter
-    # increment, which we keep) must be an `add.<int_type> %dest, %a, %b`
-    # with operands of one of the cheap-to-compact shapes:
-    #   - reg + imm  (foldable via imm_add_fold across iterations)
-    #   - reg + reg  (foldable via repeated_add_reduce → mad.lo)
-    # Anything else (`ld`, `st`, `mul`, `xor`, `shl`, ...) survives the
-    # unroll N times unfolded and the cloned body ends up larger than
-    # the rolled form. Once a load-CSE pass and richer chain-reducers
-    # land, this gate can be loosened. Surfaced via suite_all regression
-    # on w1_loop_load_acc (artifact 20260427_192702).
+    # Pure-add gating: body (excl. counter increment) must be add-only.
+    # Even with the per-iteration counter substitution above, downstream
+    # folds only catch `add` chains — `mul`/`xor`/`shl` bodies survive
+    # unrolling N times unfolded and the cloned body ends up larger
+    # than the rolled form (suite regression: w1_loop_xor +4 → +9,
+    # w1_loop_mul_acc +4 → +8, artifact 20260427_194103). Once load-
+    # CSE / mul-chain reduce / xor-chain reduce land, the gate can
+    # loosen further; const-prop is already in place to feed them.
     _CHEAP_INT_TYPES = {"u32", "s32", "u64", "s64", "b32", "b64"}
     for inst in body_excl_incr:
         if inst.op != "add":
@@ -267,7 +268,6 @@ def _try_unroll(fn: Function, idx: int) -> bool:
             return False
         if inst.pred is not None or inst.mods:
             return False
-        # Must be `dest, %x, %y_or_imm`.
         if (inst.dest is None or not isinstance(inst.dest, RegOp)
                 or len(inst.srcs) != 2
                 or not isinstance(inst.srcs[0], RegOp)):
@@ -295,13 +295,32 @@ def _try_unroll(fn: Function, idx: int) -> bool:
             return False
 
     # Transform: replace the block's instructions with N cloned copies
-    # of `body`, then the post-loop tail. We drop the setp + bra (and
-    # the duplicate of the increment is preserved inside each clone so
-    # the counter ends up at the right post-loop value).
+    # of `body`, then the post-loop tail. We drop the setp + bra. Each
+    # iteration's body[:-1] (everything before the counter increment)
+    # gets %ctr substituted with the iteration-specific constant value
+    # so downstream constant-folding can fire on `mul %r,%r0,%ctr`,
+    # `xor %r,%r,%ctr`, etc. The increment itself stays as-is so the
+    # counter ends up at init + N*step at the post-loop point.
     new_instrs: list[Instruction] = []
+    iter_ctr_val = init_val
     for _ in range(iterations):
-        for inst in body:
-            new_instrs.append(deepcopy(inst))
+        for inst in body_excl_incr:
+            cloned = deepcopy(inst)
+            new_srcs = []
+            for src in cloned.srcs:
+                if isinstance(src, RegOp) and src.name == ctr_name:
+                    new_srcs.append(ImmOp(iter_ctr_val))
+                else:
+                    new_srcs.append(src)
+            cloned.srcs = new_srcs
+            new_instrs.append(cloned)
+        # Counter increment: unchanged (it writes to %ctr and reads %ctr —
+        # we don't substitute the increment because it IS the source of
+        # the next iteration's counter value when not unrolled, and the
+        # cumulative effect of N un-substituted increments is the
+        # post-loop value we want).
+        new_instrs.append(deepcopy(body[-1]))
+        iter_ctr_val += step_val
     new_instrs.extend(tail)
     bb.instructions = new_instrs
     return True

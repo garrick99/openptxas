@@ -877,15 +877,18 @@ def compile_function(fn: Function, verbose: bool = False,
     from ptx.passes.add3_chain_reduce   import run_function as _add3_chain_reduce_run
     from ptx.passes.trivial_fold        import run_function as _trivial_fold_run
     from ptx.passes.imm_add_fold        import run_function as _imm_add_fold_run
+    from ptx.passes.imm_xor_fold        import run_function as _imm_xor_fold_run
     from ptx.passes.repeated_add_reduce import run_function as _repeated_add_reduce_run
     _unroll_run(fn)
     _load_cse_run(fn)
-    # 3-op add chain reducer — runs BEFORE trivial_fold so the
-    # `add %tmp, %a, K_i; add %acc, %acc, %tmp` pairs are intact.
-    # Collapses N pairs into `mad.lo %acc, %a, N, %acc + ΣK_i`.
     _add3_chain_reduce_run(fn)
     _trivial_fold_run(fn)
     _imm_add_fold_run(fn)
+    # Imm-xor fold: collapses `xor %r,%r,K_i` × N (with no intervening
+    # writes to %r) into a single `xor %r,%r,XOR(K_i)`, dropping the
+    # whole chain when the xor-sum is zero (algebraic no-op). Surfaces
+    # for w1_loop_xor where counter values 0..7 xor-cancel.
+    _imm_xor_fold_run(fn)
     _repeated_add_reduce_run(fn)
 
     # 0b. Sink ld.param from entry block to first-use block (reduces GPR pressure)

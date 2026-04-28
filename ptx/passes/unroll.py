@@ -246,20 +246,40 @@ def _try_unroll(fn: Function, idx: int) -> bool:
 
     # Cheap-body gating: each non-increment body instruction must be
     # one of:
-    #   - `add.<int_type>` reg+reg or reg+imm (foldable post-unroll)
+    #   - `add.<int_type>` reg+reg or reg+imm
+    #   - `xor.<bits>` reg+reg or reg+imm (foldable post-unroll +
+    #     const-prop via imm_xor_fold)
     #   - `ld.<space>.<type>` from a register-base MemOp
-    #     (load-CSE-able post-unroll IF address registers don't change
-    #      across iterations — which we approximate by requiring no
-    #      writes to any address-base reg in the body other than the
-    #      ld dests themselves; checked further down via cache
-    #      invalidation in load_cse)
-    # Anything else (mul, xor, shl, st, ...) survives the unroll N
-    # times unfolded and bloats the body. Loosen further as new
-    # chain-reduction passes land.
+    # AND: no register may be the destination of more than one op
+    # KIND (e.g. both `add` and `xor` writing the same %acc). Mixed-
+    # op writers are non-commutative — fold passes can't combine the
+    # cloned bodies into a single chain, and unroll just bloats the
+    # output. Surfaced as a regression on w1_loop_shift (mixed add+
+    # xor on %r2, MIXED → GAP, artifact 20260427_203853).
     _CHEAP_INT_TYPES = {"u32", "s32", "u64", "s64", "b32", "b64"}
     _ALLOWED_LD_SPACES = {"global", "shared", "const", "param"}
+    dest_op_kinds: dict[str, set[str]] = {}
+    for inst in body_excl_incr:
+        if inst.dest is not None and isinstance(inst.dest, RegOp):
+            dest_op_kinds.setdefault(inst.dest.name, set()).add(inst.op)
+    for reg, kinds in dest_op_kinds.items():
+        if len(kinds) > 1:
+            return False
+
     for inst in body_excl_incr:
         if inst.op == "add":
+            if not inst.types or inst.types[0] not in _CHEAP_INT_TYPES:
+                return False
+            if inst.pred is not None or inst.mods:
+                return False
+            if (inst.dest is None or not isinstance(inst.dest, RegOp)
+                    or len(inst.srcs) != 2
+                    or not isinstance(inst.srcs[0], RegOp)):
+                return False
+            if not isinstance(inst.srcs[1], (RegOp, ImmOp)):
+                return False
+            continue
+        if inst.op == "xor":
             if not inst.types or inst.types[0] not in _CHEAP_INT_TYPES:
                 return False
             if inst.pred is not None or inst.mods:

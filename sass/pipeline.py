@@ -873,9 +873,15 @@ def compile_function(fn: Function, verbose: bool = False,
     # free body (no atomics / barriers / fences) plus tight trip-count
     # and body-size budgets to avoid regressions.
     from ptx.passes.unroll              import run_function as _unroll_run
+    from ptx.passes.load_cse             import run_function as _load_cse_run
     from ptx.passes.imm_add_fold        import run_function as _imm_add_fold_run
     from ptx.passes.repeated_add_reduce import run_function as _repeated_add_reduce_run
     _unroll_run(fn)
+    # Load-CSE catches `ld.global %r4, [%rd3]` × N (same address) that
+    # the unroller's body cloning produces — drops the redundant loads
+    # so reduce can collapse the resulting `add %r2, %r2, %r4` × N
+    # into a single mad.lo.
+    _load_cse_run(fn)
     _imm_add_fold_run(fn)
     _repeated_add_reduce_run(fn)
 

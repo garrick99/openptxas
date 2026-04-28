@@ -252,28 +252,48 @@ def _try_unroll(fn: Function, idx: int) -> bool:
             if isinstance(src, RegOp) and src.name == ctr_name:
                 return False
 
-    # Pure-add gating: body (excl. counter increment) must be add-only.
-    # Even with the per-iteration counter substitution above, downstream
-    # folds only catch `add` chains — `mul`/`xor`/`shl` bodies survive
-    # unrolling N times unfolded and the cloned body ends up larger
-    # than the rolled form (suite regression: w1_loop_xor +4 → +9,
-    # w1_loop_mul_acc +4 → +8, artifact 20260427_194103). Once load-
-    # CSE / mul-chain reduce / xor-chain reduce land, the gate can
-    # loosen further; const-prop is already in place to feed them.
+    # Cheap-body gating: each non-increment body instruction must be
+    # one of:
+    #   - `add.<int_type>` reg+reg or reg+imm (foldable post-unroll)
+    #   - `ld.<space>.<type>` from a register-base MemOp
+    #     (load-CSE-able post-unroll IF address registers don't change
+    #      across iterations — which we approximate by requiring no
+    #      writes to any address-base reg in the body other than the
+    #      ld dests themselves; checked further down via cache
+    #      invalidation in load_cse)
+    # Anything else (mul, xor, shl, st, ...) survives the unroll N
+    # times unfolded and bloats the body. Loosen further as new
+    # chain-reduction passes land.
     _CHEAP_INT_TYPES = {"u32", "s32", "u64", "s64", "b32", "b64"}
+    _ALLOWED_LD_SPACES = {"global", "shared", "const", "param"}
     for inst in body_excl_incr:
-        if inst.op != "add":
-            return False
-        if not inst.types or inst.types[0] not in _CHEAP_INT_TYPES:
-            return False
-        if inst.pred is not None or inst.mods:
-            return False
-        if (inst.dest is None or not isinstance(inst.dest, RegOp)
-                or len(inst.srcs) != 2
-                or not isinstance(inst.srcs[0], RegOp)):
-            return False
-        if not isinstance(inst.srcs[1], (RegOp, ImmOp)):
-            return False
+        if inst.op == "add":
+            if not inst.types or inst.types[0] not in _CHEAP_INT_TYPES:
+                return False
+            if inst.pred is not None or inst.mods:
+                return False
+            if (inst.dest is None or not isinstance(inst.dest, RegOp)
+                    or len(inst.srcs) != 2
+                    or not isinstance(inst.srcs[0], RegOp)):
+                return False
+            if not isinstance(inst.srcs[1], (RegOp, ImmOp)):
+                return False
+            continue
+        if inst.op == "ld":
+            if inst.pred is not None or inst.mods:
+                return False
+            if not inst.types or len(inst.types) < 2:
+                return False
+            if inst.types[0] not in _ALLOWED_LD_SPACES:
+                return False
+            if (inst.dest is None or not isinstance(inst.dest, RegOp)
+                    or len(inst.srcs) != 1):
+                return False
+            from ..ir import MemOp as _MemOp
+            if not isinstance(inst.srcs[0], _MemOp):
+                return False
+            continue
+        return False
 
     # Disallow loops whose body contains:
     #   - mid-iteration control flow (would break linear cloning)

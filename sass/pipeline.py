@@ -2395,6 +2395,67 @@ def compile_function(fn: Function, verbose: bool = False,
                 _p2[9] = 0x0a  # descriptor: standard encoding
                 sass_instrs[_i1] = SassInstr(bytes(_p1), _si2.comment + ' [FG30:swap]')
                 sass_instrs[_i2] = SassInstr(bytes(_p2), _si1.comment + ' [FG30:swap]')
+
+                # WB-ldcu-rotate-post-fg30 (2026-04-28): FG30 swapped two
+                # LDCU.64 bytes including their ctrl bytes (wdep/rbar/etc).
+                # The swap inverts the wdep rotation order vs ptxas:
+                # we end up with 0x33-then-0x31 where ptxas uses 0x31-
+                # then-0x33.  Re-rotate the wdep bits in their final
+                # positions: first LDCU.64 (now param) -> 0x31, second
+                # (now descriptor) -> 0x33.  Verified by per-kernel
+                # kdiff against k200_triple_acc, k100_add64_chain etc.
+                from sass.scoreboard import _patch_ctrl as _wb_patch_ctrl
+                def _wb_set_wdep(raw_bytes: bytes, new_wdep: int) -> bytes:
+                    _r24 = raw_bytes[13] | (raw_bytes[14] << 8) | (raw_bytes[15] << 16)
+                    _ctrl = _r24 >> 1
+                    _ctrl = (_ctrl & ~(0x3f << 4)) | (new_wdep << 4)
+                    return _wb_patch_ctrl(raw_bytes, _ctrl)
+                _ldcu64_idx = 0
+                _ur_to_wdep = {}  # ur_dest -> new wdep (post-rotation)
+                for _scan_i in range(len(sass_instrs)):
+                    _scan_si = sass_instrs[_scan_i]
+                    _scan_opc = (_scan_si.raw[0] | (_scan_si.raw[1] << 8)) & 0xFFF
+                    if _scan_opc == 0x7ac and _scan_si.raw[9] in (0x0a, 0x0c):
+                        _new_wdep = 0x31 if (_ldcu64_idx % 2 == 0) else 0x33
+                        _new_raw = _wb_set_wdep(_scan_si.raw, _new_wdep)
+                        if _new_raw != _scan_si.raw:
+                            sass_instrs[_scan_i] = SassInstr(
+                                _new_raw,
+                                _scan_si.comment + f' [WB:wdep=0x{_new_wdep:02x}]')
+                        _ur_dest = _scan_si.raw[2]
+                        _ur_to_wdep[_ur_dest] = _new_wdep
+                        _ur_to_wdep[_ur_dest + 1] = _new_wdep
+                        _ldcu64_idx += 1
+
+                # WB: STG.E rbar follows descriptor LDCU's wdep slot.
+                # If the descriptor (UR at b8) is now wdep=0x33, the
+                # STG must wait on slot 0x33 (rbar bit -> 0x05) not
+                # 0x31 (rbar bit -> 0x03).  Match ptxas on the 10-
+                # occurrence STG.E rbar bucket.
+                _SLOT_TO_RBAR_BIT = {0x31: 0x02, 0x33: 0x04, 0x35: 0x08}
+                for _scan_i in range(len(sass_instrs)):
+                    _scan_si = sass_instrs[_scan_i]
+                    _scan_opc = (_scan_si.raw[0] | (_scan_si.raw[1] << 8)) & 0xFFF
+                    if _scan_opc == 0x986:  # STG.E
+                        _ur_desc = _scan_si.raw[8]  # UR descriptor at b8
+                        if _ur_desc not in _ur_to_wdep:
+                            continue
+                        _desc_wdep = _ur_to_wdep[_ur_desc]
+                        # Read current rbar
+                        _r24 = _scan_si.raw[13] | (_scan_si.raw[14] << 8) | (_scan_si.raw[15] << 16)
+                        _ctrl = _r24 >> 1
+                        _curr_rbar = (_ctrl >> 10) & 0x1f
+                        # Re-derive: clear LDCU rbar bits (0x02, 0x04),
+                        # then set the bit for the descriptor's new slot.
+                        _new_rbar = _curr_rbar & ~(0x02 | 0x04)
+                        _new_rbar |= _SLOT_TO_RBAR_BIT.get(_desc_wdep, 0)
+                        _new_rbar |= 0x01  # base "no-other" bit
+                        if _new_rbar != _curr_rbar:
+                            _new_ctrl = (_ctrl & ~(0x1f << 10)) | (_new_rbar << 10)
+                            _new_raw = _wb_patch_ctrl(_scan_si.raw, _new_ctrl)
+                            sass_instrs[_scan_i] = SassInstr(
+                                _new_raw,
+                                _scan_si.comment + f' [WB:stg_rbar=0x{_new_rbar:02x}]')
     else:
         # SM_120 rule #29: the first LDCU.64 param load after @P0 EXIT must use
         # b9=0x0c (not 0x0a). ptxas uses this encoding. Without it, post-EXIT

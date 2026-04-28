@@ -1160,22 +1160,25 @@ def _wdep_for_opcode(opcode: int, raw: bytes = None) -> int:
     """Assign the scoreboard write-dependency slot for an opcode."""
     if opcode == 0x7ac:  # LDCU
         if raw is not None and raw[9] == 0x0a:  # LDCU.64
-            # WB-wdep-audit (2026-04-28): aligned with ptxas at wdep=0x31
-            # for LDCU.64 across the corpus.  Original rotation (0x35
-            # first, then 0x31/0x33) was internally inconsistent with
-            # our rbar usage and never matched ptxas evidence.  An
-            # attempted per-offset rule (descriptor 0x358 -> 0x33) was
-            # also wrong: 16 kernels still mismatched.  The remaining
-            # 7-occurrence ptxas-uses-0x33 bucket appears
-            # context-dependent; defer until more ptxas evidence is
-            # gathered.
+            # WB-wdep-audit (2026-04-28, refined): ptxas rotates
+            # LDCU.64 wdep through [0x31, 0x33].  The first LDCU.64
+            # gets 0x31, the second 0x33, third 0x31, etc.  Verified
+            # by per-kernel kdiff evidence across the 100-kernel
+            # majority (conv2d/tensor exceptions handled separately).
+            # Earlier flat-0x31 rule produced systemic STG.E rbar
+            # mismatches because consumers waiting for the
+            # 2nd-LDCU-loaded UR were waiting on the wrong slot.
+            slots = [0x31, 0x33]
+            slot = slots[_ldcu_slot_counter[0] % 2]
             _ldcu_slot_counter[0] += 1
-            return 0x31
+            return slot
         # LDCU.32: WB-wdep-audit (2026-04-28): aligned with ptxas, which
         # uses 0x31 flat for LDCU.32 across the corpus.  Earlier rotation
         # (0x31/0x33) didn't match ptxas evidence and produced 13 audit
         # discrepancies.  Flat 0x31 closes them.
-        _ldcu_slot_counter[0] += 1
+        # NB: do NOT increment _ldcu_slot_counter — that counter tracks
+        # LDCU.64 rotation only.  Mixing the two would shift LDCU.64
+        # phase based on LDCU.32 presence.
         return 0x31
     if opcode == 0x918:  # NOP: even wdep (misc=0 paired with 0x3e is safe)
         return 0x3e

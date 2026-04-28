@@ -34,6 +34,17 @@ _INT_TYPES = {"u8", "u16", "u32", "u64", "s8", "s16", "s32", "s64",
               "b8", "b16", "b32", "b64"}
 
 
+_BITWIDTH = {
+    "u8": 8, "s8": 8, "b8": 8,
+    "u16": 16, "s16": 16, "b16": 16,
+    "u32": 32, "s32": 32, "b32": 32,
+    "u64": 64, "s64": 64, "b64": 64,
+}
+
+
+_DROP_SENTINEL = "__drop__"
+
+
 def _imm_value(op) -> Optional[int]:
     return op.value if isinstance(op, ImmOp) else None
 
@@ -100,6 +111,14 @@ def _try_fold(inst: Instruction) -> Optional[Instruction]:
         # and with 0 → mov dest, 0
         if b_val == 0 or a_val == 0:
             return _make_mov(inst.dest, ImmOp(0), inst.types[0], pred, neg)
+        # and with all-ones (full bitwidth mask) → mov dest, other
+        bw = _BITWIDTH.get(inst.types[0])
+        if bw is not None:
+            mask = (1 << bw) - 1
+            if b_val is not None and (b_val & mask) == mask:
+                return _make_mov(inst.dest, a, inst.types[0], pred, neg)
+            if a_val is not None and (a_val & mask) == mask:
+                return _make_mov(inst.dest, b, inst.types[0], pred, neg)
         return None
 
     if op == "mul":
@@ -141,13 +160,53 @@ def _try_fold(inst: Instruction) -> Optional[Instruction]:
     return None
 
 
+def _is_self_alias_identity(inst: Instruction) -> bool:
+    """True if this instruction is a self-aliased algebraic identity
+    that produces no observable change (e.g. `or %r, %r, 0`).  Such
+    instructions can be dropped entirely.
+    """
+    if inst.dest is None or not isinstance(inst.dest, RegOp):
+        return False
+    if inst.pred is not None or inst.mods or inst.neg:
+        return False
+    if not inst.types:
+        return False
+    if len(inst.srcs) != 2:
+        return False
+    a, b = inst.srcs
+    op = inst.op
+    if not isinstance(a, RegOp) or a.name != inst.dest.name:
+        return False
+    b_val = _imm_value(b)
+    if b_val is None:
+        return False
+    if op in ("add", "sub", "or", "xor", "shl", "shr") and b_val == 0:
+        return True
+    if op == "and":
+        bw = _BITWIDTH.get(inst.types[0])
+        if bw is not None and (b_val & ((1 << bw) - 1)) == (1 << bw) - 1:
+            return True
+    if op == "mul":
+        if (len(inst.types) >= 2 and inst.types[0] == "lo"
+                and b_val == 1):
+            return True
+    return False
+
+
 def _fold_block(instructions: list[Instruction]) -> int:
     n_folded = 0
-    for i, inst in enumerate(instructions):
+    new_instrs: list[Instruction] = []
+    for inst in instructions:
+        if _is_self_alias_identity(inst):
+            n_folded += 1
+            continue
         replacement = _try_fold(inst)
         if replacement is not None:
-            instructions[i] = replacement
+            new_instrs.append(replacement)
             n_folded += 1
+        else:
+            new_instrs.append(inst)
+    instructions[:] = new_instrs
     return n_folded
 
 

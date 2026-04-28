@@ -1,21 +1,13 @@
 """
 Mul-then-add chain reduction at the PTX IR level.
 
-STATUS (2026-04-27): DORMANT — implemented and IR-correct, but NOT
-wired into sass/pipeline.py because of a downstream SASS correctness
-failure on w1_loop_mul_acc. The IR transform is verified semantically
-correct via direct trace:
-
-  Input: 4× (mul.lo %r4,%r0,K_i ; add.u32 %r2,%r2,%r4) with K=0,1,2,3
-  Output: mad.lo.u32 %r2, %r0, 6, %r2  (i.e. acc = 1 + tid*6, matches
-          the original `acc=1; for i in 0..3: acc += tid*i`)
-
-But the resulting SASS `IMAD R4, R3, 0x6, R4` (write+read same reg)
-produces wrong GPU output on this fixture, while structurally
-identical patterns elsewhere (e.g. `IADD3 R4, R4, R6, RZ`) pass.
-Suspected scoreboard/wait-mask interaction with the ALLOC-folded
-address calc that follows. Diagnosis blocked on SASS-level encoding
-investigation. Re-wire in sass/pipeline.py only after that resolves.
+STATUS (2026-04-27): ACTIVE — re-wired after the underlying SASS
+issue was diagnosed.  The fused 3-operand form `IMAD R, A, K, R`
+(dest aliasing src2) emits wrong GPU output for non-pow-2 K
+immediates.  sass/isel.py now decomposes that case into a separate
+IMAD (with RZ accumulator) followed by IADD3, sidestepping the
+fused-form bug.  The pass IR transform was always correct — only
+the downstream lowering needed fixing.
 
 Recognizes the pattern produced by unroll + counter constant-prop on
 loops whose body computes `tmp = a * counter` and accumulates

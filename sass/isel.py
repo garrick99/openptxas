@@ -5378,10 +5378,26 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                     _encode_imad_r_imm(d, a, imm, c),
                                     f'IMAD R{d}, R{a}, 0x{imm:x}, R{c}  // mad.lo imm (inline)'))
                         elif imm <= 0xffff:
-                            # Direct inline-immediate IMAD.
-                            output.append(SassInstr(
-                                _encode_imad_r_imm(d, a, imm, c),
-                                f'IMAD R{d}, R{a}, 0x{imm:x}, R{c}  // mad.lo imm (inline)'))
+                            # Direct inline-immediate IMAD — but if dest
+                            # aliases the accumulator (c == d), the fused
+                            # 3-operand form `IMAD R, A, K, R` is suspected
+                            # to produce wrong GPU output for non-pow-2 K
+                            # (see ptx/passes/mul3_chain_reduce.py header).
+                            # Decompose into separate mul + add when this
+                            # alias holds.  The pow-of-2 path above
+                            # already takes the split route via IMAD.SHL,
+                            # so this only affects non-pow-2 K.
+                            if c == d:
+                                t = _alloc_gpr(ctx)
+                                output.append(SassInstr(
+                                    _encode_imad_r_imm(t, a, imm, RZ),
+                                    f'IMAD R{t}, R{a}, 0x{imm:x}, RZ  // mad.lo split-mul (acc-alias avoidance)'))
+                                output.append(SassInstr(encode_iadd3(d, t, c, RZ),
+                                    f'IADD3 R{d}, R{t}, R{c}, RZ  // mad.lo split-add'))
+                            else:
+                                output.append(SassInstr(
+                                    _encode_imad_r_imm(d, a, imm, c),
+                                    f'IMAD R{d}, R{a}, 0x{imm:x}, R{c}  // mad.lo imm (inline)'))
                         else:
                             # imm > 0xffff: still need the literal-pool
                             # path.  The lit_pool_base alignment hack in

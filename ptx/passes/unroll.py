@@ -291,6 +291,13 @@ def _try_unroll(fn: Function, idx: int) -> bool:
             if not isinstance(inst.srcs[1], (RegOp, ImmOp)):
                 return False
             continue
+        # NB: `mul.lo.<int>` body shape was previously allowed here to
+        # feed ptx/passes/mul3_chain_reduce.py post-unroll. That pass
+        # is currently DORMANT (see its header) due to a SASS-level
+        # correctness failure on w1_loop_mul_acc. Without the reducer
+        # downstream, allowing mul-body unroll alone makes things
+        # worse (+8 SASS vs +4 unrolled-and-reduced). Re-add the gate
+        # here when mul3_chain_reduce is re-wired.
         if inst.op == "ld":
             if inst.pred is not None or inst.mods:
                 return False

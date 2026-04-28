@@ -879,15 +879,21 @@ def compile_function(fn: Function, verbose: bool = False,
     from ptx.passes.imm_add_fold        import run_function as _imm_add_fold_run
     from ptx.passes.imm_xor_fold        import run_function as _imm_xor_fold_run
     from ptx.passes.repeated_add_reduce import run_function as _repeated_add_reduce_run
+    # NB: ptx/passes/mul3_chain_reduce.py exists as dormant infrastructure
+    # but is NOT wired in. Its IR transform is semantically correct
+    # (`mul %tmp,%a,K_i; add %acc,%acc,%tmp` × N → `mad.lo %acc,%a,ΣK_i,%acc`),
+    # verified by tracing IR through the full pass suite. However on
+    # w1_loop_mul_acc the resulting `IMAD R4, R3, 0x6, R4` SASS produces
+    # wrong GPU output despite identical-shape `IADD3 R4, R4, R6, RZ`
+    # (read+write same reg) elsewhere passing correctness. Suspected
+    # scoreboard/wait-mask interaction with the surrounding ALLOC-folded
+    # address calc on this kernel's specific layout. Re-enable only after
+    # diagnosing the SASS-level encoding difference.
     _unroll_run(fn)
     _load_cse_run(fn)
     _add3_chain_reduce_run(fn)
     _trivial_fold_run(fn)
     _imm_add_fold_run(fn)
-    # Imm-xor fold: collapses `xor %r,%r,K_i` × N (with no intervening
-    # writes to %r) into a single `xor %r,%r,XOR(K_i)`, dropping the
-    # whole chain when the xor-sum is zero (algebraic no-op). Surfaces
-    # for w1_loop_xor where counter values 0..7 xor-cancel.
     _imm_xor_fold_run(fn)
     _repeated_add_reduce_run(fn)
 

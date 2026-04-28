@@ -5,6 +5,9 @@
 #
 # One fixture name per line.  Blank lines and `#` comments ignored.
 
-relu           # u64 p_out routes through GPR LDC.64 + IADD3 carry chain
-               # instead of UR + IADD.64 R-UR — structural regalloc fix
-               # needed (see MILESTONE_142_142.md "Deferred" section)
+# (empty — `relu` was removed 2026-04-27 after Bug 6 fix landed.
+#  The FG26 + descriptor UR4 collision that produced relu's sync=700
+#  was resolved at sass/isel.py:1421 in commit 025599a62c. Subsequent
+#  loop-optimization passes confirmed relu now passes on GPU; the
+#  corpus-gpu run at workflow ID 25029383142 surfaced it as an
+#  UNEXPECTED-PASS, prompting this delisting.)

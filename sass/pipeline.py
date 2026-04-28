@@ -2715,7 +2715,13 @@ def compile_function(fn: Function, verbose: bool = False,
     if _fg29_eligible:
         # Opcodes in the body ALU region (between ISETP/EXIT and 0xc11/STG)
         _ALU_OPCODES = {0x210, 0x810, 0x212, 0x812, 0x824, 0xc24, 0x825,
-                        0x835, 0x819, 0x202, 0x424}
+                        0x835, 0x819, 0x202, 0x424,
+                        # Unary integer ops (added 2026-04-28 by probe mower
+                        # after clz.b32 chain corruption: FG29 was renaming
+                        # the IADD3 subtract step's src R4→R0 but skipping
+                        # the FLO producer at the same R4, leaving IADD3
+                        # reading uninit R0).  These need rename participation.
+                        0x300, 0x301, 0x309, 0x213}  # FLO, BREV, POPC, IABS
         _BOUNDARY = {0xc11, 0x986, 0x981, 0x94d, 0x947}  # 0xc11/STG/EXIT/BRA
         _PREAMBLE = {0xb82, 0x919, 0x7ac, 0xc0c, 0x94d}  # LDC/S2R/LDCU/ISETP/EXIT
 
@@ -2854,7 +2860,32 @@ def compile_function(fn: Function, verbose: bool = False,
                     _r0_conflict_reg = max(_src_body, key=_prev_write)
                     break
 
-            if (_rename_candidates or _outside_users) and not _r0_used:
+            # Multi-body-reg gate (added 2026-04-28 by probe mower):
+            # FG29 collapses intermediate body regs to R0 assuming a single
+            # chain.  When multiple body regs are simultaneously alive — e.g.
+            # FFMA R5, R4, R6, R7 reads three distinct body regs at once —
+            # collapsing them all to R0 destroys the values.  Detect this
+            # by counting body-reg writes whose live-range overlaps another's
+            # by at least one consumer position.
+            _fg29_multi_live = False
+            if len(_all_body_regs) > 2:
+                # Find the position(s) where body regs are read together.
+                # If any single instruction reads >=2 body regs at byte 3/4/8
+                # we cannot safely collapse all-to-R0.
+                for _ri in range(_alu_start, len(sass_instrs)):
+                    _raw = sass_instrs[_ri].raw
+                    _ropc = (struct.unpack_from('<Q', _raw, 0)[0]) & 0xFFF
+                    _gpr_pos = _GPR_FIELDS.get(_ropc, (3, 4, 8))
+                    _read_body = sum(
+                        1 for _bp in _gpr_pos
+                        if _bp != 2 and _bp < len(_raw)
+                        and _raw[_bp] in _all_body_regs
+                        and _raw[_bp] not in {0, 1, 2, 3, 255})
+                    if _read_body >= 2:
+                        _fg29_multi_live = True
+                        break
+
+            if (_rename_candidates or _outside_users) and not _r0_used and not _fg29_multi_live:
                 # Apply rename: for each ALU instruction in the region,
                 # rename GPR fields to R0 EXCEPT the last write of a
                 # register that escapes (whose dest must stay).

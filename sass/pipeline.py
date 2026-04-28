@@ -2889,7 +2889,8 @@ def compile_function(fn: Function, verbose: bool = False,
                     # EXCEPT reads of the conflict reg at its last-write position.
                     # PTXAS-R49: b4 is an IMMEDIATE byte (not GPR) for ALU
                     # opcodes that encode a literal inline — 0x810 IADD3.IMM32,
-                    # 0x812 LOP3.LUT.IMM32, 0x824 IMAD.SHL/.I (imm16 at b4-b5),
+                    # 0x812 LOP3.LUT.IMM32, 0x819 SHF (b4 = K shift amount),
+                    # 0x824 IMAD.SHL/.I (imm16 at b4-b5),
                     # 0x835 UIADD.IMM32, and 0xc24 IMAD.R-UR (UR at b4).  Only
                     # opcodes whose b4 is a true GPR src1 participate in the b4
                     # rename.  Without this guard, LOP3.LUT imm=4 had its low
@@ -2897,7 +2898,11 @@ def compile_function(fn: Function, verbose: bool = False,
                     # turning `xor imm=0x4` into `xor imm=0x0` (observed in
                     # k200_xor_reduce: 3rd chained XOR dropped its imm under
                     # the alternating R0↔R5 regalloc produced by FG29-C).
-                    _R49_B4_IS_IMM = {0x810, 0x812, 0x824, 0x835, 0xc24}
+                    # 0x819 SHF added 2026-04-28 after the autonomous probe
+                    # mower flagged shr.b32 %r2, %r0, 4 producing wrong GPU
+                    # output: FG29 was zeroing the shift amount (b4=0x04
+                    # matched as "R4" and renamed to R0).
+                    _R49_B4_IS_IMM = {0x810, 0x812, 0x819, 0x824, 0x835, 0xc24}
                     _rename_bytes = (3,) if _ropc in _R49_B4_IS_IMM else (3, 4)
                     for _sbp in _rename_bytes:
                         _src = _patched[_sbp]

@@ -2902,8 +2902,17 @@ def compile_function(fn: Function, verbose: bool = False,
                     # mower flagged shr.b32 %r2, %r0, 4 producing wrong GPU
                     # output: FG29 was zeroing the shift amount (b4=0x04
                     # matched as "R4" and renamed to R0).
-                    _R49_B4_IS_IMM = {0x810, 0x812, 0x819, 0x824, 0x835, 0xc24}
-                    _rename_bytes = (3,) if _ropc in _R49_B4_IS_IMM else (3, 4)
+                    # 0x825 IMAD.WIDE added 2026-04-28 after the mower flagged
+                    # shl.b64 %rd2, %rd1, 2 (folded to IMAD.WIDE * 4) producing
+                    # all-zero output: FG29 was zeroing the multiplier imm at b4.
+                    _R49_B4_IS_IMM = {0x810, 0x812, 0x819, 0x824, 0x825, 0x835, 0xc24}
+                    # Byte 8 is src2 (third GPR source) for all ALU opcodes
+                    # in _ALU_OPCODES. Added 2026-04-28 after the autonomous
+                    # probe mower flagged mad.lo.u32 imm=65536 acc-self
+                    # producing garbage: FG29 renamed an init-write of R4 to
+                    # R0 but didn't rename the IMAD's src2 reference at b8,
+                    # causing IMAD to read uninitialized R4.
+                    _rename_bytes = (3, 8) if _ropc in _R49_B4_IS_IMM else (3, 4, 8)
                     for _sbp in _rename_bytes:
                         _src = _patched[_sbp]
                         if _src in _all_body_regs and _src not in {0, 1, 2, 3, 255}:
@@ -3053,6 +3062,23 @@ def compile_function(fn: Function, verbose: bool = False,
                         # outside one here — set a sentinel that bypasses
                         # the rest of the FG36 block.
                         _alu_instrs = []
+                    else:
+                        # Tighter gate (2026-04-28, autonomous probe mower):
+                        # FG36 force-renames the body data-register through
+                        # the chain.  That's only correct when all 4 ALUs
+                        # write the SAME destination GPR (the chain target).
+                        # If they write different dests (e.g. probe template
+                        # init MOVs writing %r2 and %r3 before the shl/or
+                        # chain), forcing R0 corrupts an unrelated value.
+                        _i0_dest = sass_instrs[_alu_instrs[0]].raw[2]
+                        _all_same_dest = all(
+                            sass_instrs[_ri].raw[2] == _i0_dest
+                            for _ri in _alu_instrs)
+                        if not _all_same_dest:
+                            if verbose:
+                                print('[FG36] skipped: 4-ALU chain dests differ '
+                                      '(not a single-target chain)')
+                            _alu_instrs = []
                 if len(_alu_instrs) == 4:
                     _i0, _i1, _i2, _i3 = _alu_instrs
                     # Check if the final ALU reads two different body regs.

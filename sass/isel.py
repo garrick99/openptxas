@@ -3169,7 +3169,29 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             f'SHF.R.S32.HI R{d_hi}, RZ, 0x1f, R{s_hi}  // shr.s64 hi=sign'))
 
                 elif op == 'sub' and typ in ('u64', 's64'):
-                    output.extend(_select_sub_u64(instr, ctx.ra))
+                    # sub.u64 with imm: materialize imm into a scratch GPR pair
+                    # and use the reg-reg path. Avoids the literal-pool LDC
+                    # path (cbuf[0] past params is undefined in synthetic
+                    # kernels — same root cause as PTXAS-R09 for sub.u32).
+                    if (isinstance(instr.srcs[1], ImmOp)
+                            and isinstance(instr.dest, RegOp)
+                            and isinstance(instr.srcs[0], RegOp)):
+                        imm = instr.srcs[1].value & 0xFFFF_FFFF_FFFF_FFFF
+                        imm_lo = imm & 0xFFFFFFFF
+                        imm_hi = (imm >> 32) & 0xFFFFFFFF
+                        a_lo = ctx.ra.lo(instr.srcs[0].name)
+                        d_lo = ctx.ra.lo(instr.dest.name)
+                        t = _alloc_gpr_pair(ctx)
+                        output.append(SassInstr(encode_iadd3_imm32(t, RZ, imm_lo, RZ),
+                                                f'IADD3 R{t}, RZ, 0x{imm_lo:x}, RZ  // sub.{typ} imm_lo'))
+                        output.append(SassInstr(encode_iadd3_imm32(t + 1, RZ, imm_hi, RZ),
+                                                f'IADD3 R{t+1}, RZ, 0x{imm_hi:x}, RZ  // sub.{typ} imm_hi'))
+                        output.append(SassInstr(encode_iadd3(d_lo, a_lo, t, RZ, negate_src1=True),
+                                                f'IADD3 R{d_lo}, R{a_lo}, -R{t}, RZ  // sub.{typ} lo'))
+                        output.append(SassInstr(encode_iadd3x(d_lo + 1, a_lo + 1, t + 1, RZ, negate_src1=True),
+                                                f'IADD3.X R{d_lo+1}, R{a_lo+1}, -R{t+1}, RZ  // sub.{typ} hi'))
+                    else:
+                        output.extend(_select_sub_u64(instr, ctx.ra))
 
                 elif op == 'add' and typ in ('u64', 's64'):
                     # PTXAS-R22 (FB-1 Phase A fix): if this add.u64's dest
@@ -3371,18 +3393,28 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     a_lo = ctx.ra.lo(instr.srcs[0].name)
                     lut = {'and': LOP3_AND, 'or': LOP3_OR, 'xor': LOP3_XOR}[op]
                     if isinstance(instr.srcs[1], ImmOp):
+                        # 64-bit AND/OR/XOR with imm: emit LOP3.IMM on lo and hi words
+                        # separately. Mirrors 32-bit path above. Avoids LDC from a
+                        # literal-pool slot that may be undefined in synthetic kernels.
                         imm = instr.srcs[1].value & 0xFFFF_FFFF_FFFF_FFFF
                         imm_lo = imm & 0xFFFFFFFF
                         imm_hi = (imm >> 32) & 0xFFFFFFFF
-                        t = _alloc_gpr(ctx)
-                        lit_lo = ctx._alloc_literal(imm_lo)
-                        output.append(SassInstr(encode_ldc(t, 0, lit_lo),
-                                                f'LDC R{t}, c[0][0x{lit_lo:x}]  // {op}.b64 imm_lo'))
-                        _emit_lop3(output, ctx, d_lo, a_lo, t, RZ, lut, f'LOP3.LUT R{d_lo}, R{a_lo}, R{t}, RZ, 0x{lut:02x}  // {op}.b64 lo')
-                        lit_hi = ctx._alloc_literal(imm_hi)
-                        output.append(SassInstr(encode_ldc(t, 0, lit_hi),
-                                                f'LDC R{t}, c[0][0x{lit_hi:x}]  // {op}.b64 imm_hi'))
-                        _emit_lop3(output, ctx, d_lo+1, a_lo+1, t, RZ, lut, f'LOP3.LUT R{d_lo+1}, R{a_lo+1}, R{t}, RZ, 0x{lut:02x}  // {op}.b64 hi')
+                        lut_imm = {'and': LOP3_IMM_AND, 'or': LOP3_IMM_OR, 'xor': LOP3_IMM_XOR}[op]
+                        for half_off, imm_half, tag in ((0, imm_lo, 'lo'), (1, imm_hi, 'hi')):
+                            d_h = d_lo + half_off
+                            a_h = a_lo + half_off
+                            if d_h < 14:
+                                output.append(SassInstr(
+                                    encode_lop3_imm32(d_h, a_h, imm_half, RZ, lut_imm),
+                                    f'LOP3.LUT R{d_h}, R{a_h}, 0x{imm_half:x}, RZ, 0x{lut_imm:02x}  // {op}.b64 {tag} imm'))
+                            else:
+                                used = {a_h, d_h}
+                                scratch = next((r for r in range(14) if r not in used), 0)
+                                output.append(SassInstr(
+                                    encode_lop3_imm32(scratch, a_h, imm_half, RZ, lut_imm),
+                                    f'LOP3.LUT R{scratch}, R{a_h}, 0x{imm_half:x}, RZ, 0x{lut_imm:02x}  // {op}.b64 {tag} imm (via R{scratch})'))
+                                output.append(SassInstr(encode_iadd3(d_h, scratch, RZ, RZ),
+                                    f'MOV R{d_h}, R{scratch}  // lop3 fixup'))
                     else:
                         b_lo = ctx.ra.lo(instr.srcs[1].name)
                         _emit_lop3(output, ctx, d_lo, a_lo, b_lo, RZ, lut, f'LOP3.LUT R{d_lo}, R{a_lo}, R{b_lo}, RZ, 0x{lut:02x}  // {op}.b64 lo')
@@ -3638,10 +3670,13 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             if shift <= 15:
                                 output.append(SassInstr(encode_imad_shl_u32(d, a, shift),
                                     f'IMAD.SHL.U32 R{d}, R{a}, 0x{imm:x}, RZ  // mul.lo imm={imm}'))
-                            elif imm <= 0xFFFF:
-                                from sass.encoding.sm_120_opcodes import encode_imad_r_imm
-                                output.append(SassInstr(encode_imad_r_imm(d, a, imm, RZ),
-                                    f'IMAD R{d}, R{a}, 0x{imm:x}, RZ  // mul.lo imm'))
+                            elif shift < 32:
+                                # 16 <= shift < 32: IMAD.SHL.U32 only handles
+                                # up to 15, but SHF.L.U32 covers the full range.
+                                # Avoids the LDCU literal-pool path that reads
+                                # undefined memory in synthetic kernels.
+                                output.append(SassInstr(encode_shf_l_u32(d, a, shift),
+                                    f'SHF.L.U32 R{d}, R{a}, 0x{shift:x}, RZ  // mul.lo imm={imm} (pow2)'))
                             else:
                                 _emit_large_imm_mul()
                         elif imm <= 0xFFFF:

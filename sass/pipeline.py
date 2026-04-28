@@ -886,6 +886,16 @@ def compile_function(fn: Function, verbose: bool = False,
     from ptx.passes.imm_add_fold        import run_function as _imm_add_fold_run
     from ptx.passes.imm_xor_fold        import run_function as _imm_xor_fold_run
     from ptx.passes.repeated_add_reduce import run_function as _repeated_add_reduce_run
+    # NB: ptx/passes/dead_self_update_dce.py exists as dormant infra.
+    # It correctly identifies dead self-update accumulators (e.g. the
+    # leftover counter increment from imm_add_fold), but DROPPING
+    # those instructions exposes a latent scheduler hazard: the
+    # spacer slot they occupied between IADD3 R, R, R and the
+    # subsequent IADD3.UR R2, R3, UR6 (ALLOC addr-lo) is needed for
+    # the scoreboard to insert a wait.  Removing the spacer makes
+    # IADD3.UR fire too early on w1_loop_sum and w1_loop_mul_acc.
+    # Re-wire only after auditing the IADD3 -> IADD3.UR scheduling
+    # rule (sass/scoreboard.py / sass/schedule.py).
     _unroll_run(fn)
     _load_cse_run(fn)
     _add3_chain_reduce_run(fn)

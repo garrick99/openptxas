@@ -11,6 +11,7 @@ Usage:
 """
 
 from __future__ import annotations
+import os
 import struct
 from pathlib import Path
 
@@ -887,21 +888,37 @@ def compile_function(fn: Function, verbose: bool = False,
     from ptx.passes.imm_xor_fold        import run_function as _imm_xor_fold_run
     from ptx.passes.repeated_add_reduce import run_function as _repeated_add_reduce_run
     from ptx.passes.dead_self_update_dce import run_function as _dead_self_update_dce_run
-    _unroll_run(fn)
-    _load_cse_run(fn)
-    _add3_chain_reduce_run(fn)
-    _mul3_chain_reduce_run(fn)
-    _cvt_roundtrip_fold_run(fn)
-    _add_forward_chain_run(fn)
-    _bitop_imm_chain_fold_run(fn)
-    _mul_imm_chain_fold_run(fn)
-    _common_mul_sum_run(fn)
-    _cvt_shl_cse_run(fn)
-    _trivial_fold_run(fn)
-    _imm_add_fold_run(fn)
-    _imm_xor_fold_run(fn)
-    _repeated_add_reduce_run(fn)
-    _dead_self_update_dce_run(fn)
+
+    # WB-pass-toggle (2026-04-28): allow workbench to disable individual
+    # PTX-IR passes via the OPENPTXAS_DISABLE_PASSES env var (comma-
+    # separated list of pass names matching the keys below).  Used by
+    # `workbench sweep` and `workbench why-fail` to attribute regressions
+    # to specific passes without hand-editing this function.
+    _disabled = set(os.environ.get("OPENPTXAS_DISABLE_PASSES", "").split(","))
+    _disabled.discard("")
+    _ptx_passes = [
+        ("unroll",                  _unroll_run),
+        ("load_cse",                _load_cse_run),
+        ("add3_chain_reduce",       _add3_chain_reduce_run),
+        ("mul3_chain_reduce",       _mul3_chain_reduce_run),
+        ("cvt_roundtrip_fold",      _cvt_roundtrip_fold_run),
+        ("add_forward_chain",       _add_forward_chain_run),
+        ("bitop_imm_chain_fold",    _bitop_imm_chain_fold_run),
+        ("mul_imm_chain_fold",      _mul_imm_chain_fold_run),
+        ("common_mul_sum",          _common_mul_sum_run),
+        ("cvt_shl_cse",             _cvt_shl_cse_run),
+        ("trivial_fold",            _trivial_fold_run),
+        ("imm_add_fold",            _imm_add_fold_run),
+        ("imm_xor_fold",            _imm_xor_fold_run),
+        ("repeated_add_reduce",     _repeated_add_reduce_run),
+        ("dead_self_update_dce",    _dead_self_update_dce_run),
+    ]
+    for _pass_name, _pass_fn in _ptx_passes:
+        if _pass_name in _disabled:
+            if verbose:
+                print(f"[pass-toggle] skipping {_pass_name} (OPENPTXAS_DISABLE_PASSES)")
+            continue
+        _pass_fn(fn)
 
     # 0b. Sink ld.param from entry block to first-use block (reduces GPR pressure)
     _sink_param_loads(fn)
@@ -3212,6 +3229,15 @@ def compile_function(fn: Function, verbose: bool = False,
     from sass.compact import compact as _fb42_compact
     sass_instrs, _compact_count = _fb42_compact(
         sass_instrs, verbose=verbose, kernel_name=fn.name)
+
+    # WB-final-trace (2026-04-28): emit a final SASS dump tagged
+    # `[trace-final]` so workbench can extract per-instruction pass
+    # markers (e.g. [FG33:ctrl], [FG36:R0/R5], [TPL01], [MP02]) that
+    # were added after the initial SASS print earlier in this function.
+    # Plain machine-parseable form: `[trace-final] +<offset>: <hex>  // <comment>`
+    if verbose:
+        for _ti, _tsi in enumerate(sass_instrs):
+            print(f'[trace-final] + {_ti*16:>4d}: {_tsi.raw.hex()}  // {_tsi.comment}')
 
     sass_bytes = b''.join(si.raw for si in sass_instrs)
 

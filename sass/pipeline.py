@@ -867,6 +867,18 @@ def compile_function(fn: Function, verbose: bool = False,
     # matching ptxas behaviour for divergent branches on SM_120.
     _if_convert(fn)
 
+    # 0a.1-3. Loop-unroll → imm-add-fold → reg-reg-add strength-reduce.
+    # Together these reproduce what ptxas's optimizer accomplishes for
+    # small constant-bounded loops. unroll.py gates on side-effect-
+    # free body (no atomics / barriers / fences) plus tight trip-count
+    # and body-size budgets to avoid regressions.
+    from ptx.passes.unroll              import run_function as _unroll_run
+    from ptx.passes.imm_add_fold        import run_function as _imm_add_fold_run
+    from ptx.passes.repeated_add_reduce import run_function as _repeated_add_reduce_run
+    _unroll_run(fn)
+    _imm_add_fold_run(fn)
+    _repeated_add_reduce_run(fn)
+
     # 0b. Sink ld.param from entry block to first-use block (reduces GPR pressure)
     _sink_param_loads(fn)
 

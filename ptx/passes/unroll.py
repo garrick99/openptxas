@@ -231,11 +231,67 @@ def _try_unroll(fn: Function, idx: int) -> bool:
     if _pred_used_after_loop(fn, pred_name, idx):
         return False
 
-    # Disallow loops whose body contains a non-self bra/call/ret/exit —
-    # would introduce mid-iteration control flow that breaks linear
-    # cloning. (The back-edge bra is at bra_idx, not in `body`.)
+    # The induction counter must only be referenced by its own
+    # increment (already validated) and the setp test. If any other
+    # body instruction reads or writes %ctr, the per-iteration value
+    # of %ctr is observable inside the body — and unrolling without
+    # constant-propagation of the counter values would clone the body
+    # N times with the same %ctr register, leaving downstream ops
+    # unable to fold (e.g. `mul %r4, %r0, %r3` × N stays N×; ptxas
+    # would have substituted iteration-specific constants for %r3).
+    # Surfaced via suite_all regression on w1_loop_mul_acc / xor /
+    # shift / countdown (artifact 20260427_192528).
+    body_excl_incr = body[:-1]  # body[-1] is the counter increment
+    for inst in body_excl_incr:
+        if inst.dest is not None and isinstance(inst.dest, RegOp) and inst.dest.name == ctr_name:
+            return False
+        for src in inst.srcs:
+            if isinstance(src, RegOp) and src.name == ctr_name:
+                return False
+
+    # Pure-add gating: every body instruction (apart from the counter
+    # increment, which we keep) must be an `add.<int_type> %dest, %a, %b`
+    # with operands of one of the cheap-to-compact shapes:
+    #   - reg + imm  (foldable via imm_add_fold across iterations)
+    #   - reg + reg  (foldable via repeated_add_reduce → mad.lo)
+    # Anything else (`ld`, `st`, `mul`, `xor`, `shl`, ...) survives the
+    # unroll N times unfolded and the cloned body ends up larger than
+    # the rolled form. Once a load-CSE pass and richer chain-reducers
+    # land, this gate can be loosened. Surfaced via suite_all regression
+    # on w1_loop_load_acc (artifact 20260427_192702).
+    _CHEAP_INT_TYPES = {"u32", "s32", "u64", "s64", "b32", "b64"}
+    for inst in body_excl_incr:
+        if inst.op != "add":
+            return False
+        if not inst.types or inst.types[0] not in _CHEAP_INT_TYPES:
+            return False
+        if inst.pred is not None or inst.mods:
+            return False
+        # Must be `dest, %x, %y_or_imm`.
+        if (inst.dest is None or not isinstance(inst.dest, RegOp)
+                or len(inst.srcs) != 2
+                or not isinstance(inst.srcs[0], RegOp)):
+            return False
+        if not isinstance(inst.srcs[1], (RegOp, ImmOp)):
+            return False
+
+    # Disallow loops whose body contains:
+    #   - mid-iteration control flow (would break linear cloning)
+    #   - side-effecting ops where unrolling N times produces N copies
+    #     that the downstream pipeline (regalloc / scoreboard) doesn't
+    #     yet handle correctly (atomics in particular: a suite_all run
+    #     showed correctness regression on `w2_loop_atom_add` when the
+    #     loop body's `atom.add` got cloned 3× and the resulting
+    #     multiple-write-to-%r3 pattern wasn't WAW-renamed).
+    _UNSAFE_OPS = {
+        "bra", "call", "ret", "exit", "trap",          # control flow
+        "atom", "red",                                  # atomic RMW / reduction
+        "bar", "barrier", "membar", "fence",           # synchronization
+        "cp",                                           # cp.async, cp.async.bulk
+        "mbarrier",
+    }
     for inst in body:
-        if inst.op in ("bra", "call", "ret", "exit", "trap"):
+        if inst.op in _UNSAFE_OPS:
             return False
 
     # Transform: replace the block's instructions with N cloned copies

@@ -886,16 +886,7 @@ def compile_function(fn: Function, verbose: bool = False,
     from ptx.passes.imm_add_fold        import run_function as _imm_add_fold_run
     from ptx.passes.imm_xor_fold        import run_function as _imm_xor_fold_run
     from ptx.passes.repeated_add_reduce import run_function as _repeated_add_reduce_run
-    # NB: ptx/passes/dead_self_update_dce.py exists as dormant infra.
-    # It correctly identifies dead self-update accumulators (e.g. the
-    # leftover counter increment from imm_add_fold), but DROPPING
-    # those instructions exposes a latent scheduler hazard: the
-    # spacer slot they occupied between IADD3 R, R, R and the
-    # subsequent IADD3.UR R2, R3, UR6 (ALLOC addr-lo) is needed for
-    # the scoreboard to insert a wait.  Removing the spacer makes
-    # IADD3.UR fire too early on w1_loop_sum and w1_loop_mul_acc.
-    # Re-wire only after auditing the IADD3 -> IADD3.UR scheduling
-    # rule (sass/scoreboard.py / sass/schedule.py).
+    from ptx.passes.dead_self_update_dce import run_function as _dead_self_update_dce_run
     _unroll_run(fn)
     _load_cse_run(fn)
     _add3_chain_reduce_run(fn)
@@ -910,6 +901,7 @@ def compile_function(fn: Function, verbose: bool = False,
     _imm_add_fold_run(fn)
     _imm_xor_fold_run(fn)
     _repeated_add_reduce_run(fn)
+    _dead_self_update_dce_run(fn)
 
     # 0b. Sink ld.param from entry block to first-use block (reduces GPR pressure)
     _sink_param_loads(fn)
@@ -2941,9 +2933,32 @@ def compile_function(fn: Function, verbose: bool = False,
                     if _ropc in _ALU_OPCODES_36:
                         _alu_instrs.append(_ri)
                 if len(_alu_instrs) == 4:
-                    # Check if the final instruction reads two DIFFERENT body
-                    # regs (liveness overlap).  LOP3.IMM (0x812) only reads
-                    # one GPR at b3 — b4 is an immediate, not a register.
+                    # FG36 BUG FIX (2026-04-28): the original gate matched any
+                    # 4 ALU ops in the right window, but FG36's register
+                    # normalization (force R0/R5) is only correct when the
+                    # chain is the k300_nasty_shl_xor LOP3+IMAD shape.  When
+                    # dead_self_update_dce shortens w1_loop_sum into a
+                    # shape-matching but semantically different layout (zero
+                    # init + IMAD.SHL + IADD3), FG36 remaps R3 (= tid) to R0
+                    # (= zero from the init), corrupting the kernel.  Restrict
+                    # firing to chains that actually contain at least one LOP3
+                    # opcode (0x212 or 0x812), which is FG36's intended target.
+                    _i0, _i1, _i2, _i3 = _alu_instrs
+                    _LOP3_OPCS = {0x212, 0x812}
+                    _has_lop3 = any(
+                        ((struct.unpack_from('<Q', sass_instrs[_ri].raw, 0)[0]) & 0xFFF) in _LOP3_OPCS
+                        for _ri in _alu_instrs)
+                    if not _has_lop3:
+                        # Not the FG36-intended pattern; skip to avoid
+                        # misnormalizing unrelated ALU sequences.
+                        if verbose:
+                            print('[FG36] skipped: no LOP3 in 4-ALU chain '
+                                  '(not the shl_xor target pattern)')
+                        # `continue` would advance the for loop but we're
+                        # outside one here — set a sentinel that bypasses
+                        # the rest of the FG36 block.
+                        _alu_instrs = []
+                if len(_alu_instrs) == 4:
                     _i0, _i1, _i2, _i3 = _alu_instrs
                     # Check if the final ALU reads two different body regs.
                     # LOP3.R (0x212) / IADD3 (0x210): b4 is a GPR source.
@@ -3120,12 +3135,36 @@ def compile_function(fn: Function, verbose: bool = False,
                 elif (9 if _ldcu_at_8 else 8) <= _fi < _fg31_n - 5:
                     _is_last_body = (_fi == _fg31_n - 6)
                     _body_opc = _fg31_opcodes[_fi]
+                    # FG33 BUG FIX (2026-04-28): the "last body" patch sets
+                    # wdep=0x3f (untracked), which removes the scoreboard
+                    # barrier the postamble STG would otherwise use to wait
+                    # on the body ALU's writeback.  When the last-body ALU's
+                    # destination IS the data register consumed by the STG,
+                    # untracking races the store against the ALU writeback
+                    # and produces wrong GPU output.  Caught on w1_loop_sum
+                    # after dead_self_update_dce shortens the body and the
+                    # mad-add becomes the last body position; without DCE the
+                    # mad-add was intermediate body (wdep=0x3e tracked) and
+                    # the dead increment held the "last body" slot.
+                    # Fix: keep wdep=0x3e (tracked) on the last body whenever
+                    # the postamble STG reads its destination register.
+                    _stg_consumes_last = False
                     if _is_last_body:
+                        _last_dest = sass_instrs[_fi].raw[2]
+                        for _kj in range(_fi + 1, _fg31_n):
+                            if _fg31_opcodes[_kj] == 0x986:  # STG.E: data at raw[4]
+                                if sass_instrs[_kj].raw[4] == _last_dest:
+                                    _stg_consumes_last = True
+                                break
+                    if _is_last_body and not _stg_consumes_last:
                         # Last body ALU: 0xe40f for LOP3, 0xe20f for IMAD
                         if _body_opc in (0x824, 0xc24, 0x835):  # IMAD or UIADD
                             _target = (0xe2, 0x0f)
                         else:
                             _target = (0xe4, 0x0f)
+                    elif _is_last_body and _stg_consumes_last:
+                        # Force tracked wdep so STG observes the writeback.
+                        _target = (0xca, 0x0f)
                     else:
                         # Intermediate body ALU: 0xc80f for LOP3, 0xca0f for
                         # IMAD or LOP3-before-IMAD.  Skip NOPs when checking

@@ -2939,27 +2939,52 @@ def compile_function(fn: Function, verbose: bool = False,
                 # Only block FG32 if R5 is used as a DESTINATION that escapes
                 # the ALU region (i.e., R5 is in _outside_users).
                 if 4 in _outside_users and 5 not in _outside_users:
-                    _r4_to_r5 = 0
+                    # FG32 was designed for kernels where the body's final
+                    # ALU writes R4, and the STG immediately consumes it.
+                    # If R4 is also read by NON-STG outside-body instructions
+                    # (ISETP using a saved tid, IMAD.WIDE for address calc),
+                    # renaming R4→R5 only inside the body leaves those reads
+                    # consuming the post-rename uninit R4 → garbage output.
+                    # Gate (added 2026-04-28 by probe mower): skip FG32 if
+                    # any outside-body instruction OTHER than STG (0x986)
+                    # references R4.
+                    _fg32_safe = True
                     for _ri in range(len(sass_instrs)):
-                        _si = sass_instrs[_ri]
-                        _raw = _si.raw
+                        if _alu_start <= _ri < _alu_end:
+                            continue
+                        _raw = sass_instrs[_ri].raw
                         _ropc = (struct.unpack_from('<Q', _raw, 0)[0]) & 0xFFF
-                        _patched = bytearray(_raw)
-                        _changed = False
-                        if _ropc in _ALU_OPCODES and _alu_start <= _ri < _alu_end:
-                            if _patched[2] == 4:
-                                _patched[2] = 5; _changed = True
-                            if _patched[3] == 4:
-                                _patched[3] = 5; _changed = True
-                        elif _ropc == 0x986:  # STG data at b4
-                            if _patched[4] == 4:
-                                _patched[4] = 5; _changed = True
-                        if _changed:
-                            sass_instrs[_ri] = SassInstr(bytes(_patched),
-                                _si.comment + ' [FG32:R5]')
-                            _r4_to_r5 += 1
-                    if verbose and _r4_to_r5:
-                        print(f'[FG32] R4->R5 final-result rename: {_r4_to_r5} instrs')
+                        if _ropc == 0x986:
+                            continue  # STG data read at b4 is renamed below
+                        _gpr_pos = _GPR_FIELDS.get(_ropc, (2, 3, 4))
+                        if any(_raw[_bp] == 4 for _bp in _gpr_pos if _bp < len(_raw)):
+                            _fg32_safe = False
+                            break
+                    if not _fg32_safe:
+                        if verbose:
+                            print('[FG32] skipped: R4 has non-STG outside reads')
+                    else:
+                        _r4_to_r5 = 0
+                        for _ri in range(len(sass_instrs)):
+                            _si = sass_instrs[_ri]
+                            _raw = _si.raw
+                            _ropc = (struct.unpack_from('<Q', _raw, 0)[0]) & 0xFFF
+                            _patched = bytearray(_raw)
+                            _changed = False
+                            if _ropc in _ALU_OPCODES and _alu_start <= _ri < _alu_end:
+                                if _patched[2] == 4:
+                                    _patched[2] = 5; _changed = True
+                                if _patched[3] == 4:
+                                    _patched[3] = 5; _changed = True
+                            elif _ropc == 0x986:  # STG data at b4
+                                if _patched[4] == 4:
+                                    _patched[4] = 5; _changed = True
+                            if _changed:
+                                sass_instrs[_ri] = SassInstr(bytes(_patched),
+                                    _si.comment + ' [FG32:R5]')
+                                _r4_to_r5 += 1
+                        if verbose and _r4_to_r5:
+                            print(f'[FG32] R4->R5 final-result rename: {_r4_to_r5} instrs')
 
     # FG52: local ISTP/IMAD reorder in the post-EXIT body.
     # PTXAS places ISTP.I before IMAD.I in the post-EXIT body when both

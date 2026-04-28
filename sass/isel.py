@@ -900,8 +900,15 @@ def _select_shl_b64(instr: Instruction, ra: RegAlloc,
             if not hasattr(ctx, '_widened_from_32'):
                 ctx._widened_from_32 = set()
             ctx._widened_from_32.add(dest.name)
-        # FG69: LDG kernels use IMAD.I + SHF.R.U32.HI
-        if getattr(ctx, '_has_ldg', False):
+        # FG69: single-LDG kernels use IMAD.I + SHF.R.U32.HI
+        # (matches PTXAS for k100_load_shift_store family).  Multi-LDG
+        # kernels get IMAD.WIDE — PTXAS uses LDCU+IADD.64-UR there but
+        # IMAD.WIDE (1 instr) beats IMAD.I+SHF (2 instrs) when we can't
+        # match the LDCU pattern.  See FG69-fix in pipeline.py
+        # (2026-04-28) — tightened gate to fix +1/+2 regressions on
+        # ilp_dual_int64 / ilp_pipeline_load / ilp_unrolled_sum4 /
+        # dual_ldg64_dadd / multi_block_atomic.
+        if getattr(ctx, '_single_ldg', False):
             return [
                 SassInstr(encode_imad_shl_u32(d_lo, src32, k),
                           f'IMAD.I R{d_lo}, R{src32}, {1<<k:#x}, RZ  // FG69: widen lo (LDG family)'),

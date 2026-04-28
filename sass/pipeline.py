@@ -1198,11 +1198,20 @@ def compile_function(fn: Function, verbose: bool = False,
         for inst in bb.instructions
     )
     _has_sync = _has_vote_shfl  # BAR alone works natively now
-    _has_ldg = any(
-        inst.op == 'ld' and 'global' in inst.types
-        for bb in fn.blocks
-        for inst in bb.instructions
+    _ldg_count = sum(
+        1 for bb in fn.blocks for inst in bb.instructions
+        if inst.op == 'ld' and 'global' in inst.types
     )
+    _has_ldg = _ldg_count > 0
+    # FG69-fix (2026-04-28): the IMAD.I + SHF widening path produces 2
+    # SASS instructions where IMAD.WIDE produced 1.  PTXAS only uses
+    # IMAD.I+SHF for kernels with a SINGLE global load (k100_load_shift_store
+    # family).  Kernels with multiple independent LDGs (ilp_dual_int64,
+    # ilp_pipeline_load, ilp_unrolled_sum4, dual_ldg64_dadd, ...) get
+    # cheaper output from IMAD.WIDE.  Gate FG69 on having exactly one LDG
+    # to match PTXAS's actual choice.  Caught by `workbench gap-trends`
+    # showing 5 silent regressions and `git log` pointing to FG67-69.
+    _single_ldg = (_ldg_count == 1)
     _has_stg = any(
         (inst.op == 'st' and 'global' in inst.types) or inst.op == 'atom'
         for bb in fn.blocks
@@ -1369,8 +1378,11 @@ def compile_function(fn: Function, verbose: bool = False,
         inst.op == 'bar' and 'sync' in inst.types
         for bb in fn.blocks for inst in bb.instructions
     )
-    # FG69: expose _has_ldg for isel SHF widening decision
+    # FG69: expose _has_ldg for isel SHF widening decision.
+    # FG69-fix (2026-04-28): also expose _single_ldg so isel can
+    # gate the IMAD.I+SHF substitution on having exactly one LDG.
     ctx._has_ldg = _has_ldg
+    ctx._single_ldg = _single_ldg
 
     body_instrs = select_function(fn, ctx)
 

@@ -1221,11 +1221,13 @@ def _wdep_for_opcode(opcode: int, raw: bytes = None) -> int:
     # Earlier analysis incorrectly decoded ctrl (forgot <<1 shift in _ctrl_to_bytes)
     if opcode in _OPCODES_IADD64_UR:
         return 0x3e  # ALU slot — consumer LDG/STG gets rbar via pending_writes
-    # WB-wdep-audit (2026-04-28): ptxas leaves LOP3.IMM (0x812) untracked
-    # (wdep=0x3f) — saves a scoreboard slot, and downstream consumers
-    # in the corpus never set rbar to wait for LOP3.IMM specifically.
-    # Aligning closes 17 wdep-audit occurrences.
-    if opcode == 0x812:
+    # WB-wdep-audit (2026-04-28): ptxas leaves these ops untracked
+    # (wdep=0x3f).  Each closes a wdep-audit bucket once aligned:
+    #   0x812 LOP3.IMM     — 17 occurrences
+    #   0xc11 IADD3.UR     — 12 occurrences (postamble carry-chain
+    #                        addr-pair; STG consumer waits via natural
+    #                        ALU latency, not scoreboard)
+    if opcode in (0x812, 0xc11):
         return 0x3f
     if opcode in _OPCODES_ALU | _OPCODES_SMEM_SETUP:
         return 0x3e

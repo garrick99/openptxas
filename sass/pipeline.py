@@ -877,6 +877,7 @@ def compile_function(fn: Function, verbose: bool = False,
     from ptx.passes.add3_chain_reduce   import run_function as _add3_chain_reduce_run
     from ptx.passes.cvt_roundtrip_fold  import run_function as _cvt_roundtrip_fold_run
     from ptx.passes.add_forward_chain   import run_function as _add_forward_chain_run
+    from ptx.passes.common_mul_sum      import run_function as _common_mul_sum_run
     from ptx.passes.trivial_fold        import run_function as _trivial_fold_run
     from ptx.passes.imm_add_fold        import run_function as _imm_add_fold_run
     from ptx.passes.imm_xor_fold        import run_function as _imm_xor_fold_run
@@ -896,6 +897,7 @@ def compile_function(fn: Function, verbose: bool = False,
     _add3_chain_reduce_run(fn)
     _cvt_roundtrip_fold_run(fn)
     _add_forward_chain_run(fn)
+    _common_mul_sum_run(fn)
     _trivial_fold_run(fn)
     _imm_add_fold_run(fn)
     _imm_xor_fold_run(fn)

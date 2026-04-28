@@ -3164,36 +3164,21 @@ def compile_function(fn: Function, verbose: bool = False,
                 elif (9 if _ldcu_at_8 else 8) <= _fi < _fg31_n - 5:
                     _is_last_body = (_fi == _fg31_n - 6)
                     _body_opc = _fg31_opcodes[_fi]
-                    # FG33 BUG FIX (2026-04-28): the "last body" patch sets
-                    # wdep=0x3f (untracked), which removes the scoreboard
-                    # barrier the postamble STG would otherwise use to wait
-                    # on the body ALU's writeback.  When the last-body ALU's
-                    # destination IS the data register consumed by the STG,
-                    # untracking races the store against the ALU writeback
-                    # and produces wrong GPU output.  Caught on w1_loop_sum
-                    # after dead_self_update_dce shortens the body and the
-                    # mad-add becomes the last body position; without DCE the
-                    # mad-add was intermediate body (wdep=0x3e tracked) and
-                    # the dead increment held the "last body" slot.
-                    # Fix: keep wdep=0x3e (tracked) on the last body whenever
-                    # the postamble STG reads its destination register.
-                    _stg_consumes_last = False
+                    # NB (2026-04-28): an earlier defensive fallback here
+                    # forced last-body wdep=0x3e when STG consumed the
+                    # body's dest, on the theory that untracking races
+                    # the writeback.  Verified by `workbench wdep-audit`:
+                    # ptxas does NOT track the last-body wdep even when
+                    # STG consumes it (in-order ALU retire is sufficient),
+                    # and our untrack matches the 17 LOP3.IMM cases.
+                    # The actual w1_loop_sum failure that motivated the
+                    # fallback was FG36's overfire, fixed separately.
                     if _is_last_body:
-                        _last_dest = sass_instrs[_fi].raw[2]
-                        for _kj in range(_fi + 1, _fg31_n):
-                            if _fg31_opcodes[_kj] == 0x986:  # STG.E: data at raw[4]
-                                if sass_instrs[_kj].raw[4] == _last_dest:
-                                    _stg_consumes_last = True
-                                break
-                    if _is_last_body and not _stg_consumes_last:
                         # Last body ALU: 0xe40f for LOP3, 0xe20f for IMAD
                         if _body_opc in (0x824, 0xc24, 0x835):  # IMAD or UIADD
                             _target = (0xe2, 0x0f)
                         else:
                             _target = (0xe4, 0x0f)
-                    elif _is_last_body and _stg_consumes_last:
-                        # Force tracked wdep so STG observes the writeback.
-                        _target = (0xca, 0x0f)
                     else:
                         # Intermediate body ALU: 0xc80f for LOP3, 0xca0f for
                         # IMAD or LOP3-before-IMAD.  Skip NOPs when checking

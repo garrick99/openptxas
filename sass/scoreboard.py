@@ -1160,22 +1160,23 @@ def _wdep_for_opcode(opcode: int, raw: bytes = None) -> int:
     """Assign the scoreboard write-dependency slot for an opcode."""
     if opcode == 0x7ac:  # LDCU
         if raw is not None and raw[9] == 0x0a:  # LDCU.64
-            # WB-wdep-audit (2026-04-28): aligned with ptxas, which uses
-            # wdep=0x31 for LDCU.64 across the corpus.  Earlier rotation
-            # (0x35 first, then 0x31/0x33) was internally inconsistent
-            # with our rbar usage and never matched ptxas evidence.
-            # Switching to flat 0x31 closed the largest wdep-audit bucket
-            # (30 occurrences).
+            # WB-wdep-audit (2026-04-28): aligned with ptxas at wdep=0x31
+            # for LDCU.64 across the corpus.  Original rotation (0x35
+            # first, then 0x31/0x33) was internally inconsistent with
+            # our rbar usage and never matched ptxas evidence.  An
+            # attempted per-offset rule (descriptor 0x358 -> 0x33) was
+            # also wrong: 16 kernels still mismatched.  The remaining
+            # 7-occurrence ptxas-uses-0x33 bucket appears
+            # context-dependent; defer until more ptxas evidence is
+            # gathered.
             _ldcu_slot_counter[0] += 1
             return 0x31
-        # LDCU.32: use rotating slots like LDCU.64.
-        # ptxas uses 0x31 for param scalar loads and 0x35 for descriptors.
-        # Using only 0x35 causes scoreboard collision with LDG in VOTE-path
-        # kernels, leading to ERR715. Rotate between 0x31 and 0x33.
-        slots32 = [0x31, 0x33]
-        slot = slots32[(_ldcu_slot_counter[0]) % len(slots32)]
+        # LDCU.32: WB-wdep-audit (2026-04-28): aligned with ptxas, which
+        # uses 0x31 flat for LDCU.32 across the corpus.  Earlier rotation
+        # (0x31/0x33) didn't match ptxas evidence and produced 13 audit
+        # discrepancies.  Flat 0x31 closes them.
         _ldcu_slot_counter[0] += 1
-        return slot
+        return 0x31
     if opcode == 0x918:  # NOP: even wdep (misc=0 paired with 0x3e is safe)
         return 0x3e
     if opcode in _OPCODES_LDC:

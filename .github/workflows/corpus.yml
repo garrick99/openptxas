@@ -31,6 +31,12 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e .
+          # forge-workbench provides the `workbench` package (KERNELS catalog
+          # + compile helpers). It used to live as openptxas/workbench.py;
+          # spun out into garrick99/forge-workbench. Several openptxas scripts
+          # (corpus_compile_check.py, corpus_sweep.py, etc.) still
+          # `import workbench` against the now-external package.
+          pip install git+https://github.com/garrick99/forge-workbench.git
       - name: corpus compile check
         run: python scripts/corpus_compile_check.py
 

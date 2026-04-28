@@ -1160,17 +1160,14 @@ def _wdep_for_opcode(opcode: int, raw: bytes = None) -> int:
     """Assign the scoreboard write-dependency slot for an opcode."""
     if opcode == 0x7ac:  # LDCU
         if raw is not None and raw[9] == 0x0a:  # LDCU.64
-            # First LDCU.64 (descriptor, c[0][0x358]) uses 0x35 so LDG gets rbar=0x09.
-            # Subsequent LDCU.64s (pointer params) use 0x31/0x33 rotation to avoid
-            # aliasing LDG's 0x35 scoreboard slot — if LDCU.64 appears between LDG and
-            # its consumer, a 0x35 write would clear LDG's barrier prematurely.
-            if _ldcu_slot_counter[0] == 0:
-                _ldcu_slot_counter[0] += 1
-                return 0x35  # first LDCU.64 = descriptor
-            slots = [0x31, 0x33]
-            slot = slots[(_ldcu_slot_counter[0] - 1) % len(slots)]
+            # WB-wdep-audit (2026-04-28): aligned with ptxas, which uses
+            # wdep=0x31 for LDCU.64 across the corpus.  Earlier rotation
+            # (0x35 first, then 0x31/0x33) was internally inconsistent
+            # with our rbar usage and never matched ptxas evidence.
+            # Switching to flat 0x31 closed the largest wdep-audit bucket
+            # (30 occurrences).
             _ldcu_slot_counter[0] += 1
-            return slot
+            return 0x31
         # LDCU.32: use rotating slots like LDCU.64.
         # ptxas uses 0x31 for param scalar loads and 0x35 for descriptors.
         # Using only 0x35 causes scoreboard collision with LDG in VOTE-path

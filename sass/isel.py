@@ -1006,6 +1006,14 @@ def _select_shr_u64(instr: Instruction, ra: RegAlloc) -> list[SassInstr]:
     s_lo = ra.lo(src.name);  s_hi = s_lo + 1
 
 
+    if k >= 64:
+        # PTX shift amount >= width produces 0 (matches ptxas).
+        return [
+            SassInstr(encode_iadd3(d_lo, RZ, RZ, RZ),
+                      f'MOV R{d_lo}, RZ  // shr.u64 {k} (>=64 → 0)'),
+            SassInstr(encode_iadd3(d_hi, RZ, RZ, RZ),
+                      f'MOV R{d_hi}, RZ  // shr.u64 {k} (>=64 → 0)'),
+        ]
     if k < 32:
         return [
             SassInstr(encode_shf_r_u32(d_lo, s_lo, k, s_hi),
@@ -1014,7 +1022,7 @@ def _select_shr_u64(instr: Instruction, ra: RegAlloc) -> list[SassInstr]:
                       f'SHF.R.U32.HI R{d_hi}, RZ, 0x{k:x}, R{s_hi}  // shr.u64 hi'),
         ]
     else:
-        # K >= 32: result.lo = src.hi >> (K-32), result.hi = 0
+        # 32 <= K < 64: result.lo = src.hi >> (K-32), result.hi = 0
         k32 = k - 32
         return [
             SassInstr(encode_shf_r_u32_hi(d_lo, s_hi, k32),
@@ -2256,9 +2264,14 @@ def _select_atom_generic_u32(instr: Instruction, ra: RegAlloc,
     if not isinstance(addr_op, MemOp):
         raise ISelError(f"atom.{op_name} addr must be MemOp")
     d    = ra.r32(dest_op.name)
-    data = ra.r32(data_op.name)
-
     prefix = []
+    if isinstance(data_op, ImmOp):
+        data = _alloc_gpr(ctx) if ctx else 0
+        prefix.append(SassInstr(
+            encode_iadd3_imm32(data, RZ, data_op.value & 0xFFFFFFFF, RZ),
+            f'IADD3 R{data}, RZ, 0x{data_op.value & 0xFFFFFFFF:x}, RZ  // atom.{op_name} imm'))
+    else:
+        data = ra.r32(data_op.name)
     base_name = addr_op.base if addr_op.base.startswith('%') else f'%{addr_op.base}'
     ur_params = getattr(ctx, '_ur_params', {}) if ctx else {}
     deferred = getattr(ctx, '_deferred_ur_params', {}) if ctx else {}
@@ -3112,7 +3125,11 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     if isinstance(instr.srcs[1], ImmOp):
                         k = instr.srcs[1].value
-                        if k <= 15:
+                        if k >= 32:
+                            # PTX shift amount >= width produces 0 (matches ptxas).
+                            output.append(SassInstr(encode_iadd3(d, RZ, RZ, RZ),
+                                                    f'MOV R{d}, RZ  // shl.{typ} {k} (>=32 → 0)'))
+                        elif k <= 15:
                             output.append(SassInstr(encode_imad_shl_u32(d, a, k),
                                                     f'IMAD.SHL.U32 R{d}, R{a}, {1<<k:#x}, RZ  // shl.{typ} {k}'))
                         else:
@@ -3129,7 +3146,16 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     is_signed = (typ == 's32')
                     if isinstance(instr.srcs[1], ImmOp):
                         k = instr.srcs[1].value
-                        if is_signed:
+                        if k >= 32:
+                            # u32/b32: shift >= width → 0.
+                            # s32: shift >= width → arithmetic of sign bit (use k=31).
+                            if is_signed:
+                                output.append(SassInstr(encode_shf_r_s32_hi(d, a, 31),
+                                                        f'SHF.R.S32.HI R{d}, RZ, 0x1f, R{a}  // shr.s32 {k} (>=32 → sign)'))
+                            else:
+                                output.append(SassInstr(encode_iadd3(d, RZ, RZ, RZ),
+                                                        f'MOV R{d}, RZ  // shr.{typ} {k} (>=32 → 0)'))
+                        elif is_signed:
                             output.append(SassInstr(encode_shf_r_s32_hi(d, a, k),
                                                     f'SHF.R.S32.HI R{d}, RZ, 0x{k:x}, R{a}  // shr.s32 {k}'))
                         else:

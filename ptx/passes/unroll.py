@@ -231,26 +231,18 @@ def _try_unroll(fn: Function, idx: int) -> bool:
     if _pred_used_after_loop(fn, pred_name, idx):
         return False
 
-    # The induction counter must only be referenced by its own
-    # increment (already validated) and the setp test. If any other
-    # body instruction reads or writes %ctr, the per-iteration value
-    # of %ctr is observable inside the body. Const-propagation across
-    # unroll iterations IS implemented (see clone loop below — it
-    # substitutes %ctr → ImmOp(init + i*step) per iteration), but
-    # currently the downstream fold passes can only collapse
-    # `add %r,%r,IMM` chains, not 3-operand `add %r,%a,IMM` shapes
-    # that show up when the counter is a body source. Until a
-    # 3-operand add chain reducer lands (`add %r,%a,K_i; add %r2,%r2,%r`
-    # × N → `mad.lo %r2, %a, N, %r2 + Σ K_i`), keep this gate strict.
-    # Surfaced via suite_all regression on w1_loop_countdown
-    # (artifact 20260427_194215).
+    # The induction counter must not be WRITTEN by any body
+    # instruction other than its own increment (which is body[-1]).
+    # READS are now allowed: per-iteration constant-propagation
+    # (the clone loop below substitutes %ctr → ImmOp(init+i*step)
+    # in body[:-1]) feeds the resulting `add %tmp, %a, K_i` pairs
+    # into add3_chain_reduce, which collapses N pairs into a single
+    # mad.lo + add(ΣK_i). Surfaced as a win for w1_loop_countdown
+    # once that reducer landed.
     body_excl_incr = body[:-1]
     for inst in body_excl_incr:
         if inst.dest is not None and isinstance(inst.dest, RegOp) and inst.dest.name == ctr_name:
             return False
-        for src in inst.srcs:
-            if isinstance(src, RegOp) and src.name == ctr_name:
-                return False
 
     # Cheap-body gating: each non-increment body instruction must be
     # one of:

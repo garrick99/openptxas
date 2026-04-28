@@ -2621,7 +2621,7 @@ def compile_function(fn: Function, verbose: bool = False,
     # needs to be at R5 (PTXAS convention).  Rename all R4 in ALU body
     # and STG data to R5.
     if _fg56_fired:
-        _ALU_56 = {0x824, 0x835, 0x812, 0x212, 0x810, 0x210}
+        _ALU_56 = {0x824, 0x835, 0x812, 0x212, 0x810, 0x210, 0x807}  # +SEL (selp)
         # PTXAS-R51: ISETP consumers of FG56b-renamed ALU dest.  When FG56b
         # renames LOP3/IMAD dest R4->R5, the downstream ISETP reading that
         # value at b3 must be renamed too, or the ISETP reads uninitialized

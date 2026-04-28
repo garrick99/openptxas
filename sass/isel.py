@@ -5291,26 +5291,25 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         pd = ctx.ra.pred(instr.srcs[2].name) if instr.srcs[2].name in ctx.ra.pred_regs else 0
                         neg = hasattr(ctx, '_negated_preds') and pd in ctx._negated_preds
                     s0, s1 = instr.srcs[0], instr.srcs[1]
-                    # Predicated-MOV path: avoids SEL predicate-read barrier races.
-                    # SM_120 scoreboard handles instruction guards (@P) correctly,
-                    # so we emit: MOV R, false_val; @P MOV R, true_val.
-                    # For negated preds (setp inversion): @!P MOV R, true_val.
+                    # imm/imm: emit SEL (opcode 0x807) — same as ptxas.  This
+                    # avoids the predicate-write-to-read hazard the previous
+                    # 2-MOV pattern (`MOV R,false; @P MOV R,true`) hit when
+                    # the @P MOV had no GPR dependency (so the scoreboard
+                    # picked stall=0 and the @P read the stale predicate).
+                    # Surfaced by the probe mower's selp_op axis (12 cases).
                     if isinstance(s0, ImmOp) and isinstance(s1, ImmOp):
                         true_val  = s0.value & 0xFFFFFFFF
                         false_val = s1.value & 0xFFFFFFFF
-                        # Emit unconditional MOV for false value
+                        from sass.encoding.sm_120_opcodes import encode_sel_imm
+                        # Materialize true_val into a scratch GPR (SEL src0).
+                        scratch = _alloc_gpr(ctx)
                         output.append(SassInstr(
-                            encode_iadd3_imm32(d, RZ, false_val, RZ),
-                            f'IADD3 R{d}, RZ, {false_val:#x}, RZ  // selp false'))
-                        # Emit predicated MOV for true value
-                        pred_byte = (pd & 0x07)
-                        if neg:
-                            pred_byte |= 0x08  # negate
-                        raw_pmov = bytearray(encode_iadd3_imm32(d, RZ, true_val, RZ))
-                        raw_pmov[1] = (raw_pmov[1] & 0x0F) | (pred_byte << 4)
+                            encode_iadd3_imm32(scratch, RZ, true_val, RZ),
+                            f'IADD3 R{scratch}, RZ, {true_val:#x}, RZ  // selp true_val'))
+                        # SEL d, scratch, false_val, P  →  d = (P ? scratch : false_val)
                         output.append(SassInstr(
-                            bytes(raw_pmov),
-                            f'@{"!" if neg else ""}P{pd} IADD3 R{d}, RZ, {true_val:#x}, RZ  // selp true'))
+                            encode_sel_imm(d, scratch, false_val, pred=pd, pred_neg=neg),
+                            f'SEL R{d}, R{scratch}, {false_val:#x}, {"!" if neg else ""}P{pd}  // selp'))
                     elif isinstance(s0, ImmOp) or isinstance(s1, ImmOp):
                         # One register, one immediate
                         if isinstance(s0, ImmOp):

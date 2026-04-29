@@ -3318,6 +3318,16 @@ def compile_function(fn: Function, verbose: bool = False,
                 elif (9 if _ldcu_at_8 else 8) <= _fi < _fg31_n - 5:
                     _is_last_body = (_fi == _fg31_n - 6)
                     _body_opc = _fg31_opcodes[_fi]
+                    # SHF.var (0x299, 0x219) needs to KEEP its scoreboard
+                    # wdep tracking from the encoder.  FG33's hardcoded
+                    # ctrl template was tuned for IMAD/LOP3/IADD3 bodies
+                    # and overwrites wdep=0x3E (tracked) → 0x3F (untracked).
+                    # That breaks shr.b32/shl.b32 with reg-shift and bfe.u32
+                    # reg-pos because the consumer (e.g. STG of the SHF
+                    # result) reads stale data without the scoreboard wait.
+                    # Surfaced 2026-04-29 via probe mower's bfe reg-pos.
+                    if _body_opc in (0x299, 0x219):
+                        continue  # leave SHF.var ctrl alone
                     # NB (2026-04-28): an earlier defensive fallback here
                     # forced last-body wdep=0x3e when STG consumed the
                     # body's dest, on the theory that untracking races

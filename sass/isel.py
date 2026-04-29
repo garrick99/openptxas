@@ -1051,9 +1051,13 @@ def _select_sub_u64(instr: Instruction, ra: RegAlloc) -> list[SassInstr]:
 
     # SM_120 rule: IADD.64 R-R (0x235) is broken. Use IADD3+IADD3.X.
     # sub.u64: d = a + (-b). IADD3 with negate on src1.
+    # write_carry=True forces b10=0xF1 (carry-out → P0) so the
+    # following IADD3.X has a real borrow to consume.  Without it the
+    # hi half is always wrong (carry never written, IADD3.X reads
+    # stale P0 from prior setp).
     return [
-        SassInstr(encode_iadd3(d_lo, a_lo, b_lo, RZ, negate_src1=True),
-                  f'IADD3 R{d_lo}, R{a_lo}, -R{b_lo}, RZ  // sub.u64 lo'),
+        SassInstr(encode_iadd3(d_lo, a_lo, b_lo, RZ, negate_src1=True, write_carry=True),
+                  f'IADD3 R{d_lo}, P0, R{a_lo}, -R{b_lo}, RZ  // sub.u64 lo'),
         SassInstr(encode_iadd3x(d_hi, a_hi, b_hi, RZ, negate_src1=True),
                   f'IADD3.X R{d_hi}, R{a_hi}, -R{b_hi}, RZ  // sub.u64 hi'),
     ]
@@ -3212,8 +3216,8 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                                 f'IADD3 R{t}, RZ, 0x{imm_lo:x}, RZ  // sub.{typ} imm_lo'))
                         output.append(SassInstr(encode_iadd3_imm32(t + 1, RZ, imm_hi, RZ),
                                                 f'IADD3 R{t+1}, RZ, 0x{imm_hi:x}, RZ  // sub.{typ} imm_hi'))
-                        output.append(SassInstr(encode_iadd3(d_lo, a_lo, t, RZ, negate_src1=True),
-                                                f'IADD3 R{d_lo}, R{a_lo}, -R{t}, RZ  // sub.{typ} lo'))
+                        output.append(SassInstr(encode_iadd3(d_lo, a_lo, t, RZ, negate_src1=True, write_carry=True),
+                                                f'IADD3 R{d_lo}, P0, R{a_lo}, -R{t}, RZ  // sub.{typ} lo'))
                         output.append(SassInstr(encode_iadd3x(d_lo + 1, a_lo + 1, t + 1, RZ, negate_src1=True),
                                                 f'IADD3.X R{d_lo+1}, R{a_lo+1}, -R{t+1}, RZ  // sub.{typ} hi'))
                     else:
@@ -5221,8 +5225,8 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     # SM_120: IADD.64 R-R broken. Use IADD3+IADD3.X.
                     d_lo = ctx.ra.lo(instr.dest.name); d_hi = d_lo + 1
                     a_lo = ctx.ra.lo(instr.srcs[0].name); a_hi = a_lo + 1
-                    output.append(SassInstr(encode_iadd3(d_lo, RZ, a_lo, RZ, negate_src1=True),
-                                            f'IADD3 R{d_lo}, RZ, -R{a_lo}, RZ  // neg.{typ} lo'))
+                    output.append(SassInstr(encode_iadd3(d_lo, RZ, a_lo, RZ, negate_src1=True, write_carry=True),
+                                            f'IADD3 R{d_lo}, P0, RZ, -R{a_lo}, RZ  // neg.{typ} lo'))
                     output.append(SassInstr(encode_iadd3x(d_hi, RZ, a_hi, RZ, negate_src1=True),
                                             f'IADD3.X R{d_hi}, RZ, -R{a_hi}, RZ  // neg.{typ} hi'))
 
@@ -5335,13 +5339,28 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         # Both register sources: use predicated MOV (P2-2).
                         # SEL only supports P0 on SM_120, but predicated IADD3
                         # works with all physical predicates (P0-P5).
+                        #
+                        # PTX: selp d, A, B, p_orig  →  d = A if p_orig else B
+                        # Stored predicate may be inverted (neg=True means
+                        # the value at pd is !p_orig due to setp lt→ge etc.).
+                        # Correct emission for inverted case:
+                        #   - Unconditional MOV d, B  (false branch)
+                        #   - @!pd MOV d, A          (negate the GUARD only;
+                        #                             do NOT swap operands)
+                        # Previous code did BOTH (swap A↔B and add negate
+                        # bit), which composes to identity → output reversed
+                        # for tid<thr vs tid>=thr.  Surfaced 2026-04-28 via
+                        # max.s64 hand-rolled (setp.lt.s64 + selp.b64) at
+                        # N=128 — for tid>=5, ours kept returning 5 instead
+                        # of tid because the @P-guard fired on the wrong
+                        # branch.
                         a = ctx.ra.r32(s0.name) if isinstance(s0, RegOp) else RZ
                         b = ctx.ra.r32(s1.name) if isinstance(s1, RegOp) else RZ
-                        true_reg, false_reg = (a, b) if not neg else (b, a)
+                        true_reg, false_reg = a, b   # NO swap on neg
                         # MOV d = false_reg (unconditional)
                         output.append(SassInstr(encode_iadd3(d, false_reg, RZ, RZ),
                             f'MOV R{d}, R{false_reg}  // selp false'))
-                        # @P MOV d = true_reg (predicated)
+                        # @P MOV d = true_reg (predicated; negate guard if neg)
                         pred_byte = (pd & 0x07)
                         if neg:
                             pred_byte |= 0x08
@@ -5716,8 +5735,8 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     b_lo  = ctx.ra.lo(instr.srcs[1].name)
                     t_lo  = ctx._next_gpr; ctx._next_gpr += 2   # diff pair (t_lo, t_lo+1)
                     mask  = _alloc_gpr(ctx)
-                    output.append(SassInstr(encode_iadd3(t_lo, a_lo, b_lo, RZ, negate_src1=True),
-                        f'IADD3 R{t_lo}, R{a_lo}, -R{b_lo}, RZ  // min.{typ} diff lo'))
+                    output.append(SassInstr(encode_iadd3(t_lo, a_lo, b_lo, RZ, negate_src1=True, write_carry=True),
+                        f'IADD3 R{t_lo}, P0, R{a_lo}, -R{b_lo}, RZ  // min.{typ} diff lo'))
                     output.append(SassInstr(encode_iadd3x(t_lo+1, a_lo+1, b_lo+1, RZ, negate_src1=True),
                         f'IADD3.X R{t_lo+1}, R{a_lo+1}, -R{b_lo+1}, RZ  // min.{typ} diff hi'))
                     output.append(SassInstr(encode_shf_r_s32_hi(mask, t_lo+1, 31),
@@ -5740,8 +5759,8 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     b_lo  = ctx.ra.lo(instr.srcs[1].name)
                     t_lo  = ctx._next_gpr; ctx._next_gpr += 2   # diff pair
                     mask  = _alloc_gpr(ctx)   # inverted sign mask
-                    output.append(SassInstr(encode_iadd3(t_lo, a_lo, b_lo, RZ, negate_src1=True),
-                        f'IADD3 R{t_lo}, R{a_lo}, -R{b_lo}, RZ  // max.{typ} diff lo'))
+                    output.append(SassInstr(encode_iadd3(t_lo, a_lo, b_lo, RZ, negate_src1=True, write_carry=True),
+                        f'IADD3 R{t_lo}, P0, R{a_lo}, -R{b_lo}, RZ  // max.{typ} diff lo'))
                     output.append(SassInstr(encode_iadd3x(t_lo+1, a_lo+1, b_lo+1, RZ, negate_src1=True),
                         f'IADD3.X R{t_lo+1}, R{a_lo+1}, -R{b_lo+1}, RZ  // max.{typ} diff hi'))
                     output.append(SassInstr(encode_shf_r_s32_hi(mask, t_lo+1, 31),

@@ -391,7 +391,8 @@ def encode_s2r(dest: int, sr_code: int, ctrl: int = 0) -> bytes:
 #   src2  -> b8  (third addend, often RZ)
 
 def encode_iadd3(dest: int, src0: int, src1: int, src2: int,
-                 negate_src1: bool = False, ctrl: int = 0) -> bytes:
+                 negate_src1: bool = False, ctrl: int = 0,
+                 write_carry: bool = False) -> bytes:
     """
     Encode IADD3 dest, P0, PT, src0, [+-]src1, src2 to 16 bytes.
 
@@ -399,16 +400,10 @@ def encode_iadd3(dest: int, src0: int, src1: int, src2: int,
     modifier bytes; only the four integer register operands are variable.
     When negate_src1=True, computes dest = src0 - src1 + src2.
 
-    Args:
-        dest:  Destination register index (0..255, 255=RZ).
-        src0:  First source register index (0..255, 255=RZ).
-        src1:  Second source register index (0..255, 255=RZ).
-        src2:  Third source register index (0..255, 255=RZ).
-        negate_src1: If True, negate src1 (subtraction).
-        ctrl:  23-bit scheduling control word (0 = default 0x7e0).
-
-    Returns:
-        16-byte little-endian instruction encoding.
+    When write_carry=True, the carry-out is written to P0 so that a
+    following IADD3.X can consume it (the 64-bit-add/sub chain).  Default
+    is False to preserve the ptxas sub.u32 behavior (no carry write).
+    For ADD chains the original b10=0xf1 (write P0) is kept.
 
     Ground truth:
         encode_iadd3(RZ, RZ, 4, RZ, ctrl=0x7f1)
@@ -416,9 +411,21 @@ def encode_iadd3(dest: int, src0: int, src1: int, src2: int,
     """
     if ctrl == 0:
         ctrl = _CTRL_DEFAULT
-    # Negate modifier: ptxas uses b7=0x80 and b10=0xff for src1 negation (sub).
-    # Ground truth: ptxas sub.u32 → IADD3 with b7=0x80 b10=0xff b11=0x07
-    b10 = 0xff if negate_src1 else 0xf1
+    # b10 layout: 0xF0 | (pred_out << 1) | 1
+    #   pred_out = 0 → P0:   0xF1
+    #   pred_out = 1 → P1:   0xF3
+    #   pred_out = 7 → PT (no write): 0xFF
+    # ADD path historically used 0xF1 (write P0) and pairs with IADD3.X
+    # b10=0x7f (read P0).  SUB-via-negate historically used 0xFF (no
+    # write), correct for sub.u32 single-instruction but BREAKS the
+    # 64-bit chain.  The IADD3.X negate form expects carry-in from P1
+    # (b10=0xff in encode_iadd3x with negate ↔ pred_in=1), so when we
+    # write_carry for a sub chain, we must write to P1 (b10=0xF3) so
+    # the consumer reads it.  Surfaced 2026-04-28 via max.s64 at N=128.
+    if write_carry:
+        b10 = 0xf3 if negate_src1 else 0xf1
+    else:
+        b10 = 0xff if negate_src1 else 0xf1
     raw = bytearray(_build(0x10, 0x72,
                            b2=dest, b3=src0, b4=src1,
                            b8=src2,

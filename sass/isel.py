@@ -3385,6 +3385,56 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         output.append(SassInstr(encode_iadd3(d, a, b, RZ, negate_src1=True),
                                                 f'IADD3 R{d}, R{a}, -R{b}, RZ  // sub.{typ}'))
 
+                elif op in ('and', 'or', 'xor') and typ == 'pred':
+                    # and.pred / or.pred / xor.pred — predicate logic via
+                    # GPR materialization + LOP3 + ISETP.NE.
+                    #
+                    # For each input predicate Pa, Pb: emit `IADD3 Rx, RZ, 0,
+                    # RZ; @Pa IADD3 Rx, RZ, 1, RZ` to materialize the bool as
+                    # a 0/1 in a scratch GPR.  Then `LOP3 Rx, Rx, Ry, RZ, lut`
+                    # with the appropriate truth-table for and/or/xor.  Then
+                    # `ISETP.NE.U32 Pd, Rx, RZ` to set the destination
+                    # predicate from the result.
+                    #
+                    # NOTE: this lowering relies on the regalloc giving
+                    # distinct physregs to the scratch vregs allocated for
+                    # Rx and Ry.  Prior to the FG32/FG56b R5-conflict guard
+                    # (pipeline.py MP03), the rename passes coalesced these
+                    # onto the same physreg and the LOP3 silently AND-ed a
+                    # value with itself.  Now that the guard is in place,
+                    # this path produces correct SASS.
+                    pd_name = instr.dest.name if hasattr(instr.dest, 'name') else None
+                    a_name  = instr.srcs[0].name if instr.srcs and hasattr(instr.srcs[0], 'name') else None
+                    b_name  = instr.srcs[1].name if len(instr.srcs) > 1 and hasattr(instr.srcs[1], 'name') else None
+                    pd = ctx.ra.pred(pd_name) if pd_name and pd_name in ctx.ra.pred_regs else 0
+                    pa = ctx.ra.pred(a_name)  if a_name  and a_name  in ctx.ra.pred_regs else 7
+                    pb = ctx.ra.pred(b_name)  if b_name  and b_name  in ctx.ra.pred_regs else 7
+                    r_b, r_c = _alloc_scratch(ctx, count=2)
+                    output.append(SassInstr(encode_iadd3_imm32(r_b, RZ, 0, RZ),
+                                            f'IADD3 R{r_b}, RZ, 0, RZ  // init 0 for {a_name}'))
+                    output.append(SassInstr(encode_iadd3_pred_small_imm(r_b, RZ, 1, RZ, pa),
+                                            f'@P{pa} IADD3 R{r_b}, RZ, 1, RZ  // R_b = {a_name} ? 1 : 0'))
+                    output.append(SassInstr(encode_iadd3_imm32(r_c, RZ, 0, RZ),
+                                            f'IADD3 R{r_c}, RZ, 0, RZ  // init 0 for {b_name}'))
+                    output.append(SassInstr(encode_iadd3_pred_small_imm(r_c, RZ, 1, RZ, pb),
+                                            f'@P{pb} IADD3 R{r_c}, RZ, 1, RZ  // R_c = {b_name} ? 1 : 0'))
+                    # LOP3 LUT bit ordering in this codebase: bit i corresponds
+                    # to (a, b, c) interpreted MSB-first as binary i (so bit 6
+                    # = a=1,b=1,c=0).  This matches the existing and.b32
+                    # lowering (e.g. ISO2's `and.b32 %r4, %r2, %r3` emits LOP3
+                    # with lut=0xc0).  Empirically verified 2026-04-29 — using
+                    # the "(c,b,a)" convention (which would give 0x88) produced
+                    # always-0 results.
+                    #   a AND b (independent of c):  bits 6, 7        -> 0xc0
+                    #   a OR  b (independent of c):  bits 2,3,4,5,6,7 -> 0xfc
+                    #   a XOR b (independent of c):  bits 2,3,4,5     -> 0x3c
+                    _LUT = {'and': 0xc0, 'or': 0xfc, 'xor': 0x3c}
+                    _emit_lop3(output, ctx, r_b, r_b, r_c, RZ, _LUT[op],
+                               f'LOP3.LUT R{r_b}, R{r_b}, R{r_c}, RZ, 0x{_LUT[op]:02x}  // {op}.pred bitwise')
+                    output.append(SassInstr(encode_isetp(pd, r_b, RZ, cmp=ISETP_NE, signed=False),
+                                            f'ISETP.NE.U32 P{pd}, R{r_b}, RZ  // {op}.pred result'))
+                    _free_scratch(ctx, [r_b, r_c])
+
                 elif op in ('and', 'or', 'xor') and typ in ('b32', 'u32', 's32'):
                     # UNIF-1: propagate SR-derived tag through bitwise-with-immediate.
                     # Guard: don't propagate in atom.xor kernels (the template has

@@ -2632,24 +2632,42 @@ def compile_function(fn: Function, verbose: bool = False,
         # rename; FG56b mirrors that exact rule for R4->R5.  b3-only: for
         # 0x80c b4 is imm (not GPR) and for 0xc0c b4 is UR (not GPR).
         _ISETP_56_SRC = {0x80c, 0xc0c}
-        _fg56b_count = 0
-        for _ri in range(len(sass_instrs)):
-            _si = sass_instrs[_ri]
+        # MP03 (added 2026-04-29 by probe mower task #54):
+        # The R4→R5 rename collapses two distinct vregs onto R5 if R5 is
+        # already used as a body ALU destination for a different vreg.
+        # Same hazard as FG32 (which has the analogous guard), surfaced by
+        # ISO2 / pred_composition.  Skip FG56b entirely when R5 is already
+        # a destination in the ALU stream.
+        _fg56b_safe = True
+        for _si in sass_instrs:
             _ropc = (struct.unpack_from('<Q', _si.raw, 0)[0]) & 0xFFF
-            _p = bytearray(_si.raw)
-            _changed = False
-            if _ropc in _ALU_56:
-                if _p[2] == 4: _p[2] = 5; _changed = True
-                if _p[3] == 4: _p[3] = 5; _changed = True
-            elif _ropc in _ISETP_56_SRC:
-                if _p[3] == 4: _p[3] = 5; _changed = True
-            elif _ropc == 0x986:  # STG data at b4
-                if _p[4] == 4: _p[4] = 5; _changed = True
-            if _changed:
-                sass_instrs[_ri] = SassInstr(bytes(_p), _si.comment + ' [FG56b:R5]')
-                _fg56b_count += 1
-        if verbose and _fg56b_count:
-            print(f'[FG56b] R4->R5 body rename: {_fg56b_count} instrs')
+            if _ropc in _ALU_56 and _si.raw[2] == 5:
+                _fg56b_safe = False
+                if verbose:
+                    print('[FG56b] skipped: R5 already a body dest — rename '
+                          'would collapse two vregs onto the same physreg')
+                break
+        if not _fg56b_safe:
+            pass
+        else:
+            _fg56b_count = 0
+            for _ri in range(len(sass_instrs)):
+                _si = sass_instrs[_ri]
+                _ropc = (struct.unpack_from('<Q', _si.raw, 0)[0]) & 0xFFF
+                _p = bytearray(_si.raw)
+                _changed = False
+                if _ropc in _ALU_56:
+                    if _p[2] == 4: _p[2] = 5; _changed = True
+                    if _p[3] == 4: _p[3] = 5; _changed = True
+                elif _ropc in _ISETP_56_SRC:
+                    if _p[3] == 4: _p[3] = 5; _changed = True
+                elif _ropc == 0x986:  # STG data at b4
+                    if _p[4] == 4: _p[4] = 5; _changed = True
+                if _changed:
+                    sass_instrs[_ri] = SassInstr(bytes(_p), _si.comment + ' [FG56b:R5]')
+                    _fg56b_count += 1
+            if verbose and _fg56b_count:
+                print(f'[FG56b] R4->R5 body rename: {_fg56b_count} instrs')
 
     # FG60: bounded predicate complement reuse for the 3 target kernels.
     # When FG56 fired and the body has ISETP.IMM(LT, P1) followed by
@@ -2997,9 +3015,31 @@ def compile_function(fn: Function, verbose: bool = False,
                         if any(_raw[_bp] == 4 for _bp in _gpr_pos if _bp < len(_raw)):
                             _fg32_safe = False
                             break
+                    # MP03 (added 2026-04-29 by probe mower task #54):
+                    # FG32's R4→R5 rename is also unsafe when R5 is *already*
+                    # used INSIDE the ALU body as a destination for a different
+                    # vreg.  The rename collapses two distinct live values onto
+                    # the same physreg.  Surfaced by ISO2 / pred_composition:
+                    # PTX `mov %r2,0; mov %r3,0; @P1 mov %r2,1; @P2 mov %r3,1;
+                    # and.b32 %r4,%r2,%r3` had regalloc map %r2→R4 and %r3→R5.
+                    # FG32 renamed %r2's writes (R4) to R5, so both vregs
+                    # ended up writing R5.  AND read R5 twice → wrong output.
+                    if _fg32_safe:
+                        for _ri in range(_alu_start, min(_alu_end, len(sass_instrs))):
+                            _raw = sass_instrs[_ri].raw
+                            _ropc = (struct.unpack_from('<Q', _raw, 0)[0]) & 0xFFF
+                            if _ropc in _ALU_OPCODES and _raw[2] == 5:
+                                _fg32_safe = False
+                                if verbose:
+                                    print('[FG32] skipped: R5 is already a body '
+                                          f'dest at idx {_ri} — renaming R4 would '
+                                          'collapse two vregs onto the same physreg')
+                                break
+
                     if not _fg32_safe:
                         if verbose:
-                            print('[FG32] skipped: R4 has non-STG outside reads')
+                            print('[FG32] skipped: R4 has non-STG outside reads '
+                                  'or R5 is already a body dest')
                     else:
                         _r4_to_r5 = 0
                         for _ri in range(len(sass_instrs)):

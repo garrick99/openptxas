@@ -5725,14 +5725,18 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                 elif op == 'min' and typ in ('u64', 's64'):
                     # min.u64 branchless: min(a,b) = b + ((a-b) & sign_mask(a-b))
                     #   diff = a - b; mask = sign_fill(diff_hi); d = b + (diff & mask)
-                    # Works for unsigned because a < b → diff wraps to large value with sign=1.
-                    # For signed min (s64), the same bit trick applies (signed subtraction).
-                    # NOTE: Known carry-chain bug for tid > b at N>=128 — emitted SASS
-                    # consistently returns b regardless of (a > b).  Pre-existing,
-                    # not exercised by production suite.  Tracked as known residual.
+                    # Carry chain fixed 2026-04-29 via encode_iadd3 write_carry=True.
                     d_lo  = ctx.ra.lo(instr.dest.name)
                     a_lo  = ctx.ra.lo(instr.srcs[0].name)
-                    b_lo  = ctx.ra.lo(instr.srcs[1].name)
+                    if isinstance(instr.srcs[1], ImmOp):
+                        imm = instr.srcs[1].value & 0xFFFF_FFFF_FFFF_FFFF
+                        b_lo = _alloc_gpr_pair(ctx)
+                        output.append(SassInstr(encode_iadd3_imm32(b_lo, RZ, imm & 0xFFFFFFFF, RZ),
+                            f'IADD3 R{b_lo}, RZ, 0x{imm & 0xFFFFFFFF:x}, RZ  // min.{typ} imm_lo'))
+                        output.append(SassInstr(encode_iadd3_imm32(b_lo+1, RZ, (imm >> 32) & 0xFFFFFFFF, RZ),
+                            f'IADD3 R{b_lo+1}, RZ, 0x{(imm >> 32) & 0xFFFFFFFF:x}, RZ  // min.{typ} imm_hi'))
+                    else:
+                        b_lo = ctx.ra.lo(instr.srcs[1].name)
                     t_lo  = ctx._next_gpr; ctx._next_gpr += 2   # diff pair (t_lo, t_lo+1)
                     mask  = _alloc_gpr(ctx)
                     output.append(SassInstr(encode_iadd3(t_lo, a_lo, b_lo, RZ, negate_src1=True, write_carry=True),
@@ -5751,12 +5755,19 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                 elif op == 'max' and typ in ('u64', 's64'):
                     # max.u64 branchless: max(a,b) = b + ((a-b) & ~sign_mask(a-b))
                     #   diff = a - b; mask = ~sign_fill(diff_hi); d = b + (diff & ~mask)
-                    # NOTE: Known carry-chain bug for tid > b at N>=128 — emitted SASS
-                    # consistently returns b regardless of (a > b).  Pre-existing,
-                    # not exercised by production suite.  Tracked as known residual.
+                    # Carry-chain fix landed 2026-04-29 (encode_iadd3 write_carry=True).
+                    # max.s64/u64 reg-reg now correct at N=128.
                     d_lo  = ctx.ra.lo(instr.dest.name)
                     a_lo  = ctx.ra.lo(instr.srcs[0].name)
-                    b_lo  = ctx.ra.lo(instr.srcs[1].name)
+                    if isinstance(instr.srcs[1], ImmOp):
+                        imm = instr.srcs[1].value & 0xFFFF_FFFF_FFFF_FFFF
+                        b_lo = _alloc_gpr_pair(ctx)
+                        output.append(SassInstr(encode_iadd3_imm32(b_lo, RZ, imm & 0xFFFFFFFF, RZ),
+                            f'IADD3 R{b_lo}, RZ, 0x{imm & 0xFFFFFFFF:x}, RZ  // max.{typ} imm_lo'))
+                        output.append(SassInstr(encode_iadd3_imm32(b_lo+1, RZ, (imm >> 32) & 0xFFFFFFFF, RZ),
+                            f'IADD3 R{b_lo+1}, RZ, 0x{(imm >> 32) & 0xFFFFFFFF:x}, RZ  // max.{typ} imm_hi'))
+                    else:
+                        b_lo = ctx.ra.lo(instr.srcs[1].name)
                     t_lo  = ctx._next_gpr; ctx._next_gpr += 2   # diff pair
                     mask  = _alloc_gpr(ctx)   # inverted sign mask
                     output.append(SassInstr(encode_iadd3(t_lo, a_lo, b_lo, RZ, negate_src1=True, write_carry=True),

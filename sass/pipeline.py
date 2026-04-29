@@ -2721,7 +2721,13 @@ def compile_function(fn: Function, verbose: bool = False,
                         # the IADD3 subtract step's src R4→R0 but skipping
                         # the FLO producer at the same R4, leaving IADD3
                         # reading uninit R0).  These need rename participation.
-                        0x300, 0x301, 0x309, 0x213}  # FLO, BREV, POPC, IABS
+                        0x300, 0x301, 0x309, 0x213,  # FLO, BREV, POPC, IABS
+                        # SHF variable-shift forms (added 2026-04-28 by probe
+                        # mower after bfe.u32 reg-pos and shr.b32 reg-shift
+                        # both produced wrong output: FG29 R0-renamed the
+                        # data-MOV's dest but skipped the SHF.var which
+                        # reads data at byte 8 — SHF read uninit R4).
+                        0x299, 0x219}  # SHF.{L,R}.U32(.HI) var, SHF.R.S32.HI var
         _BOUNDARY = {0xc11, 0x986, 0x981, 0x94d, 0x947}  # 0xc11/STG/EXIT/BRA
         _PREAMBLE = {0xb82, 0x919, 0x7ac, 0xc0c, 0x94d}  # LDC/S2R/LDCU/ISETP/EXIT
 

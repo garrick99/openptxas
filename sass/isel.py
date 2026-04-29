@@ -6281,12 +6281,11 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         # Reg-position bfe: SHF.R.U32 with register shift, then mask.
                         # mask is computed from length only when length is imm; if
                         # length is reg too, fall back to no-mask (rare in real code).
-                        from sass.encoding.sm_120_encode import encode_shf_r_u32_hi_var
+                        # encode_shf_r_u32_hi_var is already imported at module top —
+                        # importing locally here shadowed the global and broke shr.b32
+                        # reg-shift in another branch.  Use module-level import.
                         start_r = ctx.ra.r32(start_op.name) if start_is_reg \
                                   else _materialize_imm(start_op, ctx, ctx.ra, output)
-                        # Add a NOP so just-written data register has time to commit
-                        # before SHF reads it (hazard observed in mower bitfield axis).
-                        output.append(_nop('data->SHF latency'))
                         output.append(SassInstr(
                             encode_shf_r_u32_hi_var(d, a, start_r),
                             f'SHF.R.U32.HI R{d}, RZ, R{start_r}, R{a}  // bfe.u32 reg-pos'))

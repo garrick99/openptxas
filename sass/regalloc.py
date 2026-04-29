@@ -807,23 +807,35 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
     quad_follow_regs: set[str] = set()
     from ptx.ir import RegOp as _RegOp, VectorRegOp as _VectorRegOp
     for inst in all_instrs:
-        if inst.op != 'mma' or 'sync' not in inst.types or inst.dest is None:
+        if inst.op != 'mma' or 'sync' not in inst.types:
             continue
-        if isinstance(inst.dest, _VectorRegOp) and inst.dest.regs:
-            quad_align_regs.add(inst.dest.regs[0])
-            for follower in inst.dest.regs[1:]:
-                quad_follow_regs.add(follower)
-        elif isinstance(inst.dest, _RegOp):
-            quad_align_regs.add(inst.dest.name)
-            # Fallback: positional neighbors (legacy behavior for non-vector dst)
-            for rd in fn.reg_decls:
-                if rd.type.kind == ScalarKind.PRED:
-                    continue
-                for i, nm in enumerate(rd.names):
-                    if nm == inst.dest.name:
-                        for j in range(1, 4):
-                            if i + j < len(rd.names):
-                                quad_follow_regs.add(rd.names[i + j])
+        # Destination tuple: 4 consecutive GPRs (or 2 for f64 DMMA), base 4-aligned.
+        if inst.dest is not None:
+            if isinstance(inst.dest, _VectorRegOp) and inst.dest.regs:
+                quad_align_regs.add(inst.dest.regs[0])
+                for follower in inst.dest.regs[1:]:
+                    quad_follow_regs.add(follower)
+            elif isinstance(inst.dest, _RegOp):
+                quad_align_regs.add(inst.dest.name)
+                for rd in fn.reg_decls:
+                    if rd.type.kind == ScalarKind.PRED:
+                        continue
+                    for i, nm in enumerate(rd.names):
+                        if nm == inst.dest.name:
+                            for j in range(1, 4):
+                                if i + j < len(rd.names):
+                                    quad_follow_regs.add(rd.names[i + j])
+        # Source tuples (A/B/C): each VectorRegOp is a contiguous GPR run.
+        # The HMMA hardware reads N consecutive registers starting at the
+        # encoded base — without this constraint, the linear-scan allocator
+        # coalesces the source vregs into a single physreg and the tensor
+        # core reads garbage from the gap registers.  Surfaced by mower
+        # probe hmma/m16n8k16/all_ones (2026-04-29).
+        for src in (inst.srcs or ()):
+            if isinstance(src, _VectorRegOp) and src.regs:
+                quad_align_regs.add(src.regs[0])
+                for follower in src.regs[1:]:
+                    quad_follow_regs.add(follower)
 
     # Co-location preferences: cvt.u64.u32 dest should overlap with 32-bit source.
     # If the source is dead after the cvt, the 64-bit dest can start at the

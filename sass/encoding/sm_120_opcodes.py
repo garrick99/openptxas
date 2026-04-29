@@ -2779,13 +2779,17 @@ def encode_flo(dest: int, src: int, ctrl: int = 0) -> bytes:
 # ---------------------------------------------------------------------------
 # Opcode: 0x13, 0x72.  Ground truth: IABS R0, R0 → 0x0000000000007213
 def encode_iabs(dest: int, src: int, ctrl: int = 0) -> bytes:
+    """IABS Rd, Rs — integer absolute value.  Src lives at b4 (matches
+    POPC/BREV/FLO and the scoreboard's read-set in scoreboard.py:443),
+    NOT b3.  Earlier encoder put src at b3, leaving b4=RZ, so hardware
+    computed |RZ| = 0 regardless of intent.  Surfaced 2026-04-28 by
+    the autonomous probe mower's alu_unary axis.
+    """
     if ctrl == 0: ctrl = _CTRL_DEFAULT
-    b13, b14, b15 = _ctrl_to_bytes(ctrl)
-    raw = bytearray(16)
-    raw[0], raw[1] = 0x13, 0x72
-    raw[2], raw[3] = dest & 0xFF, src & 0xFF
-    raw[13], raw[14], raw[15] = b13, b14, b15
-    return bytes(raw)
+    return _build(0x13, 0x72,
+                  b2=dest, b3=0x00, b4=src,
+                  b8=0x00, b9=0x00, b10=0x00, b11=0x00,
+                  ctrl=ctrl)
 
 
 # ---------------------------------------------------------------------------

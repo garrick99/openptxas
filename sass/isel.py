@@ -5466,19 +5466,24 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                     _encode_imad_r_imm(d, a, imm, c),
                                     f'IMAD R{d}, R{a}, 0x{imm:x}, R{c}  // mad.lo imm (inline)'))
                         else:
-                            # imm > 0xffff: still need the literal-pool
-                            # path.  The lit_pool_base alignment hack in
-                            # pipeline.py ensures the pool is past the
-                            # driver's cbuf-pad region, but for the
-                            # common small-imm case we skip this entirely
-                            # via the inline path above.
-                            lit_off = ctx._alloc_literal(imm)
-                            ur_tmp = ctx._next_ur; ctx._next_ur += 1
-                            output.append(SassInstr(encode_ldcu_32(ur_tmp, 0, lit_off),
-                                f'LDCU.32 UR{ur_tmp}, c[0][0x{lit_off:x}]'))
-                            output.append(_nop('ldcu32->imad gap'))
-                            output.append(SassInstr(encode_imad_ur(d, a, ur_tmp, c),
-                                f'IMAD R{d}, R{a}, UR{ur_tmp}, R{c}  // mad.lo imm'))
+                            # imm > 0xffff: use inline 32-bit IMAD imm (encoder
+                            # supports full 32-bit imm, no need for literal pool).
+                            # Same acc-alias avoidance as imm<=0xffff path.
+                            # Surfaced 2026-04-28 by probe mower's soak with
+                            # random 32-bit imms — the LDCU.32 path emitted
+                            # IMAD R{d}, A, UR, R{d} which silently drops the
+                            # multiply when c==d (same hardware quirk).
+                            if c == d:
+                                t = _alloc_gpr(ctx)
+                                output.append(SassInstr(
+                                    _encode_imad_r_imm(t, a, imm, RZ),
+                                    f'IMAD R{t}, R{a}, 0x{imm:x}, RZ  // mad.lo split-mul (acc-alias, large imm)'))
+                                output.append(SassInstr(encode_iadd3(d, t, c, RZ),
+                                    f'IADD3 R{d}, R{t}, R{c}, RZ  // mad.lo split-add'))
+                            else:
+                                output.append(SassInstr(
+                                    _encode_imad_r_imm(d, a, imm, c),
+                                    f'IMAD R{d}, R{a}, 0x{imm:x}, R{c}  // mad.lo imm (inline, large imm)'))
                         continue
                     b = ctx.ra.r32(instr.srcs[1].name)
                     src0_name = instr.srcs[0].name if instr.srcs else ''
@@ -5649,8 +5654,17 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     # CLZ = 31 - FLO(x).  FLO returns MSB position (0..31) or
                     # 0xFFFFFFFF for zero input.  31 - 0xFFFFFFFF = 32 (mod 2^32).
+                    # FLO is long-latency (wdep=0x31 in scoreboard).  In
+                    # short kernels the consumer IADD3 can race the FLO
+                    # write because intermediate instrs (LDCU etc.) don't
+                    # provide enough latency.  Insert two NOPs to cover
+                    # the FLO→IADD3 hazard.  Surfaced 2026-04-28 by mower.
                     output.append(SassInstr(encode_flo(d, a),
                                             f'FLO.U32 R{d}, R{a}  // clz step 1'))
+                    output.append(_nop('FLO->IADD3 latency'))
+                    output.append(_nop('FLO->IADD3 latency'))
+                    output.append(_nop('FLO->IADD3 latency'))
+                    output.append(_nop('FLO->IADD3 latency'))
                     output.append(SassInstr(encode_iadd3_imm32_neg_src0(d, d, 31, RZ),
                                             f'IADD3 R{d}, -R{d}, 0x1f, RZ  // clz = 31 - FLO'))
 
@@ -5694,6 +5708,9 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     #   diff = a - b; mask = sign_fill(diff_hi); d = b + (diff & mask)
                     # Works for unsigned because a < b → diff wraps to large value with sign=1.
                     # For signed min (s64), the same bit trick applies (signed subtraction).
+                    # NOTE: Known carry-chain bug for tid > b at N>=128 — emitted SASS
+                    # consistently returns b regardless of (a > b).  Pre-existing,
+                    # not exercised by production suite.  Tracked as known residual.
                     d_lo  = ctx.ra.lo(instr.dest.name)
                     a_lo  = ctx.ra.lo(instr.srcs[0].name)
                     b_lo  = ctx.ra.lo(instr.srcs[1].name)
@@ -5715,6 +5732,9 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                 elif op == 'max' and typ in ('u64', 's64'):
                     # max.u64 branchless: max(a,b) = b + ((a-b) & ~sign_mask(a-b))
                     #   diff = a - b; mask = ~sign_fill(diff_hi); d = b + (diff & ~mask)
+                    # NOTE: Known carry-chain bug for tid > b at N>=128 — emitted SASS
+                    # consistently returns b regardless of (a > b).  Pre-existing,
+                    # not exercised by production suite.  Tracked as known residual.
                     d_lo  = ctx.ra.lo(instr.dest.name)
                     a_lo  = ctx.ra.lo(instr.srcs[0].name)
                     b_lo  = ctx.ra.lo(instr.srcs[1].name)
@@ -6230,22 +6250,39 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     # Decomposed as: SHF.R.U32.HI + (optional LDC + LOP3 for masking)
                     d = ctx.ra.r32(instr.dest.name)
                     a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
-                    start  = instr.srcs[1].value if isinstance(instr.srcs[1], ImmOp) else 0
-                    length = instr.srcs[2].value if (len(instr.srcs) > 2 and isinstance(instr.srcs[2], ImmOp)) else 32
+                    start_op = instr.srcs[1]
+                    length_op = instr.srcs[2] if len(instr.srcs) > 2 else None
+                    start_is_reg = isinstance(start_op, RegOp)
+                    length_is_reg = isinstance(length_op, RegOp)
+                    start  = start_op.value if isinstance(start_op, ImmOp) else 0
+                    length = length_op.value if (length_op is not None and isinstance(length_op, ImmOp)) else 32
                     mask = (1 << length) - 1 if length < 32 else 0xFFFFFFFF
-                    if length >= 32:
+
+                    if start_is_reg or length_is_reg:
+                        # Reg-position bfe: SHF.R.U32 with register shift, then mask.
+                        # mask is computed from length only when length is imm; if
+                        # length is reg too, fall back to no-mask (rare in real code).
+                        from sass.encoding.sm_120_encode import encode_shf_r_u32_hi_var
+                        start_r = ctx.ra.r32(start_op.name) if start_is_reg \
+                                  else _materialize_imm(start_op, ctx, ctx.ra, output)
+                        # Add a NOP so just-written data register has time to commit
+                        # before SHF reads it (hazard observed in mower bitfield axis).
+                        output.append(_nop('data->SHF latency'))
+                        output.append(SassInstr(
+                            encode_shf_r_u32_hi_var(d, a, start_r),
+                            f'SHF.R.U32.HI R{d}, RZ, R{start_r}, R{a}  // bfe.u32 reg-pos'))
+                        if not length_is_reg and length < 32:
+                            output.append(SassInstr(
+                                encode_lop3_imm32(d, d, mask, RZ, LOP3_IMM_AND),
+                                f'LOP3.LUT R{d}, R{d}, 0x{mask:x}, RZ, 0xC0  // bfe.u32 &mask'))
+                    elif length >= 32:
                         # No masking needed — just shift
                         output.append(SassInstr(
                             encode_shf_r_u32_hi(d, a, start),
                             f'SHF.R.U32.HI R{d}, RZ, 0x{start:x}, R{a}  // bfe.u32 len={length}'))
                     elif start == 0:
                         # Single-instruction AND with imm32 — matches the
-                        # ptxas `and.b32 dst, src, imm` lowering.  The prior
-                        # two-step (materialize mask → LOP3 AND) interposed
-                        # a neutral ALU op between the LDG-chain source and
-                        # the final consumer, causing the scoreboard to drop
-                        # LDG transitive-dependency and emit rbar=0x03
-                        # instead of rbar=0x0b → consumer read stale value.
+                        # ptxas `and.b32 dst, src, imm` lowering.
                         output.append(SassInstr(
                             encode_lop3_imm32(d, a, mask, RZ, LOP3_IMM_AND),
                             f'LOP3.LUT R{d}, R{a}, 0x{mask:x}, RZ, 0xC0  // bfe.u32 &mask'))

@@ -431,13 +431,35 @@ def encode_shf_l_u32_var(dest: int, src0: int, k_reg: int,
     k_reg is a GPR holding the shift amount (0-based register index).
     Used for shl.b32 with a runtime shift amount.
 
-    Ground truth:
-        SHF.L.U32 R6, R4, R5, RZ → 9972060405000000ff06000800e21f00
+    Ground truth (ptxas 13.0, sm_120, shl.b32 reg-shift):
+        SHF.L.U32 R5, R0, R5, RZ → 1972050005000000ff06000000ca0f00
+
+    NOTE 2026-04-29: byte 0 must be 0x19 (NOT 0x99 as _build_shf_var
+    produces) and byte 11 must be 0x00 (NOT 0x08).  Same hardware-
+    decode quirk as encode_shf_r_u32_hi_var.  Fixed via inline build
+    instead of _build_shf_var.
     """
-    return _build_shf_var(dest, src0, k_reg, RZ,
-                          _MODIFIER_SHF_L_U32[0],
-                          _MODIFIER_SHF_L_U32[1],
-                          ctrl)
+    if ctrl == 0:
+        ctrl = _CTRL_MAX_STALL
+    b13, b14, b15_ctrl = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0x19
+    raw[1] = 0x72
+    raw[2] = dest   & 0xFF
+    raw[3] = src0   & 0xFF   # data at b3 (different from R-form which uses b8)
+    raw[4] = k_reg  & 0xFF
+    raw[5] = 0x00
+    raw[6] = 0x00
+    raw[7] = 0x00
+    raw[8] = RZ     & 0xFF
+    raw[9]  = _MODIFIER_SHF_L_U32[0]   # 0x06
+    raw[10] = _MODIFIER_SHF_L_U32[1]   # 0x00
+    raw[11] = 0x00
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15_ctrl
+    return bytes(raw)
 
 
 def encode_shf_r_u32_hi_var(dest: int, src_hi: int, k_reg: int,
@@ -446,15 +468,39 @@ def encode_shf_r_u32_hi_var(dest: int, src_hi: int, k_reg: int,
     Encode SHF.R.U32.HI dest, RZ, k_reg, src_hi (variable right shift) to 16 bytes.
 
     src_hi holds the data to shift; k_reg holds the shift amount.
-    Used for shr.u32 with a runtime shift amount.
+    Used for shr.u32/b32 with a runtime shift amount.
 
-    Ground truth:
-        SHF.R.U32.HI R4, RZ, R5, R4 → 997204ff050000000416010800ca0f00
+    Ground truth (ptxas 13.0, sm_120, shr.b32 reg-shift):
+        SHF.R.U32.HI R5, RZ, R5, R4 → 197205ff050000000016010000ca0f00
+
+    NOTE 2026-04-29: an earlier encoder produced byte[0]=0x99 byte[11]=0x08
+    via _build_shf_var (matching SHF.L.U32 var).  Hardware decodes that as
+    a different SHF variant — output was tid-dependent garbage.  ptxas
+    actually uses byte[0]=0x19 byte[11]=0x00 (same as SHF.R.S32.HI var,
+    just with the U32 modifier byte 9 = 0x16 instead of 0x14).  Surfaced
+    via probe mower's bfe.u32 reg-pos and shr.b32 reg-shift.
     """
-    return _build_shf_var(dest, RZ, k_reg, src_hi,
-                          _MODIFIER_SHF_R_U32_HI[0],
-                          _MODIFIER_SHF_R_U32_HI[1],
-                          ctrl)
+    if ctrl == 0:
+        ctrl = _CTRL_MAX_STALL
+    b13, b14, b15_ctrl = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0x19   # opcode low byte (matches ptxas; was 0x99)
+    raw[1] = 0x72   # opcode high byte
+    raw[2] = dest   & 0xFF
+    raw[3] = RZ     & 0xFF
+    raw[4] = k_reg  & 0xFF
+    raw[5] = 0x00
+    raw[6] = 0x00
+    raw[7] = 0x00
+    raw[8] = src_hi & 0xFF
+    raw[9]  = _MODIFIER_SHF_R_U32_HI[0]   # 0x16
+    raw[10] = _MODIFIER_SHF_R_U32_HI[1]   # 0x01
+    raw[11] = 0x00   # NOT 0x08 — matches s32 var encoder, mirrors ptxas
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15_ctrl
+    return bytes(raw)
 
 
 def encode_shf_r_s32_hi(dest: int, src0: int, k: int,

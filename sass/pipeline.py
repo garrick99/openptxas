@@ -2874,7 +2874,7 @@ def compile_function(fn: Function, verbose: bool = False,
             # by counting body-reg writes whose live-range overlaps another's
             # by at least one consumer position.
             _fg29_multi_live = False
-            if len(_all_body_regs) > 2:
+            if len(_all_body_regs) >= 2:
                 # Find the position(s) where body regs are read together.
                 # If any single instruction reads >=2 body regs at byte 3/4/8
                 # we cannot safely collapse all-to-R0.

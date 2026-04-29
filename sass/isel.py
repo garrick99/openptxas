@@ -77,7 +77,6 @@ from sass.encoding.sm_120_opcodes import (
     encode_imma_s8_s32, encode_dmma_8x8x4,
     encode_qmma_e4m3_f32, encode_qmma_e5m2_f32,
     encode_ldsm_x4, encode_ldsm_x2, encode_ldsm_x1,
-    encode_plop3,
     encode_redux_sum, encode_redux_sum_s32, encode_redux_min_s32, encode_redux_max_s32,
     encode_redux_and_b32, encode_redux_or_b32, encode_redux_xor_b32,
     encode_ldgsts_e, encode_ldgdepbar, encode_depbar_le,
@@ -3385,49 +3384,6 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         b = ctx.ra.r32(instr.srcs[1].name)
                         output.append(SassInstr(encode_iadd3(d, a, b, RZ, negate_src1=True),
                                                 f'IADD3 R{d}, R{a}, -R{b}, RZ  // sub.{typ}'))
-
-                elif op in ('and', 'or', 'xor') and typ == 'pred':
-                    # and.pred / or.pred / xor.pred — partial lowering via
-                    # GPR materialization + LOP3 + ISETP.NE.  This produces
-                    # functionally correct SASS for SOME pred-composition
-                    # shapes but not all (3/21 mower bins) — there is an
-                    # underlying interaction with predicated-IADD3 register
-                    # liveness that we have not yet root-caused.  Tracked
-                    # under task #48; landing the partial fix because it
-                    # replaces a silent "unimplemented" warning with at least
-                    # an attempt at the lowering.
-                    pd_name = instr.dest.name if hasattr(instr.dest, 'name') else None
-                    a_name  = instr.srcs[0].name if instr.srcs and hasattr(instr.srcs[0], 'name') else None
-                    b_name  = instr.srcs[1].name if len(instr.srcs) > 1 and hasattr(instr.srcs[1], 'name') else None
-                    pd = ctx.ra.pred(pd_name) if pd_name and pd_name in ctx.ra.pred_regs else 0
-                    pa = ctx.ra.pred(a_name)  if a_name  and a_name  in ctx.ra.pred_regs else 7
-                    pb = ctx.ra.pred(b_name)  if b_name  and b_name  in ctx.ra.pred_regs else 7
-                    r_b, r_c = _alloc_scratch(ctx, count=2)
-                    # Materialize each pred to 0/1 in a GPR using the proven
-                    # IADD3-init + predicated-IADD3 pattern (known to work for
-                    # @predicate-guarded mov.u32 imm in the existing isel paths).
-                    #   IADD3   R_b, RZ, 0, RZ     ; R_b = 0
-                    #   @P_pa IADD3 R_b, RZ, 1, RZ ; R_b = 1 when pa is true
-                    output.append(SassInstr(encode_iadd3_imm32(r_b, RZ, 0, RZ),
-                                            f'IADD3 R{r_b}, RZ, 0, RZ  // init 0 for {a_name}'))
-                    output.append(SassInstr(encode_iadd3_pred_small_imm(r_b, RZ, 1, RZ, pa),
-                                            f'@P{pa} IADD3 R{r_b}, RZ, 1, RZ  // R_b=1 if {a_name}'))
-                    output.append(SassInstr(encode_iadd3_imm32(r_c, RZ, 0, RZ),
-                                            f'IADD3 R{r_c}, RZ, 0, RZ  // init 0 for {b_name}'))
-                    output.append(SassInstr(encode_iadd3_pred_small_imm(r_c, RZ, 1, RZ, pb),
-                                            f'@P{pb} IADD3 R{r_c}, RZ, 1, RZ  // R_c=1 if {b_name}'))
-                    # LUT bits indexed by (c,b,a): bit i set if op(c,b,a) is true.
-                    # We pass src2=RZ (= always 0 in slot c), so c=0 for all live bits.
-                    # a AND b: bits 3 (c=0,b=1,a=1), 7 (1,1,1) → 0x88
-                    # a OR  b: bits 1,2,3,5,6,7                 → 0xEE
-                    # a XOR b: bits 1,2,5,6                     → 0x66
-                    _LUT = {'and': 0x88, 'or': 0xEE, 'xor': 0x66}
-                    _emit_lop3(output, ctx, r_b, r_b, r_c, RZ, _LUT[op],
-                               f'LOP3.LUT R{r_b}, R{r_b}, R{r_c}, RZ, 0x{_LUT[op]:02x}  // {op}.pred bitwise')
-                    # ISETP.NE.U32 P_dest = (r_b != 0)
-                    output.append(SassInstr(encode_isetp(pd, r_b, RZ, cmp=ISETP_NE, signed=False),
-                                            f'ISETP.NE.U32 P{pd}, R{r_b}, RZ  // {op}.pred result'))
-                    _free_scratch(ctx, [r_b, r_c])
 
                 elif op in ('and', 'or', 'xor') and typ in ('b32', 'u32', 's32'):
                     # UNIF-1: propagate SR-derived tag through bitwise-with-immediate.

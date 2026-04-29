@@ -101,11 +101,15 @@ _OPCODE_META: dict[int, _OpMeta] = {
     0x81a: _OpMeta('BFE_SEXT',  1, 0x3e, 1),  # BFE sign-extension step (bfe.s32 lowering)
     0x207: _OpMeta('SEL',       0, 0x3e, 1),  # SEL: register select (P3-2)
     0x22a: _OpMeta('DSETP',     0, 0x3e, 0),  # DSETP FP64 compare → predicate (misc=0, like ISETP)
-    # Tensor core MMA: wdep=0x3e (ALU), min_gpr_gap=1, misc from ptxas (2 for HMMA/DMMA)
-    0x23c: _OpMeta('HMMA',      1, 0x3e, 2),  # HMMA FP16/BF16/TF32 MMA (m16n8k*) misc=2 ptxas-observed
-    0x237: _OpMeta('IMMA',      1, 0x3e, 2),  # IMMA INT8 MMA (m16n8k32)
-    0x23f: _OpMeta('DMMA',      1, 0x3e, 2),  # DMMA FP64 MMA (m8n8k4)
-    0x27a: _OpMeta('QMMA',      1, 0x3e, 2),  # QMMA FP8 E4M3/E5M2 MMA (m16n8k32)
+    # Tensor core MMA: dedicated wdep slot 0x32 with rbar bit 0x11 (bit 4 +
+    # gate bit 0).  Previously used 0x3e (ALU class), which was too short a
+    # latency class — consumer of HMMA dest read stale data.  The new slot
+    # is registered in _WDEP_TO_RBAR so consumers properly wait.  Surfaced
+    # by mower hmma probe (2026-04-29).
+    0x23c: _OpMeta('HMMA',      1, 0x32, 2),  # HMMA FP16/BF16/TF32 MMA (m16n8k*)
+    0x237: _OpMeta('IMMA',      1, 0x32, 2),  # IMMA INT8 MMA (m16n8k32)
+    0x23f: _OpMeta('DMMA',      1, 0x32, 2),  # DMMA FP64 MMA (m8n8k4)
+    0x27a: _OpMeta('QMMA',      1, 0x32, 2),  # QMMA FP8 E4M3/E5M2 MMA (m16n8k32)
     0x83b: _OpMeta('LDSM',      1, 0x33, 2),  # LDSM load shared→matrix regs (wdep=LDS slot)
     0x3c4: _OpMeta('REDUX',     0, 0x3f, 0),  # REDUX warp reduction → UR (no GPR dest)
     0xc02: _OpMeta('MOV.UR',   1, 0x3e, 1),  # MOV R, UR — copy uniform reg to GPR
@@ -1233,6 +1237,13 @@ def _wdep_for_opcode(opcode: int, raw: bytes = None) -> int:
     #                        ALU latency, not scoreboard)
     if opcode in (0x812, 0xc11):
         return 0x3f
+    # Tensor-core MMA family: dedicated long-latency slot 0x32.
+    # Consumers wait via _WDEP_TO_RBAR[0x32]=0x11 (bit 4).  Surfaced by
+    # mower hmma probe — was returning ALU slot 0x3e via the fallback
+    # below, which gave too-short a latency window for the consumer to
+    # see the tensor write retire.
+    if opcode in (0x23c, 0x237, 0x23f, 0x27a):
+        return 0x32
     if opcode in _OPCODES_ALU | _OPCODES_SMEM_SETUP:
         return 0x3e
     # No write tracking for control flow (EXIT/BRA), stores, barriers
@@ -1365,6 +1376,7 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
     # rbar encoding: maps wdep_slot → rbar bit pattern
     _WDEP_TO_RBAR = {
         0x31: 0x03,   # LDC/LDCU slot → rbar=0x03
+        0x32: 0x11,   # HMMA/IMMA/DMMA/QMMA tensor-core slot → rbar=0x11 (bit 4 + gate)
         0x33: 0x05,   # LDS/LDCU.32 slot → rbar=0x05
         0x35: 0x09,   # LDG slot → rbar=0x09 (all LDGs share this slot, ptxas-verified)
         0x3b: 0x09,   # FG-3.2: LDG rotating variant, same class as 0x35

@@ -2614,6 +2614,11 @@ def compile_function(fn: Function, verbose: bool = False,
                         elif _p[9] == 0x14 and _p[10] == 0x0f:
                             _p[10] = 0x8f
                         _changed = True
+                    elif _ropc == 0x219 and (_p[3] == 3 or _p[4] == 3 or _p[8] == 3):
+                        if _p[3] == 3: _p[3] = 0
+                        if _p[4] == 3: _p[4] = 0
+                        if _p[8] == 3: _p[8] = 0
+                        _changed = True
                     if _changed:
                         sass_instrs[_ri] = SassInstr(bytes(_p), _si.comment + ' [FG56:R0]')
                         _fg56_count += 1
@@ -3193,6 +3198,16 @@ def compile_function(fn: Function, verbose: bool = False,
                                 print('[FG36] skipped: 4-ALU chain dests differ '
                                       '(not a single-target chain)')
                             _alu_instrs = []
+                        else:
+                            _chain_reads_dest = all(
+                                sass_instrs[_alu_instrs[_ci]].raw[3] == _i0_dest
+                                for _ci in (1, 2, 3))
+                            if not _chain_reads_dest:
+                                if verbose:
+                                    print('[FG36] skipped: ALUs do not chain '
+                                          'through common dest at src0 '
+                                          '(allocator reuse, not a real chain)')
+                                _alu_instrs = []
                 if len(_alu_instrs) == 4:
                     _i0, _i1, _i2, _i3 = _alu_instrs
                     # Check if the final ALU reads two different body regs.

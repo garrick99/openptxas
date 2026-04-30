@@ -2643,10 +2643,11 @@ def compile_function(fn: Function, verbose: bool = False,
         # Same hazard as FG32 (which has the analogous guard), surfaced by
         # ISO2 / pred_composition.  Skip FG56b entirely when R5 is already
         # a destination in the ALU stream.
+        _FG56B_DEST_GUARD = _ALU_56 | {0x219, 0x299, 0x819}
         _fg56b_safe = True
         for _si in sass_instrs:
             _ropc = (struct.unpack_from('<Q', _si.raw, 0)[0]) & 0xFFF
-            if _ropc in _ALU_56 and _si.raw[2] == 5:
+            if _ropc in _FG56B_DEST_GUARD and _si.raw[2] == 5:
                 _fg56b_safe = False
                 if verbose:
                     print('[FG56b] skipped: R5 already a body dest — rename '

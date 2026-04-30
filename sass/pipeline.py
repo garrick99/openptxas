@@ -2655,6 +2655,8 @@ def compile_function(fn: Function, verbose: bool = False,
         if not _fg56b_safe:
             pass
         else:
+            _RR_RR_RR = {0x210, 0x212}
+            _SEL_IMM = {0x807}
             _fg56b_count = 0
             for _ri in range(len(sass_instrs)):
                 _si = sass_instrs[_ri]
@@ -2664,6 +2666,10 @@ def compile_function(fn: Function, verbose: bool = False,
                 if _ropc in _ALU_56:
                     if _p[2] == 4: _p[2] = 5; _changed = True
                     if _p[3] == 4: _p[3] = 5; _changed = True
+                    if _ropc in _RR_RR_RR and _p[4] == 4:
+                        _p[4] = 5; _changed = True
+                    if _ropc not in _SEL_IMM and _p[8] == 4:
+                        _p[8] = 5; _changed = True
                 elif _ropc in _ISETP_56_SRC:
                     if _p[3] == 4: _p[3] = 5; _changed = True
                 elif _ropc == 0x986:  # STG data at b4

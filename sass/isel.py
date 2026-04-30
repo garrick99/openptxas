@@ -4048,15 +4048,35 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         if output and f'R{c}, RZ, 0x0, RZ' in output[-1].comment:
                             output.pop()
                         c = RZ
-                    # FFMA.IMM: if the multiplier is a known immediate, bake it in
+                    # FFMA.IMM: if the multiplier is a known immediate, bake it in.
+                    # The dead-IADD3 elimination is only safe when the multiplier
+                    # register is not referenced elsewhere in the function — if a
+                    # later instruction (e.g. another FMA's addend) still reads
+                    # that register, the IADD3 must stay live.
                     _imm_regs = getattr(ctx, '_imm_regs', {})
                     if b in _imm_regs:
                         imm_val = _imm_regs[b]
-                        # Remove the IADD3 that loaded this immediate
-                        for j in range(len(output) - 1, max(len(output) - 5, -1), -1):
-                            if j >= 0 and f'R{b}, RZ, 0x{imm_val:x}, RZ' in output[j].comment:
-                                output.pop(j)
-                                break
+                        _src1 = instr.srcs[1]
+                        _mul_name = _src1.name if isinstance(_src1, RegOp) else None
+                        _used_elsewhere = False
+                        if _mul_name is not None:
+                            for _bb_chk in fn.blocks:
+                                for _inst_chk in _bb_chk.instructions:
+                                    if _inst_chk is instr:
+                                        continue
+                                    for _s in _inst_chk.srcs:
+                                        if isinstance(_s, RegOp) and _s.name == _mul_name:
+                                            _used_elsewhere = True
+                                            break
+                                    if _used_elsewhere:
+                                        break
+                                if _used_elsewhere:
+                                    break
+                        if not _used_elsewhere:
+                            for j in range(len(output) - 1, max(len(output) - 5, -1), -1):
+                                if j >= 0 and f'R{b}, RZ, 0x{imm_val:x}, RZ' in output[j].comment:
+                                    output.pop(j)
+                                    break
                         output.append(SassInstr(encode_ffma_imm(d, a, imm_val, c),
                                                 f'FFMA.IMM R{d}, R{a}, 0x{imm_val:x}, R{c}  // fma.f32 (imm)'))
                     else:

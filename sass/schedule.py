@@ -642,6 +642,22 @@ def _enforce_gpr_latency(instrs: list[SassInstr]) -> list[SassInstr]:
             result.insert(i + 1, SassInstr(encode_nop(), 'NOP  // ALU GPR latency'))
             i += 2  # skip the NOP; re-examine the original i+1 at i+2
         else:
+            # IADD3-class writer feeding an FFMA reader at gap=1 (one
+            # unrelated instruction in between) is unsafe on SM_120 even
+            # though the standard min_gpr_gap=1 check would allow it: the
+            # FFMA pipeline reads its source register before the integer
+            # ALU's float-bit-pattern write fully retires.  Force a 2-
+            # instruction gap when the writer is IADD3 (R-R or imm form)
+            # and the reader two slots ahead is FFMA (R-R-R or imm).
+            _IADD3_WRITERS = (0x210, 0x810)
+            _FFMA_READERS  = (0x223, 0x823)
+            if (opc_i in _IADD3_WRITERS
+                    and i + 2 < len(result)
+                    and _sc_opc(result[i + 2].raw) in _FFMA_READERS
+                    and dest_i & _sc_src(result[i + 2].raw)):
+                result.insert(i + 1, SassInstr(encode_nop(), 'NOP  // IADD3->FFMA latency'))
+                i += 2
+                continue
             i += 1
     return result
 

@@ -2580,6 +2580,11 @@ def compile_function(fn: Function, verbose: bool = False,
                     # k300_nasty_pred_xor tids 0..16 before this rename.
                     elif _ropc == 0x812 and _p[3] == 3:
                         _p[3] = 0; _changed = True
+                    elif _ropc == 0x212 and (_p[3] == 3 or _p[4] == 3 or _p[8] == 3):
+                        if _p[3] == 3: _p[3] = 0
+                        if _p[4] == 3: _p[4] = 0
+                        if _p[8] == 3: _p[8] = 0
+                        _changed = True
                     # MP02: IADD3 R-R (0x210): rename src R3->R0.
                     # Used by `mov.u32 %rN, %r0` which lowers to
                     # IADD3 R_dest, R3, RZ, RZ. After FG56 R3→R0 rename of

@@ -86,6 +86,7 @@ _OPCODE_META: dict[int, _OpMeta] = {
     0x235: _OpMeta('IADD.64',    1, 0x3e, 1),
     0xc35: _OpMeta('IADD.64-UR', 1, 0x3e, 5),  # misc=5 per hardware bisect 2026-03-25
     0x202: _OpMeta('MOV',        0, 0x3e, 1),
+    0x802: _OpMeta('MOV.IMM',    0, 0x3e, 1),  # GPR-immediate move (b0=0x02, b1=0x78); same scheduling as 0x202.
     0x20b: _OpMeta('FSETP.RR',   0, 0x3c, 5),  # FSETP R-R: misc=5, wdep=0x3c (ptxas-verified from forced_match)
     0x808: _OpMeta('FSEL.IMM',   1, 0x3e, 1),  # FSEL with 32-bit immediate (float select)
     0x20c: _OpMeta('ISETP.RR',   0, 0x3e, 0),  # ISETP R-R: misc=0 (SM_120 predicate)
@@ -314,6 +315,7 @@ _OPCODES_ALU = {
     0x3c4,        # REDUX.SUM (warp sum → UR)
     # MOV R, UR — copy uniform register to GPR (after REDUX)
     0xc02,        # MOV R, UR
+    0x802,        # MOV.IMM (32-bit immediate → GPR; replaces IADD3-imm-as-MOV)
     # Rare opcodes batch (2026-04-04)
     0xc26,        # IDP.4A with UR source
     0x31c,        # B2R (barrier result to register)
@@ -393,6 +395,10 @@ def _get_src_regs(raw: bytes) -> set[int]:
         # that returns {b3} produced {R0} regardless of the real source.
         # FG-2.5 fix: return {b4} explicitly.
         if raw[4] < 255: regs.add(raw[4])
+        return regs
+    if opcode == 0x802:
+        # MOV.IMM — 32-bit immediate to GPR; b4..b7 = imm32 (not a source).
+        # No GPR sources.
         return regs
 
     if opcode in _OPCODES_LDG:
@@ -757,6 +763,7 @@ _FORWARDING_SAFE_PAIRS: set[tuple[int, int]] = {
     (0x984, 0x824),   # LDS → IMAD.Ri (shared load→multiply)
     (0x824, 0x388),   # IMAD.Ri → STS (multiply→shared store)
     (0x824, 0x202),   # IMAD.Ri → MOV (multiply→register move)
+    (0x824, 0x802),   # IMAD.Ri → MOV.IMM (multiply→imm move; same forwarding window as 0x202)
     (0xb82, 0x835),   # S2R → IADD.64.IMM (special reg→64-bit add, large gap OK)
 }
 

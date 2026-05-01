@@ -5189,6 +5189,48 @@ def encode_umov_imm(dest_ur: int, imm32: int, ctrl: int = 0) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# MOV.IMM — GPR Register Move (immediate)
+# ---------------------------------------------------------------------------
+# Opcode: 0x802 (b[0]=0x02, b[1]=0x78) — GPR sibling of UMOV.IMM (0x882).
+# Ground truth (ptxas sm_120, MOV R7, 0x7fc00001):
+#   02 78 07 00 01 00 c0 7f 00 0f 00 00 00 e2 0f 00
+#   b[2] = dest_gpr, b[4..7] = 32-bit immediate (little-endian)
+#   b[3]=0x00, b[8]=0x00, b[9]=0x0f — fixed (matches UMOV.IMM layout)
+#   ctrl default 0x07F1 (matches ptxas).
+
+def encode_mov_imm(dest_gpr: int, imm32: int, ctrl: int = 0x07F1) -> bytes:
+    """Encode MOV Rn, imm32 — load 32-bit immediate into a GPR.
+
+    Args:
+        dest_gpr: Destination GPR index (R0..R254; RZ is 0xFF).
+        imm32: 32-bit immediate value.
+        ctrl: 23-bit scheduling control word; default 0x07F1 (ptxas's choice).
+
+    Ground truth: MOV R7, 0x7fc00001 → 02 78 07 00 01 00 c0 7f | 00 0f 00 00 ...
+    """
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+
+    raw = bytearray(16)
+    raw[0] = 0x02
+    raw[1] = 0x78
+    raw[2] = dest_gpr & 0xFF
+    raw[3] = 0x00  # fixed/unused
+    raw[4] = imm32 & 0xFF
+    raw[5] = (imm32 >> 8) & 0xFF
+    raw[6] = (imm32 >> 16) & 0xFF
+    raw[7] = (imm32 >> 24) & 0xFF
+    raw[8] = 0x00
+    raw[9] = 0x0f
+    raw[10] = 0x00
+    raw[11] = 0x00
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
 # UIADD3 — Uniform Integer 3-Input Add
 # ---------------------------------------------------------------------------
 # Opcode: 0x890 (b[0]=0x90, b[1]=0x78)

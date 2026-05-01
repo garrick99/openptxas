@@ -107,10 +107,12 @@ GPR_FIELDS: dict[int, list[tuple[int, str]]] = {
     # PRMT has imm at byte[4-7]; sources at byte[3] and byte[8]
     0x416: [(2, 'dst'), (3, 'src0'), (8, 'src2')],                # PRMT
 
-    # --- Predicated MOV / MOV R,UR ---
+    # --- Predicated MOV / MOV R,UR / MOV.IMM ---
     # @P MOV R,R: byte[2]=dst, byte[4]=src (byte[3] unused)
     0x202: [(2, 'dst'), (4, 'src0')],                             # @P MOV
     0xc02: [(2, 'dst')],                                          # MOV R, UR
+    # MOV.IMM R, imm32: byte[2]=dst only — b4..b7 are the immediate, not a src GPR
+    0x802: [(2, 'dst')],                                          # MOV.IMM
 
     # --- Vote / redux ---
     0x806: [(2, 'dst')],                                          # VOTE (src is predicate)

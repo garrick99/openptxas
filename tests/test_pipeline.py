@@ -289,16 +289,16 @@ IMM_KERNEL = """\
 
 
 def test_mov_immediate_compiles():
-    """mov.u32 with immediate literal compiles to IADD3_IMM32 (not a TODO NOP)."""
+    """mov.u32 with immediate literal compiles to a real materialization (MOV.IMM or IADD3), not a TODO NOP."""
     results = compile_ptx_source(IMM_KERNEL)
     cubin = results["imm_kernel"]
     elf = ELF64(cubin)
     text = elf.section_data('.text.imm_kernel')
     opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
                for off in range(0, len(text), 16)]
-    # IADD3.IMM32 (0x810) or IADD3 (0x210) must appear for the mov immediate
-    assert 0x810 in opcodes or 0x210 in opcodes, \
-        f"Expected IADD3 for mov immediate, opcodes={[hex(o) for o in set(opcodes)]}"
+    # MOV.IMM (0x802) or IADD3.IMM32 (0x810) or IADD3 (0x210) must appear for the mov immediate
+    assert 0x810 in opcodes or 0x210 in opcodes or 0x802 in opcodes, \
+        f"Expected MOV.IMM (0x802) or IADD3 (0x210/0x810) for mov immediate, opcodes={[hex(o) for o in set(opcodes)]}"
 
 
 def test_mov_immediate_bakes_constant():

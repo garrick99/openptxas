@@ -221,6 +221,8 @@ def _get_src_regs(raw: bytes) -> set[int]:
     elif opcode == 0x202:  # MOV: src=byte[4]
         if b4 < 255:
             regs.add(b4)
+    elif opcode == 0x802:  # MOV.IMM: imm32 at b4..b7, no GPR sources
+        pass
     return regs
 
 
@@ -245,7 +247,7 @@ def _get_dest_regs(raw: bytes) -> set[int]:
         if dest < 255:
             regs.add(dest)
             regs.add(dest + 1)
-    elif opcode in (0x819, 0x202):  # SHF, MOV
+    elif opcode in (0x819, 0x202, 0x802):  # SHF, MOV, MOV.IMM
         if dest < 255:
             regs.add(dest)
     return regs
@@ -1414,7 +1416,7 @@ def _hide_ldg_latency(instrs: list[SassInstr]) -> list[SassInstr]:
         0x235, 0xc35,                    # IADD.64 / IADD.64-UR
         0x824, 0x224, 0x2a4, 0xc24,      # IMAD variants
         0x825, 0x225, 0xc25,             # IMAD.WIDE variants
-        0x202, 0xc02,                    # MOV / MOV R, UR
+        0x202, 0xc02, 0x802,             # MOV / MOV R, UR / MOV.IMM
         0x819,                           # SHF (constant shift)
         0x812,                           # LOP3.IMM
         0x211, 0x811,                    # LEA / LEA.IMM
@@ -1435,7 +1437,7 @@ def _hide_ldg_latency(instrs: list[SassInstr]) -> list[SassInstr]:
         0x235, 0xc35,                    # IADD.64 / IADD.64-UR
         0x824, 0x224, 0x2a4, 0xc24,      # IMAD variants
         0x825, 0x225, 0xc25,             # IMAD.WIDE variants
-        0x202, 0xc02,                    # MOV / MOV R, UR
+        0x202, 0xc02, 0x802,             # MOV / MOV R, UR / MOV.IMM
         0x819,                           # SHF (constant shift)
         0x812,                           # LOP3.IMM
         0x211, 0x811,                    # LEA / LEA.IMM

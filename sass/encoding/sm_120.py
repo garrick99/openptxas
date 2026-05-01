@@ -45,6 +45,7 @@ OPCODES: dict[str, int] = {
 
     # Data movement
     "MOV":            0x202,   # register move
+    "MOV.IMM":        0x802,   # 32-bit immediate move (GPR sibling of UMOV.IMM 0x882)
     "S2R":            0x919,   # system register to register (e.g. S2R %r, SR_CTAID.X)
     "S2UR":           0x9C3,   # system register to uniform register
     "LDC":            0xB82,   # load from constant bank

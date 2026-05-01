@@ -85,7 +85,7 @@ from sass.encoding.sm_120_opcodes import (
     encode_utmaldg_1d, encode_utmaldg_2d, encode_utmastg_1d,
     encode_utmacmdflush, encode_elect, encode_cctl_ivall,
     encode_mov_gpr_from_ur,
-    encode_iadd3_imm32, encode_iadd3_imm32_neg_src0,
+    encode_iadd3_imm32, encode_iadd3_imm32_neg_src0, encode_mov_imm,
     encode_iadd3_neg_b4, encode_iadd3_neg_b3,
     encode_iadd3_pred_neg_b4, encode_iadd3_pred_small_imm,
     encode_iadd3_pred_neg_b3, encode_lop3_pred,
@@ -795,8 +795,8 @@ def _select_mov(instr: Instruction, ra: RegAlloc,
             d = ra.r32(dest.name)
             imm_val = src.value & 0xFFFFFFFF
             return _apply_pred_byte([SassInstr(
-                encode_iadd3_imm32(d, RZ, imm_val, RZ),
-                f'IADD3 R{d}, RZ, 0x{imm_val:x}, RZ  // mov.u32 imm')], instr, ctx)
+                encode_mov_imm(d, imm_val),
+                f'MOV R{d}, 0x{imm_val:x}  // mov.u32 imm')], instr, ctx)
         raise ISelError("MOV from immediate not yet supported in isel (use LDC for params)")
 
     if not isinstance(src, RegOp):
@@ -3055,9 +3055,16 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         if not hasattr(ctx, '_imm_regs'):
                             ctx._imm_regs = {}
                         ctx._imm_regs[d] = imm
-                        # Use IADD3_IMM32 to load immediate directly (works for any 32-bit pattern)
-                        output.append(SassInstr(encode_iadd3_imm32(d, RZ, imm, RZ),
-                                                f'IADD3 R{d}, RZ, 0x{imm:x}, RZ  // mov.{typ} imm'))
+                        # Integer mov.{u32,s32,b32} imm → MOV.IMM (0x802), the GPR sibling
+                        # of UMOV.IMM that ptxas emits.  f32 keeps the IADD3.IMM form so
+                        # downstream FFMA.IMM / HFMA2 packed-half fusion still recognizes
+                        # the constant materializer pattern.
+                        if typ in ('u32', 's32', 'b32'):
+                            output.append(SassInstr(encode_mov_imm(d, imm),
+                                                    f'MOV R{d}, 0x{imm:x}  // mov.{typ} imm'))
+                        else:
+                            output.append(SassInstr(encode_iadd3_imm32(d, RZ, imm, RZ),
+                                                    f'IADD3 R{d}, RZ, 0x{imm:x}, RZ  // mov.{typ} imm'))
                         continue
                     # Track special register sources
                     if (isinstance(instr.srcs[0], RegOp) and

@@ -3248,6 +3248,8 @@ def compile_function(fn: Function, verbose: bool = False,
                         _p = bytearray(sass_instrs[_ri].raw)
                         _changed = False
                         for bp, val in patches:
+                            if _p[bp] == 255:
+                                continue
                             if _p[bp] != val:
                                 _p[bp] = val
                                 _changed = True

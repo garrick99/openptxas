@@ -4070,8 +4070,28 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     def _ensure_u64_gpr(src):
                         """Return the GPR lo index for a u64 source, materializing
                         from UR via MOV R,UR if the vreg is UR-resident and has
-                        not yet been copied to a GPR pair.
+                        not yet been copied to a GPR pair.  For an ImmOp source
+                        (Forge emits e.g. ``mul.lo.u64 %rd, %rd, 8``), splat the
+                        constant's lo/hi 32-bit halves into a fresh GPR pair.
                         """
+                        if isinstance(src, ImmOp):
+                            val = src.value & 0xFFFFFFFFFFFFFFFF
+                            imm_lo = val & 0xFFFFFFFF
+                            imm_hi = (val >> 32) & 0xFFFFFFFF
+                            tmp_lo = _alloc_gpr_pair(ctx)
+                            output.append(SassInstr(
+                                encode_iadd3_imm32(tmp_lo, RZ, imm_lo, RZ),
+                                f'IADD3 R{tmp_lo}, RZ, 0x{imm_lo:x}, RZ  '
+                                f'// FG-1.12: u64 imm.lo for mul.lo.{typ}'))
+                            output.append(SassInstr(
+                                encode_iadd3_imm32(tmp_lo + 1, RZ, imm_hi, RZ),
+                                f'IADD3 R{tmp_lo+1}, RZ, 0x{imm_hi:x}, RZ  '
+                                f'// FG-1.12: u64 imm.hi for mul.lo.{typ}'))
+                            if imm_hi == 0:
+                                if not hasattr(ctx, '_zero_regs'):
+                                    ctx._zero_regs = set()
+                                ctx._zero_regs.add(tmp_lo + 1)
+                            return tmp_lo
                         if not isinstance(src, RegOp):
                             return ctx.ra.lo(src.name)
                         if (src.name in _ur_params

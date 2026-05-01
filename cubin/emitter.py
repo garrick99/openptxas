@@ -343,20 +343,24 @@ def _patch_capmerc_text_size(capmerc: bytes, text_size: int) -> bytes:
     ptxas_pages = (text_size + 127) // 128  # 128 bytes per page
 
     # Patch terminal record (type 02 sub 0x38): byte[20] = pages - 2
+    # For very large kernels (>~32KB text, pages-2 > 255), the byte slot
+    # cannot represent the full page count. Clamp to 0xFF — capmerc is
+    # optimization metadata not required for execution.
     for i in range(len(cm) - 1):
         if cm[i] == 0x02 and cm[i + 1] == 0x38:
             if i + 20 < len(cm):
-                cm[i + 20] = max(ptxas_pages - 2, 0)
+                cm[i + 20] = min(max(ptxas_pages - 2, 0), 0xFF)
             break
 
     # Patch barrier region records (type 02 sub 0x22): byte[28] = window size
-    # First barrier: pages * 8; subsequent: 0x10 (multi-page) or 0x08
+    # First barrier: pages * 8; subsequent: 0x10 (multi-page) or 0x08.
+    # Clamp to byte range for very large kernels (pages > 31).
     barrier_idx = 0
     for i in range(len(cm) - 1):
         if cm[i] == 0x02 and cm[i + 1] == 0x22:
             if i + 28 < len(cm):
                 if barrier_idx == 0:
-                    cm[i + 28] = ptxas_pages * 8
+                    cm[i + 28] = min(ptxas_pages * 8, 0xFF)
                 # Others keep their relative values
             barrier_idx += 1
 

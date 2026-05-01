@@ -3889,9 +3889,10 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             _read_other = False
                             for _si_i, _s in enumerate(getattr(_later, 'srcs', []) or []):
                                 if isinstance(_s, RegOp) and _s.name == _dn:
-                                    if (_later.op == 'st' and 'global' in (_later.types or ())
+                                    _ltypes = _later.types or ()
+                                    if (_later.op == 'st' and 'global' in _ltypes
                                             and _si_i == 1
-                                            and 'u32' in (_later.types or ())):
+                                            and any(_t in _ltypes for _t in ('u32', 'b32', 's32'))):
                                         _read_as_data = True
                                     else:
                                         _read_other = True

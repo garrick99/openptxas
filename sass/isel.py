@@ -2514,7 +2514,10 @@ def _select_st_global(instr: Instruction, ra: RegAlloc,
         return prefix + [SassInstr(encode_stg_e_64(ur_desc, addr, data, imm_offset=extra_offset, ctrl=0xff1),
                           f'STG.E.64 desc[UR{ur_desc}][R{addr}.64{off_str}], R{data}')]
     else:
-        data = ra.r32(src_op.name)
+        if ctx is not None and src_op.name in getattr(ctx, '_ptx_rz_bound', set()):
+            data = RZ
+        else:
+            data = ra.r32(src_op.name)
         return prefix + [SassInstr(encode_stg_e(ur_desc, addr, data, width=32, imm_offset=extra_offset, ctrl=0xff1),
                           f'STG.E desc[UR{ur_desc}][R{addr}.64{off_str}], R{data}')]
 
@@ -2565,6 +2568,11 @@ class ISelContext:
     # driver-zeroed cbuf[0] region.  Off by default for test-baseline
     # compatibility; enabled by the fuzzer path.
     _aggressive_imad_imm: bool = False
+    # Set of PTX register names that are semantically bound to RZ (zero).
+    # Populated by mul.lo.s32 R-R src=0 fold when the dest is consumed only
+    # by ops that can substitute RZ (e.g. st.global data).  Consumers
+    # check this set and emit RZ directly instead of looking up a GPR.
+    _ptx_rz_bound: set = field(default_factory=set)
     # Next available scratch GPR (for isel-internal temporaries, e.g. bfe mask)
     # Initialized from alloc.num_gprs by the pipeline; may grow during isel.
     # SM_120 HARDWARE LIMIT: Without proper merc 0x5a metadata, the GPU only
@@ -2979,6 +2987,64 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 if hasattr(ctx, '_imm_regs'):
                                     ctx._imm_regs.pop(_d_skip, None)
                                 continue
+                            # WB-edge57: if mov imm=0 and the only later
+                            # reads in the BB are mul.lo.{s32,u32} R-R that
+                            # consume this reg as a source, the mul will
+                            # fold to IADD3 RZ,0,RZ (edge_54 path) without
+                            # actually reading the reg.  Drop the mov but
+                            # still mark the phys reg as known-zero so the
+                            # fold fires downstream.  Saves a redundant
+                            # IADD3 imm=0 that FG29 would otherwise rename
+                            # to R0 (a dead store visible on GD).
+                            if ((instr.srcs[0].value & 0xFFFFFFFF) == 0
+                                    and bb.instructions
+                                    and bb.instructions[-1].op == 'ret'
+                                    and getattr(bb.instructions[-1], 'pred', None) is None
+                                    and not any(_bi.op == 'mma'
+                                                for _bb2 in fn.blocks
+                                                for _bi in _bb2.instructions)):
+                                _all_mul_fold = True
+                                _saw_any = False
+                                for _later in bb.instructions[_instr_idx + 1:]:
+                                    _ldest2 = getattr(_later, 'dest', None)
+                                    if (isinstance(_ldest2, RegOp)
+                                            and _ldest2.name == _dest_name
+                                            and getattr(_later, 'pred', None) is None):
+                                        break
+                                    _read_here = False
+                                    for _s in getattr(_later, 'srcs', []):
+                                        if isinstance(_s, RegOp) and _s.name == _dest_name:
+                                            _read_here = True
+                                            break
+                                        if isinstance(_s, _MemOp) and _s.base:
+                                            _bn = _s.base
+                                            _qn = _bn if _bn.startswith('%') else f'%{_bn}'
+                                            if _qn == _dest_name:
+                                                _read_here = True
+                                                break
+                                    if not _read_here:
+                                        continue
+                                    _saw_any = True
+                                    _ltypes = getattr(_later, 'types', [])
+                                    if not (_later.op == 'mul'
+                                            and 'lo' in _ltypes
+                                            and ('s32' in _ltypes or 'u32' in _ltypes)):
+                                        _all_mul_fold = False
+                                        break
+                                    if not (len(_later.srcs) == 2
+                                            and isinstance(_later.srcs[0], RegOp)
+                                            and isinstance(_later.srcs[1], RegOp)):
+                                        _all_mul_fold = False
+                                        break
+                                if _saw_any and _all_mul_fold:
+                                    _d_zero = ctx.ra.r32(_dest_name)
+                                    if not hasattr(ctx, '_zero_regs'):
+                                        ctx._zero_regs = set()
+                                    ctx._zero_regs.add(_d_zero)
+                                    if not hasattr(ctx, '_imm_regs'):
+                                        ctx._imm_regs = {}
+                                    ctx._imm_regs[_d_zero] = 0
+                                    continue
                         d = ctx.ra.r32(instr.dest.name)
                         imm = instr.srcs[0].value & 0xFFFFFFFF
                         if imm == 0:
@@ -3811,6 +3877,40 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     # R0 normalization on SM_120.
                     if (hasattr(ctx, '_zero_regs')
                             and (a in ctx._zero_regs or b in ctx._zero_regs)):
+                        from ptx.ir import MemOp as _MemOp_mz
+                        _dn = instr.dest.name if isinstance(instr.dest, RegOp) else None
+                        _all_stg_data = _dn is not None
+                        _saw_use = False
+                        for _later in bb.instructions[_instr_idx + 1:]:
+                            _ldest = getattr(_later, 'dest', None)
+                            if isinstance(_ldest, RegOp) and _ldest.name == _dn:
+                                break
+                            _read_as_data = False
+                            _read_other = False
+                            for _si_i, _s in enumerate(getattr(_later, 'srcs', []) or []):
+                                if isinstance(_s, RegOp) and _s.name == _dn:
+                                    if (_later.op == 'st' and 'global' in (_later.types or ())
+                                            and _si_i == 1
+                                            and 'u32' in (_later.types or ())):
+                                        _read_as_data = True
+                                    else:
+                                        _read_other = True
+                                if isinstance(_s, _MemOp_mz) and _s.base:
+                                    _bn = _s.base if _s.base.startswith('%') else f'%{_s.base}'
+                                    if _bn == _dn:
+                                        _read_other = True
+                            if _read_other:
+                                _all_stg_data = False
+                                _saw_use = True
+                                break
+                            if _read_as_data:
+                                _saw_use = True
+                        if (_all_stg_data and _saw_use
+                                and bb.instructions
+                                and bb.instructions[-1].op == 'ret'
+                                and getattr(bb.instructions[-1], 'pred', None) is None):
+                            ctx._ptx_rz_bound.add(_dn)
+                            continue
                         output.append(SassInstr(encode_iadd3_imm32(d, RZ, 0, RZ),
                             f'IADD3 R{d}, RZ, 0x0, RZ  // mul.lo.{typ} R-R src=0'))
                         ctx._zero_regs.add(d)

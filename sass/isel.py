@@ -3576,6 +3576,9 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     _emit_lop3(output, ctx, d_lo+1, a_lo+1, RZ, RZ, 0x0F, f'LOP3.LUT R{d_lo+1}, R{a_lo+1}, RZ, RZ, 0x0f  // not.{typ} hi')
 
                 elif op == 'mul' and 'lo' in instr.types and typ in ('u32', 's32'):
+                    if (isinstance(instr.srcs[0], ImmOp)
+                            and isinstance(instr.srcs[1], RegOp)):
+                        instr.srcs = [instr.srcs[1], instr.srcs[0]]
                     # PEEPHOLE: mul+add fusion → IMAD with third operand (DISABLED FOR TESTING)
                     if False:
                         pass

@@ -3802,6 +3802,22 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 f'IMAD R{d}, R{a}, 0x{imm:x}, RZ  // mul.lo imm'))
                         continue
                     b = ctx.ra.r32(instr.srcs[1].name)
+                    # WB-edge54: fold mul.lo R-R when either source GPR is
+                    # known-zero (tracked via _zero_regs from a prior
+                    # mov.b32 imm=0).  Match the imm=0 path: emit a single
+                    # IADD3 R, RZ, 0, RZ instead of IMAD R-R-R (0x224).
+                    # Resolves a GPU-incorrect cluster where the dead
+                    # init-acc + zero-source mul interacted with FG29's
+                    # R0 normalization on SM_120.
+                    if (hasattr(ctx, '_zero_regs')
+                            and (a in ctx._zero_regs or b in ctx._zero_regs)):
+                        output.append(SassInstr(encode_iadd3_imm32(d, RZ, 0, RZ),
+                            f'IADD3 R{d}, RZ, 0x0, RZ  // mul.lo.{typ} R-R src=0'))
+                        ctx._zero_regs.add(d)
+                        if not hasattr(ctx, '_imm_regs'):
+                            ctx._imm_regs = {}
+                        ctx._imm_regs[d] = 0
+                        continue
                     # Check if either source lives in a UR (ctaid.x via S2UR)
                     a_ur = ctx._ur_for_param.get(
                         instr.srcs[0].name if isinstance(instr.srcs[0], RegOp) else None)

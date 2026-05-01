@@ -2648,7 +2648,7 @@ def compile_function(fn: Function, verbose: bool = False,
         # Same hazard as FG32 (which has the analogous guard), surfaced by
         # ISO2 / pred_composition.  Skip FG56b entirely when R5 is already
         # a destination in the ALU stream.
-        _FG56B_DEST_GUARD = _ALU_56 | {0x219, 0x299, 0x819}
+        _FG56B_DEST_GUARD = _ALU_56 | {0x219, 0x299, 0x819, 0x802}
         _fg56b_safe = True
         for _si in sass_instrs:
             _ropc = (struct.unpack_from('<Q', _si.raw, 0)[0]) & 0xFFF
@@ -2680,6 +2680,8 @@ def compile_function(fn: Function, verbose: bool = False,
                     if _p[3] == 4: _p[3] = 5; _changed = True
                 elif _ropc == 0x986:  # STG data at b4
                     if _p[4] == 4: _p[4] = 5; _changed = True
+                elif _ropc == 0x802:  # MOV.IMM dest at b2 (init_acc producer)
+                    if _p[2] == 4: _p[2] = 5; _changed = True
                 if _changed:
                     sass_instrs[_ri] = SassInstr(bytes(_p), _si.comment + ' [FG56b:R5]')
                     _fg56b_count += 1

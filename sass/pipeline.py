@@ -2762,7 +2762,8 @@ def compile_function(fn: Function, verbose: bool = False,
                         # both produced wrong output: FG29 R0-renamed the
                         # data-MOV's dest but skipped the SHF.var which
                         # reads data at byte 8 — SHF read uninit R4).
-                        0x299, 0x219}  # SHF.{L,R}.U32(.HI) var, SHF.R.S32.HI var
+                        0x299, 0x219,  # SHF.{L,R}.U32(.HI) var, SHF.R.S32.HI var
+                        0x224}  # IMAD R-R-R (mul.lo.{u32,s32} R-R lowering)
         _BOUNDARY = {0xc11, 0x986, 0x981, 0x94d, 0x947}  # 0xc11/STG/EXIT/BRA
         _PREAMBLE = {0xb82, 0x919, 0x7ac, 0xc0c, 0x94d}  # LDC/S2R/LDCU/ISETP/EXIT
 

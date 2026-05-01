@@ -3310,6 +3310,17 @@ def compile_function(fn: Function, verbose: bool = False,
                             for o in _fg31_opcodes):
             _fg33_ok = False
 
+        # IMAD R-R-R (0x224) admission: when body contains a register-multiply
+        # (mul.lo.{u32,s32} R-R lowering), FG33's hardcoded ctrl template strips
+        # the scoreboard wdep on both the producer (IADD3.IM that materializes
+        # the zero source) and consumer (IMAD).  Without scoreboard tracking,
+        # the IMAD races reading the IADD3-written R0.  PTXAS folds the zero
+        # constant so it never emits this pattern itself — there's no byte-
+        # exact target to converge on.  Surfaced 2026-05-01 by GreenDragon
+        # detective (184 probes for mul.lo.s32 %r2,%r0,%r3 with %r3=0).
+        if _fg33_ok and any(o == 0x224 for o in _fg31_opcodes):
+            _fg33_ok = False
+
         # MP02: FG33's hardcoded ctrl template (rbar=0x01 on body ALU) wipes
         # the scoreboard's rbar=0x03 wait on predicate producers.  For
         # multi-predicate kernels (≥2 @Px-guarded body instructions), the

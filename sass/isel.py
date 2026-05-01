@@ -6382,11 +6382,6 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             output.append(SassInstr(
                                 encode_lop3_imm32(d, d, mask, RZ, LOP3_IMM_AND),
                                 f'LOP3.LUT R{d}, R{d}, 0x{mask:x}, RZ, 0xC0  // bfe.u32 &mask'))
-                    elif length >= 32:
-                        # No masking needed — just shift
-                        output.append(SassInstr(
-                            encode_shf_r_u32_hi(d, a, start),
-                            f'SHF.R.U32.HI R{d}, RZ, 0x{start:x}, R{a}  // bfe.u32 len={length}'))
                     elif start == 0:
                         # Single-instruction AND with imm32 — matches the
                         # ptxas `and.b32 dst, src, imm` lowering.

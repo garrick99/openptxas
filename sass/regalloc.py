@@ -143,6 +143,60 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
     pred_regs: dict[str, int] = {}
     unif_regs: dict[str, int] = {}
 
+    # Auto-declare any vregs referenced in the function body that lack a
+    # `.reg` declaration.  Forge-emitted PTX occasionally references names
+    # like `%rd_unknown_col_len` without declaring them; without a RegDecl
+    # the linear scan never assigns a slot and isel's int_regs lookup
+    # KeyErrors.  Infer the type from the standard PTX prefix and append a
+    # synthetic RegDecl so the rest of the allocator behaves normally.
+    from ptx.ir import RegOp as _RO0, MemOp as _MO0, VectorRegOp as _VRO0
+    _declared_names: set[str] = set()
+    for _rd in fn.reg_decls:
+        _declared_names.update(_rd.names)
+    _SPECIAL_SR = {
+        '%tid.x', '%tid.y', '%tid.z',
+        '%ctaid.x', '%ctaid.y', '%ctaid.z',
+        '%ntid.x', '%ntid.y', '%ntid.z',
+        '%nctaid.x', '%nctaid.y', '%nctaid.z',
+        '%laneid', '%lanemask_lt',
+        '%warpid', '%smid', '%gridid', '%clock', '%clock64',
+    }
+    _used_in_body: set[str] = set()
+    for _bb in fn.blocks:
+        for _inst in _bb.instructions:
+            if isinstance(_inst.dest, _RO0):
+                _used_in_body.add(_inst.dest.name)
+            if isinstance(_inst.dest, _VRO0) and _inst.dest.regs:
+                _used_in_body.update(_inst.dest.regs)
+            for _src in _inst.srcs:
+                if isinstance(_src, _RO0):
+                    _used_in_body.add(_src.name)
+                if isinstance(_src, _VRO0) and _src.regs:
+                    _used_in_body.update(_src.regs)
+                if (isinstance(_src, _MO0) and isinstance(_src.base, str)
+                        and _src.base.startswith('%')):
+                    _used_in_body.add(_src.base)
+            if _inst.pred:
+                _pn = _inst.pred.lstrip('@').lstrip('!')
+                if _pn.startswith('%'):
+                    _used_in_body.add(_pn)
+    _PREFIX_TYPES = (
+        ('rd', TypeSpec(ScalarKind.U, 64)),
+        ('fd', TypeSpec(ScalarKind.F, 64)),
+        ('r',  TypeSpec(ScalarKind.U, 32)),
+        ('f',  TypeSpec(ScalarKind.F, 32)),
+        ('p',  TypeSpec(ScalarKind.PRED, 1)),
+    )
+    for _name in sorted(_used_in_body - _declared_names):
+        if _name in _SPECIAL_SR or '.' in _name:
+            continue
+        _bare = _name.lstrip('%')
+        for _prefix, _ts in _PREFIX_TYPES:
+            if _bare.startswith(_prefix):
+                fn.reg_decls.append(RegDecl(type=_ts, name=_bare, count=1))
+                _declared_names.add(_name)
+                break
+
     # Find LDG coalescing opportunities (dest shares addr register)
     coalesces = _find_ldg_coalesces(fn)
 

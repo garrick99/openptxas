@@ -3768,13 +3768,10 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                     f'SHF.L.U32 R{d}, R{a}, 0x{shift:x}, RZ  // mul.lo imm={imm} (pow2)'))
                             else:
                                 _emit_large_imm_mul()
-                        elif imm <= 0xFFFF:
-                            # 16-bit immediate: use IMAD R-imm directly (ptxas pattern).
+                        else:
                             from sass.encoding.sm_120_opcodes import encode_imad_r_imm
                             output.append(SassInstr(encode_imad_r_imm(d, a, imm, RZ),
                                 f'IMAD R{d}, R{a}, 0x{imm:x}, RZ  // mul.lo imm'))
-                        else:
-                            _emit_large_imm_mul()
                         continue
                     b = ctx.ra.r32(instr.srcs[1].name)
                     # Check if either source lives in a UR (ctaid.x via S2UR)

@@ -2942,6 +2942,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             from ptx.ir import MemOp as _MemOp
                             _dest_name = instr.dest.name
                             _dead = False
+                            _saw_read_or_write = False
                             for _later in bb.instructions[_instr_idx + 1:]:
                                 _read = False
                                 for _s in getattr(_later, 'srcs', []):
@@ -2955,12 +2956,22 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             _read = True
                                             break
                                 if _read:
+                                    _saw_read_or_write = True
                                     break
                                 _ldest = getattr(_later, 'dest', None)
                                 if isinstance(_ldest, RegOp) and _ldest.name == _dest_name:
                                     if getattr(_later, 'pred', None) is None:
                                         _dead = True
+                                    _saw_read_or_write = True
                                     break
+                            if (not _saw_read_or_write
+                                    and bb.instructions
+                                    and bb.instructions[-1].op == 'ret'
+                                    and getattr(bb.instructions[-1], 'pred', None) is None
+                                    and not any(_bi.op == 'mma'
+                                                for _bb2 in fn.blocks
+                                                for _bi in _bb2.instructions)):
+                                _dead = True
                             if _dead:
                                 _d_skip = ctx.ra.r32(_dest_name)
                                 if hasattr(ctx, '_zero_regs'):

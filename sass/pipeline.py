@@ -2868,11 +2868,13 @@ def compile_function(fn: Function, verbose: bool = False,
             _all_body_regs = (_alu_gprs_written | _rename_candidates) - {0, 1, 2, 3, 255}
             # Find the last write index for each reg in the ALU region
             _last_write: dict[int, int] = {}  # reg → sass_instrs index
+            _first_write: dict[int, int] = {}  # reg → first write in body
             for _ri in range(_alu_start, _alu_end):
                 _raw = sass_instrs[_ri].raw
                 _ropc = (struct.unpack_from('<Q', _raw, 0)[0]) & 0xFFF
                 if _ropc in _ALU_OPCODES and _raw[2] in _all_body_regs:
                     _last_write[_raw[2]] = _ri
+                    _first_write.setdefault(_raw[2], _ri)
 
             # FG39: detect liveness overlap — if any ALU instruction reads
             # two different body regs (both would become R0), the second-
@@ -2990,6 +2992,9 @@ def compile_function(fn: Function, verbose: bool = False,
                         _src = _patched[_sbp]
                         if _src in _all_body_regs and _src not in {0, 1, 2, 3, 255}:
                             if _src != _r0_conflict_reg:
+                                _fw = _first_write.get(_src, -1)
+                                if _fw == -1 or _fw >= _ri:
+                                    continue
                                 _patched[_sbp] = 0
                                 _changed = True
                     if _changed:

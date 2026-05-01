@@ -3726,6 +3726,9 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         if imm == 0xFFFFFFFF:
                             output.append(SassInstr(encode_iadd3_neg_b3(d, a, RZ, RZ),
                                 f'IADD3 R{d}, -R{a}, RZ, RZ  // mul.lo imm=-1'))
+                        elif imm == 0:
+                            output.append(SassInstr(encode_iadd3_imm32(d, RZ, 0, RZ),
+                                f'IADD3 R{d}, RZ, 0x0, RZ  // mul.lo imm=0'))
                         elif imm > 0 and (imm & (imm - 1)) == 0:
                             shift = imm.bit_length() - 1
                             if shift <= 15:

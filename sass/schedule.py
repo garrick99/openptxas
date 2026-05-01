@@ -1372,21 +1372,142 @@ def _remove_forwarding_safe_nops(instrs: list[SassInstr]) -> list[SassInstr]:
     return result
 
 
+def _hide_ldg_latency(instrs: list[SassInstr]) -> list[SassInstr]:
+    """Reorder an independent ALU instruction into the gap between an LDG
+    and its immediately-following dependent consumer.
+
+    Global memory loads have hundreds-of-cycles latency on SM_120.  The
+    scoreboard handles the actual stall, but if the LDG's consumer is the
+    very next instruction, the warp stalls on every load.  Even one
+    independent instruction in the gap lets it overlap with the load.
+
+    Conservative pure-reorder pass — no NOPs are emitted.  Fires only when:
+      • LDG (in _OPCODES_LDG) at index i has non-RZ destination regs.
+      • The instruction at i+1 reads any LDG dest reg (true RAW consumer).
+      • An instruction at i+2 .. i+1+SEARCH_WINDOW is on a small whitelist
+        of pure-GPR ALU opcodes, has guard PT (unconditional), and is
+        independent of LDG and of every reg read/write in the cross-over
+        region (i+1 .. j-1).  Crossing a control-flow op (EXIT/BRA/...)
+        terminates the search.
+      • If no clean candidate exists, the pass is a no-op for this LDG.
+
+    Mirrors ptxas's load-latency hiding observed on probe 1541 where
+    `IADD.64 R2, R2, UR8` is reordered between the LDG and its IADD3
+    consumer.  Designed to preserve byte-match on already-aligned kernels
+    by being independence-strict.
+    """
+    from sass.scoreboard import (
+        _get_dest_regs as _sc_dest,
+        _get_src_regs  as _sc_src,
+        _get_opcode    as _sc_opc,
+        _OPCODES_LDG,
+    )
+
+    # Whitelist of opcodes safe to hoist into the gap.  Pure GPR ALU
+    # only — no predicate writers (ISETP/FSETP/DSETP/PLOP3), no warp
+    # shuffles, no tensor MMAs, no long-latency MUFU/POPC/BREV/FLO,
+    # no FP64.  The list intentionally targets the address-arithmetic
+    # and integer-ALU ops that ptxas itself reorders into LDG slots
+    # (probe 1541 evidence: IADD.64 R-UR / IADD3 / IMAD).
+    _SAFE_HOIST = {
+        0x210, 0x810,                    # IADD3 / IADD3.IMM
+        0x235, 0xc35,                    # IADD.64 / IADD.64-UR
+        0x824, 0x224, 0x2a4, 0xc24,      # IMAD variants
+        0x825, 0x225, 0xc25,             # IMAD.WIDE variants
+        0x202, 0xc02,                    # MOV / MOV R, UR
+        0x819,                           # SHF (constant shift)
+        0x812,                           # LOP3.IMM
+        0x211, 0x811,                    # LEA / LEA.IMM
+        0xc11,                           # IADD3.R-UR (carry-chain)
+    }
+
+    # Opcodes for which scoreboard._get_src_regs / _get_dest_regs cover
+    # every GPR source and destination precisely.  Restricting the LDG
+    # *consumer* to this set avoids reordering past instructions whose
+    # operand model is incomplete (e.g. plain FSEL 0x208 which silently
+    # reads b4 and the predicate operand: the under-modeled src would
+    # let the cand falsely pass independence checks and overwrite a
+    # register that the consumer actually depends on).  This is the
+    # subset of _OPCODES_ALU with explicit per-opcode src branches in
+    # sass.scoreboard._get_src_regs as of this commit.
+    _CONS_WELL_MODELED = {
+        0x210, 0x810, 0x212,             # IADD3 / IADD3.IMM / IADD3X
+        0x235, 0xc35,                    # IADD.64 / IADD.64-UR
+        0x824, 0x224, 0x2a4, 0xc24,      # IMAD variants
+        0x825, 0x225, 0xc25,             # IMAD.WIDE variants
+        0x202, 0xc02,                    # MOV / MOV R, UR
+        0x819,                           # SHF (constant shift)
+        0x812,                           # LOP3.IMM
+        0x211, 0x811,                    # LEA / LEA.IMM
+        0xc11, 0xc12,                    # IADD3.R-UR / IADD3X R-UR
+        0x20c, 0xc0c, 0x80c,             # ISETP variants (well-modeled b3,b4 srcs)
+        0x986,                           # STG (b3 addr pair, b4 data)
+        0x981,                           # LDG (b3 addr pair only)
+    }
+
+    result = list(instrs)
+    i = 0
+    while i < len(result) - 2:
+        if _sc_opc(result[i].raw) not in _OPCODES_LDG:
+            i += 1
+            continue
+        ldg_dest = _sc_dest(result[i].raw)
+        if not ldg_dest:
+            i += 1
+            continue
+        cons_opc = _sc_opc(result[i + 1].raw)
+        if cons_opc not in _CONS_WELL_MODELED:
+            i += 1
+            continue
+        cons_src = _sc_src(result[i + 1].raw)
+        cons_dst = _sc_dest(result[i + 1].raw)
+        if not (cons_src & ldg_dest):
+            i += 1
+            continue
+
+        # Single-slot search: candidate must be the very next instruction
+        # after the consumer (j = i+2).  Keeping the cross-over region to
+        # exactly the consumer means independence is decided by precise
+        # src/dest analysis on opcodes we have full models for; widening
+        # the window would require trusting under-modeled mid-region ops.
+        j = i + 2
+        cand = result[j]
+        cand_opc = _sc_opc(cand.raw)
+        if cand_opc in _SAFE_HOIST and ((cand.raw[1] >> 4) & 0xF) == 0x7:
+            cand_src = _sc_src(cand.raw)
+            cand_dst = _sc_dest(cand.raw)
+            independent_of_ldg = (
+                not (cand_src & ldg_dest) and not (cand_dst & ldg_dest))
+            independent_of_cons = (
+                not (cand_dst & (cons_src | cons_dst))
+                and not (cand_src & cons_dst))
+            if independent_of_ldg and independent_of_cons:
+                cand_instr = result.pop(j)
+                result.insert(i + 1, SassInstr(
+                    cand_instr.raw,
+                    cand_instr.comment + ' [LDGfill]'))
+        i += 1
+    return result
+
+
 def schedule(instrs: list[SassInstr]) -> list[SassInstr]:
     """
     Reorder and pad instructions for correct SM_120 execution.
 
     Passes (in order):
       1. _hoist_ldcu64        — move LDCU.64 early (≥3-cycle gap before UR consumers)
-      2. _enforce_gpr_latency — insert NOPs for ALU GPR RAW hazards
-      3. _fill_ldcu_latency   — hoist deferred LDCU.64 to fill latency with useful work
-      4. _enforce_gpr_latency — re-check after fill reordering
-      5. _remove_forwarding_safe_nops — PERF-1: remove NOPs where hardware forwarding
+      2. _hide_ldg_latency    — reorder an independent ALU op into the gap
+                                between an LDG and a back-to-back consumer
+      3. _enforce_gpr_latency — insert NOPs for ALU GPR RAW hazards
+      4. _fill_ldcu_latency   — hoist deferred LDCU.64 to fill latency with useful work
+      5. _enforce_gpr_latency — re-check after fill reordering
+      6. _remove_forwarding_safe_nops — PERF-1: remove NOPs where hardware forwarding
                                         is proven safe (23 evidence-backed pairs from FG-4)
 
     Ctrl assignment is handled separately by sass.scoreboard.assign_ctrl().
     """
     instrs = _hoist_ldcu64(instrs)
+    instrs = _hide_ldg_latency(instrs)
     # TE24: _hoist_bounds_check disabled — moving LDCU.64 after EXIT
     # violates the ≥3-instruction latency constraint between LDCU.64
     # and its UR consumer.  The PTXAS layout works because PTXAS

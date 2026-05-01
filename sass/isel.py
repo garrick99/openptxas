@@ -3849,8 +3849,49 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             output.append(SassInstr(encode_iadd3_neg_b3(d, a, RZ, RZ),
                                 f'IADD3 R{d}, -R{a}, RZ, RZ  // mul.lo imm=-1'))
                         elif imm == 0:
+                            from ptx.ir import MemOp as _MemOp_mi0
+                            _dn0 = instr.dest.name if isinstance(instr.dest, RegOp) else None
+                            _all_stg_data0 = _dn0 is not None
+                            _saw_use0 = False
+                            for _later in bb.instructions[_instr_idx + 1:]:
+                                _ldest0 = getattr(_later, 'dest', None)
+                                if isinstance(_ldest0, RegOp) and _ldest0.name == _dn0:
+                                    break
+                                _read_as_data0 = False
+                                _read_other0 = False
+                                for _si_i, _s in enumerate(getattr(_later, 'srcs', []) or []):
+                                    if isinstance(_s, RegOp) and _s.name == _dn0:
+                                        _ltypes0 = _later.types or ()
+                                        if (_later.op == 'st' and 'global' in _ltypes0
+                                                and _si_i == 1
+                                                and any(_t in _ltypes0 for _t in ('u32', 'b32', 's32'))):
+                                            _read_as_data0 = True
+                                        else:
+                                            _read_other0 = True
+                                    if isinstance(_s, _MemOp_mi0) and _s.base:
+                                        _bn0 = _s.base if _s.base.startswith('%') else f'%{_s.base}'
+                                        if _bn0 == _dn0:
+                                            _read_other0 = True
+                                if _read_other0:
+                                    _all_stg_data0 = False
+                                    _saw_use0 = True
+                                    break
+                                if _read_as_data0:
+                                    _saw_use0 = True
+                            if (_all_stg_data0 and _saw_use0
+                                    and bb.instructions
+                                    and bb.instructions[-1].op == 'ret'
+                                    and getattr(bb.instructions[-1], 'pred', None) is None):
+                                ctx._ptx_rz_bound.add(_dn0)
+                                continue
                             output.append(SassInstr(encode_iadd3_imm32(d, RZ, 0, RZ),
                                 f'IADD3 R{d}, RZ, 0x0, RZ  // mul.lo imm=0'))
+                            if not hasattr(ctx, '_zero_regs'):
+                                ctx._zero_regs = set()
+                            ctx._zero_regs.add(d)
+                            if not hasattr(ctx, '_imm_regs'):
+                                ctx._imm_regs = {}
+                            ctx._imm_regs[d] = 0
                         elif imm == 1:
                             output.append(SassInstr(encode_iadd3_imm32(d, a, 0, RZ),
                                 f'IADD3 R{d}, R{a}, 0x0, RZ  // mul.lo imm=1'))

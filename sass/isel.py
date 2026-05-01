@@ -2926,6 +2926,48 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         continue
                     # Immediate source: load via IADD3_IMM32 (integer) or FMUL_IMM (float)
                     if isinstance(instr.srcs[0], ImmOp) and typ in ('u32', 's32', 'b32', 'f32'):
+                        # WB-edge40: drop the init when the next reference to
+                        # dest within this BB is an unpredicated write that
+                        # does not read dest.  Without this, regalloc can
+                        # reuse the same physical GPR for the (now dead) init
+                        # and the live overwrite — a WAW hazard on SM_120 the
+                        # waw_rename pass tracks (SHIFT_BOUNDARY /
+                        # SIGN_FLIP_CHAIN classes).  compile_function with
+                        # enable_dce=True covers this via PTX-IR DCE +
+                        # waw_rename; this peephole gives the standalone
+                        # compile_ptx_source path the same correctness
+                        # without enabling the full pass.
+                        if (instr.pred is None
+                                and isinstance(instr.dest, RegOp)):
+                            from ptx.ir import MemOp as _MemOp
+                            _dest_name = instr.dest.name
+                            _dead = False
+                            for _later in bb.instructions[_instr_idx + 1:]:
+                                _read = False
+                                for _s in getattr(_later, 'srcs', []):
+                                    if isinstance(_s, RegOp) and _s.name == _dest_name:
+                                        _read = True
+                                        break
+                                    if isinstance(_s, _MemOp) and _s.base:
+                                        _bn = _s.base
+                                        _qn = _bn if _bn.startswith('%') else f'%{_bn}'
+                                        if _qn == _dest_name:
+                                            _read = True
+                                            break
+                                if _read:
+                                    break
+                                _ldest = getattr(_later, 'dest', None)
+                                if isinstance(_ldest, RegOp) and _ldest.name == _dest_name:
+                                    if getattr(_later, 'pred', None) is None:
+                                        _dead = True
+                                    break
+                            if _dead:
+                                _d_skip = ctx.ra.r32(_dest_name)
+                                if hasattr(ctx, '_zero_regs'):
+                                    ctx._zero_regs.discard(_d_skip)
+                                if hasattr(ctx, '_imm_regs'):
+                                    ctx._imm_regs.pop(_d_skip, None)
+                                continue
                         d = ctx.ra.r32(instr.dest.name)
                         imm = instr.srcs[0].value & 0xFFFFFFFF
                         if imm == 0:

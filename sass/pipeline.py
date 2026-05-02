@@ -1026,12 +1026,24 @@ def compile_function(fn: Function, verbose: bool = False,
                         and isinstance(inst.dest, RegOp)):
                     _addr_fold_dead_vregs.add(inst.dest.name)
 
+    # Phase 20: pre-compute IMAD.WIDE.U32-imm fuse map so the allocator can
+    # promote eligible u64 params from LDCU.64 (UR) to LDC.64 (GPR).  The
+    # PTX has not been mutated since the passes finished, so this analysis
+    # is identical to the post-allocate one we still need for isel below;
+    # we reuse the result rather than re-running.
+    from sass.isel import analyze_imad_wide_fuse
+    _imad_wide_fuse_map = analyze_imad_wide_fuse(fn) if sm_version == 120 else {}
+    _imad_wide_fuse_bases: set[str] = {
+        _entry[2] for _entry in _imad_wide_fuse_map.values()
+    }
+
     # 1. Register allocation
     from sass.regalloc import PARAM_BASE_SM120, PARAM_BASE_SM89
     param_base = PARAM_BASE_SM89 if sm_version == 89 else PARAM_BASE_SM120
     has_capmerc = ptxas_meta is not None and 'capmerc' in (ptxas_meta or {})
     alloc = allocate(fn, param_base=param_base, has_capmerc=has_capmerc,
-                     sm_version=sm_version, skip_vregs=_addr_fold_dead_vregs)
+                     sm_version=sm_version, skip_vregs=_addr_fold_dead_vregs,
+                     imad_wide_fuse_bases=_imad_wide_fuse_bases)
 
     if verbose:
         print(f"[pipeline] {fn.name}: {alloc.num_gprs} GPRs, "
@@ -1128,8 +1140,9 @@ def compile_function(fn: Function, verbose: bool = False,
     ctx._hmma_dead_movs = _hmma_dead_movs
     # Phase 19v2: pre-compute IMAD.WIDE.U32 fusion candidates for the
     # (param_base + idx*K_const) address pattern.  See analyze_imad_wide_fuse.
-    from sass.isel import analyze_imad_wide_fuse
-    ctx._imad_wide_fuse_map = analyze_imad_wide_fuse(fn)
+    # Phase 20: reuse the map computed before allocate() (same fn, same
+    # PTX state — running it twice would be wasted work).
+    ctx._imad_wide_fuse_map = _imad_wide_fuse_map
     # Pre-populate _skip_instrs with the dead mov.u64 imm instructions whose
     # only use was a fused mul.  Those movs precede the mul in linear PTX
     # order, so we must skip them at iteration time (not when the mul fires).

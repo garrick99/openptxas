@@ -182,14 +182,20 @@ _EXPECTED_COUNTS = {
     #     boundary LDCU.64 wdep=0x37).
     #   - Totals grow by the number of LDCU edges R1 used to miss
     #     (STG-consumer edges and LDCU.32 edges).
-    "diag":                  (4, 0, 0, 0, 0, 1, 0, 0, 3, 0, 0, 0, 0),
-    "diag3":                 (4, 0, 0, 0, 0, 1, 0, 0, 3, 0, 0, 0, 0),  # TE29: STG rbar covers desc LDCU
+    # Phase 20 drift: kernels whose `add.u64 %F, %B, %M_const` matches
+    # the IMAD.WIDE.U32-imm fuse pattern from Phase 19v2 now promote
+    # the base param from LDCU.64 (UR) to LDC.64 (GPR).  This eliminates
+    # the MOV R, UR materialization edge (so total drops by 1 in some
+    # kernels) and shifts the consumer edge from UR_MEMORY_*_SAFE to
+    # MEMORY_SCOREBOARD_SAFE (LDC.64 writes a GPR pair).
+    "diag":                  (4, 0, 0, 0, 0, 2, 0, 0, 2, 0, 0, 0, 0),  # P20: %rd0 LDCU.64→LDC.64
+    "diag3":                 (4, 0, 0, 0, 0, 2, 0, 0, 2, 0, 0, 0, 0),  # P20: %rd0 LDCU.64→LDC.64
     # FG-4.4 drift: the bug-1 fix moves one u64 param from UR to GPR
     # (LDC.64 direct) on kernels where the param register is redefined
     # later.  That adds one MEMORY_SCOREBOARD_SAFE edge for the new
     # LDC.64 → consumer chain and shifts one UR_MEMORY_* edge.
-    "min_store_guarded":     (5, 0, 0, 0, 0, 2, 0, 0, 3, 0, 0, 0, 0),  # TE26: LDCU.64 post-EXIT
-    "probe_fresh":           (6, 0, 0, 0, 0, 3, 0, 0, 3, 0, 0, 0, 0),  # P19v2: IMAD.WIDE.U32 imm fuse adds MOV R,UR + IMAD.WIDE.U32 edges
+    "min_store_guarded":     (5, 0, 0, 0, 0, 3, 0, 0, 2, 0, 0, 0, 0),  # P20: param LDCU.64→LDC.64
+    "probe_fresh":           (5, 0, 0, 0, 0, 3, 0, 0, 2, 0, 0, 0, 0),  # P20: MOV R,UR edge eliminated
     "reduce_sum":            (19, 5, 6, 0, 0, 3, 0, 0, 4, 0, 1, 0, 0),  # TE12: 0xc11 now ALU
     # edge_87 drift: 32-bit IADD (opcode 0x235, b9=0x00) emitted for
     # add.u32/sub.u32 reg+reg via encode_iadd; 9 NOPs removed because
@@ -197,12 +203,15 @@ _EXPECTED_COUNTS = {
     # edges from VIOLATION/GAP_SAFE to FORWARDING_SAFE.  See REPORT.md.
     "conv2d_looped":         (105, 14, 0, 0, 0, 55, 0, 0, 36, 0, 0, 0, 0),  # edge_87: IADD-32 path
     "conv2d_unrolled":       (93, 3, 8, 0, 0, 47, 0, 0, 35, 0, 0, 0, 0),  # TE12: 0xc11 now ALU
-    "fg21:k_ge":             (6, 0, 1, 0, 0, 2, 0, 0, 3, 0, 0, 0, 0),  # edge_87: +1 FORWARDING_SAFE for IADD-32 → consumer
-    "fg21:k_lt":             (6, 0, 1, 0, 0, 2, 0, 0, 3, 0, 0, 0, 0),  # edge_87: +1 FORWARDING_SAFE for IADD-32 → consumer
-    "fg21:k_gt":             (6, 0, 1, 0, 0, 2, 0, 0, 3, 0, 0, 0, 0),  # edge_87: +1 FORWARDING_SAFE for IADD-32 → consumer
-    "fg21:k_le":             (6, 0, 1, 0, 0, 2, 0, 0, 3, 0, 0, 0, 0),  # edge_87: +1 FORWARDING_SAFE for IADD-32 → consumer
-    "fg21:k_eq":             (6, 0, 1, 0, 0, 2, 0, 0, 3, 0, 0, 0, 0),  # edge_87: +1 FORWARDING_SAFE for IADD-32 → consumer
-    "fg21:k_ne":             (6, 0, 1, 0, 0, 2, 0, 0, 3, 0, 0, 0, 0),  # edge_87: +1 FORWARDING_SAFE for IADD-32 → consumer
+    # P20: fg21:k_* — promoting the base param drops one MOV R,UR edge
+    # (total 6→5) and shifts the address-arithmetic consumer back to
+    # MEMORY_SCOREBOARD_SAFE.  UR_MEMORY drops from 3 to 1.
+    "fg21:k_ge":             (5, 0, 1, 0, 0, 3, 0, 0, 1, 0, 0, 0, 0),  # P20: LDC.64 promotion
+    "fg21:k_lt":             (5, 0, 1, 0, 0, 3, 0, 0, 1, 0, 0, 0, 0),  # P20: LDC.64 promotion
+    "fg21:k_gt":             (5, 0, 1, 0, 0, 3, 0, 0, 1, 0, 0, 0, 0),  # P20: LDC.64 promotion
+    "fg21:k_le":             (5, 0, 1, 0, 0, 3, 0, 0, 1, 0, 0, 0, 0),  # P20: LDC.64 promotion
+    "fg21:k_eq":             (5, 0, 1, 0, 0, 3, 0, 0, 1, 0, 0, 0, 0),  # P20: LDC.64 promotion
+    "fg21:k_ne":             (5, 0, 1, 0, 0, 3, 0, 0, 1, 0, 0, 0, 0),  # P20: LDC.64 promotion
 }
 
 

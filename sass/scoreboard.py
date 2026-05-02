@@ -1762,6 +1762,17 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
             # earlier >= 0xd threshold missed 0xb/0xc.  Remap >= 0xb into 0..7
             # via `& 0x7`, which stays within ptxas's observed safe range.
             misc = misc & 0x7
+        # Phase 20: S2UR (0x9c3) shares the same opex pattern as LDC.  Its
+        # wdep is 0x31 (bit 0 set), so opex = 0x10 | misc.  Counter-based
+        # misc values 0xd/0xe/0xf produce opex 0x1d/0x1e/0x1f, which
+        # nvdisasm rejects as "Opclass 's2ur_', undefined value 0x1d
+        # for table TABLES_opex_0".  Latent in pre-Phase 20 schedules
+        # because the counter never reached 0xd at the S2UR position;
+        # surfaced by Phase 20's expanded LDC.64 prologue (each promoted
+        # u64 param adds an LDC.64 before the S2UR, advancing the
+        # counter past 0xc).  Remap to the same safe 0..7 range as LDC.
+        if opcode == 0x9c3 and misc >= 0xb:
+            misc = misc & 0x7
         # Phase 8 (LOP3.IMM opex_4 clamp): wdep=0x3f for LOP3.IMM (0x812)
         # → opex = 0x10 | misc.  Counter-based misc=0 / 0xc..0xf produces
         # opex values 0x10 / 0x1c..0x1f, which the SM_120 disassembler

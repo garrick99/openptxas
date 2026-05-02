@@ -125,7 +125,8 @@ def _find_ldg_coalesces(fn: Function) -> dict[str, tuple[str, int]]:
 
 def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
              has_capmerc: bool = False, sm_version: int = 120,
-             skip_vregs: set | None = None) -> AllocResult:
+             skip_vregs: set | None = None,
+             imad_wide_fuse_bases: set | None = None) -> AllocResult:
     """
     Allocate physical registers for a PTX function.
 
@@ -136,9 +137,17 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
     `skip_vregs` (WB-7): vreg names whose producing instruction will be
     elided by isel (e.g. address-fold dead `add.u64`).  These vregs are
     excluded from reg_info so no phys pair is reserved.
+
+    `imad_wide_fuse_bases` (Phase 20): u64 param vreg names that appear
+    as the addend of a Phase 19v2 IMAD.WIDE.U32-imm-with-addend fusion.
+    Eligible params are promoted from LDCU.64 (UR) to LDC.64 (GPR) so
+    the fused IMAD.WIDE.U32-imm consumer reads them directly without a
+    MOV R, UR materialization.
     """
     if skip_vregs is None:
         skip_vregs = set()
+    if imad_wide_fuse_bases is None:
+        imad_wide_fuse_bases = set()
     int_regs: dict[str, int] = {}
     pred_regs: dict[str, int] = {}
     unif_regs: dict[str, int] = {}
@@ -745,6 +754,49 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
             if has_any_use and only_scalar_ldg_base:
                 direct_ldc_params.add(_pn)
                 ur_param_regs.discard(_pn)
+
+        # Phase 20: u64 params used as the addend of a fused IMAD.WIDE.U32-imm
+        # (Phase 19v2 lowering) need their base value in a GPR pair so the
+        # IMAD.WIDE.U32 R, R, IMM, R form can read it directly.  When the
+        # param is left in UR space (default LDCU.64 path), the consumer
+        # has to emit a 2-MOV R,UR materialization sequence per fusion
+        # site — one of those per IMAD.WIDE-imm.  Promoting the param to
+        # LDC.64 GPR-direct eliminates the MOVs and matches ptxas's
+        # natural codegen for `(param_base + idx*K_const)` address
+        # patterns (e.g. forge gather/merkle).
+        #
+        # Eligibility:
+        #   - param vreg appears as the addend of >=1 IMAD.WIDE-fuse pair
+        #   - param is NOT redefined elsewhere (single ld.param.u64 def)
+        #   - param is NOT predicated (predicated load defeats the
+        #     unconditional-LDC.64 emission path)
+        #
+        # Backward-compat: kernels with no IMAD.WIDE-fuse hits leave
+        # `imad_wide_fuse_bases` empty → no promotion happens → existing
+        # LDCU.64 paths are preserved.
+        for _pn in _u64_param_dests:
+            if _pn in direct_ldc_params:
+                continue
+            if _pn not in imad_wide_fuse_bases:
+                continue
+            # Verify single ld.param def, not redefined.
+            n_def = 0
+            redefined = False
+            ld_param_pred = False
+            for inst in all_instrs:
+                if (isinstance(inst.dest, RegOp)
+                        and inst.dest.name == _pn):
+                    if inst.op == 'ld' and 'param' in inst.types:
+                        n_def += 1
+                        if inst.pred:
+                            ld_param_pred = True
+                    else:
+                        redefined = True
+                        break
+            if redefined or n_def != 1 or ld_param_pred:
+                continue
+            direct_ldc_params.add(_pn)
+            ur_param_regs.discard(_pn)
 
         # PTXAS-R29.3: S2R live-range extension for direct-LDC.64 safety.
         #

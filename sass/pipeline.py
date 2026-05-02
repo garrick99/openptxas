@@ -892,6 +892,7 @@ def compile_function(fn: Function, verbose: bool = False,
     from ptx.passes.copy_prop            import run_function as _copy_prop_run
     from ptx.passes.rotate32             import run_function as _rotate32_run
     from ptx.passes.cvta_eliminate       import run_function as _cvta_eliminate_run
+    from ptx.passes.mul_distribute        import run_function as _mul_distribute_run
 
     # WB-pass-toggle (2026-04-28): allow workbench to disable individual
     # PTX-IR passes via the OPENPTXAS_DISABLE_PASSES env var (comma-
@@ -909,6 +910,13 @@ def compile_function(fn: Function, verbose: bool = False,
         # the eliminated cvta boundary.
         ("cvta_eliminate",          _cvta_eliminate_run),
         ("imm_propagate",           _imm_propagate_run),
+        # Phase 22: strength reduction for chained multiply-add address
+        # arithmetic — (idx*K1 + i)*K2 -> idx*(K1*K2) + i*K2, matching
+        # ptxas's address-arithmetic strategy.  Runs after imm_propagate
+        # so K1/K2/Y mov-imms have been folded into ImmOps where possible,
+        # and BEFORE the chain-fold passes / IMAD.WIDE-fuse analyzer (in
+        # compile_function) so they observe the rewritten chain.
+        ("mul_distribute",          _mul_distribute_run),
         ("load_cse",                _load_cse_run),
         ("add3_chain_reduce",       _add3_chain_reduce_run),
         ("mul3_chain_reduce",       _mul3_chain_reduce_run),

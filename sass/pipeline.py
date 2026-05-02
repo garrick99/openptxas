@@ -889,6 +889,7 @@ def compile_function(fn: Function, verbose: bool = False,
     from ptx.passes.imm_xor_fold        import run_function as _imm_xor_fold_run
     from ptx.passes.repeated_add_reduce import run_function as _repeated_add_reduce_run
     from ptx.passes.dead_self_update_dce import run_function as _dead_self_update_dce_run
+    from ptx.passes.copy_prop            import run_function as _copy_prop_run
     from ptx.passes.rotate32             import run_function as _rotate32_run
     from ptx.passes.cvta_eliminate       import run_function as _cvta_eliminate_run
 
@@ -922,6 +923,15 @@ def compile_function(fn: Function, verbose: bool = False,
         ("imm_xor_fold",            _imm_xor_fold_run),
         ("repeated_add_reduce",     _repeated_add_reduce_run),
         ("dead_self_update_dce",    _dead_self_update_dce_run),
+        # Phase 17: PTX-IR reg-reg copy propagation.  trivial_fold has
+        # already converted `add %r, %a, 0` -> `mov %r, %a` (a fresh
+        # reg-reg mov that didn't exist in the source PTX); copy_prop
+        # substitutes %a for %r at every use and drops the mov.  Must
+        # run after trivial_fold (creates the movs) and after
+        # dead_self_update_dce (cleanup pass) so the visible mov set is
+        # final, but before rotate32 (so any rotated patterns benefit
+        # from the reduced reg pressure).
+        ("copy_prop",               _copy_prop_run),
         # Phase 11: 32-bit rotate fusion (shr+shl+or → SHF.L.U32.HI).
         # Runs after imm_propagate has folded constant shift amounts
         # into ImmOps and dead_self_update_dce has cleaned up.

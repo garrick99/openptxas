@@ -38,7 +38,7 @@ from sass.encoding.sm_120_opcodes import (
     encode_ldc, encode_ldc_64,
     encode_s2r,
     encode_iadd3, encode_iadd3x,
-    encode_iadd, encode_iadd64,
+    encode_iadd, encode_iadd_imm, encode_iadd64,
     encode_imad_wide, encode_imad_wide_rr, encode_imad_wide_u32, encode_imad_wide_u32_carry, encode_imad_wide_u32x,
     encode_imad, encode_imad_rr, encode_imad_ur, encode_imad_hi, encode_imad_shl_u32,
     encode_s2ur,
@@ -3528,13 +3528,17 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                                     f'UIADD R{d}, R{a}, 0x{imm:x}  // TE35/UI03: {_tag} add.{typ}'))
                         else:
                             a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
-                            output.append(SassInstr(encode_iadd3_imm32(d, a, imm, RZ),
-                                                    f'IADD3 R{d}, R{a}, 0x{imm:x}, RZ  // add.{typ} imm'))
+                            # Phase 9: route reg+IMM through 32-bit IADD-IMM
+                            # (b1=0x78, synthetic key 0x1235), inheriting the
+                            # forwarding-safe pairs of IADD-32 R-R.  Avoids
+                            # the +1-gap penalty of IADD3.IMM (0x810).
+                            output.append(SassInstr(encode_iadd_imm(d, a, imm),
+                                                    f'IADD R{d}, R{a}, 0x{imm:x}  // add.{typ} imm'))
                     elif isinstance(instr.srcs[0], ImmOp):
                         b = _materialize_imm(instr.srcs[1], ctx, ctx.ra, output)
                         imm = instr.srcs[0].value & 0xFFFFFFFF
-                        output.append(SassInstr(encode_iadd3_imm32(d, b, imm, RZ),
-                                                f'IADD3 R{d}, R{b}, 0x{imm:x}, RZ  // add.{typ} imm'))
+                        output.append(SassInstr(encode_iadd_imm(d, b, imm),
+                                                f'IADD R{d}, R{b}, 0x{imm:x}  // add.{typ} imm'))
                     else:
                         a = ctx.ra.r32(instr.srcs[0].name)
                         b = ctx.ra.r32(instr.srcs[1].name)
@@ -3550,13 +3554,13 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     if isinstance(instr.srcs[1], ImmOp):
                         imm = instr.srcs[1].value & 0xFFFFFFFF
-                        # PTXAS-R09: use inline negated immediate via IADD3
-                        # instead of literal pool + LDC.  The CUDA driver
-                        # zeroes the cbuf[0] literal region past params,
-                        # so LDC-loaded literals read 0 at runtime.
+                        # Phase 9: PTX `sub %d, %s, IMM` lowers as IADD-IMM
+                        # with the immediate negated.  ptxas natural
+                        # compile emits the same shape (b9=0x00, imm =
+                        # 0xffff...) — see _harvest/prompts/iadd_imm_probes.
                         neg_imm = (-imm) & 0xFFFFFFFF
-                        output.append(SassInstr(encode_iadd3_imm32(d, a, neg_imm, RZ),
-                                                f'IADD3 R{d}, R{a}, -{imm:#x}, RZ  // sub.{typ} imm'))
+                        output.append(SassInstr(encode_iadd_imm(d, a, neg_imm),
+                                                f'IADD R{d}, R{a}, -{imm:#x}  // sub.{typ} imm'))
                     else:
                         b = ctx.ra.r32(instr.srcs[1].name)
                         # Phase 1 (edge_87): 32-bit IADD with src1 negation.

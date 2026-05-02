@@ -1928,6 +1928,54 @@ def encode_iadd(dest: int, src0: int, src1: int,
     return bytes(raw)
 
 
+def encode_iadd_imm(dest: int, src0: int, imm32: int,
+                    negate_src0: bool = False, ctrl: int = 0) -> bytes:
+    """
+    Encode 32-bit IADD.IMM dest, [-]src0, imm32 to 16 bytes (b0=0x35, b1=0x78,
+    b9=0x00).
+
+    The IMM-form companion to encode_iadd: shares all of the 32-bit IADD
+    pipeline's forwarding-safe pairs (synthetic scoreboard key 0x1235) but
+    encodes the second operand as a 32-bit immediate at b4..b7 instead of a
+    GPR.  Used by ptxas-13.2 natural compile for `add.u32 %r, %s, IMM` and
+    `sub.u32 %r, %s, IMM` when no third addend is needed.
+
+    Empirically verified at _harvest/prompts/iadd_imm_probes/probe2.cubin:
+        IADD R0, R4, 0xdead -> 35 78 00 04 ad de 00 00 | 00 00 8e 07 00 ca 4f 00
+    Differs from the R-R IADD encoding (b1=0x72) only in b1; b9 (32-bit ALU
+    path), b10=0x8e, b11=0x07 are identical.
+
+    Sub forms:
+      - PTX `sub %d, %s, IMM` lowers as `IADD %d, %s, -IMM` (negate the
+        immediate; b9 stays 0x00).
+      - PTX `sub %d, IMM, %s` lowers as `IADD %d, -%s, IMM` (set
+        negate_src0=True; sets b9 bit 0).  Probe evidence:
+        IADD R0, -R4, 0xdead -> 35 78 00 04 ad de 00 00 | 00 01 8e 07 00 ca 4f 00
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0x35
+    raw[1] = 0x78
+    raw[2] = dest & 0xFF
+    raw[3] = src0 & 0xFF
+    imm32 = imm32 & 0xFFFFFFFF
+    raw[4] = imm32 & 0xFF
+    raw[5] = (imm32 >> 8) & 0xFF
+    raw[6] = (imm32 >> 16) & 0xFF
+    raw[7] = (imm32 >> 24) & 0xFF
+    raw[8] = 0x00
+    raw[9] = 0x01 if negate_src0 else 0x00
+    raw[10] = 0x8e
+    raw[11] = 0x07
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
 def encode_iadd64(dest: int, src0: int, src1: int,
                   negate_src1: bool = False, ctrl: int = 0) -> bytes:
     """

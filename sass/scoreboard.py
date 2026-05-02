@@ -361,6 +361,15 @@ def _disc_opcode(raw: bytes) -> int:
     opc = struct.unpack_from('<Q', raw, 0)[0] & 0xFFF
     if opc == 0x235 and len(raw) >= 10 and raw[9] == 0x00:
         return 0x1235
+    # Phase 9: 32-bit IADD-IMM (b1=0x78, b9=0x00, b10=0x8e, b11=0x07) shares
+    # the IADD-32 R-R ALU pipeline.  Maps to the synthetic 0x1235 key so it
+    # inherits the IADD-32 forwarding-safe pairs (probe at
+    # _harvest/prompts/iadd_imm_probes/probe2.cubin).  Discriminate on the
+    # full instruction-format signature (b9, b10, b11) to avoid colliding
+    # with other opcode-0x835 forms (e.g. IADD.64 IMM if it ever exists).
+    if (opc == 0x835 and len(raw) >= 12
+            and raw[9] == 0x00 and raw[10] == 0x8e and raw[11] == 0x07):
+        return 0x1235
     return opc
 
 
@@ -389,12 +398,18 @@ def _get_src_regs(raw: bytes) -> set[int]:
         if raw[8] < 255: regs.add(raw[8])
         return regs
     if opcode == 0x835:
-        # IADD.64 R-imm: b3:b3+1 = src0 pair, b4..b7 = 32-bit imm.
-        # Unlike IADD3.IMM the 64-bit form has no src2 at b8 — empirical
-        # evidence from smem_exchange/bar_ldc_xor PARITY kernels shows
-        # b8 is a reserved/padding byte (typically 0x00) that the
-        # hardware does not treat as a source register.
-        if raw[3] < 255: regs |= {raw[3], raw[3]+1}
+        # 0x835 hosts two encodings differentiated by b9/b10/b11:
+        #   * 32-bit IADD-IMM (b9=0x00 b10=0x8e b11=0x07) — src0 = single
+        #     GPR at b3, b4..b7 = 32-bit imm.  Phase 9 routing; also
+        #     emitted by encode_uiadd_imm.
+        #   * IADD.64 R-imm (legacy treatment) — src0 = b3:b3+1 pair.
+        # Discriminate to avoid spurious b3+1 reads (which over-constrain
+        # scheduling for the 32-bit form).
+        if (len(raw) >= 12 and raw[9] == 0x00
+                and raw[10] == 0x8e and raw[11] == 0x07):
+            if raw[3] < 255: regs.add(raw[3])
+        else:
+            if raw[3] < 255: regs |= {raw[3], raw[3]+1}
         return regs
     if opcode == 0xc11:
         # LEA R-UR: b3 = base GPR, b4 = UR (not a GPR source), b9 = shift.
@@ -826,6 +841,15 @@ _FORWARDING_SAFE_PAIRS: set[tuple[int, int]] = {
     (0x1235, 0x1235),  # IADD-32 → IADD-32 (self-chain)
     (0x1235, 0x235),   # IADD-32 → IADD.64 (data path forwards by analogy)
     (0x1235, 0x212),   # IADD-32 → IADD3X (carry-extended add; same ALU class)
+    # Phase 9: UIADD (encoded as IADD-32-IMM, now disc'd to 0x1235) → UR
+    # pipeline init / finalize.  PTXAS emits the IADD R0..,/UIADD UR0,..
+    # right before the UR-pipeline 0x886 init (atom.xor descriptor setup) /
+    # 0x2bd finalize without any intervening NOPs in the w2_atom_xor_reduce
+    # PARITY kernel — the GPR-side R0 write is unused by 0x886 (b3 is a
+    # descriptor field, not a real R0 read) so the pair is empirically
+    # 0-gap safe.
+    (0x1235, 0x886),   # IADD/UIADD → UR pipeline init  (PARITY ground truth)
+    (0x1235, 0x2bd),   # IADD/UIADD → UR pipeline finalize (PARITY ground truth)
     # NOT added: (0x1235, 0x27a) → QMMA, (0x1235, 0x23c) → HMMA,
     # (0x1235, 0x237) → IMMA, (0x1235, 0x23f) → DMMA — Phase 0 explicitly
     # carved these out; v2 transcript confirms removing the gap on opcode

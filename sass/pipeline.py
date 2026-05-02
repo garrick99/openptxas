@@ -889,6 +889,7 @@ def compile_function(fn: Function, verbose: bool = False,
     from ptx.passes.imm_xor_fold        import run_function as _imm_xor_fold_run
     from ptx.passes.repeated_add_reduce import run_function as _repeated_add_reduce_run
     from ptx.passes.dead_self_update_dce import run_function as _dead_self_update_dce_run
+    from ptx.passes.dead_mov_dce          import run_function as _dead_mov_dce_run
     from ptx.passes.copy_prop            import run_function as _copy_prop_run
     from ptx.passes.rotate32             import run_function as _rotate32_run
     from ptx.passes.cvta_eliminate       import run_function as _cvta_eliminate_run
@@ -944,6 +945,11 @@ def compile_function(fn: Function, verbose: bool = False,
         # Runs after imm_propagate has folded constant shift amounts
         # into ImmOps and dead_self_update_dce has cleaned up.
         ("rotate32",                _rotate32_run),
+        # Phase 29: forge-emitted unit-typed `mov.u32 %rN, 0; // unit`
+        # tail assigns (and the chained `mov %r33, %r32`) are dead by
+        # construction.  Narrow `mov`-only DCE removes them; ptxas does
+        # the same.  Runs last so prior chain-folds have settled.
+        ("dead_mov_dce",            _dead_mov_dce_run),
     ]
     for _pass_name, _pass_fn in _ptx_passes:
         if _pass_name in _disabled:

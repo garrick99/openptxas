@@ -831,10 +831,14 @@ def _select_mov(instr: Instruction, ra: RegAlloc,
                                     f'MOV R{d_hi}, R{s_hi}  // {dest.name}.hi = {src.name}.hi'))
         return _apply_pred_byte(instrs or [_nop(f'MOV {dest.name} = {src.name} (same reg, elided)')], instr, ctx)
     else:
-        # 32-bit
+        # 32-bit register MOV → MOV (0x202), the GPR sibling of MOV.IMM (0x802)
+        # added in 148170701b for the immediate case.  Was IADD3 R, R, RZ, RZ —
+        # a 3-input add used as a synthetic MOV — which inflated ours_n on Forge
+        # merkle_hash_leaves.  Scoreboard / scheduler / compact tables already
+        # cover 0x202 (FG-2.5).
         d = ra.r32(dest.name)
         s = ra.r32(src.name)
-        return _apply_pred_byte([SassInstr(encode_iadd3(d, s, RZ, RZ), f'MOV R{d}, R{s}  // {dest.name} = {src.name}')], instr, ctx)
+        return _apply_pred_byte([SassInstr(encode_mov(d, s), f'MOV R{d}, R{s}  // {dest.name} = {src.name}')], instr, ctx)
 
 
 def _select_shl_b64(instr: Instruction, ra: RegAlloc,

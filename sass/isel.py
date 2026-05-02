@@ -61,7 +61,8 @@ from sass.encoding.sm_120_opcodes import (
     encode_popc, encode_brev, encode_flo, encode_iabs, encode_bfe_sext,
     encode_shfl, SHFL_IDX, SHFL_UP, SHFL_DOWN, SHFL_BFLY,
     encode_vote_ballot,
-    encode_atomg_cas_b32, encode_atomg_cas_b64, encode_atomg_u32, encode_atomg_add_f32,
+    encode_atomg_cas_b32, encode_atomg_cas_b64, encode_atomg_u32, encode_atomg_u64,
+    encode_atomg_add_f32,
     ATOMG_ADD, ATOMG_MIN, ATOMG_MAX, ATOMG_EXCH, ATOMG_OR, ATOMG_AND, ATOMG_XOR,
     encode_membar, MEMBAR_GPU, MEMBAR_CTA,
     encode_idp4a,
@@ -2360,6 +2361,48 @@ def _select_atom_add_f32(instr: Instruction, ra: RegAlloc,
                      f'ATOMG.E.ADD.F32 R{d}, desc[UR{ur_d}][R{addr}.64], R{data}')]
 
 
+def _select_atom_generic_u64(instr: Instruction, ra: RegAlloc,
+                              ctx: 'ISelContext', atom_op: int,
+                              op_name: str) -> list[SassInstr]:
+    """atom.global.{min|max}.u64 → ATOMG.E.{op}.64."""
+    from ptx.ir import MemOp
+    dest_op = instr.dest
+    addr_op = instr.srcs[0]
+    data_op = instr.srcs[1]
+    if not isinstance(addr_op, MemOp):
+        raise ISelError(f"atom.{op_name} addr must be MemOp")
+    d    = ra.lo(dest_op.name)
+    data = ra.lo(data_op.name)
+    prefix = []
+    base_name = addr_op.base if addr_op.base.startswith('%') else f'%{addr_op.base}'
+    ur_params = getattr(ctx, '_ur_params', {}) if ctx else {}
+    deferred = getattr(ctx, '_deferred_ur_params', {}) if ctx else {}
+    gpr_written = getattr(ctx, '_gpr_written', set()) if ctx else set()
+    if base_name in gpr_written and addr_op.base in ra.int_regs:
+        addr = ra.lo(addr_op.base)
+    elif base_name in deferred:
+        param_off = deferred.get(base_name)
+        ur_tmp = 6
+        addr = getattr(ctx, '_addr_scratch_lo', None)
+        if addr is None:
+            addr = _alloc_gpr_pair(ctx)
+        prefix.append(SassInstr(encode_ldcu_64(ur_tmp, 0, param_off),
+                                f'LDCU.64 UR{ur_tmp}, c[0][0x{param_off:x}]  // deferred param'))
+        prefix.extend(_emit_ur_to_gpr(addr, ur_tmp, "deferred UR->GPR addr"))
+    elif base_name in ur_params:
+        ur_idx = ur_params[base_name]
+        addr = getattr(ctx, '_addr_scratch_lo', None)
+        if addr is None:
+            addr = _alloc_gpr_pair(ctx)
+        prefix.extend(_emit_ur_to_gpr(addr, ur_idx, "UR->GPR addr"))
+    else:
+        addr = ra.lo(addr_op.base) if addr_op.base in ra.int_regs else RZ
+
+    ur_d = ctx.ur_desc if ctx else 4
+    return prefix + [SassInstr(encode_atomg_u64(d, addr, 0, data, atom_op, ur_desc=ur_d),
+                     f'ATOMG.E.{op_name} R{d}, desc[UR{ur_d}][R{addr}.64], R{data}')]
+
+
 def _select_atom_cas_b64(instr: Instruction, ra: RegAlloc,
                           ctx: 'ISelContext' = None) -> list[SassInstr]:
     """atom.cas.b64 → ATOMG.E.CAS.64.
@@ -4538,6 +4581,12 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     if not _applied:
                         output.extend(_select_atom_generic_u32(instr, ctx.ra, ctx, ATOMG_MAX, 'MAX.u32'))
 
+                elif op == 'atom' and 'min' in instr.types and 'u64' in instr.types:
+                    output.extend(_select_atom_generic_u64(instr, ctx.ra, ctx, ATOMG_MIN, 'MIN.64'))
+
+                elif op == 'atom' and 'max' in instr.types and 'u64' in instr.types:
+                    output.extend(_select_atom_generic_u64(instr, ctx.ra, ctx, ATOMG_MAX, 'MAX.64'))
+
                 elif op == 'atom' and 'cas' in instr.types and 'b64' in instr.types:
                     output.extend(_select_atom_cas_b64(instr, ctx.ra, ctx))
 
@@ -5187,19 +5236,19 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         s_hi = (s_lo + 1) if is_src_64 else None
                         if d_lo != s_lo:
                             output.append(SassInstr(
-                                encode_iadd3(d_lo, s_lo, RZ, RZ),
+                                encode_mov(d_lo, s_lo),
                                 f'MOV R{d_lo}, R{s_lo}  // cvta.{types_str} lo'))
                             cvta_emitted += 1
                         if d_hi is not None:
                             if is_global and is_src_64:
                                 if d_hi != s_hi:
                                     output.append(SassInstr(
-                                        encode_iadd3(d_hi, s_hi, RZ, RZ),
+                                        encode_mov(d_hi, s_hi),
                                         f'MOV R{d_hi}, R{s_hi}  // cvta.{types_str} hi'))
                                     cvta_emitted += 1
                             else:
                                 output.append(SassInstr(
-                                    encode_iadd3(d_hi, RZ, RZ, RZ),
+                                    encode_mov(d_hi, RZ),
                                     f'MOV R{d_hi}, RZ  // cvta.{types_str} hi=0'))
                                 cvta_emitted += 1
                         if cvta_emitted == 0:

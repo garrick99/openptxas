@@ -2651,6 +2651,52 @@ def encode_atomg_u32(dest: int, addr_base: int, offset: int, data: int,
     return bytes(raw)
 
 
+# 64-bit ATOMG variants share the same opcode (0x9a8) as their u32 siblings;
+# only b9 toggles to 0xf5 to mark the 64-bit width.  Verified against ptxas
+# sm_120 ground truth on minimal probe kernels:
+#   ATOMG.E.MIN.64.STRONG.GPU PT, R4, desc[UR4][R6.64], R4
+#     hi=0x001ea200089ef504 → b9=0xf5, b10=0x9e, b11=0x08
+#   ATOMG.E.MAX.64.STRONG.GPU PT, R2, desc[UR4][R4.64], R2
+#     hi=0x001ea800091ef504 → b9=0xf5, b10=0x1e, b11=0x09
+_ATOMG_U64_MODES = {
+    ATOMG_MIN: (0xf5, 0x9e, 0x08),
+    ATOMG_MAX: (0xf5, 0x1e, 0x09),
+}
+
+
+def encode_atomg_u64(dest: int, addr_base: int, offset: int, data: int,
+                      atom_op: int = ATOMG_MIN, ctrl: int = 0,
+                      ur_desc: int = 4) -> bytes:
+    """Encode ATOMG.E.{MIN|MAX}.64.STRONG.GPU for u64 atomic operations.
+
+    All register operands are 64-bit pairs, named by their low half:
+      `dest`, `data` occupy (R[x], R[x+1]); `addr_base` is the lo of an
+      address pair (R[x], R[x+1]) that holds the 64-bit pointer.
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    b9_val, b10_val, b11_val = _ATOMG_U64_MODES.get(atom_op, (0xf5, 0x9e, 0x08))
+    raw = bytearray(16)
+    raw[0]  = 0xa8
+    raw[1]  = 0x79
+    raw[2]  = dest & 0xFF
+    raw[3]  = addr_base & 0xFF
+    raw[4]  = data & 0xFF
+    raw[5]  = offset & 0xFF
+    raw[6]  = (offset >> 8) & 0xFF
+    raw[7]  = 0x80 | ((offset >> 16) & 0x7F)
+    raw[8]  = ur_desc & 0xFF
+    raw[9]  = b9_val
+    raw[10] = b10_val
+    raw[11] = b11_val
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
 def encode_uiadd_imm(dest: int, src: int, imm32: int, ctrl: int = 0) -> bytes:
     """Encode UIADD: uniform add with 32-bit immediate (opcode 0x835).
 

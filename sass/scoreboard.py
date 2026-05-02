@@ -847,6 +847,18 @@ _FORWARDING_SAFE_PAIRS: set[tuple[int, int]] = {
     (0xc11, 0x1235),  # IADD3.R-UR → IADD-32 (mirror of (0xc11, 0x235))
     (0x824, 0x1235),  # IMAD    → IADD-32  (IMAD-family pipeline)
     (0xb82, 0x1235),  # S2R     → IADD-32  (mirror of (0xb82, 0x835))
+    # ------------------------------------------------------------------
+    # Phase 4 (mov_iadd3_probes/REPORT.md): empirically validated 0-gap
+    # safe pairs for IADD3 producers feeding ISETP / STG consumers.
+    # Each pair PASSed Phase 4's stripped-ctrl probe (consumer wdep=0x3f,
+    # rbar=0x00, stall=0) at 128 threads — register-file forwarding alone
+    # delivered the value correctly.  IADD3 → IMAD/LOP3/SHF/FFMA/FSEL/POPC
+    # all FAILed the same probe and remain at min_gpr_gap=1.
+    (0x810, 0x20c),  # IADD3.IMM → ISETP.RR  (Phase 4 PASS, natural+stripped)
+    (0x210, 0x20c),  # IADD3.RRR → ISETP.RR  (Phase 4 PASS)
+    (0x210, 0x986),  # IADD3.RRR → STG.E     (Phase 4 PASS, data port; the
+                     # address-port wdep on a 64-bit IADD producer is
+                     # preserved by the unchanged 0x235/0xc11/0x212 rules.)
 }
 
 

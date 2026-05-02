@@ -5747,6 +5747,13 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                     f'IMAD.SHL.U32 R{t}, R{a}, 0x{imm:x}, RZ  // mad.lo shift'))
                                 output.append(SassInstr(encode_iadd3(d, t, c, RZ),
                                     f'IADD3 R{d}, R{t}, R{c}, RZ  // mad.lo add'))
+                            elif c == d:
+                                t = _alloc_gpr(ctx)
+                                output.append(SassInstr(
+                                    _encode_imad_r_imm(t, a, imm, RZ),
+                                    f'IMAD R{t}, R{a}, 0x{imm:x}, RZ  // mad.lo split-mul (acc-alias, pow2 shift>15)'))
+                                output.append(SassInstr(encode_iadd3(d, t, c, RZ),
+                                    f'IADD3 R{d}, R{t}, R{c}, RZ  // mad.lo split-add'))
                             else:
                                 output.append(SassInstr(
                                     _encode_imad_r_imm(d, a, imm, c),

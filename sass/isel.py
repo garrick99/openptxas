@@ -662,7 +662,7 @@ def _emit_lop3(output: list, ctx: 'ISelContext', dest: int, src0: int,
         scratch = next((r for r in range(14) if r not in used), 0)
         output.append(SassInstr(encode_lop3(scratch, src0, src1, src2, lut),
                                 f'{comment} (via R{scratch})'))
-        output.append(SassInstr(encode_iadd3(dest, scratch, RZ, RZ),
+        output.append(SassInstr(encode_mov(dest, scratch),
                                 f'MOV R{dest}, R{scratch}  // lop3 fixup'))
 
 
@@ -826,10 +826,10 @@ def _select_mov(instr: Instruction, ra: RegAlloc,
         s_hi = s_lo + 1
         instrs = []
         if d_lo != s_lo:
-            instrs.append(SassInstr(encode_iadd3(d_lo, s_lo, RZ, RZ),
+            instrs.append(SassInstr(encode_mov(d_lo, s_lo),
                                     f'MOV R{d_lo}, R{s_lo}  // {dest.name}.lo = {src.name}.lo'))
         if d_hi != s_hi:
-            instrs.append(SassInstr(encode_iadd3(d_hi, s_hi, RZ, RZ),
+            instrs.append(SassInstr(encode_mov(d_hi, s_hi),
                                     f'MOV R{d_hi}, R{s_hi}  // {dest.name}.hi = {src.name}.hi'))
         return _apply_pred_byte(instrs or [_nop(f'MOV {dest.name} = {src.name} (same reg, elided)')], instr, ctx)
     else:
@@ -962,7 +962,7 @@ def _select_shl_b64(instr: Instruction, ra: RegAlloc,
         # 32 <= K < 64: result.hi = src.lo << (K-32), result.lo = 0
         k32 = k - 32
         return [
-            SassInstr(encode_iadd3(d_lo, RZ, RZ, RZ),
+            SassInstr(encode_mov_imm(d_lo, 0),
                       f'MOV R{d_lo}, RZ  // shl.b64 lo = 0 (K>={k})'),
             SassInstr(encode_shf_l_u32(d_hi, s_lo, k32),
                       f'SHF.L.U32 R{d_hi}, R{s_lo}, 0x{k32:x}, RZ  // shl.b64 hi'),
@@ -973,9 +973,9 @@ def _select_shl_b64(instr: Instruction, ra: RegAlloc,
         # like `shl(shl(x, 4), 62)` into a single shl(x, 66), so k
         # reaches this branch from fuzzer-generated patterns.)
         return [
-            SassInstr(encode_iadd3(d_lo, RZ, RZ, RZ),
+            SassInstr(encode_mov_imm(d_lo, 0),
                       f'MOV R{d_lo}, RZ  // shl.b64 lo = 0 (K={k} >= 64)'),
-            SassInstr(encode_iadd3(d_hi, RZ, RZ, RZ),
+            SassInstr(encode_mov_imm(d_hi, 0),
                       f'MOV R{d_hi}, RZ  // shl.b64 hi = 0 (K={k} >= 64)'),
         ]
 
@@ -1024,9 +1024,9 @@ def _select_shr_u64(instr: Instruction, ra: RegAlloc) -> list[SassInstr]:
     if k >= 64:
         # PTX shift amount >= width produces 0 (matches ptxas).
         return [
-            SassInstr(encode_iadd3(d_lo, RZ, RZ, RZ),
+            SassInstr(encode_mov_imm(d_lo, 0),
                       f'MOV R{d_lo}, RZ  // shr.u64 {k} (>=64 → 0)'),
-            SassInstr(encode_iadd3(d_hi, RZ, RZ, RZ),
+            SassInstr(encode_mov_imm(d_hi, 0),
                       f'MOV R{d_hi}, RZ  // shr.u64 {k} (>=64 → 0)'),
         ]
     if k < 32:
@@ -1042,7 +1042,7 @@ def _select_shr_u64(instr: Instruction, ra: RegAlloc) -> list[SassInstr]:
         return [
             SassInstr(encode_shf_r_u32_hi(d_lo, s_hi, k32),
                       f'SHF.R.U32.HI R{d_lo}, RZ, 0x{k32:x}, R{s_hi}  // shr.u64 lo (K>={k})'),
-            SassInstr(encode_iadd3(d_hi, RZ, RZ, RZ),
+            SassInstr(encode_mov_imm(d_hi, 0),
                       f'MOV R{d_hi}, RZ  // shr.u64 hi = 0'),
         ]
 
@@ -3332,7 +3332,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         k = instr.srcs[1].value
                         if k >= 32:
                             # PTX shift amount >= width produces 0 (matches ptxas).
-                            output.append(SassInstr(encode_iadd3(d, RZ, RZ, RZ),
+                            output.append(SassInstr(encode_mov_imm(d, 0),
                                                     f'MOV R{d}, RZ  // shl.{typ} {k} (>=32 → 0)'))
                         elif k <= 15:
                             output.append(SassInstr(encode_imad_shl_u32(d, a, k),
@@ -3358,7 +3358,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 output.append(SassInstr(encode_shf_r_s32_hi(d, a, 31),
                                                         f'SHF.R.S32.HI R{d}, RZ, 0x1f, R{a}  // shr.s32 {k} (>=32 → sign)'))
                             else:
-                                output.append(SassInstr(encode_iadd3(d, RZ, RZ, RZ),
+                                output.append(SassInstr(encode_mov_imm(d, 0),
                                                         f'MOV R{d}, RZ  // shr.{typ} {k} (>=32 → 0)'))
                         elif is_signed:
                             output.append(SassInstr(encode_shf_r_s32_hi(d, a, k),
@@ -3686,7 +3686,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             output.append(SassInstr(
                                 encode_lop3_imm32(scratch, a, imm, RZ, lut_imm),
                                 f'LOP3.LUT R{scratch}, R{a}, 0x{imm:x}, RZ, 0x{lut_imm:02x}  // {op}.{typ} imm (via R{scratch})'))
-                            output.append(SassInstr(encode_iadd3(d, scratch, RZ, RZ),
+                            output.append(SassInstr(encode_mov(d, scratch),
                                 f'MOV R{d}, R{scratch}  // lop3 fixup'))
                     else:
                         b = ctx.ra.r32(instr.srcs[1].name)
@@ -3718,7 +3718,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 output.append(SassInstr(
                                     encode_lop3_imm32(scratch, a_h, imm_half, RZ, lut_imm),
                                     f'LOP3.LUT R{scratch}, R{a_h}, 0x{imm_half:x}, RZ, 0x{lut_imm:02x}  // {op}.b64 {tag} imm (via R{scratch})'))
-                                output.append(SassInstr(encode_iadd3(d_h, scratch, RZ, RZ),
+                                output.append(SassInstr(encode_mov(d_h, scratch),
                                     f'MOV R{d_h}, R{scratch}  // lop3 fixup'))
                     else:
                         b_lo = ctx.ra.lo(instr.srcs[1].name)

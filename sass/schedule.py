@@ -680,6 +680,18 @@ def _enforce_gpr_latency(instrs: list[SassInstr]) -> list[SassInstr]:
                 (0x212, 0x819),  # LOP3.LUT R-R-R -> SHF.L.U32.HI
                 (0x210, 0x212),  # IADD3.RRR     -> LOP3.LUT R-R-R
                 (0x819, 0x212),  # SHF.L.U32.HI  -> LOP3.LUT R-R-R (prod-only PASS)
+                # Phase 13: LOP3 -> MOV pair, sibling to (0x212, 0x210) /
+                # (0x812, 0x210) above.  isel.py's lop3-fixup pattern (LOP3
+                # to a low scratch when dest >= R14) used to emit IADD3-as-MOV
+                # for the copy step, which the (LOP3, IADD3) entries already
+                # cover.  Replacing the fixup copy with native MOV (0x202)
+                # — opcode that reads its src on byte[4] just like IADD3.RRR's
+                # src1 — must be paired here so the scheduler does not insert
+                # a NOP per fixup.  Same scoreboard-sync rationale as Phase 6:
+                # MOV's wdep_class (per _OPCODE_META) is 0x3e, identical to
+                # IADD3's, so the producer's wdep covers the forwarding gap.
+                (0x212, 0x202),  # LOP3.LUT R-R-R -> MOV (lop3 fixup, merkle hot)
+                (0x812, 0x202),  # LOP3.IMM      -> MOV (lop3-imm fixup)
             }
             if (opc_i, opc_j) in _SCHED_FORWARDING_SAFE:
                 i += 1

@@ -96,7 +96,12 @@ def _allowed_positions(op: str, width: Optional[int]) -> tuple[int, ...]:
     # scheduler-side NOP gap closed by promoting IADD3.IMM-as-writer
     # pairs in sass/schedule.py's _SCHED_FORWARDING_SAFE.
     if op == "add":   return (1,)
-    if op == "sub":   return (1,)
+    # Phase 10: sub also accepts IMM at position 0 — the rotate-emulation
+    # pattern `sub %d, 32, %n` (Blake2s 32-bit right-rotate emulation).
+    # The isel `sub.<int_t>` handler emits `IADD R, -R, IMM` (IADD-IMM
+    # with negate_src0=True; b9 bit 0 set) for this shape — same 1-instr
+    # form ptxas natural compile uses, no MOV.IMM required.
+    if op == "sub":   return (0, 1)
     # Phase 8: and/or/xor second source — LOP3.IMM lowering, with the
     # ctrl-byte / opex_4 collision closed by remapping invalid misc
     # values for opcode 0x812 in sass/scoreboard.py.
@@ -144,9 +149,67 @@ def _is_simple_mov_imm(inst: Instruction) -> Optional[tuple[str, int, int]]:
     return (inst.dest.name, src.value, width)
 
 
+def _try_const_eval_to_mov(inst: Instruction) -> bool:
+    """Phase 10: if `inst` has reduced to a fully-constant binary op
+    (both srcs ImmOp), evaluate at compile time and rewrite in-place
+    as `mov.<t> dest, IMM_result`.  Returns True if rewritten.
+
+    Why this matters: imm_propagate's pos-0 fold for sub combined with
+    pos-1 fold (Phase 9) collapses Blake2s's rotate emulation
+    (`mov %r, 32; sub %d, %r, %n`) to `sub %d, 32, IMM_n` when %n is
+    also a foldable mov-imm (e.g. `mov %n, 16`).  Without this eval,
+    isel materializes 32 via IADD3.IMM (0x810) then emits IADD-IMM
+    (0x835) for the difference — a pair that requires a scheduler NOP.
+    With this eval, sub becomes `mov %d, 16`, the new mov gets
+    re-folded into the downstream `shl %r, %x, %d` shift count, and
+    the rotate step collapses from 5 SASS instructions to 3.
+
+    Conservative: only sub.<int> for now (the Phase 10 target).  The
+    other allowed ops (add/and/or/xor/shl/shr) could be extended the
+    same way, but each invites a separate validation against the
+    forge corpus.
+    """
+    if inst.op != "sub":
+        return False
+    if not inst.types or not _is_int_type(inst.types[0]):
+        return False
+    if len(inst.srcs) != 2:
+        return False
+    if not (isinstance(inst.srcs[0], ImmOp) and isinstance(inst.srcs[1], ImmOp)):
+        return False
+    if inst.pred is not None or inst.mods:
+        return False
+    if inst.dest is None or not isinstance(inst.dest, RegOp):
+        return False
+    width = _bitwidth_of_type(inst.types[0])
+    if width is None:
+        return False
+    mask = (1 << width) - 1
+    diff = (inst.srcs[0].value - inst.srcs[1].value) & mask
+    inst.op = "mov"
+    inst.srcs = [ImmOp(diff)]
+    return True
+
+
 def run_function(fn: Function) -> int:
-    """Run imm_propagate on a single function.  Returns the number of
-    operand substitutions performed."""
+    """Run imm_propagate on a single function.  Returns the total number
+    of operand substitutions performed across all fixpoint iterations."""
+    total_subs = 0
+    # Fixpoint loop: a sub-pos-0 + pos-1 fold can produce `sub %d, IMM,
+    # IMM`, which _try_const_eval_to_mov rewrites as `mov %d, IMM_diff`.
+    # That new mov may then be foldable into a downstream consumer
+    # (e.g. shl-pos-1 shift count), so we re-iterate until no further
+    # folds occur.  Bounded by 4 iterations to cap pathological inputs.
+    for _ in range(4):
+        n_subs = _propagate_once(fn)
+        if n_subs == 0:
+            break
+        total_subs += n_subs
+    return total_subs
+
+
+def _propagate_once(fn: Function) -> int:
+    """One iteration of imm_propagate.  Returns substitution count."""
     def_counts = _walk_def_counts(fn)
     imm_defs: dict[str, tuple[int, int, Instruction]] = {}
 
@@ -191,6 +254,12 @@ def run_function(fn: Function) -> int:
                     continue
                 inst.srcs[i] = ImmOp(value)
                 n_subs += 1
+            # Phase 10: if both srcs of a sub became ImmOp this round,
+            # evaluate at compile time and rewrite as mov.  See
+            # _try_const_eval_to_mov for the rationale (avoids the
+            # IADD3.IMM→IADD-IMM scheduler-NOP penalty on Blake2s
+            # rotate emulation).
+            _try_const_eval_to_mov(inst)
 
     if n_subs == 0:
         return 0

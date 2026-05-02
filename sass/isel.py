@@ -3551,21 +3551,36 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
 
                 elif op == 'sub' and typ in ('u32', 's32'):
                     d = ctx.ra.r32(instr.dest.name)
-                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
-                    if isinstance(instr.srcs[1], ImmOp):
-                        imm = instr.srcs[1].value & 0xFFFFFFFF
-                        # Phase 9: PTX `sub %d, %s, IMM` lowers as IADD-IMM
-                        # with the immediate negated.  ptxas natural
-                        # compile emits the same shape (b9=0x00, imm =
-                        # 0xffff...) — see _harvest/prompts/iadd_imm_probes.
-                        neg_imm = (-imm) & 0xFFFFFFFF
-                        output.append(SassInstr(encode_iadd_imm(d, a, neg_imm),
-                                                f'IADD R{d}, R{a}, -{imm:#x}  // sub.{typ} imm'))
-                    else:
+                    if (isinstance(instr.srcs[0], ImmOp)
+                            and isinstance(instr.srcs[1], RegOp)):
+                        # Phase 10: PTX `sub %d, IMM, %s` (Blake2s 32-bit
+                        # right-rotate emulation: `32 - n`).  ptxas natural
+                        # compile emits `IADD R, -R, IMM` (IADD-IMM with
+                        # negate_src0=True; b9 bit 0 set), inheriting the
+                        # forwarding-safe pairs of IADD-32 R-R.  Probe
+                        # evidence: _harvest/prompts/iadd_imm_probes/probe2.cubin
+                        # shows IADD R0, -R4, 0xdead -> b9=0x01.
                         b = ctx.ra.r32(instr.srcs[1].name)
-                        # Phase 1 (edge_87): 32-bit IADD with src1 negation.
-                        output.append(SassInstr(encode_iadd(d, a, b, negate_src1=True),
-                                                f'IADD R{d}, R{a}, -R{b}  // sub.{typ}'))
+                        imm = instr.srcs[0].value & 0xFFFFFFFF
+                        output.append(SassInstr(
+                            encode_iadd_imm(d, b, imm, negate_src0=True),
+                            f'IADD R{d}, -R{b}, 0x{imm:x}  // sub.{typ} imm-reg'))
+                    else:
+                        a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
+                        if isinstance(instr.srcs[1], ImmOp):
+                            imm = instr.srcs[1].value & 0xFFFFFFFF
+                            # Phase 9: PTX `sub %d, %s, IMM` lowers as IADD-IMM
+                            # with the immediate negated.  ptxas natural
+                            # compile emits the same shape (b9=0x00, imm =
+                            # 0xffff...) — see _harvest/prompts/iadd_imm_probes.
+                            neg_imm = (-imm) & 0xFFFFFFFF
+                            output.append(SassInstr(encode_iadd_imm(d, a, neg_imm),
+                                                    f'IADD R{d}, R{a}, -{imm:#x}  // sub.{typ} imm'))
+                        else:
+                            b = ctx.ra.r32(instr.srcs[1].name)
+                            # Phase 1 (edge_87): 32-bit IADD with src1 negation.
+                            output.append(SassInstr(encode_iadd(d, a, b, negate_src1=True),
+                                                    f'IADD R{d}, R{a}, -R{b}  // sub.{typ}'))
 
                 elif op in ('and', 'or', 'xor') and typ == 'pred':
                     # and.pred / or.pred / xor.pred — predicate logic via

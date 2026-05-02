@@ -361,14 +361,17 @@ def _disc_opcode(raw: bytes) -> int:
     opc = struct.unpack_from('<Q', raw, 0)[0] & 0xFFF
     if opc == 0x235 and len(raw) >= 10 and raw[9] == 0x00:
         return 0x1235
-    # Phase 9: 32-bit IADD-IMM (b1=0x78, b9=0x00, b10=0x8e, b11=0x07) shares
-    # the IADD-32 R-R ALU pipeline.  Maps to the synthetic 0x1235 key so it
-    # inherits the IADD-32 forwarding-safe pairs (probe at
+    # Phase 9: 32-bit IADD-IMM (b1=0x78, b9 low-bit = negate_src0, b10=0x8e,
+    # b11=0x07) shares the IADD-32 R-R ALU pipeline.  Maps to the synthetic
+    # 0x1235 key so it inherits the IADD-32 forwarding-safe pairs (probe at
     # _harvest/prompts/iadd_imm_probes/probe2.cubin).  Discriminate on the
     # full instruction-format signature (b9, b10, b11) to avoid colliding
     # with other opcode-0x835 forms (e.g. IADD.64 IMM if it ever exists).
+    # Phase 10: mask b9's bit-0 (negate_src0) — the `sub %d, IMM, %s`
+    # rotate-emulation path emits b9=0x01, but it's still the same 32-bit
+    # IADD-IMM ALU class.
     if (opc == 0x835 and len(raw) >= 12
-            and raw[9] == 0x00 and raw[10] == 0x8e and raw[11] == 0x07):
+            and (raw[9] & 0xfe) == 0x00 and raw[10] == 0x8e and raw[11] == 0x07):
         return 0x1235
     return opc
 
@@ -399,13 +402,14 @@ def _get_src_regs(raw: bytes) -> set[int]:
         return regs
     if opcode == 0x835:
         # 0x835 hosts two encodings differentiated by b9/b10/b11:
-        #   * 32-bit IADD-IMM (b9=0x00 b10=0x8e b11=0x07) — src0 = single
-        #     GPR at b3, b4..b7 = 32-bit imm.  Phase 9 routing; also
-        #     emitted by encode_uiadd_imm.
+        #   * 32-bit IADD-IMM (b9 low-bit=negate_src0, b10=0x8e, b11=0x07) —
+        #     src0 = single GPR at b3, b4..b7 = 32-bit imm.  Phase 9 routing;
+        #     also emitted by encode_uiadd_imm.  Phase 10: b9=0x01 is the
+        #     same 32-bit form with src0 negated (sub IMM-reg path).
         #   * IADD.64 R-imm (legacy treatment) — src0 = b3:b3+1 pair.
         # Discriminate to avoid spurious b3+1 reads (which over-constrain
         # scheduling for the 32-bit form).
-        if (len(raw) >= 12 and raw[9] == 0x00
+        if (len(raw) >= 12 and (raw[9] & 0xfe) == 0x00
                 and raw[10] == 0x8e and raw[11] == 0x07):
             if raw[3] < 255: regs.add(raw[3])
         else:

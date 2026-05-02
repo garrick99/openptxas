@@ -40,6 +40,7 @@ from sass.encoding.sm_120_opcodes import (
     encode_iadd3, encode_iadd3x,
     encode_iadd, encode_iadd_imm, encode_iadd64,
     encode_imad_wide, encode_imad_wide_rr, encode_imad_wide_u32, encode_imad_wide_u32_carry, encode_imad_wide_u32x,
+    encode_imad_wide_u32_imm,
     encode_imad, encode_imad_rr, encode_imad_ur, encode_imad_hi, encode_imad_shl_u32,
     encode_s2ur,
     encode_ldg_e, encode_ldg_e_64,
@@ -600,6 +601,168 @@ def analyze_addr_offset_fold(fn) -> tuple[dict, set]:
         dead_adds.add(id(inst))
 
     return fold_map, dead_adds
+
+
+def analyze_imad_wide_fuse(fn) -> dict:
+    """Phase 19v2: detect (param_base + idx*K) address-arithmetic patterns
+    that ptxas lowers to a single IMAD.WIDE.U32 instruction.
+
+    Match a `mul.lo.u64 %M, %I, IMM_K` whose only consumer is
+    `add.u64 %F, %B, %M` (or symmetric) where:
+      - K fits in 32 bits and K > 0
+      - %I is provably zero-extended in its high 32 bits (defined by
+        cvt.u64.u32 / cvt.u64.b32, or by mov.u64 with imm < 2^32)
+      - %B is a 64-bit register name (the addend / base pointer)
+      - %M has exactly one def (the mul) and one use (the add)
+
+    Returns a dict mapping `id(mul_instr) -> (idx_name, K, base_name,
+    fused_dest_name, id(add_instr))`.  The mul is emitted as a single
+    IMAD.WIDE.U32 dest, idx_lo, K, base; the add is then skipped via
+    ctx._skip_instrs.
+
+    This replaces the 4-instruction lowering
+    (IADD3-imm-lo + IADD3-imm-hi + IMAD.WIDE-RR + IADD.64-R-UR) with
+    1 instruction (or 1+2 MOVs when the base is UR-only).
+    """
+    from ptx.ir import RegOp, ImmOp
+
+    all_instrs = []
+    for bb in fn.blocks:
+        all_instrs.extend(bb.instructions)
+
+    # Build def_count and use_count for each vreg name across the function.
+    def_count: dict[str, int] = {}
+    use_count: dict[str, int] = {}
+    def_instr: dict[str, object] = {}
+    for inst in all_instrs:
+        if isinstance(inst.dest, RegOp):
+            n = inst.dest.name
+            def_count[n] = def_count.get(n, 0) + 1
+            def_instr[n] = inst
+        for src in (inst.srcs or []):
+            if isinstance(src, RegOp):
+                use_count[src.name] = use_count.get(src.name, 0) + 1
+            else:
+                # MemOp.base counts as a use
+                base = getattr(src, 'base', None)
+                if isinstance(base, str) and base.startswith('%'):
+                    use_count[base] = use_count.get(base, 0) + 1
+
+    def _idx_hi_zero(idx_name: str) -> bool:
+        """Check whether the high 32 bits of idx_name are statically zero."""
+        df = def_instr.get(idx_name)
+        if df is None:
+            return False
+        # cvt.u64.u32 or cvt.u64.b32 zero-extends the 32-bit source.
+        if df.op == 'cvt' and isinstance(df.srcs[0], RegOp):
+            t = df.types or ()
+            if any(d in ('u64', 'b64') for d in t[:1]) and any(
+                    s in ('u32', 'b32') for s in t[1:]):
+                return True
+        # mov.u64 with an immediate that fits in 32 bits.
+        if df.op == 'mov' and any(
+                t in ('u64', 's64', 'b64') for t in df.types or ()):
+            if df.srcs and isinstance(df.srcs[0], ImmOp):
+                if (df.srcs[0].value & 0xFFFFFFFF00000000) == 0:
+                    return True
+        return False
+
+    def _resolve_u64_const(op):
+        """Return (value, dead_mov_id|None) for op if it is a u64 const.
+
+        - ImmOp: returns (value, None)
+        - RegOp whose single def is `mov.u64 imm` AND whose only use is
+          the consumer we are fusing: returns (value, id(mov)) so the
+          mov can be skipped at emission time.
+        - Otherwise returns None.
+        """
+        if isinstance(op, ImmOp):
+            return (op.value & 0xFFFFFFFFFFFFFFFF, None)
+        if isinstance(op, RegOp):
+            df = def_instr.get(op.name)
+            if df is None or def_count.get(op.name, 0) != 1:
+                return None
+            if use_count.get(op.name, 0) != 1:
+                return None
+            if df.op != 'mov':
+                return None
+            if not any(t in ('u64', 's64', 'b64') for t in df.types or ()):
+                return None
+            if not df.srcs or not isinstance(df.srcs[0], ImmOp):
+                return None
+            return (df.srcs[0].value & 0xFFFFFFFFFFFFFFFF, id(df))
+        return None
+
+    fuse_map: dict[int, tuple[str, int, str, str, int, int | None]] = {}
+    # Walk pairs of (mul, add) within the same BB.  The add must be the
+    # *first* use of the mul dest; if any earlier instr (including the
+    # mul itself) uses %M, that's surprising — bail.  We iterate over BB
+    # instruction lists since a fusion can only happen when both instrs
+    # are present and mul is followed by add in linear order.
+    for bb in fn.blocks:
+        instrs = bb.instructions
+        for i, inst in enumerate(instrs):
+            if inst.op != 'mul' or 'lo' not in (inst.types or ()):
+                continue
+            if not any(t == 'u64' for t in (inst.types or ())):
+                continue
+            if not isinstance(inst.dest, RegOp):
+                continue
+            if len(inst.srcs or []) < 2:
+                continue
+            idx_op, k_op = inst.srcs[0], inst.srcs[1]
+            if not isinstance(idx_op, RegOp):
+                continue
+            kc = _resolve_u64_const(k_op)
+            if kc is None:
+                continue
+            K, dead_mov_id = kc
+            if K == 0 or (K >> 32) != 0:
+                continue
+            mul_dest = inst.dest.name
+            if def_count.get(mul_dest, 0) != 1:
+                continue
+            if use_count.get(mul_dest, 0) != 1:
+                continue
+            if not _idx_hi_zero(idx_op.name):
+                continue
+            # The single use must be an add.u64/s64/b64 in the same BB,
+            # immediately following or close after the mul.
+            if i + 1 >= len(instrs):
+                continue
+            # Find the add.u64 use within this BB.  Walk forward; if the
+            # mul dest appears in any *non*-add instruction, bail.
+            add_inst = None
+            for j in range(i + 1, len(instrs)):
+                later = instrs[j]
+                # Check if `later` reads mul_dest.
+                reads_md = any(
+                    isinstance(s, RegOp) and s.name == mul_dest
+                    for s in (later.srcs or []))
+                if reads_md:
+                    if (later.op == 'add'
+                            and any(t in ('u64', 's64', 'b64') for t in (later.types or ()))
+                            and isinstance(later.dest, RegOp)
+                            and len(later.srcs or []) == 2):
+                        add_inst = later
+                    break
+            if add_inst is None:
+                continue
+            a, b = add_inst.srcs[0], add_inst.srcs[1]
+            base = None
+            if isinstance(a, RegOp) and a.name == mul_dest and isinstance(b, RegOp):
+                base = b.name
+            elif isinstance(b, RegOp) and b.name == mul_dest and isinstance(a, RegOp):
+                base = a.name
+            if base is None or base == mul_dest:
+                continue
+            # Base must be u64 — Forge convention: %rdN.
+            if not base.startswith('%rd'):
+                continue
+            fuse_map[id(inst)] = (idx_op.name, K, base, add_inst.dest.name,
+                                  id(add_inst), dead_mov_id)
+
+    return fuse_map
 
 
 def _alloc_gpr_pair(ctx: 'ISelContext') -> int:
@@ -4098,6 +4261,54 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             f'IMAD R{d}, R{a}, R{b}, RZ  // mul.lo.{typ} R-R'))
 
                 elif op == 'mul' and 'lo' in instr.types and typ in ('u64', 's64', 'b64'):
+                    # Phase 19v2: fuse `mul.lo.u64 %M, %I, K + add.u64 %F, %B, %M`
+                    # into a single IMAD.WIDE.U32 %F, %I_lo, K, %B.  Pre-computed
+                    # by analyze_imad_wide_fuse.  Saves 3 instructions per
+                    # address-arithmetic site (IADD3 imm.lo + IADD3 imm.hi +
+                    # IADD.64 R-UR collapsed into one IMAD.WIDE.U32).
+                    _fuse_map = getattr(ctx, '_imad_wide_fuse_map', {})
+                    if id(instr) in _fuse_map:
+                        (_idx_name, _K, _base_name, _fused_dest_name,
+                         _add_id, _dead_mov_id) = _fuse_map[id(instr)]
+                        _idx_lo = ctx.ra.lo(_idx_name)
+                        _final_lo = ctx.ra.lo(_fused_dest_name)
+                        _gw = getattr(ctx, '_gpr_written', set())
+                        _ur = getattr(ctx, '_ur_params', {})
+                        _base_lo = None
+                        if (_base_name not in _ur) or (_base_name in _gw):
+                            # Already GPR-resident (or never UR-bound).
+                            _base_lo = ctx.ra.lo(_base_name)
+                        else:
+                            # UR-only: materialize via 2 MOV R,UR (amortized
+                            # across later uses since we update _gpr_written).
+                            _ur_base = _ur[_base_name]
+                            _tmp_lo = _alloc_gpr_pair(ctx)
+                            output.append(SassInstr(
+                                encode_mov_gpr_from_ur(_tmp_lo, _ur_base),
+                                f'MOV R{_tmp_lo}, UR{_ur_base}  '
+                                f'// P19v2: materialize {_base_name}.lo for IMAD.WIDE.U32'))
+                            output.append(SassInstr(
+                                encode_mov_gpr_from_ur(_tmp_lo + 1, _ur_base + 1),
+                                f'MOV R{_tmp_lo+1}, UR{_ur_base+1}  '
+                                f'// P19v2: materialize {_base_name}.hi for IMAD.WIDE.U32'))
+                            ctx.ra.int_regs[_base_name] = _tmp_lo
+                            if hasattr(ctx, '_gpr_written'):
+                                ctx._gpr_written.add(_base_name)
+                            _base_lo = _tmp_lo
+                        output.append(SassInstr(
+                            encode_imad_wide_u32_imm(_final_lo, _idx_lo, _K, _base_lo),
+                            f'IMAD.WIDE.U32 R{_final_lo}, R{_idx_lo}, 0x{_K:x}, R{_base_lo}'
+                            f'  // P19v2: fused mul.lo.u64+add.u64'))
+                        if hasattr(ctx, '_gpr_written'):
+                            ctx._gpr_written.add(_fused_dest_name)
+                        if not hasattr(ctx, '_skip_instrs'):
+                            ctx._skip_instrs = set()
+                        ctx._skip_instrs.add(_add_id)
+                        # Note: _dead_mov_id is already in _skip_instrs (pre-
+                        # populated by pipeline.compile_function) so the mov
+                        # was skipped before reaching this point.
+                        continue
+
                     # mul.lo.u64 d, a, b = lower 64 bits of a * b
                     # Decomposed into three IMAD operations:
                     #   IMAD.WIDE d_lo, a_lo, b_lo, RZ  → d_lo:d_hi = a_lo × b_lo

@@ -189,7 +189,7 @@ _EXPECTED_COUNTS = {
     # later.  That adds one MEMORY_SCOREBOARD_SAFE edge for the new
     # LDC.64 → consumer chain and shifts one UR_MEMORY_* edge.
     "min_store_guarded":     (5, 0, 0, 0, 0, 2, 0, 0, 3, 0, 0, 0, 0),  # TE26: LDCU.64 post-EXIT
-    "probe_fresh":           (5, 0, 0, 0, 0, 2, 0, 0, 3, 0, 0, 0, 0),  # TE26: LDCU.64 post-EXIT
+    "probe_fresh":           (6, 0, 0, 0, 0, 3, 0, 0, 3, 0, 0, 0, 0),  # P19v2: IMAD.WIDE.U32 imm fuse adds MOV R,UR + IMAD.WIDE.U32 edges
     "reduce_sum":            (19, 5, 6, 0, 0, 3, 0, 0, 4, 0, 1, 0, 0),  # TE12: 0xc11 now ALU
     # edge_87 drift: 32-bit IADD (opcode 0x235, b9=0x00) emitted for
     # add.u32/sub.u32 reg+reg via encode_iadd; 9 NOPs removed because

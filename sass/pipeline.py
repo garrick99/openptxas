@@ -1126,6 +1126,20 @@ def compile_function(fn: Function, verbose: bool = False,
     _hmma_rz_subst, _hmma_dead_movs = analyze_mma_zero_subst(fn)
     ctx._hmma_rz_subst = _hmma_rz_subst
     ctx._hmma_dead_movs = _hmma_dead_movs
+    # Phase 19v2: pre-compute IMAD.WIDE.U32 fusion candidates for the
+    # (param_base + idx*K_const) address pattern.  See analyze_imad_wide_fuse.
+    from sass.isel import analyze_imad_wide_fuse
+    ctx._imad_wide_fuse_map = analyze_imad_wide_fuse(fn)
+    # Pre-populate _skip_instrs with the dead mov.u64 imm instructions whose
+    # only use was a fused mul.  Those movs precede the mul in linear PTX
+    # order, so we must skip them at iteration time (not when the mul fires).
+    if ctx._imad_wide_fuse_map:
+        if not hasattr(ctx, '_skip_instrs'):
+            ctx._skip_instrs = set()
+        for _entry in ctx._imad_wide_fuse_map.values():
+            _dead_mov_id = _entry[5]
+            if _dead_mov_id is not None:
+                ctx._skip_instrs.add(_dead_mov_id)
 
     # WB-2 / WB-4: When mma RZ-substitution leaves the address scratch
     # above the kernel's true register high-water, rebase it down into

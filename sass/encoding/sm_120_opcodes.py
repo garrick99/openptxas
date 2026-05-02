@@ -1802,6 +1802,53 @@ def encode_imad_imm(dest: int, src0: int, imm: int, src2: int,
     return bytes(raw)
 
 
+def encode_imad_wide_u32_imm(dest: int, src0: int, imm: int, src2: int,
+                              ctrl: int = 0) -> bytes:
+    """
+    Encode IMAD.WIDE.U32 dest, src0, imm, src2 — unsigned 32x32→64 multiply
+    by 32-bit immediate plus 64-bit register addend.
+
+    (dest, dest+1) = (src0 * imm) + (src2, src2+1), all unsigned 32-bit
+    multiplicands; 64-bit addend and result.  ptxas uses this single-
+    instruction form for the common (param_base + idx*K) address pattern,
+    where idx is a 32-bit zero-extended u64, K is a small constant, and
+    param_base is loaded into a GPR pair (LDC.64).
+
+    b9=0x00 selects the unsigned form (vs b9=0x02 for signed
+    encode_imad_imm).  Immediate occupies bytes 4..7 (full 32 bits).
+
+    Ground truth (ptxas sm_120, gather kernel):
+        IMAD.WIDE.U32 R2, R4, 0x4, R2 ->
+            bytes 25 78 02 04 04 00 00 00 02 00 8e 07 00 ca 1f 00
+        IMAD.WIDE.U32 R8, R8, 0x8, RZ ->
+            bytes 25 78 08 08 08 00 00 00 ff 00 8e 07 00 ca 8f 00
+        IMAD.WIDE.U32 R4, R4, 0x4, R6 ->
+            bytes 25 78 04 04 04 00 00 00 06 00 8e 07 00 ca 1f 00
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    imm32 = imm & 0xFFFFFFFF
+    raw = bytearray(16)
+    raw[0] = 0x25
+    raw[1] = 0x78
+    raw[2] = dest & 0xFF
+    raw[3] = src0 & 0xFF
+    raw[4] = imm32 & 0xFF
+    raw[5] = (imm32 >> 8) & 0xFF
+    raw[6] = (imm32 >> 16) & 0xFF
+    raw[7] = (imm32 >> 24) & 0xFF
+    raw[8] = src2 & 0xFF
+    raw[9] = 0x00
+    raw[10] = 0x8e
+    raw[11] = 0x07
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
 def encode_ldcu_32(dest_ur: int, const_bank: int, const_offset_bytes: int,
                    ctrl: int = 0) -> bytes:
     """Encode LDCU.32 dest_ur, c[bank][offset] — 32-bit constant to single UR.

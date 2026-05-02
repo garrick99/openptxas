@@ -75,6 +75,7 @@ OPCODE_SHF = 0x819            # bits [11:0] for all SHF variants
 # Confirmed: constant across ALL instances in the encoding table
 _MODIFIER_SHF_L_W_U32_HI = (0x0e, 0x01)   # byte9=0x0e, byte10=0x01
 _MODIFIER_SHF_L_U32       = (0x06, 0x00)   # byte9=0x06, byte10=0x00
+_MODIFIER_SHF_L_U32_HI    = (0x06, 0x01)   # byte9=0x06, byte10=0x01 — Phase 11
 _MODIFIER_SHF_L_U64_HI    = (0x02, 0x01)   # byte9=0x02, byte10=0x01
 
 # Fixed bytes 11 and 12 (bits [95:88] and [103:96]) — always 0x00 for all SHF
@@ -83,9 +84,11 @@ _FIXED_BYTES_11_12 = (0x00, 0x00)
 # byte15 (bits [127:120]):
 #   SHF.L.W.U32.HI -> 0x00
 #   SHF.L.U32      -> 0x00
+#   SHF.L.U32.HI   -> 0x00
 #   SHF.L.U64.HI   -> 0x04  (reuse flag in control context)
 _BYTE15_SHF_L_W_U32_HI = 0x00
 _BYTE15_SHF_L_U32       = 0x00
+_BYTE15_SHF_L_U32_HI    = 0x00
 _BYTE15_SHF_L_U64_HI    = 0x04
 
 # RZ (zero register) index on SM_120
@@ -279,6 +282,46 @@ def encode_shf_l_u32(dest: int, src0: int, k: int, ctrl: int = 0) -> bytes:
                       _MODIFIER_SHF_L_U32[0],
                       _MODIFIER_SHF_L_U32[1],
                       _BYTE15_SHF_L_U32,
+                      ctrl)
+
+
+def encode_shf_l_u32_hi(dest: int, src0: int, k: int, src1: int,
+                         ctrl: int = 0) -> bytes:
+    """
+    Encode SHF.L.U32.HI dest, src0, k, src1 to 16 bytes.
+
+    SHF.L.U32.HI is the .HI form of SHF.L.U32 (no .W wrap modifier): a 32-bit
+    funnel-shift left of the (src1:src0) pair, returning the high 32 bits.
+    With src0 == src1 == x and shift K, this computes a 32-bit left-rotate of
+    x by K.  ptxas emits this for the shr/shl/or rotate-emulation pattern.
+
+    Modifier bytes (byte9=0x06, byte10=0x01) sit at the union of:
+        - U32 width   (bit[74] set, like SHF.L.U32)
+        - .HI output  (bit[80] set, like SHF.L.W.U32.HI)
+    No .W wrap bit is set (bit[75]=0).
+
+    Args:
+        dest:  Destination register index (0..254)
+        src0:  First source register index (0..254)
+        k:     Shift amount (0..31 for U32 — 32 is encodable but not emitted by ptxas)
+        src1:  Second source register index (0..254)
+        ctrl:  23-bit scheduling control word (0 = max-stall safe default)
+
+    Returns:
+        16-byte little-endian instruction encoding.
+
+    Ground truth validation (ptxas-13.2 SM_120 merkle_hash_leaves):
+        SHF.L.U32.HI R6, R6, 0x10, R6: bytes = 0000001006067819 000fc60000010606
+        SHF.L.U32.HI R15, R7, 0x10, R7: bytes = 00000010070f7819 000fe40000010607
+        SHF.L.U32.HI R17, R17, 0x14, R17: bytes = 0000001411117819 000fe40000010611
+        SHF.L.U32.HI R15, R15, 0x18, R15: bytes = 000000180f0f7819 000fe4000001060f
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_MAX_STALL
+    return _build_shf(dest, src0, k, src1,
+                      _MODIFIER_SHF_L_U32_HI[0],
+                      _MODIFIER_SHF_L_U32_HI[1],
+                      _BYTE15_SHF_L_U32_HI,
                       ctrl)
 
 

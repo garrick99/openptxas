@@ -889,6 +889,7 @@ def compile_function(fn: Function, verbose: bool = False,
     from ptx.passes.imm_xor_fold        import run_function as _imm_xor_fold_run
     from ptx.passes.repeated_add_reduce import run_function as _repeated_add_reduce_run
     from ptx.passes.dead_self_update_dce import run_function as _dead_self_update_dce_run
+    from ptx.passes.rotate32             import run_function as _rotate32_run
 
     # WB-pass-toggle (2026-04-28): allow workbench to disable individual
     # PTX-IR passes via the OPENPTXAS_DISABLE_PASSES env var (comma-
@@ -914,6 +915,10 @@ def compile_function(fn: Function, verbose: bool = False,
         ("imm_xor_fold",            _imm_xor_fold_run),
         ("repeated_add_reduce",     _repeated_add_reduce_run),
         ("dead_self_update_dce",    _dead_self_update_dce_run),
+        # Phase 11: 32-bit rotate fusion (shr+shl+or → SHF.L.U32.HI).
+        # Runs after imm_propagate has folded constant shift amounts
+        # into ImmOps and dead_self_update_dce has cleaned up.
+        ("rotate32",                _rotate32_run),
     ]
     for _pass_name, _pass_fn in _ptx_passes:
         if _pass_name in _disabled:

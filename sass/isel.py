@@ -107,6 +107,7 @@ from sass.encoding.sm_120_opcodes import (
 from sass.encoding.sm_120_encode import (
     encode_shf_l_w_u32_hi,
     encode_shf_l_u32,
+    encode_shf_l_u32_hi,
     encode_shf_l_u64_hi,
     encode_shf_r_u32, encode_shf_r_u32_hi,
     encode_shf_l_u32_var, encode_shf_r_u32_hi_var,
@@ -3293,6 +3294,24 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                     _did_pred_fuse = True
                     if not _did_pred_fuse:
                         output.extend(_select_mov(instr, ctx.ra, ctx))
+
+                elif op == 'rot' and typ == 'b32':
+                    # Phase 11: 32-bit left-rotate fused from (shr+shl+or)
+                    # by the rotate32 IR pass.  Lowers to a single
+                    # SHF.L.U32.HI dest, src, K, src — funnel-shift left
+                    # of (src:src) returning the high 32 bits, equivalent
+                    # to ROTL32(src, K).
+                    if (instr.dest is None
+                            or not isinstance(instr.dest, RegOp)
+                            or len(instr.srcs) != 2
+                            or not isinstance(instr.srcs[0], RegOp)
+                            or not isinstance(instr.srcs[1], ImmOp)):
+                        raise ISelError(f"rot.b32: expected (RegOp dest, RegOp src, ImmOp K)")
+                    d = ctx.ra.r32(instr.dest.name)
+                    s = ctx.ra.r32(instr.srcs[0].name)
+                    k = instr.srcs[1].value & 0x1F
+                    output.append(SassInstr(encode_shf_l_u32_hi(d, s, k, s),
+                                            f'SHF.L.U32.HI R{d}, R{s}, 0x{k:x}, R{s}  // rot.b32 {k} (Phase 11)'))
 
                 elif op == 'shl' and typ in ('b64', 'u64', 's64'):
                     output.extend(_select_shl_b64(instr, ctx.ra, ctx, output))

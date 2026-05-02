@@ -5147,6 +5147,61 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                       file=_sys.stderr)
                                 output.append(_nop(f'WARNING: unimplemented cvt {".".join(instr.types)}'))
 
+                elif op == 'cvta':
+                    from ptx.ir import LabelOp as _CvtaLabelOp
+                    d = instr.dest
+                    s = instr.srcs[0]
+                    if not isinstance(d, RegOp):
+                        raise ISelError(f"cvta dest must be register: {d!r}")
+                    is_global = 'global' in instr.types
+                    is_dst_64 = any(t in ('u64', 's64', 'b64') for t in instr.types)
+                    if is_dst_64:
+                        d_lo = ctx.ra.lo(d.name)
+                        d_hi = d_lo + 1
+                    else:
+                        d_lo = ctx.ra.r32(d.name)
+                        d_hi = None
+                    types_str = '.'.join(instr.types)
+                    cvta_emitted = 0
+                    if isinstance(s, _CvtaLabelOp):
+                        smem_off = (ctx._smem_offsets.get(s.name, 0)
+                                    if hasattr(ctx, '_smem_offsets') else 0)
+                        output.append(SassInstr(
+                            encode_iadd3_imm32(d_lo, RZ, smem_off, RZ),
+                            f'IADD3 R{d_lo}, RZ, 0x{smem_off:x}, RZ  // cvta.{types_str} {s.name}'))
+                        cvta_emitted += 1
+                        if d_hi is not None:
+                            output.append(SassInstr(
+                                encode_iadd3_imm32(d_hi, RZ, 0, RZ),
+                                f'IADD3 R{d_hi}, RZ, 0, RZ  // cvta.{types_str} hi=0'))
+                            cvta_emitted += 1
+                    elif isinstance(s, RegOp):
+                        s_name = s.name
+                        is_src_64 = s_name.startswith('%rd') or s_name.startswith('%fd')
+                        s_lo = ctx.ra.lo(s_name) if is_src_64 else ctx.ra.r32(s_name)
+                        s_hi = (s_lo + 1) if is_src_64 else None
+                        if d_lo != s_lo:
+                            output.append(SassInstr(
+                                encode_iadd3(d_lo, s_lo, RZ, RZ),
+                                f'MOV R{d_lo}, R{s_lo}  // cvta.{types_str} lo'))
+                            cvta_emitted += 1
+                        if d_hi is not None:
+                            if is_global and is_src_64:
+                                if d_hi != s_hi:
+                                    output.append(SassInstr(
+                                        encode_iadd3(d_hi, s_hi, RZ, RZ),
+                                        f'MOV R{d_hi}, R{s_hi}  // cvta.{types_str} hi'))
+                                    cvta_emitted += 1
+                            else:
+                                output.append(SassInstr(
+                                    encode_iadd3(d_hi, RZ, RZ, RZ),
+                                    f'MOV R{d_hi}, RZ  // cvta.{types_str} hi=0'))
+                                cvta_emitted += 1
+                        if cvta_emitted == 0:
+                            output.append(_nop(f'cvta.{types_str} elided (d==s)'))
+                    else:
+                        raise ISelError(f"cvta src must be register or label: {s!r}")
+
                 elif op == 'setp':
                     pred = instr.dest
                     a    = instr.srcs[0]

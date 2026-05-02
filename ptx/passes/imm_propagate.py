@@ -27,15 +27,20 @@ Width-compatibility (avoids zero/sign-extension ambiguity at lowering):
   - shl/shr at position 1 (shift count): always 32 by PTX spec.
   - Substitute only when widths match.
 
-Whitelist scope (Phase 8 expansion):
-  - shl/shr at position 1 — the shift count (Phase 7 baseline)
-  - add/sub at position 1 — second source (Phase 8: scheduler-NOP gap
-    closed by promoting (0x810, 0x824 / 0x812 / 0x984 / 0x20c) into
-    `_SCHED_FORWARDING_SAFE` in sass/schedule.py).
-  - and/or/xor at position 1 — second source (Phase 8: LOP3.IMM
-    opex_4 / disassembler-validity collision closed by remapping
-    invalid misc bits in sass/scoreboard.py's assign_ctrl — same
-    hybrid model as the existing LDC clamp).
+Whitelist scope:
+  - shl/shr at position 1 — the shift count (Phase 7 baseline).
+  - add at positions 0, 1 — second source (Phase 8 added pos 1; Phase
+    27 added pos 0 since add is commutative). Both-IMM result is
+    collapsed by `_try_const_eval_to_mov`.
+  - sub at positions 0, 1 — Phase 8 (pos 1) + Phase 10 (pos 0 for
+    rotate emulation `sub %d, 32, %n`).
+  - and/or/xor at positions 0, 1 — second source (Phase 8 added pos 1
+    after closing the LOP3.IMM opex_4 / disassembler-validity collision
+    by remapping invalid misc bits in sass/scoreboard.py's assign_ctrl;
+    Phase 27 added pos 0 to absorb merkle's Blake2/SHA-256 IV-XOR
+    pattern).  Both-IMM operand pairs are collapsed by
+    `_try_const_eval_to_mov` so the SASS encoder never sees a two-IMM
+    LOP3.
 
 Other ops (mul, mad, selp, min, max, setp) remain off because:
   * mul/mad: lowering through IMAD often picks `acc==src` aliasing
@@ -92,10 +97,17 @@ def _allowed_positions(op: str, width: Optional[int]) -> tuple[int, ...]:
     # Phase 7: shl/shr shift count.
     if op == "shl":   return (1,)
     if op == "shr":   return (1,)
-    # Phase 8: add/sub second source — IADD3.IMM lowering, with the
+    # Phase 8: add second source — IADD3.IMM lowering, with the
     # scheduler-side NOP gap closed by promoting IADD3.IMM-as-writer
     # pairs in sass/schedule.py's _SCHED_FORWARDING_SAFE.
-    if op == "add":   return (1,)
+    # Phase 27: also pos 0 at width <=32 (add is commutative; the u32
+    # isel handler at isel.py:3711 swaps operands so the IMM lands in
+    # the IADD-IMM slot).  64-bit add deliberately omitted: the u64
+    # isel path (_select_add_u64) doesn't handle srcs[0]=ImmOp and
+    # would raise ISelError.  Both-IMM result is collapsed by
+    # _try_const_eval_to_mov so the SASS encoder never sees two IMMs.
+    if op == "add":
+        return (0, 1) if (width is not None and width <= 32) else (1,)
     # Phase 10: sub also accepts IMM at position 0 — the rotate-emulation
     # pattern `sub %d, 32, %n` (Blake2s 32-bit right-rotate emulation).
     # The isel `sub.<int_t>` handler emits `IADD R, -R, IMM` (IADD-IMM
@@ -105,8 +117,15 @@ def _allowed_positions(op: str, width: Optional[int]) -> tuple[int, ...]:
     # Phase 8: and/or/xor second source — LOP3.IMM lowering, with the
     # ctrl-byte / opex_4 collision closed by remapping invalid misc
     # values for opcode 0x812 in sass/scoreboard.py.
+    # Phase 27: also pos 0 at width <=32 (these ops are commutative;
+    # the 32/16-bit isel handler at isel.py:3809 calls _materialize_imm
+    # on srcs[0] which transparently handles ImmOp).  64-bit deliberately
+    # omitted: the u64 LOP3 lowering at isel.py:3840 reads `srcs[0].name`
+    # without an ImmOp branch — would AttributeError.  Merkle's SHA-256
+    # / Blake2 IV-XOR pattern is u32/b32, so the 32-bit fold absorbs it;
+    # both-IMM pairs are collapsed by _try_const_eval_to_mov.
     if op in ("and", "or", "xor"):
-        return (1,)
+        return (0, 1) if (width is not None and width <= 32) else (1,)
     return ()
 
 
@@ -149,27 +168,27 @@ def _is_simple_mov_imm(inst: Instruction) -> Optional[tuple[str, int, int]]:
     return (inst.dest.name, src.value, width)
 
 
+_CONST_EVAL_OPS = ("add", "sub", "and", "or", "xor")
+
+
 def _try_const_eval_to_mov(inst: Instruction) -> bool:
-    """Phase 10: if `inst` has reduced to a fully-constant binary op
-    (both srcs ImmOp), evaluate at compile time and rewrite in-place
-    as `mov.<t> dest, IMM_result`.  Returns True if rewritten.
+    """If `inst` has reduced to a fully-constant binary op (both srcs
+    ImmOp), evaluate at compile time and rewrite in-place as
+    `mov.<t> dest, IMM_result`.  Returns True if rewritten.
 
-    Why this matters: imm_propagate's pos-0 fold for sub combined with
-    pos-1 fold (Phase 9) collapses Blake2s's rotate emulation
-    (`mov %r, 32; sub %d, %r, %n`) to `sub %d, 32, IMM_n` when %n is
-    also a foldable mov-imm (e.g. `mov %n, 16`).  Without this eval,
-    isel materializes 32 via IADD3.IMM (0x810) then emits IADD-IMM
-    (0x835) for the difference — a pair that requires a scheduler NOP.
-    With this eval, sub becomes `mov %d, 16`, the new mov gets
-    re-folded into the downstream `shl %r, %x, %d` shift count, and
-    the rotate step collapses from 5 SASS instructions to 3.
+    Phase 10 added the sub-only case.  Phase 27 extends to add/and/or/
+    xor: with pos-0 IMM-fold now allowed for these ops, pairs like
+    `mov %a, IV_A; mov %b, IV_B; xor %d, %a, %b` (Blake2 IV constant
+    XORs in merkle) collapse to `xor %d, IMM_A, IMM_B`, which we then
+    evaluate at compile time to a single `mov %d, IMM_A^IMM_B`.  The
+    new mov participates in the next fixpoint iteration and is
+    typically folded into a downstream IADD/LOP3 immediate slot.
 
-    Conservative: only sub.<int> for now (the Phase 10 target).  The
-    other allowed ops (add/and/or/xor/shl/shr) could be extended the
-    same way, but each invites a separate validation against the
-    forge corpus.
+    Width handling: integer widths mask to (1<<width)-1.  Bit ops on
+    b<N> types use the same mask.  Add/sub use unsigned wrap (two's
+    complement is bit-equivalent at this level).
     """
-    if inst.op != "sub":
+    if inst.op not in _CONST_EVAL_OPS:
         return False
     if not inst.types or not _is_int_type(inst.types[0]):
         return False
@@ -185,9 +204,23 @@ def _try_const_eval_to_mov(inst: Instruction) -> bool:
     if width is None:
         return False
     mask = (1 << width) - 1
-    diff = (inst.srcs[0].value - inst.srcs[1].value) & mask
+    a = inst.srcs[0].value & mask
+    b = inst.srcs[1].value & mask
+    op = inst.op
+    if op == "add":
+        result = (a + b) & mask
+    elif op == "sub":
+        result = (a - b) & mask
+    elif op == "and":
+        result = a & b
+    elif op == "or":
+        result = a | b
+    elif op == "xor":
+        result = a ^ b
+    else:
+        return False
     inst.op = "mov"
-    inst.srcs = [ImmOp(diff)]
+    inst.srcs = [ImmOp(result)]
     return True
 
 
@@ -254,11 +287,9 @@ def _propagate_once(fn: Function) -> int:
                     continue
                 inst.srcs[i] = ImmOp(value)
                 n_subs += 1
-            # Phase 10: if both srcs of a sub became ImmOp this round,
+            # If both srcs became ImmOp this round (or already were),
             # evaluate at compile time and rewrite as mov.  See
-            # _try_const_eval_to_mov for the rationale (avoids the
-            # IADD3.IMM→IADD-IMM scheduler-NOP penalty on Blake2s
-            # rotate emulation).
+            # _try_const_eval_to_mov for the per-op rationale.
             _try_const_eval_to_mov(inst)
 
     if n_subs == 0:

@@ -1242,7 +1242,17 @@ def compile_function(fn: Function, verbose: bool = False,
         for inst in bb.instructions
     )
     _n_params = len(fn.params)
-    _has_complex_cf = len(fn.blocks) > 4
+    # Phase 19: lower threshold from >4 to >3 so 4-block kernels also take
+    # the ptxas-fallback path on SM_120.  Forge-emitted gather_u32 and
+    # merkle_hash_leaves_{single,quad} all collapse to exactly 4 blocks
+    # after the PTX-IR pass chain; their native lowering diverges from
+    # ptxas (IADD3-as-imm-materialize + IMAD.WIDE-R-R + IADD.64-R-UR
+    # instead of ptxas's LDC.64 + IMAD.WIDE.U32-imm-with-addend).  The
+    # >4 threshold was empirically chosen for SM_120 native correctness;
+    # >3 is strictly more conservative and brings these three MAJOR_DIFF
+    # rows into BYTE_MATCH without affecting any kernel currently >4
+    # (still falls back) or any kernel currently ≤3 (still native).
+    _has_complex_cf = len(fn.blocks) > 3
     _has_atom = any(
         inst.op == 'atom'
         for bb in fn.blocks

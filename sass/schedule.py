@@ -653,6 +653,21 @@ def _enforce_gpr_latency(instrs: list[SassInstr]) -> list[SassInstr]:
                 (0x812, 0x210),  # LOP3.IMM      -> IADD3.RRR
                 (0x812, 0x810),  # LOP3.IMM      -> IADD3.IMM
                 (0x819, 0x812),  # SHF.U32       -> LOP3.IMM
+                # Phase 8: imm_propagate's add/sub fold turns
+                # `mov.u32 %r, K; add.u32 %d, %s, %r` (MOV.IMM + IADD3.RR)
+                # into `add.u32 %d, %s, K` (IADD3.IMM, opcode 0x810).
+                # Without these promotions, every IADD3.IMM-feeds-consumer
+                # pair drops a NOP — eating the elimination win.  Each pair
+                # is already in the global _FORWARDING_SAFE_PAIRS with
+                # explicit GPU-correctness evidence (P2-5 IMAD-family,
+                # FG-2.5/Phase 4 Phase 6 chains).  Promoting only the
+                # IADD3.IMM-as-WRITER direction; the WRITER must not be
+                # 0xc35 (IADD.64-UR — Phase 6 revert evidence) or a float
+                # producer, both of which are unaffected here.
+                (0x810, 0x824),  # IADD3.IMM     -> IMAD.Ri  (P2-5 evidence)
+                (0x810, 0x812),  # IADD3.IMM     -> LOP3.IMM (chained add+mask)
+                (0x810, 0x984),  # IADD3.IMM     -> LDS      (offset+shared load)
+                (0x810, 0x20c),  # IADD3.IMM     -> ISETP.RR (Phase 4 PASS)
             }
             if (opc_i, opc_j) in _SCHED_FORWARDING_SAFE:
                 i += 1

@@ -66,7 +66,7 @@ def test_shl_hot_path_substitutes_and_drops_mov():
     assert shls[0].srcs[1].value == 32
 
 
-SUB_NOT_FOLDED_PTX = """\
+SUB_FOLDED_PTX = """\
 .version 9.0
 .target sm_120
 .address_size 64
@@ -84,13 +84,18 @@ SUB_NOT_FOLDED_PTX = """\
 """
 
 
-def test_sub_is_not_in_whitelist():
-    """sub is excluded — folding causes scheduler-induced NOP bloat."""
-    mod = parse(SUB_NOT_FOLDED_PTX)
+def test_sub_at_pos1_is_folded():
+    """Phase 8: sub at position 1 (subtrahend) is folded.  IADD3.IMM
+    consumer NOPs are absorbed by the _SCHED_FORWARDING_SAFE
+    (0x810, ...) promotions in sass/schedule.py."""
+    mod = parse(SUB_FOLDED_PTX)
     fn = mod.functions[0]
     n = run_function(fn)
-    assert n == 0
-    assert list(_find(fn, "mov", "u32")), "mov must survive"
+    assert n == 1
+    assert not list(_find(fn, "mov", "u32")), "mov should be DCE'd"
+    subs = list(_find(fn, "sub", "u32"))
+    assert len(subs) == 1
+    assert isinstance(subs[0].srcs[1], ImmOp) and subs[0].srcs[1].value == 16
 
 
 MULTI_USE_PTX = """\
@@ -128,7 +133,7 @@ def test_multi_use_propagates_into_all_consumers_and_drops_mov():
     assert isinstance(shls[0].srcs[1], ImmOp) and shls[0].srcs[1].value == 8
 
 
-XOR_NOT_FOLDED_PTX = """\
+XOR_FOLDED_PTX = """\
 .version 9.0
 .target sm_120
 .address_size 64
@@ -146,43 +151,50 @@ XOR_NOT_FOLDED_PTX = """\
 """
 
 
-def test_xor_is_not_in_whitelist():
-    """and/or/xor are intentionally excluded from the whitelist
-    (LOP3.IMM scheduler-ctrl issue).  The mov must survive."""
-    mod = parse(XOR_NOT_FOLDED_PTX)
+def test_xor_at_pos1_is_folded():
+    """Phase 8: xor at position 1 is folded into LOP3.IMM (opcode
+    0x812).  The opex_4 collision was closed by remapping invalid
+    misc values for 0x812 in sass/scoreboard.py."""
+    mod = parse(XOR_FOLDED_PTX)
     fn = mod.functions[0]
     n = run_function(fn)
-    assert n == 0
-    assert list(_find(fn, "mov", "u32")), "mov must survive"
+    assert n == 1
+    assert not list(_find(fn, "mov", "u32")), "mov should be DCE'd"
     xors = list(_find(fn, "xor", "b32"))
-    assert isinstance(xors[0].srcs[1], RegOp)
+    assert isinstance(xors[0].srcs[1], ImmOp)
+    assert xors[0].srcs[1].value == 1779033703
 
 
-U64_ADD_NOT_FOLDED_PTX = """\
+U32_ADD_FOLDED_PTX = """\
 .version 9.0
 .target sm_120
 .address_size 64
 .visible .entry k(.param .u64 a)
 {
-    .reg .b64 %rd<10>;
+    .reg .b64 %rd<5>;
     .reg .u32 %r<5>;
     ld.param.u64 %rd1, [a];
-    ld.global.u64 %rd2, [%rd1];
-    mov.u64 %rd3, 4;
-    add.u64 %rd4, %rd2, %rd3;
-    st.global.u64 [%rd1], %rd4;
+    ld.global.u32 %r1, [%rd1];
+    mov.u32 %r2, 100;
+    add.u32 %r3, %r1, %r2;
+    st.global.u32 [%rd1], %r3;
     ret;
 }
 """
 
 
-def test_add_is_not_in_whitelist():
-    """add is excluded — narrow whitelist limits to shl/shr only."""
-    mod = parse(U64_ADD_NOT_FOLDED_PTX)
+def test_add_at_pos1_is_folded():
+    """Phase 8: add at position 1 (second source) is folded for u32.
+    The IADD3.IMM consumer NOP gap was closed by the _SCHED_FORWARDING_SAFE
+    promotions in sass/schedule.py."""
+    mod = parse(U32_ADD_FOLDED_PTX)
     fn = mod.functions[0]
     n = run_function(fn)
-    assert n == 0
-    assert list(_find(fn, "mov", "u64")), "mov must survive"
+    assert n == 1
+    assert not list(_find(fn, "mov", "u32")), "mov should be DCE'd"
+    adds = list(_find(fn, "add", "u32"))
+    assert len(adds) == 1
+    assert isinstance(adds[0].srcs[1], ImmOp) and adds[0].srcs[1].value == 100
 
 
 # ---------------------------------------------------------------------------

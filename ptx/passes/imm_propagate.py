@@ -27,28 +27,22 @@ Width-compatibility (avoids zero/sign-extension ambiguity at lowering):
   - shl/shr at position 1 (shift count): always 32 by PTX spec.
   - Substitute only when widths match.
 
-Whitelist scope (intentionally narrow on first landing):
-  - shl/shr at position 1 — the shift count.
+Whitelist scope (Phase 8 expansion):
+  - shl/shr at position 1 — the shift count (Phase 7 baseline)
+  - add/sub at position 1 — second source (Phase 8: scheduler-NOP gap
+    closed by promoting (0x810, 0x824 / 0x812 / 0x984 / 0x20c) into
+    `_SCHED_FORWARDING_SAFE` in sass/schedule.py).
+  - and/or/xor at position 1 — second source (Phase 8: LOP3.IMM
+    opex_4 / disassembler-validity collision closed by remapping
+    invalid misc bits in sass/scoreboard.py's assign_ctrl — same
+    hybrid model as the existing LDC clamp).
 
-Other ops (add, sub, mul, mad, and/or/xor, selp, min, max, setp) are
-deliberately omitted on this landing because two scheduler-side
-interactions surfaced during forge-corpus validation:
-
-  1. and/or/xor: folding triggers isel's LOP3.IMM path (opcode 0x812),
-     which exposes a scheduler bug — the 5-bit OPEX_4 sub-field is
-     sourced from the low 5 bits of the scheduler-assigned ctrl word,
-     and the scheduler does not always land on a value the SM_120
-     disassembler accepts.
-
-  2. add/sub: folding produces correct SASS but the scheduler responds
-     to the changed dependency shape by inserting many extra NOPs
-     (empirically +338 NOPs on merkle_hash_leaves_single), eating the
-     per-instruction win.
-
-shl/shr at position 1 is the cleanest target: the shift count slots
-into SHF.{L,R}.U32 / IMAD.SHL.U32 directly without disturbing the
-surrounding scoreboard.  The rest of the ops can be re-enabled here as
-the underlying scheduler / encoder gaps are closed in follow-up work.
+Other ops (mul, mad, selp, min, max, setp) remain off because:
+  * mul/mad: lowering through IMAD often picks `acc==src` aliasing
+    that is sensitive to the second-operand form;
+  * selp/min/max/setp: predicate-bearing or comparison-shaped — the
+    immediate slot at PTX position 1 doesn't match the consumer's
+    SASS-side immediate slot in all cases.
 
 Not touched in any case: mov, ld, st, atom, red, bar, membar, fence,
 ret, bra, call, cvt (isel requires RegOp source), and predicate-related
@@ -95,25 +89,19 @@ def _is_int_type(t: str) -> bool:
 
 
 def _allowed_positions(op: str, width: Optional[int]) -> tuple[int, ...]:
+    # Phase 7: shl/shr shift count.
     if op == "shl":   return (1,)
     if op == "shr":   return (1,)
-    # Other ops (add, sub, mul, mad, and/or/xor, selp, min, max, setp)
-    # are deliberately NOT in this whitelist.
-    #
-    #   - and/or/xor: folding triggers isel's LOP3.IMM path (opcode
-    #     0x812), which interacts with a scheduler-side OPEX_4 ctrl-bit
-    #     issue (low 5 bits of ctrl encode an opclass extension that
-    #     the scheduler does not always assign a valid value to).
-    #     Fixing that is out of this pass's mandate.
-    #
-    #   - add/sub/mul: folding here produces correct SASS but the
-    #     scheduler responds to the changed dependency shape by
-    #     inserting many extra NOPs (empirically +338 NOPs on
-    #     merkle_hash_leaves), eating the per-instruction win.
-    #
-    # shl/shr at position 1 is the cleanest win: the shift count
-    # immediate slots into SHF.{L,R}.U32 / IMAD.SHL.U32 directly
-    # without disturbing the surrounding scoreboard.
+    # Phase 8: add/sub second source — IADD3.IMM lowering, with the
+    # scheduler-side NOP gap closed by promoting IADD3.IMM-as-writer
+    # pairs in sass/schedule.py's _SCHED_FORWARDING_SAFE.
+    if op == "add":   return (1,)
+    if op == "sub":   return (1,)
+    # Phase 8: and/or/xor second source — LOP3.IMM lowering, with the
+    # ctrl-byte / opex_4 collision closed by remapping invalid misc
+    # values for opcode 0x812 in sass/scoreboard.py.
+    if op in ("and", "or", "xor"):
+        return (1,)
     return ()
 
 

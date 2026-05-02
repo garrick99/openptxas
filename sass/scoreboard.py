@@ -1452,6 +1452,12 @@ _OPCODE_MISC: dict[int, int] = {
     0x825: 1,   # IMAD.WIDE R-imm: misc=1
     0xc24: 1,   # IMAD R-UR: misc=1
     0x810: 1,   # IADD3.IMM: misc=1 (ptxas: all 10 IADD3.IMM in fp64 preamble use 1)
+    # 0x812 (LOP3.IMM): intentionally NOT in this table — uses counter-based
+    # misc with a clamp below.  See the LOP3.IMM clamp comment in assign_ctrl
+    # for the rationale.  Forcing a fixed misc here regresses w1_smem_xor_swap
+    # (RTX 5090 sync_err=700) — runtime hardware accepts a different misc set
+    # than disassembler validation does, so we keep counter behavior and only
+    # remap the disassembler-invalid range.
     0x919: 1,   # S2R: misc=1 (ptxas-verified; counter=0 at body start would give 0)
     0xfae: 4,   # LDGSTS.E: misc=4 (ptxas-verified: async global→shared copy)
     0x9af: 1,   # LDGDEPBAR: misc=1 (ptxas-verified: cp.async commit group)
@@ -1728,6 +1734,25 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
             # earlier >= 0xd threshold missed 0xb/0xc.  Remap >= 0xb into 0..7
             # via `& 0x7`, which stays within ptxas's observed safe range.
             misc = misc & 0x7
+        # Phase 8 (LOP3.IMM opex_4 clamp): wdep=0x3f for LOP3.IMM (0x812)
+        # → opex = 0x10 | misc.  Counter-based misc=0 / 0xc..0xf produces
+        # opex values 0x10 / 0x1c..0x1f, which the SM_120 disassembler
+        # rejects ("undefined value for table TABLES_opex_4" on opclass
+        # 'lop3_lut__RuIR_RIR'; valid opex set is 0x11..0x1b).  Reproduced
+        # with merkle_hash_leaves under expanded imm_propagate (and/or/xor
+        # fold path).  Remap invalid misc values into the safe 1..0xb
+        # range via `(misc & 0x7) | 1` for misc=0 (so opex stays >= 0x11)
+        # and `(misc & 0x3) | 8` for misc>=0xc (so opex stays <= 0x1b).
+        # Same hybrid model as LDC: keep counter-pattern for already-safe
+        # values, remap only the invalid range.  Forcing a fixed misc=2
+        # was tried and regressed w1_smem_xor_swap on RTX 5090 (sync_err
+        # 700 / ILLEGAL_INSTRUCTION) — counter-based misc must be
+        # preserved per-position, only invalid values remapped.
+        if opcode == 0x812:
+            if misc == 0:
+                misc = 1
+            elif misc >= 0xc:
+                misc = (misc & 0x3) | 0x8
         # ISETP misc: context-sensitive. Default misc=0 (from _OPCODE_MISC).
         # When within 3 instructions of VOTE (0x806), use counter-based misc
         # instead. ptxas uses counter-based misc for ISETP near VOTE.

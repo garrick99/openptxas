@@ -641,16 +641,30 @@ def _enforce_gpr_latency(instrs: list[SassInstr]) -> list[SassInstr]:
                 (0xc11, 0x986),  # TE27: IADD3.UR -> STG.E (31 PTXAS instances)
                 (0x812, 0x812),  # TE28: LOP3 -> LOP3 (13 PTXAS instances)
                 (0x812, 0x824),  # TE28: LOP3 -> IMAD (2 PTXAS instances)
+                # Phase 6 (lop3_shf_probes/REPORT.md): scoreboard-sync at
+                # gap=0, validated by per-pair probe natural=PASS with
+                # ptxas-equivalent ctrl-words.  Post-8ca57fe35a (R-R LOP3
+                # isel), the merkle SHA core emits R-R-R LOP3 (0x212) and
+                # variable-shift SHF (0x219); the (0x212, 0x210) and
+                # (0x219, 0x212) entries collapse ~969 of the 989 NOP
+                # residuals identified at Phase 5 (a23b4315d4).
+                (0x212, 0x210),  # LOP3.LUT R-R-R -> IADD3.RRR (merkle hot)
+                (0x219, 0x212),  # SHF.R.VAR     -> LOP3.LUT R-R-R (merkle hot)
+                (0x812, 0x210),  # LOP3.IMM      -> IADD3.RRR
+                (0x812, 0x810),  # LOP3.IMM      -> IADD3.IMM
+                (0x819, 0x812),  # SHF.U32       -> LOP3.IMM
             }
             if (opc_i, opc_j) in _SCHED_FORWARDING_SAFE:
                 i += 1
                 continue
             # Phase 2 (edge_87): also honor the global _FORWARDING_SAFE_PAIRS
             # ONLY when the writer or reader is the synthetic 32-bit-IADD
-            # key (0x1235).  Restricting to the IADD-32 family preserves
-            # the existing narrow safety net (the comment above documents
-            # that broader fallback breaks qmma_zero) while picking up the
-            # Phase 0 evidence (REPORT.md) for IADD-32.
+            # key (0x1235).  A wider fallback was attempted in Phase 6 but
+            # reverted -- entries in the global table validated for the
+            # verifier path (e.g. (0xc35, 0x986) IADD.64-UR -> STG.E) are
+            # not all schedule-safe; broadening regressed test_4ptr_add
+            # (3-input float add).  The 0x1235 carve-out + the explicit
+            # _SCHED_FORWARDING_SAFE set above is the curated safe subset.
             if (opc_i == 0x1235 or opc_j == 0x1235) and \
                     _is_forwarding_safe_pair(opc_i, opc_j):
                 i += 1

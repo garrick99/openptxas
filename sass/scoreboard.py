@@ -860,27 +860,28 @@ _FORWARDING_SAFE_PAIRS: set[tuple[int, int]] = {
                      # address-port wdep on a 64-bit IADD producer is
                      # preserved by the unchanged 0x235/0xc11/0x212 rules.)
     # ------------------------------------------------------------------
-    # Phase 5 Part B diagnosis (NOT applied — left for Phase 6).
-    # `merkle_hash_leaves:single` still emits 1001 NOPs vs ptxas's 12.
-    # Pre-NOP producer histogram (openptxas SASS):
-    #     LOP3.LUT  → NOP → IADD3      649  (66% of all NOP sites)
-    #     SHF.L.U32 → NOP → LOP3.LUT   320  (32%)
-    #     all others (IADD3, IADD.64, IMAD, ISETP, ...)  ≤ 17 each
-    # ptxas's natural schedule for the same kernel emits 300+ instances
-    # of LOP3→LOP3, 291 of SHF→SHF, 175 of SHF→LOP3, and 19 of LOP3→IADD3
-    # at gap=0.  The candidate fix is two new entries:
-    #     (0x812, 0x210)  LOP3.IMM → IADD3
-    #     (0x819, 0x812)  SHF      → LOP3.IMM
-    # which would collapse ~969 of the 989 extras (≈97%).  These are
-    # NOT added here because Phase 4's empirical strip-test discipline
-    # (consumer wdep=0x3f, rbar=0x00, stall=0 at 128 threads) has not
-    # been run on these specific pairs — and Phase 4 explicitly carved
-    # IADD3 → LOP3/SHF as min_gpr_gap=1 because the symmetric direction
-    # FAILed.  Phase 6 should run the same strip-test for the LOP3→IADD3
-    # and SHF→LOP3 directions before adding them.  Part A's three pairs
-    # (above) only collapse 1 NOP across the full forge corpus on their
-    # own; the merkle bloat is entirely driven by the two SHA-core
-    # patterns above.
+    # Phase 6 (lop3_shf_probes/REPORT.md): the merkle SHA-core RAW chains
+    # LOP3 → IADD3 and SHF → LOP3 dominate the `merkle_hash_leaves:single`
+    # NOP residual (969 of 989 extras per the Phase 5 diagnosis at
+    # a23b4315d4).  After commit 8ca57fe35a (R-R LOP3 isel), the merkle
+    # core now uses the R-R-R LOP3 form (0x212) and the variable-shift
+    # SHF form (0x219), not the IMM forms — so the actual hot pairs are
+    # (0x212, 0x210) and (0x219, 0x212).  IMM-form variants are added too
+    # for completeness (kernels with constant masks still emit 0x812).
+    #
+    # Each pair PASSes the natural-compile probe at gap=0 with ptxas's
+    # own ctrl-word configuration (consumer wdep=0x3e waiting on the
+    # producer's ALU scoreboard slot).  Strip-tests FAIL — these are
+    # scoreboard-sync at gap=0, not pure register-file forwarding — but
+    # our encoder always emits ALU consumers with wdep=0x3e per `_OpMeta`,
+    # so removing the NOP yields SASS byte-equivalent to ptxas's natural
+    # compile.  Same evidence basis as the existing TE28 entries
+    # (0x812, 0x812), (0x812, 0x824).
+    (0x212, 0x210),   # LOP3.LUT R-R-R → IADD3.RRR  (~649 instances in merkle:single)
+    (0x219, 0x212),   # SHF.R.VAR     → LOP3.LUT R-R-R  (~320 instances in merkle:single)
+    (0x812, 0x210),   # LOP3.IMM      → IADD3.RRR
+    (0x812, 0x810),   # LOP3.IMM      → IADD3.IMM (prod-only-strip also PASSes)
+    (0x819, 0x812),   # SHF.U32       → LOP3.IMM
     # ------------------------------------------------------------------
 }
 

@@ -3613,7 +3613,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             f'ISETP.NE.U32 P{pd}, R{r_b}, RZ  // {op}.pred result'))
                     _free_scratch(ctx, [r_b, r_c])
 
-                elif op in ('and', 'or', 'xor') and typ in ('b32', 'u32', 's32'):
+                elif op in ('and', 'or', 'xor') and typ in ('b32', 'u32', 's32', 'b16', 'u16', 's16'):
                     # UNIF-1: propagate SR-derived tag through bitwise-with-immediate.
                     # Guard: don't propagate in atom.xor kernels (the template has
                     # its own SR-source handling and extra tags cause regression).

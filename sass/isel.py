@@ -651,19 +651,11 @@ def _release_scratch(ctx: 'ISelContext'):
 
 def _emit_lop3(output: list, ctx: 'ISelContext', dest: int, src0: int,
                src1: int, src2: int, lut: int, comment: str = ''):
-    """Emit LOP3.LUT with register safety. On SM_120, LOP3 dest must be < R14
-    (hardware limitation of the logic execution unit). If dest >= 14, use a
-    scratch register and MOV the result."""
-    if dest < 14:
-        output.append(SassInstr(encode_lop3(dest, src0, src1, src2, lut), comment))
-    else:
-        # LOP3 to a low scratch, then MOV to actual dest.
-        used = {src0, src1, src2, dest}
-        scratch = next((r for r in range(14) if r not in used), 0)
-        output.append(SassInstr(encode_lop3(scratch, src0, src1, src2, lut),
-                                f'{comment} (via R{scratch})'))
-        output.append(SassInstr(encode_mov(dest, scratch),
-                                f'MOV R{dest}, R{scratch}  // lop3 fixup'))
+    """Emit LOP3.LUT directly to dest.  The historical `dest < 14` restriction
+    was misattributed — Phase 15 verified that ptxas freely writes LOP3.LUT
+    to R0..R27 on SM_120 in its natural compile of merkle_hash_leaves, and
+    a hand-written LOP3.LUT R20, ... runs correctly on the RTX 5090."""
+    output.append(SassInstr(encode_lop3(dest, src0, src1, src2, lut), comment))
 
 
 def _alloc_scratch_pred(ctx: 'ISelContext', count: int = 1) -> list[int]:
@@ -3675,19 +3667,9 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         # 32-bit immediate on SM_120 (LUT values differ from R-R form).
                         imm = instr.srcs[1].value & 0xFFFFFFFF
                         lut_imm = {'and': LOP3_IMM_AND, 'or': LOP3_IMM_OR, 'xor': LOP3_IMM_XOR}[op]
-                        if d < 14:
-                            output.append(SassInstr(
-                                encode_lop3_imm32(d, a, imm, RZ, lut_imm),
-                                f'LOP3.LUT R{d}, R{a}, 0x{imm:x}, RZ, 0x{lut_imm:02x}  // {op}.{typ} imm'))
-                        else:
-                            # LOP3 dest must be < R14 on SM_120 — use scratch + MOV
-                            used = {a, d}
-                            scratch = next((r for r in range(14) if r not in used), 0)
-                            output.append(SassInstr(
-                                encode_lop3_imm32(scratch, a, imm, RZ, lut_imm),
-                                f'LOP3.LUT R{scratch}, R{a}, 0x{imm:x}, RZ, 0x{lut_imm:02x}  // {op}.{typ} imm (via R{scratch})'))
-                            output.append(SassInstr(encode_mov(d, scratch),
-                                f'MOV R{d}, R{scratch}  // lop3 fixup'))
+                        output.append(SassInstr(
+                            encode_lop3_imm32(d, a, imm, RZ, lut_imm),
+                            f'LOP3.LUT R{d}, R{a}, 0x{imm:x}, RZ, 0x{lut_imm:02x}  // {op}.{typ} imm'))
                     else:
                         b = ctx.ra.r32(instr.srcs[1].name)
                         _emit_lop3(output, ctx, d, a, b, RZ, lut, f'LOP3.LUT R{d}, R{a}, R{b}, RZ, 0x{lut:02x}  // {op}.{typ}')
@@ -3708,18 +3690,9 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         for half_off, imm_half, tag in ((0, imm_lo, 'lo'), (1, imm_hi, 'hi')):
                             d_h = d_lo + half_off
                             a_h = a_lo + half_off
-                            if d_h < 14:
-                                output.append(SassInstr(
-                                    encode_lop3_imm32(d_h, a_h, imm_half, RZ, lut_imm),
-                                    f'LOP3.LUT R{d_h}, R{a_h}, 0x{imm_half:x}, RZ, 0x{lut_imm:02x}  // {op}.b64 {tag} imm'))
-                            else:
-                                used = {a_h, d_h}
-                                scratch = next((r for r in range(14) if r not in used), 0)
-                                output.append(SassInstr(
-                                    encode_lop3_imm32(scratch, a_h, imm_half, RZ, lut_imm),
-                                    f'LOP3.LUT R{scratch}, R{a_h}, 0x{imm_half:x}, RZ, 0x{lut_imm:02x}  // {op}.b64 {tag} imm (via R{scratch})'))
-                                output.append(SassInstr(encode_mov(d_h, scratch),
-                                    f'MOV R{d_h}, R{scratch}  // lop3 fixup'))
+                            output.append(SassInstr(
+                                encode_lop3_imm32(d_h, a_h, imm_half, RZ, lut_imm),
+                                f'LOP3.LUT R{d_h}, R{a_h}, 0x{imm_half:x}, RZ, 0x{lut_imm:02x}  // {op}.b64 {tag} imm'))
                     else:
                         b_lo = ctx.ra.lo(instr.srcs[1].name)
                         _emit_lop3(output, ctx, d_lo, a_lo, b_lo, RZ, lut, f'LOP3.LUT R{d_lo}, R{a_lo}, R{b_lo}, RZ, 0x{lut:02x}  // {op}.b64 lo')

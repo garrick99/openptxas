@@ -191,14 +191,18 @@ _EXPECTED_COUNTS = {
     "min_store_guarded":     (5, 0, 0, 0, 0, 2, 0, 0, 3, 0, 0, 0, 0),  # TE26: LDCU.64 post-EXIT
     "probe_fresh":           (5, 0, 0, 0, 0, 2, 0, 0, 3, 0, 0, 0, 0),  # TE26: LDCU.64 post-EXIT
     "reduce_sum":            (19, 5, 6, 0, 0, 3, 0, 0, 4, 0, 1, 0, 0),  # TE12: 0xc11 now ALU
-    "conv2d_looped":         (114, 23, 0, 0, 0, 55, 0, 0, 36, 0, 0, 0, 0),  # TE12: 0xc11 now ALU
+    # edge_87 drift: 32-bit IADD (opcode 0x235, b9=0x00) emitted for
+    # add.u32/sub.u32 reg+reg via encode_iadd; 9 NOPs removed because
+    # Phase 0 forwarding-safe pairs collapse IADD-32 → ALU consumer
+    # edges from VIOLATION/GAP_SAFE to FORWARDING_SAFE.  See REPORT.md.
+    "conv2d_looped":         (105, 14, 0, 0, 0, 55, 0, 0, 36, 0, 0, 0, 0),  # edge_87: IADD-32 path
     "conv2d_unrolled":       (93, 3, 8, 0, 0, 47, 0, 0, 35, 0, 0, 0, 0),  # TE12: 0xc11 now ALU
-    "fg21:k_ge":             (5, 0, 0, 0, 0, 2, 0, 0, 3, 0, 0, 0, 0),  # TE26: LDCU.64 post-EXIT
-    "fg21:k_lt":             (5, 0, 0, 0, 0, 2, 0, 0, 3, 0, 0, 0, 0),  # TE26: LDCU.64 post-EXIT
-    "fg21:k_gt":             (5, 0, 0, 0, 0, 2, 0, 0, 3, 0, 0, 0, 0),  # TE26: LDCU.64 post-EXIT
-    "fg21:k_le":             (5, 0, 0, 0, 0, 2, 0, 0, 3, 0, 0, 0, 0),  # TE26: LDCU.64 post-EXIT
-    "fg21:k_eq":             (5, 0, 0, 0, 0, 2, 0, 0, 3, 0, 0, 0, 0),  # TE26: LDCU.64 post-EXIT
-    "fg21:k_ne":             (5, 0, 0, 0, 0, 2, 0, 0, 3, 0, 0, 0, 0),  # TE26: LDCU.64 post-EXIT
+    "fg21:k_ge":             (6, 0, 1, 0, 0, 2, 0, 0, 3, 0, 0, 0, 0),  # edge_87: +1 FORWARDING_SAFE for IADD-32 → consumer
+    "fg21:k_lt":             (6, 0, 1, 0, 0, 2, 0, 0, 3, 0, 0, 0, 0),  # edge_87: +1 FORWARDING_SAFE for IADD-32 → consumer
+    "fg21:k_gt":             (6, 0, 1, 0, 0, 2, 0, 0, 3, 0, 0, 0, 0),  # edge_87: +1 FORWARDING_SAFE for IADD-32 → consumer
+    "fg21:k_le":             (6, 0, 1, 0, 0, 2, 0, 0, 3, 0, 0, 0, 0),  # edge_87: +1 FORWARDING_SAFE for IADD-32 → consumer
+    "fg21:k_eq":             (6, 0, 1, 0, 0, 2, 0, 0, 3, 0, 0, 0, 0),  # edge_87: +1 FORWARDING_SAFE for IADD-32 → consumer
+    "fg21:k_ne":             (6, 0, 1, 0, 0, 2, 0, 0, 3, 0, 0, 0, 0),  # edge_87: +1 FORWARDING_SAFE for IADD-32 → consumer
 }
 
 

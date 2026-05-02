@@ -487,7 +487,8 @@ class TestCompileTimeInvariants:
             _OPCODE_META as _META,
             _get_dest_regs as _meta_dest,
             _get_src_regs  as _meta_src,
-            _get_opcode    as _meta_opc,
+            _disc_opcode   as _meta_opc,
+            _is_forwarding_safe_pair,
         )
         # Triple-chain kernel has 2 consecutive ALU RAWs — the strongest test
         text   = self._text(_PTX_ALU_TRIPLE_CHAIN, 'hazard_alu_triple_chain')
@@ -496,6 +497,10 @@ class TestCompileTimeInvariants:
         violations = []
         for i in range(len(instrs) - 1):
             raw_i = instrs[i]
+            # Phase 2 (edge_87): use the discriminating opcode so 32-bit
+            # IADD (b9=0x00, key 0x1235) and IADD.64 (b9=0x02, key 0x235)
+            # are looked up against their per-variant meta + forwarding-
+            # safe rules.  See _harvest/prompts/iadd_probes/REPORT.md.
             opc_i = _meta_opc(raw_i)
             meta_i = _META.get(opc_i)
             if meta_i is None or meta_i.min_gpr_gap == 0:
@@ -507,7 +512,7 @@ class TestCompileTimeInvariants:
             opc_j = _meta_opc(raw_j)
             src_j = _meta_src(raw_j)
             overlap = dest_i & src_j
-            if overlap:
+            if overlap and not _is_forwarding_safe_pair(opc_i, opc_j):
                 violations.append(
                     f"instr[{i}] {meta_i.name} writes {overlap} "
                     f"→ instr[{i+1}] opc=0x{opc_j:03x} reads immediately (0-gap RAW)"
@@ -515,7 +520,9 @@ class TestCompileTimeInvariants:
 
         assert not violations, (
             "ALU GPR RAW at 0-gap (SM_120 stall field is ignored — "
-            "hardware needs ≥1 instruction of separation):\n"
+            "hardware needs ≥1 instruction of separation, unless the "
+            "(writer, reader) pair is on _FORWARDING_SAFE_PAIRS per "
+            "Phase 0 evidence):\n"
             + "\n".join(violations))
 
     def test_schedule_legality(self):

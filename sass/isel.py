@@ -38,7 +38,7 @@ from sass.encoding.sm_120_opcodes import (
     encode_ldc, encode_ldc_64,
     encode_s2r,
     encode_iadd3, encode_iadd3x,
-    encode_iadd64,
+    encode_iadd, encode_iadd64,
     encode_imad_wide, encode_imad_wide_rr, encode_imad_wide_u32, encode_imad_wide_u32_carry, encode_imad_wide_u32x,
     encode_imad, encode_imad_rr, encode_imad_ur, encode_imad_hi, encode_imad_shl_u32,
     encode_s2ur,
@@ -3495,8 +3495,12 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     else:
                         a = ctx.ra.r32(instr.srcs[0].name)
                         b = ctx.ra.r32(instr.srcs[1].name)
-                        output.append(SassInstr(encode_iadd3(d, a, b, RZ),
-                                                f'IADD3 R{d}, R{a}, R{b}, RZ  // add.{typ}'))
+                        # Phase 1 (edge_87): 32-bit IADD (opcode 0x235, b9=0x00).
+                        # Forwarding-safe to IADD3/IMAD/SHF/FFMA/ISETP/FSEL/POPC/
+                        # STG.E per Phase 0 _harvest/prompts/iadd_probes/REPORT.md.
+                        # Replaces `IADD3 d,a,b,RZ` which forced gap=1 NOPs.
+                        output.append(SassInstr(encode_iadd(d, a, b),
+                                                f'IADD R{d}, R{a}, R{b}  // add.{typ}'))
 
                 elif op == 'sub' and typ in ('u32', 's32'):
                     d = ctx.ra.r32(instr.dest.name)
@@ -3512,8 +3516,9 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                                 f'IADD3 R{d}, R{a}, -{imm:#x}, RZ  // sub.{typ} imm'))
                     else:
                         b = ctx.ra.r32(instr.srcs[1].name)
-                        output.append(SassInstr(encode_iadd3(d, a, b, RZ, negate_src1=True),
-                                                f'IADD3 R{d}, R{a}, -R{b}, RZ  // sub.{typ}'))
+                        # Phase 1 (edge_87): 32-bit IADD with src1 negation.
+                        output.append(SassInstr(encode_iadd(d, a, b, negate_src1=True),
+                                                f'IADD R{d}, R{a}, -R{b}  // sub.{typ}'))
 
                 elif op in ('and', 'or', 'xor') and typ == 'pred':
                     # and.pred / or.pred / xor.pred — predicate logic via

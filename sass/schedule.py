@@ -578,6 +578,7 @@ def _enforce_gpr_latency(instrs: list[SassInstr]) -> list[SassInstr]:
         _get_dest_regs as _sc_dest,
         _get_src_regs  as _sc_src,
         _get_opcode    as _sc_opc,
+        _disc_opcode   as _sc_disc,
         _is_forwarding_safe_pair,
     )
 
@@ -591,11 +592,14 @@ def _enforce_gpr_latency(instrs: list[SassInstr]) -> list[SassInstr]:
     result = list(instrs)
     i = 0
     while i < len(result) - 1:
-        opc_i = _sc_opc(result[i].raw)
+        opc_i_bare = _sc_opc(result[i].raw)
+        # Phase 2 (edge_87): discriminating opcode for meta + forwarding-
+        # safe-pair lookups (0x1235 for IADD-32 vs 0x235 for IADD.64).
+        opc_i = _sc_disc(result[i].raw)
 
         # ISETP → FSEL pred hazard: ISETP writes pred at raw[2];
         # FSEL reads pred from raw[10..11]. Needs ≥1 intervening instruction.
-        if opc_i in _ISETP_OPCODES:
+        if opc_i_bare in _ISETP_OPCODES:
             opc_j = _sc_opc(result[i + 1].raw)
             if opc_j == _FSEL_OPCODE:
                 isetp_pred = result[i].raw[2]
@@ -618,7 +622,7 @@ def _enforce_gpr_latency(instrs: list[SassInstr]) -> list[SassInstr]:
         if not dest_i:
             i += 1
             continue
-        opc_j = _sc_opc(result[i + 1].raw)
+        opc_j = _sc_disc(result[i + 1].raw)
         src_j = _sc_src(result[i + 1].raw)
         if dest_i & src_j:
             # TE27/28: skip NOP for PTXAS-proven forwarding-safe pairs.
@@ -641,6 +645,16 @@ def _enforce_gpr_latency(instrs: list[SassInstr]) -> list[SassInstr]:
             if (opc_i, opc_j) in _SCHED_FORWARDING_SAFE:
                 i += 1
                 continue
+            # Phase 2 (edge_87): also honor the global _FORWARDING_SAFE_PAIRS
+            # ONLY when the writer or reader is the synthetic 32-bit-IADD
+            # key (0x1235).  Restricting to the IADD-32 family preserves
+            # the existing narrow safety net (the comment above documents
+            # that broader fallback breaks qmma_zero) while picking up the
+            # Phase 0 evidence (REPORT.md) for IADD-32.
+            if (opc_i == 0x1235 or opc_j == 0x1235) and \
+                    _is_forwarding_safe_pair(opc_i, opc_j):
+                i += 1
+                continue
             result.insert(i + 1, SassInstr(encode_nop(), 'NOP  // ALU GPR latency'))
             i += 2  # skip the NOP; re-examine the original i+1 at i+2
         else:
@@ -653,7 +667,7 @@ def _enforce_gpr_latency(instrs: list[SassInstr]) -> list[SassInstr]:
             # and the reader two slots ahead is FFMA (R-R-R or imm).
             _IADD3_WRITERS = (0x210, 0x810)
             _FFMA_READERS  = (0x223, 0x823)
-            if (opc_i in _IADD3_WRITERS
+            if (opc_i_bare in _IADD3_WRITERS
                     and i + 2 < len(result)
                     and _sc_opc(result[i + 2].raw) in _FFMA_READERS
                     and dest_i & _sc_src(result[i + 2].raw)):
@@ -715,6 +729,7 @@ def verify_proof(instrs: list[SassInstr]) -> ProofReport:
         _get_dest_regs as _sc_dest,
         _get_src_regs  as _sc_src,
         _get_opcode    as _sc_opc,
+        _disc_opcode   as _sc_disc,
         _is_forwarding_safe_pair,
         _is_zero_init_fastpath,
         _WDEP_TO_RBAR_MASK,
@@ -804,7 +819,7 @@ def verify_proof(instrs: list[SassInstr]) -> ProofReport:
             src_j = _sc_src(instrs[j].raw)
             overlap = live_dest & src_j
             if overlap:
-                opc_j = _sc_opc(instrs[j].raw)
+                opc_j = _sc_disc(instrs[j].raw)
                 gap = j - i - 1
 
                 if mode_inert:
@@ -1050,10 +1065,13 @@ def verify_proof(instrs: list[SassInstr]) -> ProofReport:
     #     otherwise                             → VIOLATION
     # where "forward" means the pair is on FG-2.4 _FORWARDING_SAFE_PAIRS.
     for i in range(len(instrs)):
-        opc_i = _sc_opc(instrs[i].raw)
+        opc_i_bare = _sc_opc(instrs[i].raw)
+        # Phase 2 (edge_87): use disc opcode (0x1235 for IADD-32 vs 0x235
+        # for IADD.64) for meta + forwarding-safe-pair lookups.
+        opc_i = _sc_disc(instrs[i].raw)
         # FG-3.1: memory producers are handled by rule R9 above.
         # Skip them here so the same edge is not double-classified.
-        if _is_memory_gpr_producer(opc_i):
+        if _is_memory_gpr_producer(opc_i_bare):
             continue
         dest_i = _sc_dest(instrs[i].raw)
         if not dest_i:
@@ -1069,7 +1087,7 @@ def verify_proof(instrs: list[SassInstr]) -> ProofReport:
             overlap = dest_i & src_j
             if not overlap:
                 continue
-            opc_j = _sc_opc(instrs[i + 1].raw)
+            opc_j = _sc_disc(instrs[i + 1].raw)
             if k == 0:
                 cls = ProofClass.LATENCY_INERT
                 rat = (f"writer opc=0x{opc_i:03x} has no min_gpr_gap entry; "
@@ -1119,7 +1137,7 @@ def verify_proof(instrs: list[SassInstr]) -> ProofReport:
             src_j = _sc_src(instrs[j].raw)
             overlap = live_dest & src_j
             if overlap:
-                opc_j = _sc_opc(instrs[j].raw)
+                opc_j = _sc_disc(instrs[j].raw)
                 gap = j - i - 1
                 if gap >= k:
                     cls = ProofClass.GAP_SAFE
@@ -1330,6 +1348,7 @@ def _remove_forwarding_safe_nops(instrs: list[SassInstr]) -> list[SassInstr]:
         _get_dest_regs as _sc_dest,
         _get_src_regs  as _sc_src,
         _get_opcode    as _sc_opc,
+        _disc_opcode   as _sc_disc,
         _is_forwarding_safe_pair,
         _is_zero_init_fastpath,
         _overlap_is_data_only,
@@ -1338,7 +1357,9 @@ def _remove_forwarding_safe_nops(instrs: list[SassInstr]) -> list[SassInstr]:
     result = list(instrs)
     i = 0
     while i < len(result) - 2:
-        opc_i = _sc_opc(result[i].raw)
+        # Phase 2 (edge_87): use disc opcode so 32-bit IADD pairs are
+        # recognized for NOP removal too.
+        opc_i = _sc_disc(result[i].raw)
         meta_i = _OPCODE_META.get(opc_i)
         if meta_i is None or meta_i.min_gpr_gap == 0:
             i += 1
@@ -1357,7 +1378,7 @@ def _remove_forwarding_safe_nops(instrs: list[SassInstr]) -> list[SassInstr]:
         if not overlap:
             i += 1
             continue
-        opc_k = _sc_opc(result[i + 2].raw)
+        opc_k = _sc_disc(result[i + 2].raw)
         # PERF-2: can we remove the NOP?  Three conditions required:
         #   1. (writer_opc, reader_opc) is forwarding-safe OR writer
         #      is a zero-init fastpath

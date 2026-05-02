@@ -420,10 +420,18 @@ def _mk(b0, b1, b2=0, b3=0, b4=0, b8=0, b9=0, b10=0, b11=0):
     ("imad_wide_r_ur",
      _mk(0x25, 0x7c, b2=0x08, b3=0x0a, b4=0x0a, b8=0x08),
      {8, 9, 10}),
-    # opcode 0x235 — IADD.64 R-R: src0 pair + src1 pair.
+    # opcode 0x235 — IADD.64 R-R (b9=0x02): src0 pair + src1 pair.
+    # Phase 2 (edge_87): byte[9] now discriminates 64-bit IADD (b9=0x02,
+    # paired GPR sources) from 32-bit IADD (b9=0x00, single GPR sources).
+    # Per Phase 0 _harvest/prompts/iadd_probes/REPORT.md.
     ("iadd64_rr_pair",
-     _mk(0x35, 0x72, b2=0x02, b3=0x02, b4=0x04),
+     _mk(0x35, 0x72, b2=0x02, b3=0x02, b4=0x04, b9=0x02),
      {2, 3, 4, 5}),
+    # opcode 0x235 — 32-bit IADD R-R (b9=0x00): single-GPR sources.
+    # New SASS form emitted for `add.u32 / sub.u32` reg+reg since edge_87.
+    ("iadd32_rr_single",
+     _mk(0x35, 0x72, b2=0x02, b3=0x02, b4=0x04, b9=0x00),
+     {2, 4}),
     # opcode 0xc35 — IADD.64-UR: only b3 pair is a GPR.
     ("iadd64_ur",
      _mk(0x35, 0x7c, b2=0x06, b3=0x08, b4=0x08),

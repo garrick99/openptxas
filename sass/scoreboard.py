@@ -84,6 +84,14 @@ _OPCODE_META: dict[int, _OpMeta] = {
     0x823: _OpMeta('FFMA.IMM',   0, 0x00, 1),  # FFMA.IMM: wdep=0, min_gpr_gap=0 (matches plain FFMA; ptxas emits back-to-back with no NOPs)
     0x80a: _OpMeta('FSEL.STEP',  1, 0x3e, 5),  # Combined float compare+select (misc=5, ptxas-verified)
     0x235: _OpMeta('IADD.64',    1, 0x3e, 1),
+    # Phase 2 (edge_87): 32-bit IADD shares opcode 0x235 with IADD.64 but
+    # selects the 32-bit ALU path via byte[9]=0x00 (vs 0x02 for IADD.64).
+    # Looked up via the synthetic key 0x1235 by `_disc_opcode(raw)` so its
+    # meta + forwarding rules can differ from IADD.64.  Base min_gpr_gap=1
+    # (default for safety); forwarding-safe consumers are listed in
+    # _FORWARDING_SAFE_PAIRS.  See _harvest/prompts/iadd_probes/REPORT.md
+    # for empirical evidence.
+    0x1235: _OpMeta('IADD',     1, 0x3e, 1),
     0xc35: _OpMeta('IADD.64-UR', 1, 0x3e, 5),  # misc=5 per hardware bisect 2026-03-25
     0x202: _OpMeta('MOV',        0, 0x3e, 1),
     0x802: _OpMeta('MOV.IMM',    0, 0x3e, 1),  # GPR-immediate move (b0=0x02, b1=0x78); same scheduling as 0x202.
@@ -341,6 +349,21 @@ def _get_opcode(raw: bytes) -> int:
     return struct.unpack_from('<Q', raw, 0)[0] & 0xFFF
 
 
+# Phase 2 (edge_87): discriminating-opcode lookup.  Same as _get_opcode for
+# everything except IADD: opcode 0x235 with byte[9]=0x00 is 32-bit IADD
+# (synthetic key 0x1235), byte[9]=0x02 is IADD.64 (kept as 0x235).  The two
+# share the same raw opcode but use different ALU paths and different
+# scoreboard rules per Phase 0 empirical study (_harvest/prompts/iadd_probes/
+# REPORT.md).  Pass the result of this function (not _get_opcode) to
+# _OPCODE_META.get() and _is_forwarding_safe_pair when distinguishing the
+# two variants matters.
+def _disc_opcode(raw: bytes) -> int:
+    opc = struct.unpack_from('<Q', raw, 0)[0] & 0xFFF
+    if opc == 0x235 and len(raw) >= 10 and raw[9] == 0x00:
+        return 0x1235
+    return opc
+
+
 def _get_dest_reg(raw: bytes) -> int:
     """Get the destination register index, or -1 if none."""
     opcode = _get_opcode(raw)
@@ -469,9 +492,15 @@ def _get_src_regs(raw: bytes) -> set[int]:
             if raw[3] < 255: regs.add(raw[3])
             if raw[4] < 255: regs.add(raw[4])
             if raw[8] < 255: regs.add(raw[8])
-        elif opcode == 0x235:  # IADD.64: src0=b3 pair, src1=b4 pair
-            if raw[3] < 255: regs |= {raw[3], raw[3]+1}
-            if raw[4] < 255: regs |= {raw[4], raw[4]+1}
+        elif opcode == 0x235:
+            # Phase 2 (edge_87): 32-bit IADD (b9=0x00) reads single GPR
+            # sources; IADD.64 (b9=0x02) reads 64-bit pair sources.
+            if raw[9] == 0x00:
+                if raw[3] < 255: regs.add(raw[3])
+                if raw[4] < 255: regs.add(raw[4])
+            else:
+                if raw[3] < 255: regs |= {raw[3], raw[3]+1}
+                if raw[4] < 255: regs |= {raw[4], raw[4]+1}
         elif opcode in (0x819,):  # SHF (const): src0=b3, K=b4(imm), src1=b8
             if raw[3] < 255: regs.add(raw[3])
             if raw[8] < 255: regs.add(raw[8])
@@ -765,6 +794,59 @@ _FORWARDING_SAFE_PAIRS: set[tuple[int, int]] = {
     (0x824, 0x202),   # IMAD.Ri → MOV (multiply→register move)
     (0x824, 0x802),   # IMAD.Ri → MOV.IMM (multiply→imm move; same forwarding window as 0x202)
     (0xb82, 0x835),   # S2R → IADD.64.IMM (special reg→64-bit add, large gap OK)
+    # ------------------------------------------------------------------
+    # Phase 2 (edge_87): 32-bit IADD (synthetic key 0x1235; opcode 0x235
+    # with byte[9]=0x00) → consumer pairs.  Empirically 0-gap forwarding-
+    # safe per Phase 0 study (_harvest/prompts/iadd_probes/REPORT.md).
+    # Each pair was probed via byte-patched cubin with the consumer's
+    # wdep/stall/rbar stripped — register-file forwarding alone delivered
+    # the value correctly to the consumer at 128 threads.  QMMA / HMMA
+    # and 64-bit IADD producers are NOT covered (see REPORT.md §"Pairs
+    # to retain min_gpr_gap=1").
+    (0x1235, 0x210),   # IADD-32 → IADD3 (probed: 2*tid+1 ✓)
+    (0x1235, 0x810),   # IADD-32 → IADD3.IMM (analogous to 0x210)
+    (0x1235, 0x824),   # IADD-32 → IMAD (probed: 4*tid+2 ✓)
+    (0x1235, 0x224),   # IADD-32 → IMAD.32 (same ALU class as 0x824)
+    (0x1235, 0x2a4),   # IADD-32 → IMAD.RR (same ALU class)
+    (0x1235, 0x819),   # IADD-32 → SHF (probed: (2*tid+1)>>1 ✓)
+    (0x1235, 0x223),   # IADD-32 → FFMA (probed: f32 roundtrip ✓)
+    (0x1235, 0x823),   # IADD-32 → FFMA.IMM (same path as 0x223)
+    (0x1235, 0x245),   # IADD-32 → I2FP/FSEL family (probed)
+    (0x1235, 0x20c),   # IADD-32 → ISETP.RR (probed: 1 (R != 0) ✓)
+    (0x1235, 0xc0c),   # IADD-32 → ISETP.RU (same scoreboard class)
+    (0x1235, 0x208),   # IADD-32 → FSEL (probed: predicate-select ✓)
+    (0x1235, 0x808),   # IADD-32 → FSEL.IMM (same class)
+    (0x1235, 0x80a),   # IADD-32 → FSEL.STEP (same class)
+    (0x1235, 0x309),   # IADD-32 → POPC (probed: popcount(2*tid+1) ✓)
+    (0x1235, 0x986),   # IADD-32 → STG.E (probed: data-port forwarding ✓)
+    (0x1235, 0xf89),   # IADD-32 → SHFL (mirror of (0x235, 0xf89))
+    (0x1235, 0x812),   # IADD-32 → LOP3.IMM (analogous to IADD.64→LOP3.IMM)
+    (0x1235, 0x202),   # IADD-32 → MOV (ptxas folded probe; safe by class)
+    (0x1235, 0x802),   # IADD-32 → MOV.IMM (same class)
+    (0x1235, 0x1235),  # IADD-32 → IADD-32 (self-chain)
+    (0x1235, 0x235),   # IADD-32 → IADD.64 (data path forwards by analogy)
+    (0x1235, 0x212),   # IADD-32 → IADD3X (carry-extended add; same ALU class)
+    # NOT added: (0x1235, 0x27a) → QMMA, (0x1235, 0x23c) → HMMA,
+    # (0x1235, 0x237) → IMMA, (0x1235, 0x23f) → DMMA — Phase 0 explicitly
+    # carved these out; v2 transcript confirms removing the gap on opcode
+    # 0x235 broke test_qmma_e4m3_zero_inputs.  Tensor-core consumers need
+    # ≥1 instruction of separation from any IADD producer.
+    # ------------------------------------------------------------------
+    # Phase 2 reader-side: when 32-bit IADD is the *consumer*, it accepts
+    # forwarded values from the same producers that already feed IADD.64
+    # at gap=0 (mirror entries with reader_opc=0x235 above).  Both variants
+    # share the integer ALU pipeline; the 32-bit consumer's read ports see
+    # forwarded values identically to the 64-bit consumer's lo half.
+    (0x224, 0x1235),  # IMAD.32 → IADD-32  (mirror of (0x224, 0x235))
+    (0x2a4, 0x1235),  # IMAD.RR → IADD-32  (mirror of (0x2a4, 0x235))
+    (0x210, 0x1235),  # IADD3   → IADD-32  (mirror of (0x210, 0x235))
+    (0x212, 0x1235),  # IADD3X  → IADD-32  (mirror of (0x212, 0x235))
+    (0x812, 0x1235),  # LOP3.IMM → IADD-32 (mirror of (0x812, 0x235))
+    (0x819, 0x1235),  # SHF     → IADD-32  (mirror of (0x819, 0x235))
+    (0x235, 0x1235),  # IADD.64 → IADD-32  (mirror of (0x235, 0x235))
+    (0xc11, 0x1235),  # IADD3.R-UR → IADD-32 (mirror of (0xc11, 0x235))
+    (0x824, 0x1235),  # IMAD    → IADD-32  (IMAD-family pipeline)
+    (0xb82, 0x1235),  # S2R     → IADD-32  (mirror of (0xb82, 0x835))
 }
 
 
@@ -772,6 +854,10 @@ def _is_forwarding_safe_pair(writer_opc: int, reader_opc: int) -> bool:
     """Return True if a 0-gap RAW between the producer and consumer
     is covered by hardware operand forwarding / ctrl-word scoreboard,
     per the FG-2.4 forwarding-safe pair table.
+
+    NOTE: the IADD-32 / IADD.64 split (Phase 2 / edge_87) is keyed via
+    `_disc_opcode(raw)` — pass the *discriminating* opcode (0x1235 for
+    IADD-32, 0x235 for IADD.64), not the bare 12-bit opcode.
     """
     return (writer_opc, reader_opc) in _FORWARDING_SAFE_PAIRS
 
@@ -1138,7 +1224,17 @@ def _get_dest_regs(raw: bytes) -> set[int]:
                 regs.add(dest+1)
     elif opcode in _OPCODES_LDS:
         if dest < 255: regs.add(dest)
-    elif opcode in (0x235, 0xc35):  # IADD.64 / IADD.64-UR: writes GPR pair
+    elif opcode == 0x235:
+        # Phase 2 (edge_87): 32-bit IADD (b9=0x00) writes a single GPR;
+        # IADD.64 (b9=0x02) writes a 64-bit pair.  Differentiate via
+        # byte[9] so the scheduler doesn't claim a phantom dest+1 write
+        # for 32-bit IADD (which would introduce false WAW conflicts).
+        if dest < 255:
+            if raw[9] == 0x00:
+                regs.add(dest)
+            else:
+                regs |= {dest, dest+1}
+    elif opcode == 0xc35:  # IADD.64-UR: writes GPR pair
         if dest < 255: regs |= {dest, dest+1}
     elif opcode in (0x23c, 0x237, 0x27a):  # HMMA/IMMA/QMMA: writes 4 regs
         if dest < 255: regs |= {dest, dest+1, dest+2, dest+3}

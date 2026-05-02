@@ -1881,6 +1881,53 @@ def encode_iadd64_ur(dest: int, src_r: int, src_ur: int,
 # For IADD.64 (add, no negate): b7=0x00
 # For IADD.64 (sub, negate src1): b7=0x80
 
+# ---------------------------------------------------------------------------
+# IADD  (32-bit integer add/subtract, two-operand form)  — Phase 2 / edge_87
+# ---------------------------------------------------------------------------
+# Same opcode/byte layout as IADD.64 (0x235), but byte[9] = 0x00 selects the
+# 32-bit ALU path instead of the 64-bit path (b9=0x02).
+#
+# Ground truth: Phase 0 IADD probe (REPORT.md) — IADD R7, R0, R7:
+#   35 72 07 00 07 00 00 00 00 00 8e 07 00 ca 4f 00
+#
+# For sub: byte[7] = 0x80 negates src1 (dest = src0 - src1), matching the
+# IADD.64 negate flag.
+
+def encode_iadd(dest: int, src0: int, src1: int,
+                negate_src1: bool = False, ctrl: int = 0) -> bytes:
+    """
+    Encode 32-bit IADD dest, src0, [+-]src1 to 16 bytes (opcode 0x235, b9=0x00).
+
+    Two-operand 32-bit add (or sub when negate_src1=True).  Used by ptxas-13.2
+    natural compile for `add.u32 / add.s32 / sub.u32 / sub.s32` register+register
+    when no third addend is needed.  Phase 0 empirical study confirms this path
+    is forwarding-safe (0-gap) into IADD3/IMAD/SHF/FFMA/ISETP/FSEL/POPC/STG.E
+    consumers; QMMA/HMMA consumers still need ≥1-instruction gap.
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    b7 = 0x80 if negate_src1 else 0x00
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0] = 0x35
+    raw[1] = 0x72
+    raw[2] = dest & 0xFF
+    raw[3] = src0 & 0xFF
+    raw[4] = src1 & 0xFF
+    raw[5] = 0x00
+    raw[6] = 0x00
+    raw[7] = b7
+    raw[8] = 0x00
+    raw[9] = 0x00     # 32-bit IADD path (vs 0x02 for IADD.64)
+    raw[10] = 0x8e
+    raw[11] = 0x07
+    raw[12] = 0x00
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
 def encode_iadd64(dest: int, src0: int, src1: int,
                   negate_src1: bool = False, ctrl: int = 0) -> bytes:
     """

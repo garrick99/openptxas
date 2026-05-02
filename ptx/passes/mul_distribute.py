@@ -1,5 +1,6 @@
 """
-Phase 22: strength reduction for chained multiply-add address arithmetic.
+Phase 22 + Phase 24: strength reduction + slot-0 hoist for chained
+multiply-add address arithmetic.
 
 Recognizes the FORGE-emitted pattern (per-slot store address compute):
 
@@ -622,128 +623,298 @@ def _try_rewrite_block_with_cse(fn: Function, bb,
     return n_rewrites
 
 
-def _try_rewrite_slot0_block(fn: Function, bb,
-                              cse: dict[tuple, tuple[str, str]],
-                              def_count: dict[str, int],
-                              use_count: dict[str, int],
-                              def_instr: dict[str, Instruction]) -> int:
-    """Slot-0 sweep.  After Pass A populated the CSE cache, scan the
-    block for `mul.lo.u64 %M2, %M1, K2; add.u64 %F, %B, %M2; st [%F]`
-    chains whose `(X = M1's source, K_combined = K1*K2, B, pred)` key
-    matches an existing CSE entry.  When a match is found, redirect the
-    store to the cached %F_shared (with offset 0 absorbed by STG.E)
-    and drop the now-redundant slot-0 mul + consumer add.
+def _match_slot0_chain(instrs, idx, x_name, b_name, K_combined,
+                        chain_pred_tuple, def_count, use_count, def_instr):
+    """Try to match a slot-0-style chain at instrs[idx..idx+2]:
+
+        mul.lo.u64 %m2, %m1, K2     (m1 = X * K1; K1 * K2 == K_combined)
+        add.u64    %f,  %B,  %m2    (or with %B, %m2 swapped)
+        st.global  [%f], data       (offset 0)
+
+    All three instructions must share `chain_pred_tuple`.  %m2 and %f
+    must be single-def, single-use.  The leading mul `m1_def` must be
+    unpredicated and have %X as its first source.
+
+    Returns (idx, mul_inst, cons_inst, store_inst, k2_dead_mov) or None.
+    """
+    if idx + 2 >= len(instrs):
+        return None
+
+    mul_cand = instrs[idx]
+    if (mul_cand.op != "mul" or not _has_lo_modifier(mul_cand)
+            or not _is_int64_typed(mul_cand) or mul_cand.mods
+            or len(mul_cand.srcs or []) != 2):
+        return None
+    if (not isinstance(mul_cand.dest, RegOp)
+            or isinstance(mul_cand.dest, VectorRegOp)):
+        return None
+    if (mul_cand.pred, mul_cand.neg) != chain_pred_tuple:
+        return None
+
+    m1_op = mul_cand.srcs[0]
+    k2_op = mul_cand.srcs[1]
+    if not isinstance(m1_op, RegOp) or isinstance(m1_op, VectorRegOp):
+        return None
+
+    m1_def = def_instr.get(m1_op.name)
+    if (m1_def is None or m1_def.op != "mul"
+            or not _has_lo_modifier(m1_def) or not _is_int64_typed(m1_def)
+            or m1_def.pred is not None or len(m1_def.srcs or []) != 2):
+        return None
+    x_op = m1_def.srcs[0]
+    if (not isinstance(x_op, RegOp) or x_op.name != x_name
+            or isinstance(x_op, VectorRegOp)):
+        return None
+
+    k1 = _resolve_u64_imm(m1_def.srcs[1], def_instr, def_count, use_count)
+    if k1 is None:
+        return None
+    K1, _ = k1
+    if K1 == 0:
+        return None
+    k2 = _resolve_u64_imm(k2_op, def_instr, def_count, use_count,
+                           allow_pred=chain_pred_tuple)
+    if k2 is None:
+        return None
+    K2, k2_dead = k2
+    if K2 == 0:
+        return None
+    full_product = K1 * K2
+    if full_product != (full_product & 0xFFFFFFFFFFFFFFFF):
+        return None
+    if (full_product & 0xFFFFFFFFFFFFFFFF) != K_combined:
+        return None
+
+    m2_name = mul_cand.dest.name
+    if (def_count.get(m2_name, 0) != 1
+            or use_count.get(m2_name, 0) != 1):
+        return None
+
+    cons_cand = instrs[idx + 1]
+    cm = _is_consumer_add(cons_cand, m2_name)
+    if cm is None or (cons_cand.pred, cons_cand.neg) != chain_pred_tuple:
+        return None
+    f_name, b_local = cm
+    if b_local != b_name:
+        return None
+    if (def_count.get(f_name, 0) != 1
+            or use_count.get(f_name, 0) != 1):
+        return None
+
+    store_cand = instrs[idx + 2]
+    if (not _is_global_store_of(store_cand, f_name)
+            or (store_cand.pred, store_cand.neg) != chain_pred_tuple):
+        return None
+    store_memop = store_cand.srcs[0]
+    if not isinstance(store_memop, MemOp) or store_memop.offset != 0:
+        return None
+
+    return (idx, mul_cand, cons_cand, store_cand, k2_dead)
+
+
+def _hoist_rebase_one_cse_entry(fn: Function, bb, cse_key, cse_value,
+                                  def_count: dict[str, int],
+                                  use_count: dict[str, int],
+                                  def_instr: dict[str, Instruction]) -> int:
+    """Process one CSE entry: rebase any slot-0 chains in `bb` onto its
+    `(M_new, F_shared)` pair, hoisting the shared definitions if a
+    chain physically precedes them in program order.
+    """
+    m_new_name, f_shared_name = cse_value
+    x_name, K_combined, b_name, chain_pred, chain_neg = cse_key
+    chain_pred_tuple = (chain_pred, chain_neg)
+
+    instrs = bb.instructions
+    m_new_idx = -1
+    f_shared_idx = -1
+    for i, inst in enumerate(instrs):
+        d = inst.dest
+        if isinstance(d, RegOp) and not isinstance(d, VectorRegOp):
+            if d.name == m_new_name:
+                m_new_idx = i
+            elif d.name == f_shared_name:
+                f_shared_idx = i
+    if m_new_idx < 0 or f_shared_idx < 0:
+        return 0
+    if m_new_idx >= f_shared_idx:
+        # Pass A always emits the shared mul before the consumer add.
+        # If this isn't true, something has shuffled them — bail.
+        return 0
+
+    candidates = []
+    i = 0
+    while i < len(instrs):
+        cand = _match_slot0_chain(instrs, i, x_name, b_name, K_combined,
+                                    chain_pred_tuple, def_count, use_count,
+                                    def_instr)
+        if cand is None:
+            i += 1
+            continue
+        slot_idx = cand[0]
+        # Don't match the M_new + consumer_add + (whatever) — the new_mul
+        # itself looks like a slot-0 mul, but the consumer_add is followed
+        # by the offset_add, not a store, so it falls out at the store
+        # check.  Defensive belt-and-suspenders here in case of overlap.
+        if slot_idx in (m_new_idx, f_shared_idx):
+            i += 1
+            continue
+        candidates.append(cand)
+        i += 3
+
+    if not candidates:
+        return 0
+
+    before = [c for c in candidates if c[0] < m_new_idx]
+    after = [c for c in candidates if c[0] > f_shared_idx]
+    n_done = 0
+
+    # Apply "after" rebases first — no hoist required.
+    if after:
+        dead_inst_ids = set()
+        for _, m, c, st, k2_dead in after:
+            dead_inst_ids.add(id(m))
+            dead_inst_ids.add(id(c))
+            if k2_dead is not None:
+                dead_inst_ids.add(id(k2_dead))
+            old_memop = st.srcs[0]
+            st.srcs[0] = MemOp(base=f_shared_name, offset=old_memop.offset)
+        bb.instructions = [inst for inst in instrs
+                            if id(inst) not in dead_inst_ids]
+        instrs = bb.instructions
+        n_done += len(after)
+        def_count, use_count, def_instr = _walk_def_use_counts(fn)
+        m_new_idx = -1
+        f_shared_idx = -1
+        for j, inst in enumerate(instrs):
+            d = inst.dest
+            if isinstance(d, RegOp) and not isinstance(d, VectorRegOp):
+                if d.name == m_new_name:
+                    m_new_idx = j
+                elif d.name == f_shared_name:
+                    f_shared_idx = j
+        if m_new_idx < 0 or f_shared_idx < 0:
+            return n_done
+
+    if not before:
+        return n_done
+
+    m_new_inst = instrs[m_new_idx]
+    f_sh_inst = instrs[f_shared_idx]
+    earliest_idx = min(c[0] for c in before)
+
+    # Hoist safety: between earliest_idx and f_shared_idx, nothing may
+    # write %X, %B, or the chain predicate.  We skip the M_new and
+    # F_shared positions themselves since those are the instructions we
+    # are moving.
+    for j in range(earliest_idx, f_shared_idx + 1):
+        if j == m_new_idx or j == f_shared_idx:
+            continue
+        inst = instrs[j]
+        if _writes(inst, x_name) or _writes(inst, b_name):
+            return n_done
+        if chain_pred is not None and _writes(inst, chain_pred):
+            return n_done
+
+    # The chain predicate (if any) must be defined BEFORE earliest_idx.
+    # If it's defined in another block, treat as dominator-defined.
+    if chain_pred is not None:
+        pred_def = def_instr.get(chain_pred)
+        if pred_def is not None:
+            try:
+                pred_idx = instrs.index(pred_def)
+                if pred_idx >= earliest_idx:
+                    return n_done
+            except ValueError:
+                pass
+
+    # %X and %B (the new mul/consumer-add operands) must each be defined
+    # before earliest_idx in this block, or in a dominating block.
+    for needed in (x_name, b_name):
+        d_inst = def_instr.get(needed)
+        if d_inst is None:
+            continue
+        try:
+            d_idx = instrs.index(d_inst)
+        except ValueError:
+            continue  # external — dominator-defined.
+        if d_idx >= earliest_idx:
+            return n_done
+
+    dead_inst_ids = {id(m_new_inst), id(f_sh_inst)}
+    for _, m, c, st, k2_dead in before:
+        dead_inst_ids.add(id(m))
+        dead_inst_ids.add(id(c))
+        if k2_dead is not None:
+            dead_inst_ids.add(id(k2_dead))
+        old_memop = st.srcs[0]
+        st.srcs[0] = MemOp(base=f_shared_name, offset=old_memop.offset)
+
+    new_instrs = []
+    inserted_hoist = False
+    for j, inst in enumerate(instrs):
+        if j == earliest_idx and not inserted_hoist:
+            new_instrs.append(m_new_inst)
+            new_instrs.append(f_sh_inst)
+            inserted_hoist = True
+        if id(inst) in dead_inst_ids:
+            continue
+        new_instrs.append(inst)
+    if not inserted_hoist:
+        return n_done
+    bb.instructions = new_instrs
+    return n_done + len(before)
+
+
+def _try_slot0_hoist_rebase_block(fn: Function, bb,
+                                    cse: dict[tuple, tuple[str, str]],
+                                    def_count: dict[str, int],
+                                    use_count: dict[str, int],
+                                    def_instr: dict[str, Instruction]) -> int:
+    """Phase 24: slot-0 chain hoist + rebase.
+
+    Pass A emits a shared `mul %M_new, %X, K_combined` plus
+    `add %F_shared, %B, %M_new` at the position of the FIRST leading-add
+    chain in a block (typically slot 1 of a per-slot store group).
+    Slots 1..N (with leading adds) reuse those via CSE and only need a
+    constant-offset add per slot.
+
+    Slot 0 lacks the leading add — its PTX form is
+
+        mul.lo.u64 %m2, %m1, K2
+        add.u64    %f,  %B, %m2
+        st.global  [%f], data
+
+    Phase 22's reverted attempt rebased slot-0 stores onto %F_shared
+    blindly, producing a use-before-def hazard whenever the slot-0 chain
+    physically preceded the Pass-A-inserted shared definitions.
+
+    Phase 24 detects that case and HOISTS the (M_new + F_shared) pair to
+    immediately before the earliest such "before" slot-0 chain, after
+    verifying that:
+
+      - %X and %B are not redefined between the hoist target index and
+        F_shared's original index;
+      - The chain predicate (if any) is defined before the hoist target;
+      - %X and %B are defined before the hoist target (or in a
+        dominating block);
+
+    then drops the slot-0's mul + consumer_add (and any dead K2 mov)
+    and repoints the slot-0 store to %F_shared.  Slot-0 chains that
+    occur AFTER F_shared's definition do not need the hoist and are
+    rebased directly.
+
+    Returns the number of slot-0 chains rewritten.
     """
     if not cse:
         return 0
-    n_rewrites = 0
-    instrs = bb.instructions
-    i = 0
-    while i < len(instrs):
-        cand = instrs[i]
-        # Look for `mul.lo.u64 %M2, %M1, K2`.
-        if cand.op != "mul" or not _has_lo_modifier(cand) or not _is_int64_typed(cand):
-            i += 1
-            continue
-        if cand.mods or len(cand.srcs or []) != 2:
-            i += 1
-            continue
-        if not isinstance(cand.dest, RegOp) or isinstance(cand.dest, VectorRegOp):
-            i += 1
-            continue
-        m2_name = cand.dest.name
-        m1_op = cand.srcs[0]
-        if not isinstance(m1_op, RegOp) or isinstance(m1_op, VectorRegOp):
-            i += 1
-            continue
-        # %M1 must be defined by `mul.lo.u64 %M1, %X, K1` (unpredicated).
-        m1_def = def_instr.get(m1_op.name)
-        if (m1_def is None or m1_def.op != "mul" or m1_def.pred is not None
-                or not _has_lo_modifier(m1_def) or not _is_int64_typed(m1_def)
-                or len(m1_def.srcs or []) != 2):
-            i += 1
-            continue
-        x_op = m1_def.srcs[0]
-        if not isinstance(x_op, RegOp) or isinstance(x_op, VectorRegOp):
-            i += 1
-            continue
-        k1 = _resolve_u64_imm(m1_def.srcs[1], def_instr, def_count, use_count)
-        if k1 is None:
-            i += 1
-            continue
-        K1, _ = k1
-        if K1 == 0:
-            i += 1
-            continue
-        # Resolve K2 (slot-0 mul's K2 — the imm to %M2 = %M1 * K2).
-        chain_pred_tuple = (cand.pred, cand.neg)
-        k2_raw = _resolve_u64_imm(cand.srcs[1], def_instr, def_count, use_count,
-                                    allow_pred=chain_pred_tuple)
-        if k2_raw is None:
-            i += 1
-            continue
-        K2, k2_dead = k2_raw
-        if K2 == 0:
-            i += 1
-            continue
-        full_product = K1 * K2
-        if full_product != (full_product & 0xFFFFFFFFFFFFFFFF):
-            i += 1
-            continue
-        K_combined = full_product & 0xFFFFFFFFFFFFFFFF
-        if K_combined == 0 or (K_combined >> 32) != 0:
-            i += 1
-            continue
-        # %M2 must be single-defined and single-used.
-        if def_count.get(m2_name, 0) != 1 or use_count.get(m2_name, 0) != 1:
-            i += 1
-            continue
-        # Find consumer add `add.u64 %F, %B, %M2` directly after.
-        if i + 1 >= len(instrs):
-            i += 1
-            continue
-        consumer_add = instrs[i + 1]
-        cm = _is_consumer_add(consumer_add, m2_name)
-        if cm is None or not _pred_match(consumer_add, cand):
-            i += 1
-            continue
-        f_name, b_name = cm
-        if def_count.get(f_name, 0) != 1 or use_count.get(f_name, 0) != 1:
-            i += 1
-            continue
-        # Find store directly after consumer add.
-        if i + 2 >= len(instrs):
-            i += 1
-            continue
-        store_inst = instrs[i + 2]
-        if (not _is_global_store_of(store_inst, f_name)
-                or not _pred_match(store_inst, cand)):
-            i += 1
-            continue
-        store_memop = store_inst.srcs[0]
-        if not isinstance(store_memop, MemOp) or store_memop.offset != 0:
-            i += 1
-            continue
-        # CSE lookup.
-        cse_key = (x_op.name, K_combined, b_name, cand.pred, cand.neg)
-        cached = cse.get(cse_key)
-        if cached is None:
-            i += 1
-            continue
-        m_shared, f_shared = cached
-        # Rebase store on %F_shared (offset stays 0).
-        store_inst.srcs[0] = MemOp(base=f_shared, offset=0)
-        # Drop the slot-0 mul, consumer add, and any dead K2 mov.
-        dead_inst_ids = {id(cand), id(consumer_add)}
-        if k2_dead is not None and k2_dead is not cand:
-            dead_inst_ids.add(id(k2_dead))
-        bb.instructions = [inst for inst in instrs if id(inst) not in dead_inst_ids]
-        instrs = bb.instructions
-        n_rewrites += 1
-        # Re-walk maps to keep them consistent.
-        def_count, use_count, def_instr = _walk_def_use_counts(fn)
-        # Don't increment i; the next instruction has shifted up.
-    return n_rewrites
+    n = 0
+    for cse_key in list(cse.keys()):
+        added = _hoist_rebase_one_cse_entry(fn, bb, cse_key, cse[cse_key],
+                                              def_count, use_count, def_instr)
+        if added:
+            n += added
+            def_count, use_count, def_instr = _walk_def_use_counts(fn)
+    return n
 
 
 def run_function(fn: Function) -> int:
@@ -753,21 +924,21 @@ def run_function(fn: Function) -> int:
     for bb in fn.blocks:
         # Pass A: leading-add chains; populates CSE within `bb` scope.
         # Pass A's shared mul/base-add are inserted at the position of
-        # the FIRST chain that triggers them; chains physically AFTER
-        # that position can reuse via CSE, but earlier chains (e.g. a
-        # slot-0-style `mul-add-st` ahead of any leading-add chain)
-        # CANNOT be rebased on the cached %F_shared without producing
-        # a use-before-def violation.  We therefore restrict the pass
-        # to leading-add chains only.  Slot-0 still benefits from the
-        # existing Phase 19v2 IMAD.WIDE-imm fuse (its mul-add already
-        # collapses to one instruction); the extra savings from also
-        # rebasing slot-0 onto the shared %F is left to a future pass
-        # that hoists the shared definition above the entire chain.
+        # the FIRST chain that triggers them.  Slot-0 chains that
+        # physically precede that position cannot be rebased without
+        # hoisting; Phase 24's pass below handles the hoist + rebase.
         bb_cse: dict[tuple, tuple[str, str]] = {}
         n = _try_rewrite_block_with_cse(fn, bb, bb_cse,
                                         def_count, use_count, def_instr)
         if n:
             total += n
+            def_count, use_count, def_instr = _walk_def_use_counts(fn)
+        # Phase 24: hoist + rebase slot-0 chains using the CSE entries
+        # populated by Pass A above.
+        n2 = _try_slot0_hoist_rebase_block(fn, bb, bb_cse,
+                                            def_count, use_count, def_instr)
+        if n2:
+            total += n2
             def_count, use_count, def_instr = _walk_def_use_counts(fn)
     return total
 

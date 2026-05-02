@@ -874,6 +874,7 @@ def compile_function(fn: Function, verbose: bool = False,
     # free body (no atomics / barriers / fences) plus tight trip-count
     # and body-size budgets to avoid regressions.
     from ptx.passes.unroll              import run_function as _unroll_run
+    from ptx.passes.imm_propagate       import run_function as _imm_propagate_run
     from ptx.passes.load_cse             import run_function as _load_cse_run
     from ptx.passes.add3_chain_reduce   import run_function as _add3_chain_reduce_run
     from ptx.passes.mul3_chain_reduce   import run_function as _mul3_chain_reduce_run
@@ -898,6 +899,7 @@ def compile_function(fn: Function, verbose: bool = False,
     _disabled.discard("")
     _ptx_passes = [
         ("unroll",                  _unroll_run),
+        ("imm_propagate",           _imm_propagate_run),
         ("load_cse",                _load_cse_run),
         ("add3_chain_reduce",       _add3_chain_reduce_run),
         ("mul3_chain_reduce",       _mul3_chain_reduce_run),

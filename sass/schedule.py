@@ -668,6 +668,18 @@ def _enforce_gpr_latency(instrs: list[SassInstr]) -> list[SassInstr]:
                 (0x810, 0x812),  # IADD3.IMM     -> LOP3.IMM (chained add+mask)
                 (0x810, 0x984),  # IADD3.IMM     -> LDS      (offset+shared load)
                 (0x810, 0x20c),  # IADD3.IMM     -> ISETP.RR (Phase 4 PASS)
+                # Phase 12 (shf_fwd_probes/REPORT.md): SHF.L.U32.HI consumer
+                # pairs introduced by the rotate32 isel pass (commit 328b08).
+                # Same scoreboard-sync evidence basis as Phase 6: each pair
+                # probed nat=PASS at gap=0 with consumer wdep=0x3e (the
+                # configuration our encoder emits, byte-verified across all
+                # instances of these pairs in merkle_hash_leaves).  The
+                # (0x210, 0x819) entry alone collapses 627 NOPs (318 in
+                # :single + 309 in :quad) introduced by Phase 11.
+                (0x210, 0x819),  # IADD3.RRR     -> SHF.L.U32.HI (merkle hot)
+                (0x212, 0x819),  # LOP3.LUT R-R-R -> SHF.L.U32.HI
+                (0x210, 0x212),  # IADD3.RRR     -> LOP3.LUT R-R-R
+                (0x819, 0x212),  # SHF.L.U32.HI  -> LOP3.LUT R-R-R (prod-only PASS)
             }
             if (opc_i, opc_j) in _SCHED_FORWARDING_SAFE:
                 i += 1

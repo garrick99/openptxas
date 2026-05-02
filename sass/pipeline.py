@@ -890,6 +890,7 @@ def compile_function(fn: Function, verbose: bool = False,
     from ptx.passes.repeated_add_reduce import run_function as _repeated_add_reduce_run
     from ptx.passes.dead_self_update_dce import run_function as _dead_self_update_dce_run
     from ptx.passes.rotate32             import run_function as _rotate32_run
+    from ptx.passes.cvta_eliminate       import run_function as _cvta_eliminate_run
 
     # WB-pass-toggle (2026-04-28): allow workbench to disable individual
     # PTX-IR passes via the OPENPTXAS_DISABLE_PASSES env var (comma-
@@ -900,6 +901,12 @@ def compile_function(fn: Function, verbose: bool = False,
     _disabled.discard("")
     _ptx_passes = [
         ("unroll",                  _unroll_run),
+        # Phase 14: cvta-as-identity on SM_120 — drop redundant
+        # cvta.to.<space>/cvta.<space> by aliasing dest to source so
+        # downstream chain-fold passes see the unified pointer.  Must
+        # run before imm_propagate / chain-fold so they can fold across
+        # the eliminated cvta boundary.
+        ("cvta_eliminate",          _cvta_eliminate_run),
         ("imm_propagate",           _imm_propagate_run),
         ("load_cse",                _load_cse_run),
         ("add3_chain_reduce",       _add3_chain_reduce_run),

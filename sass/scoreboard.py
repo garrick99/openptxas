@@ -859,6 +859,29 @@ _FORWARDING_SAFE_PAIRS: set[tuple[int, int]] = {
     (0x210, 0x986),  # IADD3.RRR → STG.E     (Phase 4 PASS, data port; the
                      # address-port wdep on a 64-bit IADD producer is
                      # preserved by the unchanged 0x235/0xc11/0x212 rules.)
+    # ------------------------------------------------------------------
+    # Phase 5 Part B diagnosis (NOT applied — left for Phase 6).
+    # `merkle_hash_leaves:single` still emits 1001 NOPs vs ptxas's 12.
+    # Pre-NOP producer histogram (openptxas SASS):
+    #     LOP3.LUT  → NOP → IADD3      649  (66% of all NOP sites)
+    #     SHF.L.U32 → NOP → LOP3.LUT   320  (32%)
+    #     all others (IADD3, IADD.64, IMAD, ISETP, ...)  ≤ 17 each
+    # ptxas's natural schedule for the same kernel emits 300+ instances
+    # of LOP3→LOP3, 291 of SHF→SHF, 175 of SHF→LOP3, and 19 of LOP3→IADD3
+    # at gap=0.  The candidate fix is two new entries:
+    #     (0x812, 0x210)  LOP3.IMM → IADD3
+    #     (0x819, 0x812)  SHF      → LOP3.IMM
+    # which would collapse ~969 of the 989 extras (≈97%).  These are
+    # NOT added here because Phase 4's empirical strip-test discipline
+    # (consumer wdep=0x3f, rbar=0x00, stall=0 at 128 threads) has not
+    # been run on these specific pairs — and Phase 4 explicitly carved
+    # IADD3 → LOP3/SHF as min_gpr_gap=1 because the symmetric direction
+    # FAILed.  Phase 6 should run the same strip-test for the LOP3→IADD3
+    # and SHF→LOP3 directions before adding them.  Part A's three pairs
+    # (above) only collapse 1 NOP across the full forge corpus on their
+    # own; the merkle bloat is entirely driven by the two SHA-core
+    # patterns above.
+    # ------------------------------------------------------------------
 }
 
 

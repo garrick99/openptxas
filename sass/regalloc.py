@@ -487,6 +487,15 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
                         _r22_misaligned_addr_arith_params.add(_src.name)
 
     ur_param_regs: set[str] = set()
+    # Phase 30: ISETP.U64.R-UR (Class-3 admission) is unsafe in kernels that
+    # also contain VOTE/SHFL/REDUX or BAR.SYNC, mirroring the u32 TE10 guard
+    # at isel.py's `ur_native_ok`.  These kernels must keep u64 setp params
+    # in a GPR so the setp falls back to the R-R path.
+    _has_vote_shfl_bar = any(
+        inst.op in ('vote', 'shfl', 'redux')
+        or (inst.op == 'bar' and 'sync' in inst.types)
+        for inst in all_instrs
+    )
     # PTXAS-R23C: default empty dead-load set for non-SM_120 paths (see below).
     _r23c_dead_ldparam_ids: set[int] = set()
     if sm_version == 120:
@@ -547,7 +556,18 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
                         base_ok = (isinstance(src, MemOp)
                                    and inst.op in ('ld', 'st', 'atom')
                                    and 'global' in inst.types)
-                        if not (arith_ok or base_ok):
+                        # Class 3 (Phase 30): setp.[lt|le|gt|ge|ne].u64 has the
+                        # ISETP.U64.R-UR form, so the param can be sourced from
+                        # the UR pair without GPR materialization.  The setp
+                        # reads the pair as src1 of the comparison; isel routes
+                        # this through encode_isetp_ur(width=64).  EQ falls
+                        # through to NE+invert per existing _INVERT logic.
+                        # Disabled in vote/shfl/bar.sync kernels — same guard
+                        # as u32 TE10's `ur_native_ok` (isel.py).
+                        setp_ok = (inst.op == 'setp'
+                                   and any(t in ('u64', 's64', 'b64') for t in inst.types)
+                                   and not _has_vote_shfl_bar)
+                        if not (arith_ok or base_ok or setp_ok):
                             only_safe = False
                             break
                 if not only_safe:

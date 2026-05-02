@@ -1305,22 +1305,30 @@ def compile_function(fn: Function, verbose: bool = False,
     # if-conversion + deferred params handle this correctly.
     ctx._has_vote = _has_vote_shfl
 
-    # Pre-scan: identify u32 params consumed ONLY by setp.
-    # These don't need a GPR LDC — setp handler emits LDCU.32 directly.
+    # Pre-scan: identify u32/u64 params consumed ONLY by setp.
+    # u32: don't need a GPR LDC — setp handler emits LDCU.32 directly.
+    # u64 (Phase 30): the regalloc routes them to UR via LDCU.64 (Class 3 of
+    #   ur_param_regs analysis), and the setp handler emits ISETP.U64.R-UR.
+    #   Tracked here for symmetry/diagnostics; the load-site routing is
+    #   driven by ur_param_regs in regalloc.
     # Only safe for non-divergent kernels (no if-converted branches).
     _setp_only_params = set()
+    _setp_only_u64_params = set()
     _has_if_converted = any(
         inst.pred and inst.op in ('ld', 'st')
         for bb in fn.blocks for inst in bb.instructions
     )
     if sm_version >= 120 and not _has_if_converted:
-        _ld_param_dests = {}
+        _ld_param_dests = {}            # u32-typed
+        _ld_param_dests_u64 = {}        # u64-typed
         for bb in fn.blocks:
             for inst in bb.instructions:
                 if inst.op == 'ld' and 'param' in inst.types and inst.dest:
                     typ = inst.types[-1] if inst.types else ''
                     if typ in ('u32', 's32', 'b32'):
                         _ld_param_dests[inst.dest.name] = True
+                    elif typ in ('u64', 's64', 'b64'):
+                        _ld_param_dests_u64[inst.dest.name] = True
         for pname in list(_ld_param_dests):
             uses = []
             for bb in fn.blocks:
@@ -1331,11 +1339,26 @@ def compile_function(fn: Function, verbose: bool = False,
                         uses.append(inst.op)
             if uses and all(op == 'setp' for op in uses):
                 _setp_only_params.add(pname)
-        if _setp_only_params:
+        # Phase 30: u64 setp-only params.  Walk all uses, accept the param
+        # only if every use is a setp (mirrors regalloc's Class-3 admission).
+        # UR-liveness: when ALL uses are setp, no instruction materializes the
+        # UR pair to a GPR, so the UR stays live across the setp emit point.
+        for pname in list(_ld_param_dests_u64):
+            uses = []
+            for bb in fn.blocks:
+                for inst in bb.instructions:
+                    if inst.op == 'ld' and inst.dest and inst.dest.name == pname:
+                        continue
+                    if any(getattr(s, 'name', None) == pname for s in (inst.srcs or [])):
+                        uses.append(inst.op)
+            if uses and all(op == 'setp' for op in uses):
+                _setp_only_u64_params.add(pname)
+        if _setp_only_params or _setp_only_u64_params:
             ctx._setp_only_params = _setp_only_params
+            ctx._setp_only_u64_params = _setp_only_u64_params
             # TE10: count how many setp instructions use each param
             _setp_use_count = {}
-            for pname in _setp_only_params:
+            for pname in _setp_only_params | _setp_only_u64_params:
                 cnt = 0
                 for bb in fn.blocks:
                     for inst in bb.instructions:

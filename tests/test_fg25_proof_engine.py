@@ -194,8 +194,11 @@ _EXPECTED_COUNTS = {
     # (LDC.64 direct) on kernels where the param register is redefined
     # later.  That adds one MEMORY_SCOREBOARD_SAFE edge for the new
     # LDC.64 → consumer chain and shifts one UR_MEMORY_* edge.
-    "min_store_guarded":     (5, 0, 0, 0, 0, 3, 0, 0, 2, 0, 0, 0, 0),  # P20: param LDCU.64→LDC.64
-    "probe_fresh":           (5, 0, 0, 0, 0, 3, 0, 0, 2, 0, 0, 0, 0),  # P20: MOV R,UR edge eliminated
+    # Phase 30 drift: cvt.u64.u32 hi-zero swapped from IADD3 (writes P0)
+    # to MOV-imm (no P0 write).  The phantom scoreboard edge from the
+    # IADD3 P0 write is gone, dropping total + MEMORY_SCOREBOARD_SAFE by 1.
+    "min_store_guarded":     (4, 0, 0, 0, 0, 2, 0, 0, 2, 0, 0, 0, 0),  # P30: cvt hi-zero IADD3→MOV
+    "probe_fresh":           (4, 0, 0, 0, 0, 2, 0, 0, 2, 0, 0, 0, 0),  # P30: cvt hi-zero IADD3→MOV
     "reduce_sum":            (19, 5, 6, 0, 0, 3, 0, 0, 4, 0, 1, 0, 0),  # TE12: 0xc11 now ALU
     # edge_87 drift: 32-bit IADD (opcode 0x235, b9=0x00) emitted for
     # add.u32/sub.u32 reg+reg via encode_iadd; 9 NOPs removed because
@@ -206,12 +209,13 @@ _EXPECTED_COUNTS = {
     # P20: fg21:k_* — promoting the base param drops one MOV R,UR edge
     # (total 6→5) and shifts the address-arithmetic consumer back to
     # MEMORY_SCOREBOARD_SAFE.  UR_MEMORY drops from 3 to 1.
-    "fg21:k_ge":             (5, 0, 1, 0, 0, 3, 0, 0, 1, 0, 0, 0, 0),  # P20: LDC.64 promotion
-    "fg21:k_lt":             (5, 0, 1, 0, 0, 3, 0, 0, 1, 0, 0, 0, 0),  # P20: LDC.64 promotion
-    "fg21:k_gt":             (5, 0, 1, 0, 0, 3, 0, 0, 1, 0, 0, 0, 0),  # P20: LDC.64 promotion
-    "fg21:k_le":             (5, 0, 1, 0, 0, 3, 0, 0, 1, 0, 0, 0, 0),  # P20: LDC.64 promotion
-    "fg21:k_eq":             (5, 0, 1, 0, 0, 3, 0, 0, 1, 0, 0, 0, 0),  # P20: LDC.64 promotion
-    "fg21:k_ne":             (5, 0, 1, 0, 0, 3, 0, 0, 1, 0, 0, 0, 0),  # P20: LDC.64 promotion
+    # P30: same cvt hi-zero IADD3→MOV drift as min_store_guarded above.
+    "fg21:k_ge":             (4, 0, 1, 0, 0, 2, 0, 0, 1, 0, 0, 0, 0),  # P30: cvt hi-zero IADD3→MOV
+    "fg21:k_lt":             (4, 0, 1, 0, 0, 2, 0, 0, 1, 0, 0, 0, 0),  # P30: cvt hi-zero IADD3→MOV
+    "fg21:k_gt":             (4, 0, 1, 0, 0, 2, 0, 0, 1, 0, 0, 0, 0),  # P30: cvt hi-zero IADD3→MOV
+    "fg21:k_le":             (4, 0, 1, 0, 0, 2, 0, 0, 1, 0, 0, 0, 0),  # P30: cvt hi-zero IADD3→MOV
+    "fg21:k_eq":             (4, 0, 1, 0, 0, 2, 0, 0, 1, 0, 0, 0, 0),  # P30: cvt hi-zero IADD3→MOV
+    "fg21:k_ne":             (4, 0, 1, 0, 0, 2, 0, 0, 1, 0, 0, 0, 0),  # P30: cvt hi-zero IADD3→MOV
 }
 
 

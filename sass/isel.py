@@ -5210,8 +5210,12 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 if not hasattr(ctx, '_zero_regs'):
                                     ctx._zero_regs = set()
                                 ctx._zero_regs.add(d_lo+1)
+                                # Phase 30 Part C: zero-ext via MOV (0x802) not
+                                # IADD3 (0x810).  ptxas emits MOV R_hi, RZ for
+                                # cvt.u64.u32 hi-zero; this is also strictly
+                                # safer (no P0 clobber).
                                 output.append(SassInstr(
-                                    encode_iadd3(d_lo+1, RZ, RZ, RZ),
+                                    encode_mov_imm(d_lo+1, 0),
                                     f'MOV R{d_lo+1}, RZ  // cvt.64.32 hi=0 (CSE)'))
                                 # Record for IMAD.WIDE fusion (CSE path)
                                 if not hasattr(ctx, '_cvt_src_map'):
@@ -5230,7 +5234,8 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             if d_lo != s_r:
                                 output.append(SassInstr(encode_iadd3(d_lo, s_r, RZ, RZ),
                                                         f'MOV R{d_lo}, R{s_r}  // cvt.64.32 lo'))
-                            output.append(SassInstr(encode_iadd3(d_lo+1, RZ, RZ, RZ),
+                            # Phase 30 Part C: MOV (0x802) instead of IADD3 (0x810).
+                            output.append(SassInstr(encode_mov_imm(d_lo+1, 0),
                                                     f'MOV R{d_lo+1}, RZ  // cvt.64.32 hi=0'))
                         elif _is_64_dst and any(t == 's32' for t in instr.types[1:]):
                             # Sign-extend s32 → s64/u64/b64
@@ -5412,7 +5417,8 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                         encode_shf_r_s32_hi(d_lo+1, a_r, 31),
                                         f'SHF.R.S32.HI R{d_lo+1}, RZ, 31, R{a_r}  // cvt.s64.s32 sign'))
                                 else:
-                                    output.append(SassInstr(encode_iadd3(d_lo+1, RZ, RZ, RZ),
+                                    # Phase 30 Part C: zero-ext via MOV (0x802) not IADD3 (0x810).
+                                    output.append(SassInstr(encode_mov_imm(d_lo+1, 0),
                                                             f'MOV R{d_lo+1}, RZ  // cvt.{_dst_t}.{_src_t} zero-ext'))
                             else:
                                 # Unsupported cvt type combo — no encoder available.
@@ -5487,6 +5493,12 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         ar = ctx.ra.r32(a.name)
                         is_f64  = 'f64' in instr.types
                         is_float = is_f64 or 'f32' in instr.types
+                        # Phase 30: detect 64-bit integer setp so the integer
+                        # path can route through ISETP.U64.R-UR when src1 is a
+                        # UR-bound u64 param.  ar already maps to the lo half
+                        # (regalloc gives one int slot per 64-bit name and the
+                        # ISETP U64 form reads it as the R_lo:R_hi pair).
+                        is_u64 = any(t in ('u64', 's64', 'b64') for t in instr.types)
                         cmp_name = next((t for t in instr.types if t in ('lt','le','gt','ge','eq','ne')), 'ge')
                         # FORGE03: derive signedness from PTX type tag.  u8/u16/u32/u64
                         # require unsigned ISETP (byte9 bit 0x02 = 0).  Default-signed
@@ -5747,14 +5759,19 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                         # Value already in GPR (from LDCU.64 + MOV).
                                         br = ctx.ra.r32(b.name)
                                         emit_pd = pd
+                                        _w_lbl = 'U64' if is_u64 else 'U32'
                                         output.append(SassInstr(
                                             encode_isetp(emit_pd, ar, br, cmp=isetp_cmp, signed=_is_signed_setp),
-                                            f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, R{br}, PT  // vote-safe GPR'))
+                                            f'ISETP.{cmp_name.upper()}.{_w_lbl}.AND P{emit_pd}, PT, R{ar}, R{br}, PT  // vote-safe GPR'))
                                     else:
                                         emit_pd = pd
+                                        # Phase 30: u64 setp against UR-bound u64
+                                        # param uses ISETP.U64.R-UR (raw[10]=0xf1).
+                                        _w = 64 if is_u64 else 32
+                                        _w_lbl = 'U64' if is_u64 else 'U32'
                                         output.append(SassInstr(
-                                            encode_isetp_ur(emit_pd, ar, b_ur_idx, cmp=isetp_cmp),
-                                            f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, UR{b_ur_idx}, PT'))
+                                            encode_isetp_ur(emit_pd, ar, b_ur_idx, cmp=isetp_cmp, width=_w),
+                                            f'ISETP.{cmp_name.upper()}.{_w_lbl}.AND P{emit_pd}, PT, R{ar}, UR{b_ur_idx}, PT'))
                                 elif b_param_off is not None and isetp_cmp in (ISETP_GE, ISETP_GT, ISETP_LE, ISETP_LT, ISETP_NE):
                                     # SM_120 rule: LDCU.32 in the body poisons IADD.64-UR.
                                     # Always use GPR R-R path. The param value was loaded

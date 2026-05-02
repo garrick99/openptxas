@@ -842,7 +842,8 @@ def encode_isetp_ge_and(pred_dest: int, src_reg: int, ur_src: int,
 
 
 def encode_isetp_ur(pred_dest: int, src_reg: int, ur_src: int,
-                    cmp: int = 0x06, ctrl: int = 0) -> bytes:  # 0x06 = ISETP_GE
+                    cmp: int = 0x06, ctrl: int = 0,
+                    width: int = 32) -> bytes:  # 0x06 = ISETP_GE
     """
     Encode ISETP.<cmp>.U32.AND pred_dest, PT, src_reg, ur_src, PT (R-UR variant).
 
@@ -862,11 +863,16 @@ def encode_isetp_ur(pred_dest: int, src_reg: int, ur_src: int,
       cmp=3 (LE)  — never (PTXAS lowers setp.le as ISETP.GT + negate)
       cmp=2 (EQ), cmp=5 (NE) — fall through to other paths in isel
 
+    Args:
+      width: 32 (default, U32 form) or 64 (U64 form).  Phase 28 found the
+        U64 form differs by a single bit: raw[10] = 0xf1 vs 0xf0.  All
+        other byte positions are identical.
+
     Ground truth (GE, R-odd, ctrl=0x17ed):
         encode_isetp_ur(0, 13, 5) -> bytes.fromhex('0c7c000d050000007062f00b00da2f00')
         encode_isetp_ur(0, 9, 5)  -> bytes.fromhex('0c7c0009050000007062f00b00da2f00')
-    Ground truth (GT, R-even, ctrl=0x17ed):
-        encode_isetp_ur(0, 2, 6, cmp=4) ->
+    Ground truth (GT, R-even, U64, ctrl=0x17ed):
+        encode_isetp_ur(0, 2, 6, cmp=4, width=64) ->
             bytes.fromhex('0c7c0002060000007040f10b00dc2f00')
             (matches PTXAS for setp.gt.u64 R2, UR6)
     """
@@ -877,10 +883,11 @@ def encode_isetp_ur(pred_dest: int, src_reg: int, ur_src: int,
     # ground truth (FG-2.1) — src_reg oddness does NOT set bit 1.
     b9_val = (cmp & 0xF) << 4
     b8_val = 0x70
+    b10_val = 0xf1 if width == 64 else 0xf0
     return _build(0x0c, 0x7c,
                   b2=pred_dest & 0xFF, b3=src_reg, b4=ur_src & 0xFF,
                   b8=b8_val,
-                  b9=b9_val, b10=0xf0, b11=0x0b,
+                  b9=b9_val, b10=b10_val, b11=0x0b,
                   ctrl=ctrl)
 
 

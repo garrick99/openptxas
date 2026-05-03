@@ -12,6 +12,7 @@ from sass.encoding.sm_120_opcodes import (
     encode_sel_64,
     encode_shf_l_u32_hi_var, encode_shf_l_w_u32_hi_var, encode_shf_l_w_u32_var,
     encode_cs2ur,
+    encode_lea_hi_x,
 )
 
 
@@ -757,6 +758,64 @@ def test_cs2ur_distinct_from_cs2r():
     assert raw_r[0]  == 0x05
     assert raw_ur[1] == 0x78
     assert raw_r[1]  == 0x78
+
+
+# --- LEA.HI.X (newly landed; ground truth from ptxas 13.2.78 sm_120) ---
+
+# Probe ptxas reproducer: see _probe_landing/probe_lea_hi_preds.ptx.
+# Ground truth (operand bytes 0..12 only):
+#   LEA.HI.X R7,  R0,  R12, R11, 0x1, P0 → 11 72 07 00 0c 00 00 00 0b 0c 0f 00 00
+#   LEA.HI.X R9,  R13, R16, R14, 0x2, P1 → 11 72 09 0d 10 00 00 00 0e 14 8f 00 00
+#   LEA.HI.X R11, R17, R18, R3,  0x3, P2 → 11 72 0b 11 12 00 00 00 03 1c 0f 01 00
+
+def test_lea_hi_x_byte_exact_p0():
+    """First sample (scale=1, P0)."""
+    raw = encode_lea_hi_x(dest=7, src_a=0, src_b=12, src_c=11, scale=1, p_in=0)
+    expected = bytes.fromhex('1172070000000000000c0f0000'.replace(' ', ''))  # bytes 0..12
+    # Wait — actually byte[4]=0x0c (R12). Let me reconstruct properly.
+    # Ground truth: 11 72 07 00 0c 00 00 00 0b 0c 0f 00 00
+    expected = bytes([0x11, 0x72, 0x07, 0x00, 0x0c, 0x00, 0x00, 0x00,
+                      0x0b, 0x0c, 0x0f, 0x00, 0x00])
+    assert raw[0:13] == expected, (
+        f"LEA.HI.X scale=1 P0 byte mismatch:\n"
+        f"  got: {raw[0:13].hex()}\n  exp: {expected.hex()}"
+    )
+
+def test_lea_hi_x_byte_exact_p1():
+    """Second sample (scale=2, P1)."""
+    raw = encode_lea_hi_x(dest=9, src_a=13, src_b=16, src_c=14, scale=2, p_in=1)
+    expected = bytes([0x11, 0x72, 0x09, 0x0d, 0x10, 0x00, 0x00, 0x00,
+                      0x0e, 0x14, 0x8f, 0x00, 0x00])
+    assert raw[0:13] == expected, (
+        f"LEA.HI.X scale=2 P1 byte mismatch:\n"
+        f"  got: {raw[0:13].hex()}\n  exp: {expected.hex()}"
+    )
+
+def test_lea_hi_x_byte_exact_p2():
+    """Third sample (scale=3, P2)."""
+    raw = encode_lea_hi_x(dest=11, src_a=17, src_b=18, src_c=3, scale=3, p_in=2)
+    expected = bytes([0x11, 0x72, 0x0b, 0x11, 0x12, 0x00, 0x00, 0x00,
+                      0x03, 0x1c, 0x0f, 0x01, 0x00])
+    assert raw[0:13] == expected, (
+        f"LEA.HI.X scale=3 P2 byte mismatch:\n"
+        f"  got: {raw[0:13].hex()}\n  exp: {expected.hex()}"
+    )
+
+def test_lea_hi_x_scale_and_hi_flag():
+    """byte[9] bit 2 (= bit 74) is the .HI flag; scale lives at bits 75..77."""
+    for scale in (0, 1, 2, 3, 4):
+        raw = encode_lea_hi_x(dest=4, src_a=2, src_b=6, src_c=255, scale=scale, p_in=0)
+        expected_b9 = ((scale & 0x07) << 3) | 0x04
+        assert raw[9] == expected_b9, f"scale={scale}: got 0x{raw[9]:02x}, exp 0x{expected_b9:02x}"
+
+def test_lea_hi_x_pred_field():
+    """P_in encoding at bits 87..89 (byte[10] bit 7 + byte[11] bits 0..1)."""
+    for p in range(8):
+        raw = encode_lea_hi_x(dest=4, src_a=2, src_b=6, src_c=255, scale=2, p_in=p)
+        # byte[10] LSB nibble always 0x0f for LEA.HI; bit 7 = p&1
+        assert (raw[10] & 0x0f) == 0x0f
+        assert (raw[10] >> 7) & 1 == (p & 1)
+        assert raw[11] & 0x03 == ((p >> 1) & 0x03)
 
 
 if __name__ == '__main__':

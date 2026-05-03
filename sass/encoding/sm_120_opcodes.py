@@ -4131,6 +4131,69 @@ def encode_lea_imm(dest: int, base: int, imm: int, scale: int = 0,
 
 
 # ---------------------------------------------------------------------------
+# LEA.HI.X — high-half address compute (NEWLY ADDED)
+# ---------------------------------------------------------------------------
+# Source: NAK MIT (encoders/ldl_stl_ldc_shf_imad_lea.rs.notes:50-52
+#         "IMAD — sm70_encode.rs:1557 ... bit 73 = signed", and the LEA
+#         family delta in sm120_deltas.rs.notes — bit 80 = .HI).
+# Cross-validated byte-exact against ptxas SM_120 ground truth.
+#
+# Opcode: byte[0]=0x11, byte[1]=0x72 (R-R-R form, same as encode_lea).
+#         The .HI variant is distinguished by byte[9] bit 2 (.HI flag).
+#
+# Ground truth (probe: _probe_landing/probe_lea_hi_preds.ptx):
+#   LEA.HI.X R7,  R0,  R12, R11, 0x1, P0
+#     → 11 72 07 00 0c 00 00 00 0b 0c 0f 00 ...
+#   LEA.HI.X R9,  R13, R16, R14, 0x2, P1
+#     → 11 72 09 0d 10 00 00 00 0e 14 8f 00 ...
+#   LEA.HI.X R11, R17, R18, R3,  0x3, P2
+#     → 11 72 0b 11 12 00 00 00 03 1c 0f 01 ...
+#
+# Field layout:
+#   byte[2]  = dest reg (the high-word destination)
+#   byte[3]  = src A reg  (the operand to be shifted, paired with low LEA)
+#   byte[4]  = src B reg  (the high half added in)
+#   byte[8]  = src C reg  (high-half carry input register, often RZ)
+#   byte[9]  = (scale << 3) | 0x04   — bit 74 = .HI flag, scale at bits 75..77
+#   byte[10] = 0x0f | ((P_in & 0x01) << 7)    — bits 80..83 fixed; bit 87 = P_in[0]
+#   byte[11] = (P_in >> 1) & 0x03             — bits 88..89 = P_in[1..2]
+#   byte[12] = 0
+#
+# PTX lowering: ptxas emits LEA + LEA.HI.X pairs for 64-bit address compute
+# when neither IMAD.WIDE nor a UR-based LEA fits.  The .X (extended) suffix
+# means the high-half consumes a carry-in predicate from the matching LEA.
+
+def encode_lea_hi_x(dest: int, src_a: int, src_b: int, src_c: int = RZ,
+                    scale: int = 0, p_in: int = 0,
+                    ctrl: int = 0) -> bytes:
+    """Encode LEA.HI.X dest, src_a, src_b, src_c, scale, P_in.
+
+    The high-half companion to LEA: takes the carry predicate produced by
+    the paired LEA (low half) and adds the high half of the address.
+
+    Args:
+        dest:   Destination register (high half).
+        src_a:  Source A (the index that was shifted in the low LEA).
+        src_b:  Source B (the high half of the base address).
+        src_c:  Source C (carry-in input register, typically RZ=255).
+        scale:  Shift amount (0..4).
+        p_in:   Carry-in predicate index (0..7).
+        ctrl:   23-bit scheduling control word.
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    p = p_in & 0x07
+    b9 = ((scale & 0x07) << 3) | 0x04           # scale at bits 75..77, .HI at bit 74
+    b10 = 0x0f | ((p & 0x01) << 7)              # fixed nibble + P_in[0]
+    b11 = (p >> 1) & 0x03                       # P_in[1..2]
+    return _build(0x11, 0x72,
+                  b2=dest, b3=src_a, b4=src_b,
+                  b8=src_c & 0xFF,
+                  b9=b9, b10=b10, b11=b11,
+                  ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
 # IMNMX — Integer Min/Max (0x217)
 # ---------------------------------------------------------------------------
 # Computes: dest = min(a, b) or max(a, b) based on predicate/mode.

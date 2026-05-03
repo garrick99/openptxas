@@ -95,8 +95,18 @@ def _is_int_type(t: str) -> bool:
 
 def _allowed_positions(op: str, width: Optional[int]) -> tuple[int, ...]:
     # Phase 7: shl/shr shift count.
-    if op == "shl":   return (1,)
-    if op == "shr":   return (1,)
+    # Phase 44: also accept IMM at the value position (0) for 32-bit
+    # shifts.  When both srcs become IMM, _try_const_eval_to_mov folds
+    # the entire shift to a mov — eliminating the SHF in the const-eval
+    # cascade through Blake2/SHA-style mixing rounds whose chaining
+    # state is fully constant (round-1 G() calls with all-zero message
+    # words and IV-derived a/b/c/d).  Only 32-bit: the 64-bit isel paths
+    # require RegOp at pos 0 and would ISelError on ImmOp; we don't
+    # emit a const-eval cascade through 64-bit shifts in practice.
+    if op == "shl":
+        return (0, 1) if width == 32 else (1,)
+    if op == "shr":
+        return (0, 1) if width == 32 else (1,)
     # Phase 8: add second source — IADD3.IMM lowering, with the
     # scheduler-side NOP gap closed by promoting IADD3.IMM-as-writer
     # pairs in sass/schedule.py's _SCHED_FORWARDING_SAFE.
@@ -168,7 +178,7 @@ def _is_simple_mov_imm(inst: Instruction) -> Optional[tuple[str, int, int]]:
     return (inst.dest.name, src.value, width)
 
 
-_CONST_EVAL_OPS = ("add", "sub", "and", "or", "xor")
+_CONST_EVAL_OPS = ("add", "sub", "and", "or", "xor", "shl", "shr")
 
 
 def _try_const_eval_to_mov(inst: Instruction) -> bool:
@@ -217,6 +227,24 @@ def _try_const_eval_to_mov(inst: Instruction) -> bool:
         result = a | b
     elif op == "xor":
         result = a ^ b
+    elif op == "shl":
+        # PTX: shift counts >= width clamp to 0.  b is the shift count
+        # (PTX-spec u32, but masked above to data width — fine since
+        # data widths are <= 32 in our pos-0-allowed cases).
+        if b >= width:
+            result = 0
+        else:
+            result = (a << b) & mask
+    elif op == "shr":
+        # Skip arithmetic (signed) right shift — sign-extension semantics
+        # complicate const-eval and the merkle / Blake2 use case is
+        # unsigned (shr.u32, shr.b32).
+        if inst.types[0].startswith("s"):
+            return False
+        if b >= width:
+            result = 0
+        else:
+            result = (a >> b) & mask
     else:
         return False
     inst.op = "mov"
@@ -232,8 +260,12 @@ def run_function(fn: Function) -> int:
     # IMM`, which _try_const_eval_to_mov rewrites as `mov %d, IMM_diff`.
     # That new mov may then be foldable into a downstream consumer
     # (e.g. shl-pos-1 shift count), so we re-iterate until no further
-    # folds occur.  Bounded by 4 iterations to cap pathological inputs.
-    for _ in range(4):
+    # folds occur.  Phase 44 raises the cap to 32: const-eval through
+    # Blake2/SHA-style mixing chains (add → xor → shr/shl → or → add ...)
+    # needs roughly one iteration per chain link, and merkle_single's
+    # round-1 fully-constant G() calls have ~12-16 link chains.  Bounded
+    # to cap pathological inputs.
+    for _ in range(32):
         n_subs = _propagate_once(fn)
         if n_subs == 0:
             break

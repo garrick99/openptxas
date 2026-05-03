@@ -675,3 +675,109 @@ def test_predicated_consumer_const_eval_skipped():
     assert len(xors) == 1, "predicated xor must remain (const-eval skipped)"
     # Both srcs may be ImmOp after fold, but op stays as xor (not mov).
     assert xors[0].pred is not None
+
+
+# Phase 44: shr/shl const-eval through fully-constant chains.
+ROTATE_CONST_PTX = """\
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry k(.param .u64 a)
+{
+    .reg .b64 %rd<5>;
+    .reg .u32 %r<10>;
+    ld.param.u64 %rd1, [a];
+    mov.u32 %r1, 0xdeadbeef;
+    mov.u32 %r2, 16;
+    mov.u32 %r3, 16;
+    shr.u32 %r4, %r1, %r2;
+    shl.b32 %r5, %r1, %r3;
+    or.b32  %r6, %r4, %r5;
+    st.global.u32 [%rd1], %r6;
+    ret;
+}
+"""
+
+
+def test_rot_const_chain_collapses_to_single_mov():
+    """Phase 44: a fully-constant rotate triple
+       `mov K1; mov 16; mov 16; shr; shl; or`
+    folds end-to-end into a single `mov %dst, rot(K1, 16)`."""
+    mod = parse(ROTATE_CONST_PTX)
+    fn = mod.functions[0]
+    run_function(fn)
+    # No shr/shl/or remains — the entire chain is gone.
+    assert not list(_find(fn, "shr", "u32"))
+    assert not list(_find(fn, "shl", "b32"))
+    assert not list(_find(fn, "or", "b32"))
+    # The final %r6 mov holds rot(0xdeadbeef, 16) = 0xbeefdead.
+    movs_to_r6 = [i for i in _all_instrs(fn)
+                  if i.op == "mov" and isinstance(i.dest, RegOp)
+                  and i.dest.name == "%r6"]
+    assert len(movs_to_r6) == 1
+    assert isinstance(movs_to_r6[0].srcs[0], ImmOp)
+    assert movs_to_r6[0].srcs[0].value == 0xbeefdead
+
+
+SHR_VAR_INPUT_PTX = """\
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry k(.param .u64 a)
+{
+    .reg .b64 %rd<5>;
+    .reg .u32 %r<5>;
+    ld.param.u64 %rd1, [a];
+    ld.global.u32 %r1, [%rd1];
+    mov.u32 %r2, 16;
+    shr.u32 %r3, %r1, %r2;
+    st.global.u32 [%rd1], %r3;
+    ret;
+}
+"""
+
+
+def test_shr_with_runtime_value_keeps_shr():
+    """Phase 44: pos-0 fold only fires for IMM at value position.  When
+    the value is a runtime register (here ld.global), shr stays."""
+    mod = parse(SHR_VAR_INPUT_PTX)
+    fn = mod.functions[0]
+    run_function(fn)
+    shrs = list(_find(fn, "shr", "u32"))
+    assert len(shrs) == 1, "shr must remain when value (pos 0) is a runtime register"
+    # Pos-1 (shift count) is folded as IMM (preserved Phase 7 behavior).
+    assert isinstance(shrs[0].srcs[1], ImmOp)
+    assert shrs[0].srcs[1].value == 16
+
+
+SHR_LARGE_SHIFT_PTX = """\
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry k(.param .u64 a)
+{
+    .reg .b64 %rd<5>;
+    .reg .u32 %r<5>;
+    ld.param.u64 %rd1, [a];
+    mov.u32 %r1, 0xdeadbeef;
+    mov.u32 %r2, 64;
+    shr.u32 %r3, %r1, %r2;
+    st.global.u32 [%rd1], %r3;
+    ret;
+}
+"""
+
+
+def test_shr_const_eval_clamps_oversize_shift_to_zero():
+    """Phase 44: PTX shr.u32 with shift >= width produces 0 (clamp,
+    not modulo)."""
+    mod = parse(SHR_LARGE_SHIFT_PTX)
+    fn = mod.functions[0]
+    run_function(fn)
+    assert not list(_find(fn, "shr", "u32"))
+    movs_to_r3 = [i for i in _all_instrs(fn)
+                  if i.op == "mov" and isinstance(i.dest, RegOp)
+                  and i.dest.name == "%r3"]
+    assert len(movs_to_r3) == 1
+    assert isinstance(movs_to_r3[0].srcs[0], ImmOp)
+    assert movs_to_r3[0].srcs[0].value == 0

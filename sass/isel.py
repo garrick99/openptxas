@@ -3736,20 +3736,43 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             f'IADD3 R{d}, R{a}, R{b}, R{c}  // iadd3.{typ}'))
 
                 elif op == 'xor3' and typ in ('b32', 'u32', 's32'):
-                    # Phase 42: synthetic 3-input XOR emitted by
+                    # Phase 42/43: synthetic 3-input XOR emitted by
                     # xor3_chain_reduce.py to fuse merkle-style xor
                     # chains (`xor %tmp, %a, %b; xor %dst, %tmp, %c`)
-                    # into a single LOP3.LUT R-R-R with the 3-input
-                    # XOR truth table.  All three sources are register
-                    # operands by construction of the pass.
+                    # into a single LOP3 with the 3-input XOR truth
+                    # table.  At most one of the three srcs may be an
+                    # ImmOp (Phase 43); the rest are RegOps.
                     # LUT 0x96 = a XOR b XOR c, verified against ptxas
-                    # emission (xor3_probe 2026-05-03).
+                    # emission for both the R-R-R form (Phase 42 probe
+                    # 2026-05-03) and the R-IMM-R form (Phase 43 probe
+                    # 2026-05-03: ptxas emits LOP3.LUT R, R, IMM, R,
+                    # 0x96, !PT for `(a^IMM)^b` chains).
                     d = ctx.ra.r32(instr.dest.name)
-                    a = ctx.ra.r32(instr.srcs[0].name)
-                    b = ctx.ra.r32(instr.srcs[1].name)
-                    c = ctx.ra.r32(instr.srcs[2].name)
-                    _emit_lop3(output, ctx, d, a, b, c, 0x96,
-                               f'LOP3.LUT R{d}, R{a}, R{b}, R{c}, 0x96  // xor3.{typ}')
+                    imm_idx = next((k for k, s in enumerate(instr.srcs)
+                                    if isinstance(s, ImmOp)), None)
+                    if imm_idx is None:
+                        a = ctx.ra.r32(instr.srcs[0].name)
+                        b = ctx.ra.r32(instr.srcs[1].name)
+                        c = ctx.ra.r32(instr.srcs[2].name)
+                        _emit_lop3(output, ctx, d, a, b, c, 0x96,
+                                   f'LOP3.LUT R{d}, R{a}, R{b}, R{c}, 0x96  // xor3.{typ}')
+                    else:
+                        # One ImmOp + two RegOps.  XOR is symmetric in
+                        # all three operands, so order doesn't change the
+                        # result; place the IMM at LOP3.IMM's middle slot
+                        # (between src0 and src2) to match ptxas layout.
+                        imm = instr.srcs[imm_idx].value & 0xFFFFFFFF
+                        regs = [s for s in instr.srcs if isinstance(s, RegOp)]
+                        a = ctx.ra.r32(regs[0].name)
+                        b = ctx.ra.r32(regs[1].name)
+                        # LUT 0x96 (3-input XOR truth table) is correct
+                        # for the LOP3.IMM 3-operand form when src2 != RZ.
+                        # The encoder accepts arbitrary LUT bytes; use
+                        # 0x96 not LOP3_IMM_XOR (= 0x3C, the 2-operand
+                        # form that ignores src2).
+                        output.append(SassInstr(
+                            encode_lop3_imm32(d, a, imm, b, 0x96),
+                            f'LOP3.LUT R{d}, R{a}, 0x{imm:x}, R{b}, 0x96  // xor3.{typ} imm'))
 
                 elif op == 'sub' and typ in ('u32', 's32'):
                     d = ctx.ra.r32(instr.dest.name)

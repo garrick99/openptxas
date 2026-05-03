@@ -90,6 +90,11 @@ class TestMufuSuite:
     def test_sqrt(self, cuda_ctx):
         self._run(cuda_ctx, 'sqrt', [1.0, 4.0, 9.0, 16.0], [1.0, 2.0, 3.0, 4.0], tol=1e-3)
 
+    def test_tanh(self, cuda_ctx):
+        import math
+        inputs = [0.0, 0.5, 1.0, -1.0]
+        self._run(cuda_ctx, 'tanh', inputs, [math.tanh(x) for x in inputs], tol=1e-2)
+
 
 # ============================================================
 # Broader kernel families

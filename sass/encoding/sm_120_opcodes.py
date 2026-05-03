@@ -2416,12 +2416,16 @@ def roundtrip_verify_opcodes(verbose: bool = True) -> bool:
 # Encoding: src in b3 (NOT b4).  dest in b2.  b4=0x00.
 # b9=0x00, b10=0x00, b11=function_id.
 
-MUFU_RCP  = 0x10
-MUFU_SQRT = 0x20
-MUFU_SIN  = 0x04
-MUFU_COS  = 0x00  # distinguished by ctrl context
-MUFU_EX2  = 0x08
-MUFU_LG2  = 0x0c
+MUFU_RCP    = 0x10
+MUFU_SQRT   = 0x20
+MUFU_SIN    = 0x04
+MUFU_COS    = 0x00  # distinguished by ctrl context
+MUFU_EX2    = 0x08
+MUFU_LG2    = 0x0c
+MUFU_RSQ    = 0x14  # reciprocal sqrt
+MUFU_RCP64H = 0x18  # FP64 rcp high-half (paired-op, used by slow-path FP64 div)
+MUFU_RSQ64H = 0x1c  # FP64 rsq high-half (paired-op)
+MUFU_TANH   = 0x24  # hyperbolic tangent (PTX 7.0+, used in transformer kernels)
 
 def encode_mufu(dest: int, src: int, func: int, ctrl: int = 0) -> bytes:
     """Encode MUFU dest, src with function selector.

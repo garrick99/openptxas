@@ -55,6 +55,7 @@ from sass.encoding.sm_120_opcodes import (
     encode_bra, patch_pred,
     encode_fadd, encode_fmul, encode_fmul_imm, encode_ffma, encode_ffma_imm,
     encode_mufu, MUFU_RCP, MUFU_SQRT, MUFU_SIN, MUFU_COS, MUFU_EX2, MUFU_LG2,
+    MUFU_RSQ, MUFU_TANH,
     encode_sel, encode_sel_imm, encode_fsel,
     encode_vimnmx_s32, encode_vimnmx_u32,
     encode_fmnmx,
@@ -7010,12 +7011,16 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             f'MUFU.LG2 R{d}, R{a}'))
 
                 elif op == 'rsqrt' and 'approx' in instr.types and typ == 'f32':
-                    # rsqrt = rcp(sqrt(x)) but MUFU has dedicated RSQ function
-                    MUFU_RSQ = 0x14  # ptxas SM_120 ground truth
                     d = ctx.ra.r32(instr.dest.name)
                     a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
                     output.append(SassInstr(encode_mufu(d, a, MUFU_RSQ),
                                             f'MUFU.RSQ R{d}, R{a}'))
+
+                elif op == 'tanh' and 'approx' in instr.types and typ == 'f32':
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
+                    output.append(SassInstr(encode_mufu(d, a, MUFU_TANH),
+                                            f'MUFU.TANH R{d}, R{a}'))
 
                 elif op == 'div' and typ == 'f32':
                     # Float division: MUFU.RCP + FMUL

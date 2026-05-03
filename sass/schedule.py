@@ -612,7 +612,11 @@ def _enforce_gpr_latency(instrs: list[SassInstr]) -> list[SassInstr]:
         meta_i = _OPCODE_META.get(opc_i)
         # TE21: 0xc11 (IADD3.R-UR) needs min_gpr_gap=1 like 0xc35, but
         # is NOT in _OPCODE_META (avoids global misc counter shift).
-        if meta_i is None and opc_i == 0xc11:
+        # Phase 32 (Fix A): _disc_opcode promotes the UR form to 0x1c11;
+        # also accept that key here so the legacy gap-1 enforcement still
+        # fires.  (No 0x1c11 _OPCODE_META entry — would drift the FG-2.5
+        # proof-engine baselines.)
+        if meta_i is None and opc_i in (0xc11, 0x1c11):
             class _M: min_gpr_gap = 1
             meta_i = _M()
         if meta_i is None or meta_i.min_gpr_gap == 0:
@@ -639,8 +643,23 @@ def _enforce_gpr_latency(instrs: list[SassInstr]) -> list[SassInstr]:
             # kernels).  Promotions need per-kernel ptxas verification.
             _SCHED_FORWARDING_SAFE = {
                 (0xc11, 0x986),  # TE27: IADD3.UR -> STG.E (31 PTXAS instances)
+                # Phase 32 (Fix A): _disc_opcode promotes UR-form 0xc11
+                # to 0x1c11; mirror the pair so the lookup still hits.
+                (0x1c11, 0x986), # TE27 mirror: IADD3.UR -> STG.E (UR-form key)
                 (0x812, 0x812),  # TE28: LOP3 -> LOP3 (13 PTXAS instances)
                 (0x812, 0x824),  # TE28: LOP3 -> IMAD (2 PTXAS instances)
+                # Phase 32 (Fix B): LOP3.RRR -> LOP3.RRR self-chain.
+                # Phase 18 BAILed on this pair — synthetic strip-tests
+                # broke test_qmma_e4m3_zero_inputs.  Phase 31's denvdis
+                # cross-check (_harvest/denvdis/REPORT.md §5) resolved
+                # the contradiction: ptxas marks lop3_lut__RRR_RRR
+                # MIN_WAIT_NEEDED=0 with INSTRUCTION_TYPE=COUPLED_MATH,
+                # so the FXU->FXU 6-cycle RAW is enforced by the
+                # COUPLED_MATH soft-scoreboard (the same mechanism the
+                # neighboring (0x812, 0x812) LOP3.IMM->LOP3.IMM pair
+                # already relies on).  Sibling of (0x212, 0x210) (LOP3
+                # -> IADD3) added in Phase 6.
+                (0x212, 0x212),  # LOP3.RRR -> LOP3.RRR self-chain
                 # Phase 6 (lop3_shf_probes/REPORT.md): scoreboard-sync at
                 # gap=0, validated by per-pair probe natural=PASS with
                 # ptxas-equivalent ctrl-words.  Post-8ca57fe35a (R-R LOP3

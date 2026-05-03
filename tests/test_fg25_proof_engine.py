@@ -315,7 +315,10 @@ def test_inv_l_negative_imad_ru_to_mov_flagged():
     )
     viols = report.violations
     assert len(viols) == 1
-    assert viols[0].writer_opc == 0xc24
+    # Phase 32 (Fix A): _disc_opcode now promotes IMAD.R-UR to the
+    # synthetic 0x1c24 (UR-form, bit 91 = 1).  Accept either key —
+    # both identify the same IMAD.R-UR writer.
+    assert viols[0].writer_opc in (0xc24, 0x1c24)
     assert viols[0].reader_opc == 0x202
     assert 4 in viols[0].regs
 

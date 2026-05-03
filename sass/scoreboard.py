@@ -194,6 +194,24 @@ _OPCODE_META: dict[int, _OpMeta] = {
     # Additional rare opcodes (2026-04-04 batch 2)
     0x3a1: _OpMeta('MATCH',        1, 0x3e, 1),  # warp match (any/all)
     0x95d: _OpMeta('NANOSLEEP',    0, 0x3f, 1),  # thread sleep
+    # Phase 32 (Fix A): 13-bit synthetic UR-form keys for opcodes whose
+    # 12-bit value collides with a bit-91=0 sibling.  `_disc_opcode`
+    # promotes the bit-91=1 UR variants to these 0x1cXX keys so meta
+    # lookups (gap, wdep, misc) and forwarding-pair lookups (below)
+    # disambiguate the two forms.  The bare 0xcXX entries above remain
+    # as the bit-91=0 sibling (currently never emitted by our isel,
+    # but kept to avoid a None-meta crash if it ever appears).  See
+    # _harvest/denvdis/REPORT.md §4.
+    0x1c02: _OpMeta('MOV.UR',     1, 0x3e, 1),  # mirror of 0xc02
+    0x1c0c: _OpMeta('ISETP.RU',   0, 0x3e, 0),  # mirror of 0xc0c
+    # NB: 0x1c11 (IADD3.R-UR, UR-form of 0xc11) intentionally LEFT OUT —
+    # mirroring the bare 0xc11 omission.  The 0xc11 entry was excluded to
+    # avoid global misc-counter shift; the inline `if meta_i is None and
+    # opc_i in (0xc11, 0x1c11)` workaround in schedule.py supplies the
+    # min_gpr_gap=1 gate.  Adding a synthetic entry here would drift the
+    # FG-2.5 proof-engine baselines (test_inv_j_class_counts_stable).
+    0x1c24: _OpMeta('IMAD.RU',    1, 0x3e, 1),  # mirror of 0xc24
+    0x1c35: _OpMeta('IADD.64-UR', 1, 0x3e, 5),  # mirror of 0xc35
 }
 
 
@@ -373,6 +391,20 @@ def _disc_opcode(raw: bytes) -> int:
     if (opc == 0x835 and len(raw) >= 12
             and (raw[9] & 0xfe) == 0x00 and raw[10] == 0x8e and raw[11] == 0x07):
         return 0x1235
+    # Phase 32 (Fix A): 13-bit opcode discrimination per denvdis
+    # `BITS_13_91_91_11_0_opcode` — bit 91 + bits 0..11 form the true
+    # opcode key.  Our 12-bit `_get_opcode` truncates bit 91, conflating
+    # 5 UR-form opcodes (0xc02 MOV.UR, 0xc0c ISETP.RU, 0xc11 IADD3.R-UR,
+    # 0xc24 IMAD.RU, 0xc35 IADD.64-UR) with their bit-91=0 siblings.
+    # Bit 91 = bit 3 of byte 11.  Promote UR-form (bit 91 = 1) to a
+    # synthetic 0x1cXX key so per-form forwarding rules and meta entries
+    # don't collide with the bit-91=0 sibling.  Latent correctness fix —
+    # the bit-91=0 siblings are not currently emitted by our isel, but
+    # the 12-bit truncation made the scoreboard fragile.  See
+    # _harvest/denvdis/REPORT.md §4.
+    if opc in (0xc02, 0xc0c, 0xc11, 0xc24, 0xc35) and len(raw) >= 12:
+        if (raw[11] >> 3) & 1:
+            return opc | 0x1000
     return opc
 
 
@@ -686,6 +718,13 @@ _FORWARDING_SAFE_PAIRS: set[tuple[int, int]] = {
     (0xc35, 0x986),   # IADD.64-UR → STG.E
     (0xc11, 0x986),   # TE21: IADD3.R-UR → STG.E (carry-chain addr → store)
     (0xc11, 0x981),   # TE21: IADD3.R-UR → LDG.E (carry-chain addr → load)
+    # Phase 32 (Fix A): 13-bit synthetic-key mirrors of the UR-form pairs
+    # above.  `_disc_opcode` promotes UR-form (bit-91=1) to 0x1cXX so
+    # the bare 0xcXX entries no longer match these instructions in the
+    # forwarding-pair lookup; mirror each pair to keep behavior intact.
+    (0x1c35, 0x986),  # IADD.64-UR → STG.E (UR-form synthetic-key mirror)
+    (0x1c11, 0x986),  # IADD3.R-UR → STG.E (UR-form synthetic-key mirror)
+    (0x1c11, 0x981),  # IADD3.R-UR → LDG.E (UR-form synthetic-key mirror)
     (0x812, 0x812),   # TE28: LOP3→LOP3 (13 PTXAS gap=0 instances)
     (0x812, 0x824),   # TE28: LOP3→IMAD (2 PTXAS gap=0 instances)
     (0x812, 0x235),   # TPL13: LOP3.IMM → IADD.64 (PTXAS gap=0 in r1_running_xor template at [8]→[9])
@@ -699,6 +738,10 @@ _FORWARDING_SAFE_PAIRS: set[tuple[int, int]] = {
     (0xc11, 0xc11),   # TE21: IADD3.R-UR → IADD3.R-UR (lo → hi carry chain)
     (0xc11, 0x235),   # TE21: IADD3.R-UR → IADD.64
     (0xc02, 0x986),   # MOV.UR     → STG.E
+    # Phase 32 (Fix A): UR-form synthetic-key mirrors.
+    (0x1c11, 0x1c11), # IADD3.R-UR → IADD3.R-UR (UR-form synthetic-key mirror)
+    (0x1c11, 0x235),  # IADD3.R-UR → IADD.64    (UR-form synthetic-key mirror)
+    (0x1c02, 0x986),  # MOV.UR     → STG.E      (UR-form synthetic-key mirror)
     (0x221, 0x986),   # FADD       → STG.E
     (0x235, 0x986),   # IADD.64    → STG.E
     # FG-4.2 additions: GPU-runtime evidence from the FG-4.0
@@ -794,6 +837,8 @@ _FORWARDING_SAFE_PAIRS: set[tuple[int, int]] = {
     # the dependency network; the subsequent IADD3.IMM's rbar
     # covers the forwarding window.
     (0xc35, 0x810),   # IADD.64-UR → IADD3.IMM
+    # Phase 32 (Fix A): UR-form synthetic-key mirror.
+    (0x1c35, 0x810),  # IADD.64-UR → IADD3.IMM (UR-form synthetic-key mirror)
     # P2-5: IMAD family forwarding pairs needed by smem kernels.
     # Evidence: same ALU pipeline class as (0x824, 0x210) which is
     # proven by FG-4.2. All IMAD variants (0x824, 0x825, 0x810, 0x812)
@@ -833,6 +878,7 @@ _FORWARDING_SAFE_PAIRS: set[tuple[int, int]] = {
     (0x1235, 0x245),   # IADD-32 → I2FP/FSEL family (probed)
     (0x1235, 0x20c),   # IADD-32 → ISETP.RR (probed: 1 (R != 0) ✓)
     (0x1235, 0xc0c),   # IADD-32 → ISETP.RU (same scoreboard class)
+    (0x1235, 0x1c0c),  # Phase 32 Fix A: UR-form synthetic-key mirror
     (0x1235, 0x208),   # IADD-32 → FSEL (probed: predicate-select ✓)
     (0x1235, 0x808),   # IADD-32 → FSEL.IMM (same class)
     (0x1235, 0x80a),   # IADD-32 → FSEL.STEP (same class)
@@ -873,6 +919,7 @@ _FORWARDING_SAFE_PAIRS: set[tuple[int, int]] = {
     (0x819, 0x1235),  # SHF     → IADD-32  (mirror of (0x819, 0x235))
     (0x235, 0x1235),  # IADD.64 → IADD-32  (mirror of (0x235, 0x235))
     (0xc11, 0x1235),  # IADD3.R-UR → IADD-32 (mirror of (0xc11, 0x235))
+    (0x1c11, 0x1235), # Phase 32 Fix A: UR-form synthetic-key mirror
     (0x824, 0x1235),  # IMAD    → IADD-32  (IMAD-family pipeline)
     (0xb82, 0x1235),  # S2R     → IADD-32  (mirror of (0xb82, 0x835))
     # ------------------------------------------------------------------

@@ -1293,7 +1293,8 @@ def test_selp_imm_compiles():
     text = elf.section_data('.text.selp_imm_kernel')
     opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
                for off in range(0, len(text), 16)]
-    assert 0x810 in opcodes, f"IADD3_IMM (0x810) not found (predicated MOV for selp)"
+    assert 0x810 in opcodes or 0x802 in opcodes, \
+        f"IADD3_IMM (0x810) or MOV.IMM (0x802) not found (predicated MOV for selp)"
 
 
 TESTP_FINITE_KERNEL = """\
@@ -1328,7 +1329,8 @@ def test_testp_finite_f32_compiles():
     text = elf.section_data('.text.testp_finite_kernel')
     opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
                for off in range(0, len(text), 16)]
-    assert 0x810 in opcodes, "IADD3_IMM (0x810) not found in testp.finite"
+    assert 0x810 in opcodes or 0x802 in opcodes, \
+        "IADD3_IMM (0x810) or MOV.IMM (0x802) not found in testp.finite"
     assert 0x212 in opcodes, "LOP3 (0x212) not found in testp.finite"
     assert 0xc0c in opcodes, "ISETP.R-UR (0xc0c) not found in testp.finite"
     last_real = max(i for i, op in enumerate(opcodes) if op != 0x918)
@@ -1566,7 +1568,8 @@ def test_f64_neg_abs_compiles():
     opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
                for off in range(0, len(text), 16)]
     assert 0x212 in opcodes, f"LOP3 (0x212) not found — neg/abs.f64 lowering missing"
-    assert 0x810 in opcodes, f"IADD3.IMM (0x810) not found — sign mask load missing"
+    assert 0x810 in opcodes or 0x802 in opcodes, \
+        f"IADD3.IMM (0x810) or MOV.IMM (0x802) not found — sign mask load missing"
 
 
 # ---------------------------------------------------------------------------

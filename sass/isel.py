@@ -840,8 +840,7 @@ def _materialize_imm(op: Operand, ctx: 'ISelContext', ra: RegAlloc,
     if isinstance(op, ImmOp):
         val = op.value & 0xFFFFFFFF
         scratch = _alloc_gpr(ctx)
-        # Use IADD3 Rd, RZ, imm, RZ to load a 32-bit immediate
-        output.append(SassInstr(encode_iadd3_imm32(scratch, RZ, val, RZ),
+        output.append(SassInstr(encode_mov_imm(scratch, val),
                                 f'MOV R{scratch}, 0x{val:x}  // materialize imm'))
         return scratch
     raise ISelError(f"Expected register or immediate operand, got {op!r}")
@@ -941,10 +940,10 @@ def _select_mov(instr: Instruction, ra: RegAlloc,
                     ctx._zero_regs = set()
                 ctx._zero_regs.add(d_hi)
             return _apply_pred_byte([
-                SassInstr(encode_iadd3_imm32(d_lo, RZ, lo, RZ),
-                          f'IADD3 R{d_lo}, RZ, 0x{lo:x}, RZ  // {dest.name}.lo = imm'),
-                SassInstr(encode_iadd3_imm32(d_hi, RZ, hi, RZ),
-                          f'IADD3 R{d_hi}, RZ, 0x{hi:x}, RZ  // {dest.name}.hi = imm'),
+                SassInstr(encode_mov_imm(d_lo, lo),
+                          f'MOV R{d_lo}, 0x{lo:x}  // {dest.name}.lo = imm'),
+                SassInstr(encode_mov_imm(d_hi, hi),
+                          f'MOV R{d_hi}, 0x{hi:x}  // {dest.name}.hi = imm'),
             ], instr, ctx)
         # FORGE03: 32-bit MOV from immediate (was: raise ISelError).
         # Forge emits this for `@P mov.u32 %r1, 1024;` clamp patterns.
@@ -966,10 +965,10 @@ def _select_mov(instr: Instruction, ra: RegAlloc,
                 d_lo = ra.lo(dest.name)
                 d_hi = d_lo + 1
                 return _apply_pred_byte([
-                    SassInstr(encode_iadd3_imm32(d_lo, RZ, smem_off, RZ),
-                              f'IADD3 R{d_lo}, RZ, 0x{smem_off:x}, RZ  // smem base lo'),
-                    SassInstr(encode_iadd3_imm32(d_hi, RZ, 0, RZ),
-                              f'IADD3 R{d_hi}, RZ, 0, RZ  // smem base hi'),
+                    SassInstr(encode_mov_imm(d_lo, smem_off),
+                              f'MOV R{d_lo}, 0x{smem_off:x}  // smem base lo'),
+                    SassInstr(encode_mov_imm(d_hi, 0),
+                              f'MOV R{d_hi}, 0  // smem base hi'),
                 ], instr, ctx)
         raise ISelError(f"MOV src must be register: {src!r}")
 
@@ -2417,7 +2416,7 @@ def _select_atom_add_u32(instr: Instruction, ra: RegAlloc,
             if ctx._next_gpr <= addr + 1:
                 ctx._next_gpr = addr + 2
         data = _alloc_gpr(ctx)
-        prefix.append(SassInstr(encode_iadd3_imm32(data, RZ, data_op.value & 0xFFFFFFFF, RZ),
+        prefix.append(SassInstr(encode_mov_imm(data, data_op.value & 0xFFFFFFFF),
                                 f'MOV R{data}, {data_op.value:#x}  // atom data imm'))
     else:
         data = ra.r32(data_op.name)
@@ -2442,8 +2441,8 @@ def _select_atom_generic_u32(instr: Instruction, ra: RegAlloc,
     if isinstance(data_op, ImmOp):
         data = _alloc_gpr(ctx) if ctx else 0
         prefix.append(SassInstr(
-            encode_iadd3_imm32(data, RZ, data_op.value & 0xFFFFFFFF, RZ),
-            f'IADD3 R{data}, RZ, 0x{data_op.value & 0xFFFFFFFF:x}, RZ  // atom.{op_name} imm'))
+            encode_mov_imm(data, data_op.value & 0xFFFFFFFF),
+            f'MOV R{data}, 0x{data_op.value & 0xFFFFFFFF:x}  // atom.{op_name} imm'))
     else:
         data = ra.r32(data_op.name)
     base_name = addr_op.base if addr_op.base.startswith('%') else f'%{addr_op.base}'
@@ -3568,10 +3567,10 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         a_lo = ctx.ra.lo(instr.srcs[0].name)
                         d_lo = ctx.ra.lo(instr.dest.name)
                         t = _alloc_gpr_pair(ctx)
-                        output.append(SassInstr(encode_iadd3_imm32(t, RZ, imm_lo, RZ),
-                                                f'IADD3 R{t}, RZ, 0x{imm_lo:x}, RZ  // sub.{typ} imm_lo'))
-                        output.append(SassInstr(encode_iadd3_imm32(t + 1, RZ, imm_hi, RZ),
-                                                f'IADD3 R{t+1}, RZ, 0x{imm_hi:x}, RZ  // sub.{typ} imm_hi'))
+                        output.append(SassInstr(encode_mov_imm(t, imm_lo),
+                                                f'MOV R{t}, 0x{imm_lo:x}  // sub.{typ} imm_lo'))
+                        output.append(SassInstr(encode_mov_imm(t + 1, imm_hi),
+                                                f'MOV R{t+1}, 0x{imm_hi:x}  // sub.{typ} imm_hi'))
                         output.append(SassInstr(encode_iadd3(d_lo, a_lo, t, RZ, negate_src1=True, write_carry=True),
                                                 f'IADD3 R{d_lo}, P0, R{a_lo}, -R{t}, RZ  // sub.{typ} lo'))
                         output.append(SassInstr(encode_iadd3x(d_lo + 1, a_lo + 1, t + 1, RZ, negate_src1=True),
@@ -3781,12 +3780,12 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     pa = ctx.ra.pred(a_name)  if a_name  and a_name  in ctx.ra.pred_regs else 7
                     pb = ctx.ra.pred(b_name)  if b_name  and b_name  in ctx.ra.pred_regs else 7
                     r_b, r_c = _alloc_scratch(ctx, count=2)
-                    output.append(SassInstr(encode_iadd3_imm32(r_b, RZ, 0, RZ),
-                                            f'IADD3 R{r_b}, RZ, 0, RZ  // init 0 for {a_name}'))
+                    output.append(SassInstr(encode_mov_imm(r_b, 0),
+                                            f'MOV R{r_b}, 0  // init 0 for {a_name}'))
                     output.append(SassInstr(encode_iadd3_pred_small_imm(r_b, RZ, 1, RZ, pa),
                                             f'@P{pa} IADD3 R{r_b}, RZ, 1, RZ  // R_b = {a_name} ? 1 : 0'))
-                    output.append(SassInstr(encode_iadd3_imm32(r_c, RZ, 0, RZ),
-                                            f'IADD3 R{r_c}, RZ, 0, RZ  // init 0 for {b_name}'))
+                    output.append(SassInstr(encode_mov_imm(r_c, 0),
+                                            f'MOV R{r_c}, 0  // init 0 for {b_name}'))
                     output.append(SassInstr(encode_iadd3_pred_small_imm(r_c, RZ, 1, RZ, pb),
                                             f'@P{pb} IADD3 R{r_c}, RZ, 1, RZ  // R_c = {b_name} ? 1 : 0'))
                     # LOP3 LUT bit ordering in this codebase: bit i corresponds
@@ -4117,8 +4116,8 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                     and getattr(bb.instructions[-1], 'pred', None) is None):
                                 ctx._ptx_rz_bound.add(_dn0)
                                 continue
-                            output.append(SassInstr(encode_iadd3_imm32(d, RZ, 0, RZ),
-                                f'IADD3 R{d}, RZ, 0x0, RZ  // mul.lo imm=0'))
+                            output.append(SassInstr(encode_mov_imm(d, 0),
+                                f'MOV R{d}, 0x0  // mul.lo imm=0'))
                             if not hasattr(ctx, '_zero_regs'):
                                 ctx._zero_regs = set()
                             ctx._zero_regs.add(d)
@@ -4186,8 +4185,8 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 and getattr(bb.instructions[-1], 'pred', None) is None):
                             ctx._ptx_rz_bound.add(_dn)
                             continue
-                        output.append(SassInstr(encode_iadd3_imm32(d, RZ, 0, RZ),
-                            f'IADD3 R{d}, RZ, 0x0, RZ  // mul.lo.{typ} R-R src=0'))
+                        output.append(SassInstr(encode_mov_imm(d, 0),
+                            f'MOV R{d}, 0x0  // mul.lo.{typ} R-R src=0'))
                         ctx._zero_regs.add(d)
                         if not hasattr(ctx, '_imm_regs'):
                             ctx._imm_regs = {}
@@ -4361,12 +4360,12 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             imm_hi = (val >> 32) & 0xFFFFFFFF
                             tmp_lo = _alloc_gpr_pair(ctx)
                             output.append(SassInstr(
-                                encode_iadd3_imm32(tmp_lo, RZ, imm_lo, RZ),
-                                f'IADD3 R{tmp_lo}, RZ, 0x{imm_lo:x}, RZ  '
+                                encode_mov_imm(tmp_lo, imm_lo),
+                                f'MOV R{tmp_lo}, 0x{imm_lo:x}  '
                                 f'// FG-1.12: u64 imm.lo for mul.lo.{typ}'))
                             output.append(SassInstr(
-                                encode_iadd3_imm32(tmp_lo + 1, RZ, imm_hi, RZ),
-                                f'IADD3 R{tmp_lo+1}, RZ, 0x{imm_hi:x}, RZ  '
+                                encode_mov_imm(tmp_lo + 1, imm_hi),
+                                f'MOV R{tmp_lo+1}, 0x{imm_hi:x}  '
                                 f'// FG-1.12: u64 imm.hi for mul.lo.{typ}'))
                             if imm_hi == 0:
                                 if not hasattr(ctx, '_zero_regs'):
@@ -5449,13 +5448,13 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         smem_off = (ctx._smem_offsets.get(s.name, 0)
                                     if hasattr(ctx, '_smem_offsets') else 0)
                         output.append(SassInstr(
-                            encode_iadd3_imm32(d_lo, RZ, smem_off, RZ),
-                            f'IADD3 R{d_lo}, RZ, 0x{smem_off:x}, RZ  // cvta.{types_str} {s.name}'))
+                            encode_mov_imm(d_lo, smem_off),
+                            f'MOV R{d_lo}, 0x{smem_off:x}  // cvta.{types_str} {s.name}'))
                         cvta_emitted += 1
                         if d_hi is not None:
                             output.append(SassInstr(
-                                encode_iadd3_imm32(d_hi, RZ, 0, RZ),
-                                f'IADD3 R{d_hi}, RZ, 0, RZ  // cvta.{types_str} hi=0'))
+                                encode_mov_imm(d_hi, 0),
+                                f'MOV R{d_hi}, 0  // cvta.{types_str} hi=0'))
                             cvta_emitted += 1
                     elif isinstance(s, RegOp):
                         s_name = s.name
@@ -5523,10 +5522,10 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 imm_bits = b.value & 0xFFFFFFFF
                                 br_lo = _alloc_gpr(ctx)
                                 br_hi = _alloc_gpr(ctx)
-                                output.append(SassInstr(encode_iadd3_imm32(br_lo, RZ, 0, RZ),
-                                    f'IADD3 R{br_lo}, RZ, 0, RZ  // dsetp imm lo'))
-                                output.append(SassInstr(encode_iadd3_imm32(br_hi, RZ, imm_bits, RZ),
-                                    f'IADD3 R{br_hi}, RZ, 0x{imm_bits:x}, RZ  // dsetp imm hi'))
+                                output.append(SassInstr(encode_mov_imm(br_lo, 0),
+                                    f'MOV R{br_lo}, 0  // dsetp imm lo'))
+                                output.append(SassInstr(encode_mov_imm(br_hi, imm_bits),
+                                    f'MOV R{br_hi}, 0x{imm_bits:x}  // dsetp imm hi'))
                                 br_lo64 = br_lo
                             elif isinstance(b, RegOp):
                                 br_lo64 = ctx.ra.lo(b.name)
@@ -5602,8 +5601,8 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                     br = _alloc_gpr(ctx)
                                     imm_val = b.value & 0xFFFFFFFF
                                     output.append(SassInstr(
-                                        encode_iadd3_imm32(br, RZ, imm_val, RZ),
-                                        f'IADD3 R{br}, RZ, 0x{imm_val:08x}, RZ  // fsetp threshold'))
+                                        encode_mov_imm(br, imm_val),
+                                        f'MOV R{br}, 0x{imm_val:08x}  // fsetp threshold'))
                                 elif isinstance(b, RegOp):
                                     br = ctx.ra.r32(b.name)
                                 else:
@@ -5623,8 +5622,8 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 # Load true_val into dest, then FSEL.imm selects
                                 # between dest (when pred TRUE) and false_val (when FALSE)
                                 output.append(SassInstr(
-                                    encode_iadd3_imm32(d, RZ, true_val, RZ),
-                                    f'IADD3 R{d}, RZ, 0x{true_val:08x}, RZ  // selp true'))
+                                    encode_mov_imm(d, true_val),
+                                    f'MOV R{d}, 0x{true_val:08x}  // selp true'))
                                 output.append(SassInstr(
                                     encode_fsel_imm(d, d, false_val, pred=pd),
                                     f'FSEL.imm R{d}, R{d}, 0x{false_val:08x}, P{pd}'))
@@ -5743,8 +5742,8 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 if isinstance(b, ImmOp):
                                     imm_val = b.value & 0xFFFFFFFF
                                     br = _alloc_gpr(ctx)
-                                    output.append(SassInstr(encode_iadd3_imm32(br, RZ, imm_val, RZ),
-                                        f'IADD3 R{br}, RZ, 0x{imm_val:x}, RZ  // setp imm'))
+                                    output.append(SassInstr(encode_mov_imm(br, imm_val),
+                                        f'MOV R{br}, 0x{imm_val:x}  // setp imm'))
                                 output.append(SassInstr(
                                     encode_isetp(pd, ar, br, cmp=isetp_cmp, signed=_is_signed_setp),
                                     f'ISETP.{cmp_name.upper()}.U32.AND P{pd}, PT, R{ar}, R{br}, PT'))
@@ -5839,7 +5838,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     R_abs  = _alloc_gpr(ctx)
                     FINITE_MASK = 0x7F800000
                     output.append(SassInstr(
-                        encode_iadd3_imm32(R_mask, RZ, FINITE_MASK, RZ),
+                        encode_mov_imm(R_mask, FINITE_MASK),
                         f'MOV R{R_mask}, 0x7f800000  // testp.finite mask'))
                     output.append(SassInstr(
                         encode_lop3(R_abs, f_reg, R_mask, RZ, LOP3_AND),
@@ -5891,8 +5890,8 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     d = ctx.ra.lo(instr.dest.name)
                     a = ctx.ra.lo(instr.srcs[0].name)
                     tmp = _alloc_gpr(ctx)
-                    output.append(SassInstr(encode_iadd3_imm32(tmp, RZ, 0x80000000, RZ),
-                                            f'IADD3 R{tmp}, RZ, 0x80000000, RZ  // neg.f64 sign mask'))
+                    output.append(SassInstr(encode_mov_imm(tmp, 0x80000000),
+                                            f'MOV R{tmp}, 0x80000000  // neg.f64 sign mask'))
                     output.append(SassInstr(encode_lop3(d+1, a+1, tmp, RZ, LOP3_XOR),
                                             f'LOP3 R{d+1}, R{a+1}, R{tmp}, RZ, XOR  // neg.f64 hi'))
                     if d != a:
@@ -5905,8 +5904,8 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     d = ctx.ra.lo(instr.dest.name)
                     a = ctx.ra.lo(instr.srcs[0].name)
                     tmp = _alloc_gpr(ctx)
-                    output.append(SassInstr(encode_iadd3_imm32(tmp, RZ, 0x7FFFFFFF, RZ),
-                                            f'IADD3 R{tmp}, RZ, 0x7FFFFFFF, RZ  // abs.f64 mask'))
+                    output.append(SassInstr(encode_mov_imm(tmp, 0x7FFFFFFF),
+                                            f'MOV R{tmp}, 0x7FFFFFFF  // abs.f64 mask'))
                     output.append(SassInstr(encode_lop3(d+1, a+1, tmp, RZ, LOP3_AND),
                                             f'LOP3 R{d+1}, R{a+1}, R{tmp}, RZ, AND  // abs.f64 hi'))
                     if d != a:
@@ -6378,10 +6377,10 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     if isinstance(instr.srcs[1], ImmOp):
                         imm = instr.srcs[1].value & 0xFFFF_FFFF_FFFF_FFFF
                         b_lo = _alloc_gpr_pair(ctx)
-                        output.append(SassInstr(encode_iadd3_imm32(b_lo, RZ, imm & 0xFFFFFFFF, RZ),
-                            f'IADD3 R{b_lo}, RZ, 0x{imm & 0xFFFFFFFF:x}, RZ  // min.{typ} imm_lo'))
-                        output.append(SassInstr(encode_iadd3_imm32(b_lo+1, RZ, (imm >> 32) & 0xFFFFFFFF, RZ),
-                            f'IADD3 R{b_lo+1}, RZ, 0x{(imm >> 32) & 0xFFFFFFFF:x}, RZ  // min.{typ} imm_hi'))
+                        output.append(SassInstr(encode_mov_imm(b_lo, imm & 0xFFFFFFFF),
+                            f'MOV R{b_lo}, 0x{imm & 0xFFFFFFFF:x}  // min.{typ} imm_lo'))
+                        output.append(SassInstr(encode_mov_imm(b_lo+1, (imm >> 32) & 0xFFFFFFFF),
+                            f'MOV R{b_lo+1}, 0x{(imm >> 32) & 0xFFFFFFFF:x}  // min.{typ} imm_hi'))
                     else:
                         b_lo = ctx.ra.lo(instr.srcs[1].name)
                     t_lo  = ctx._next_gpr; ctx._next_gpr += 2   # diff pair (t_lo, t_lo+1)
@@ -6409,10 +6408,10 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     if isinstance(instr.srcs[1], ImmOp):
                         imm = instr.srcs[1].value & 0xFFFF_FFFF_FFFF_FFFF
                         b_lo = _alloc_gpr_pair(ctx)
-                        output.append(SassInstr(encode_iadd3_imm32(b_lo, RZ, imm & 0xFFFFFFFF, RZ),
-                            f'IADD3 R{b_lo}, RZ, 0x{imm & 0xFFFFFFFF:x}, RZ  // max.{typ} imm_lo'))
-                        output.append(SassInstr(encode_iadd3_imm32(b_lo+1, RZ, (imm >> 32) & 0xFFFFFFFF, RZ),
-                            f'IADD3 R{b_lo+1}, RZ, 0x{(imm >> 32) & 0xFFFFFFFF:x}, RZ  // max.{typ} imm_hi'))
+                        output.append(SassInstr(encode_mov_imm(b_lo, imm & 0xFFFFFFFF),
+                            f'MOV R{b_lo}, 0x{imm & 0xFFFFFFFF:x}  // max.{typ} imm_lo'))
+                        output.append(SassInstr(encode_mov_imm(b_lo+1, (imm >> 32) & 0xFFFFFFFF),
+                            f'MOV R{b_lo+1}, 0x{(imm >> 32) & 0xFFFFFFFF:x}  // max.{typ} imm_hi'))
                     else:
                         b_lo = ctx.ra.lo(instr.srcs[1].name)
                     t_lo  = ctx._next_gpr; ctx._next_gpr += 2   # diff pair
@@ -6830,6 +6829,69 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     output.append(SassInstr(
                         encode_lop3_pred(d, RZ, b, RZ, 0x33, pnz, inverted=True),
                         f'@!P{pnz} LOP3.LUT R{d}, RZ, R{b}, RZ, 0x33  // rem-by-zero'))
+
+                elif op in ('div', 'rem') and typ == 'u64':
+                    want_rem = (op == 'rem')
+
+                    def _materialize_u64(op_node):
+                        if isinstance(op_node, RegOp):
+                            return ctx.ra.lo(op_node.name)
+                        if isinstance(op_node, ImmOp):
+                            v = op_node.value & 0xFFFFFFFFFFFFFFFF
+                            r = _alloc_gpr_pair(ctx)
+                            output.append(SassInstr(encode_mov_imm(r, v & 0xFFFFFFFF),
+                                f'MOV R{r}, 0x{v & 0xFFFFFFFF:x}  // {op}.u64 imm.lo'))
+                            output.append(SassInstr(encode_mov_imm(r + 1, (v >> 32) & 0xFFFFFFFF),
+                                f'MOV R{r+1}, 0x{(v >> 32) & 0xFFFFFFFF:x}  // {op}.u64 imm.hi'))
+                            return r
+                        raise ISelError(f"{op}.u64: unexpected operand type {op_node!r}")
+
+                    a_in = _materialize_u64(instr.srcs[0])
+                    b_in = _materialize_u64(instr.srcs[1])
+
+                    aw = _alloc_gpr_pair(ctx)
+                    rw = _alloc_gpr_pair(ctx)
+                    p_guard = ctx._next_pred; ctx._next_pred += 1
+
+                    output.append(SassInstr(encode_mov(aw, a_in),
+                        f'MOV R{aw}, R{a_in}  // {op}.u64 work_lo init'))
+                    output.append(SassInstr(encode_mov(aw + 1, a_in + 1),
+                        f'MOV R{aw+1}, R{a_in+1}  // {op}.u64 work_hi init'))
+                    output.append(SassInstr(encode_mov_imm(rw, 0),
+                        f'MOV R{rw}, RZ  // {op}.u64 rem_lo init'))
+                    output.append(SassInstr(encode_mov_imm(rw + 1, 0),
+                        f'MOV R{rw+1}, RZ  // {op}.u64 rem_hi init'))
+
+                    for _it in range(64):
+                        output.append(SassInstr(encode_shf_l_u64_hi(rw + 1, rw, 1, rw + 1),
+                            f'SHF.L.U64.HI R{rw+1}, R{rw}, 0x1, R{rw+1}'))
+                        output.append(SassInstr(encode_shf_l_u64_hi(rw, aw + 1, 1, rw),
+                            f'SHF.L.U64.HI R{rw}, R{aw+1}, 0x1, R{rw}'))
+                        output.append(SassInstr(encode_shf_l_u64_hi(aw + 1, aw, 1, aw + 1),
+                            f'SHF.L.U64.HI R{aw+1}, R{aw}, 0x1, R{aw+1}'))
+                        output.append(SassInstr(encode_shf_l_u32(aw, aw, 1),
+                            f'SHF.L.U32 R{aw}, R{aw}, 0x1, RZ'))
+                        output.append(SassInstr(
+                            encode_isetp(p_guard, rw, b_in, ISETP_GE, signed=False, width=64),
+                            f'ISETP.GE.U64 P{p_guard}, PT, R{rw}, R{b_in}, PT'))
+                        raw_or = encode_iadd3_imm32(aw, aw, 1, RZ)
+                        output.append(SassInstr(patch_pred(raw_or, pred=p_guard, neg=False),
+                            f'@P{p_guard} IADD3 R{aw}, R{aw}, 0x1, RZ  // q-bit'))
+                        raw_sub_lo = encode_iadd3(rw, rw, b_in, RZ,
+                                                  negate_src1=True, write_carry=True)
+                        output.append(SassInstr(patch_pred(raw_sub_lo, pred=p_guard, neg=False),
+                            f'@P{p_guard} IADD3 R{rw}, P1, R{rw}, -R{b_in}, RZ'))
+                        raw_sub_hi = encode_iadd3x(rw + 1, rw + 1, b_in + 1, RZ,
+                                                   negate_src1=True)
+                        output.append(SassInstr(patch_pred(raw_sub_hi, pred=p_guard, neg=False),
+                            f'@P{p_guard} IADD3.X R{rw+1}, R{rw+1}, -R{b_in+1}, RZ'))
+
+                    d_lo = ctx.ra.lo(instr.dest.name)
+                    src_lo = rw if want_rem else aw
+                    output.append(SassInstr(encode_mov(d_lo, src_lo),
+                        f'MOV R{d_lo}, R{src_lo}  // {op}.u64 result lo'))
+                    output.append(SassInstr(encode_mov(d_lo + 1, src_lo + 1),
+                        f'MOV R{d_lo+1}, R{src_lo+1}  // {op}.u64 result hi'))
 
                 elif op == 'rcp' and any(m in instr.types for m in ('approx','rn','rz','rm','rp')) and typ == 'f32':
                     d = ctx.ra.r32(instr.dest.name)

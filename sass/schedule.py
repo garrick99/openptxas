@@ -711,6 +711,26 @@ def _enforce_gpr_latency(instrs: list[SassInstr]) -> list[SassInstr]:
                 # IADD3's, so the producer's wdep covers the forwarding gap.
                 (0x212, 0x202),  # LOP3.LUT R-R-R -> MOV (lop3 fixup, merkle hot)
                 (0x812, 0x202),  # LOP3.IMM      -> MOV (lop3-imm fixup)
+                # Phase 35 (denvdis-grounded IADD3->consumer audit):
+                # Phase 34's iadd3_pair_reduce fused 2-op IADD3 chains
+                # into single IADD3.R-R-R writes.  On merkle:quad this
+                # dropped 1088->1072; on :single the new IADD3.R-R-R
+                # writes accept SHF.IMM-produced operands as inputs,
+                # leaving SHF.IMM->IADD3.RRR as the hot RAW-NOP pair
+                # (5 instances in :single, 21 in :quad — measured via
+                # diagnostic NOP audit).  IADD3.RRR self-chains are
+                # also created directly by Phase 34's fusion.
+                #
+                # Per denvdis (_harvest/denvdis/sm120_classes.tsv):
+                #   shf__RuIR_RIR        minw=0  COUPLED_MATH  FXU
+                #   iadd3_noimm__RRR_RRR minw=0  COUPLED_MATH  FXU
+                # Same FXU pipe, both COUPLED_MATH — the 6-cycle FXU->FXU
+                # RAW window is enforced by the COUPLED_MATH soft-scoreboard
+                # on the consumer's wdep=0x3e slot (identical mechanism to
+                # the existing (0x212,0x212) LOP3-LOP3 self-chain added in
+                # Phase 32 + (0x210,0x819) IADD3->SHF added in Phase 12).
+                (0x819, 0x210),  # SHF.IMM -> IADD3.RRR (mirror of Phase 12 (0x210,0x819))
+                (0x210, 0x210),  # IADD3.RRR self-chain (Phase 34 fusion target)
             }
             if (opc_i, opc_j) in _SCHED_FORWARDING_SAFE:
                 i += 1

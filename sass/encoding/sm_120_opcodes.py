@@ -3244,7 +3244,7 @@ ISETP_NE = 0x05
 ISETP_GE = 0x06
 
 def encode_isetp(pred_dest: int, src0: int, src1: int, cmp: int = ISETP_GE,
-                  signed: bool = True, ctrl: int = 0) -> bytes:
+                  signed: bool = True, ctrl: int = 0, width: int = 32) -> bytes:
     """Encode ISETP R-R variant with variable comparison type.
 
     Ground truth from ptxas (ISETP.GE.U32.AND P0, PT, R4, R7, PT):
@@ -3255,6 +3255,9 @@ def encode_isetp(pred_dest: int, src0: int, src1: int, cmp: int = ISETP_GE,
       b10=0xf0|(pred_dest<<1): P0→0xf0, P1→0xf2, P2→0xf4, P3→0xf6
       b11=0x03 (R-R GPR operand flag)
     Verified with div.u32 sequence: NE→b9=0x50, GE→b9=0x60, P2→b10=0xf4.
+
+    width=64 mirrors the R-UR U64 form (Phase 28): raw[10] low bit set
+    (0xf1 vs 0xf0).  Used by the bit-serial div.u64 / rem.u64 lowering.
     """
     if ctrl == 0: ctrl = _CTRL_DEFAULT
     b13, b14, b15 = _ctrl_to_bytes(ctrl)
@@ -3269,7 +3272,7 @@ def encode_isetp(pred_dest: int, src0: int, src1: int, cmp: int = ISETP_GE,
     raw[7]  = 0x00
     raw[8]  = 0x70                          # fixed for R-R comparisons
     raw[9]  = ((cmp & 0x0F) << 4) | (0x02 if signed else 0x00)  # cmp type + signed bit
-    raw[10] = 0xf0 | ((pred_dest & 0x07) << 1)
+    raw[10] = (0xf1 if width == 64 else 0xf0) | ((pred_dest & 0x07) << 1)
     raw[11] = 0x03
     raw[12] = 0x00
     raw[13] = b13

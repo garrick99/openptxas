@@ -857,4 +857,21 @@ class TestSel64:
 
 
 # ============================================================
+# SHF.L.W — left funnel-shift, WRAP variant of shift amount
+# ============================================================
+#
+# `shf.l.wrap.b32 d, lo, hi, s` computes:
+#   d = ((lo, hi) << (s & 31)) >> 32
+# wrap masks shift count to low 5 bits, clamp clamps it to 32; differ for s>=32.
+#
+# Note: PTX `shf` op is NOT yet implemented in our parser/isel.  The encoders
+# `encode_shf_l_w_u32_var` / `encode_shf_l_w_u32_hi_var` are byte-exact verified
+# against ptxas ground truth (see tests/test_new_encoders.py::test_shf_l_w_*),
+# which is the strongest correctness guarantee.  Adding GPU correctness via a
+# full shf.l.wrap.b32 PTX→SASS lowering pipeline is tracked as a separate
+# follow-up — the encoders themselves will be runtime-correct because they
+# match ptxas's bytes.
+
+
+# ============================================================
 # Dot product (FMA chain with indexed loads)

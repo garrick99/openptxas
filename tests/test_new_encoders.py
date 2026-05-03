@@ -10,6 +10,7 @@ from sass.encoding.sm_120_opcodes import (
     encode_f2fp_f16_f32,
     encode_hmma_bf16_f32, encode_hmma_tf32_f32, encode_dmma_8x8x4, encode_cs2r,
     encode_sel_64,
+    encode_shf_l_u32_hi_var, encode_shf_l_w_u32_hi_var, encode_shf_l_w_u32_var,
 )
 
 
@@ -659,6 +660,50 @@ def test_sel_64_dest_src_fields():
     assert raw[2] == 12
     assert raw[3] == 20
     assert raw[4] == 30
+
+
+# --- SHF.L family (newly landed; ground truth from ptxas 13.2.78 sm_120) ---
+
+# Probe ptxas reproducer: see _probe_landing/probe_shf.ptx.  The four ground
+# truth bytes are:
+#   SHF.L.U32.HI    R5,R6,R5,R7 → 19 72 05 06 05 00 00 00 07 06 01 00 ...
+#   SHF.L.W.U32.HI  R0,R6,R5,R7 → 19 72 00 06 05 00 00 00 07 0e 01 00 ...
+#   SHF.R.W.U32     R2,R6,R5,R7 → 19 72 02 06 05 00 00 00 07 1e 00 00 ...   (existing-shape reference)
+#   SHF.R.U32       R3,R6,R5,R7 → 19 72 03 06 05 00 00 00 07 16 00 00 ...   (existing-shape reference)
+
+def test_shf_l_u32_hi_byte_exact():
+    raw = encode_shf_l_u32_hi_var(dest=5, src_lo=6, shift_reg=5, src_hi=7)
+    expected = bytes.fromhex('19720506050000000706010000')
+    assert raw[0:13] == expected, (
+        f"SHF.L.U32.HI byte mismatch:\n  got: {raw[0:13].hex()}\n  exp: {expected.hex()}"
+    )
+
+def test_shf_l_w_u32_hi_byte_exact():
+    raw = encode_shf_l_w_u32_hi_var(dest=0, src_lo=6, shift_reg=5, src_hi=7)
+    expected = bytes.fromhex('19720006050000000706 010000'.replace(' ', ''))
+    # rebuild without space
+    expected = bytes.fromhex('1972000605000000070e010000')
+    assert raw[0:13] == expected, (
+        f"SHF.L.W.U32.HI byte mismatch:\n  got: {raw[0:13].hex()}\n  exp: {expected.hex()}"
+    )
+
+def test_shf_l_w_vs_clamp_bit_75():
+    """The wrap-vs-clamp distinction is bit 75 (= byte[9] bit 3 = 0x08)."""
+    clamp = encode_shf_l_u32_hi_var(dest=5, src_lo=6, shift_reg=5, src_hi=7)
+    wrap  = encode_shf_l_w_u32_hi_var(dest=5, src_lo=6, shift_reg=5, src_hi=7)
+    # XOR difference must be exactly bit 75
+    assert clamp[9] ^ wrap[9] == 0x08, \
+        f"clamp/wrap should differ only at byte[9] bit 3, got XOR=0x{clamp[9]^wrap[9]:02x}"
+    # And nothing else in the opcode/operand bytes
+    for i in range(13):
+        if i != 9:
+            assert clamp[i] == wrap[i], f"unexpected diff at byte {i}: {clamp[i]:#x} vs {wrap[i]:#x}"
+
+def test_shf_l_w_low_word_clears_hi_bit():
+    """Low-word variant clears byte[10] bit 0 (.HI flag)."""
+    raw = encode_shf_l_w_u32_var(dest=5, src_lo=6, shift_reg=5, src_hi=7)
+    assert raw[9] == 0x0e
+    assert raw[10] == 0x00
 
 
 if __name__ == '__main__':

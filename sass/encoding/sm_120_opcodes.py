@@ -4478,6 +4478,73 @@ def encode_shf_r_s32_hi(dest, src_lo, shift_reg, src_hi, ctrl=0):
 
 
 # ---------------------------------------------------------------------------
+# SHF.L family — left funnel-shift (NEWLY ADDED)
+# ---------------------------------------------------------------------------
+# Source: NAK MIT (encoders/ldl_stl_ldc_shf_imad_lea.rs.notes:42–48):
+#     "SHF — sm70_encode.rs:1929"
+#     "  bit 75: .W (wrap, else clamp)"
+#     "  bit 76: .R (right, else .L)"
+#     "  bit 80: .HI"
+# Cross-validated against ptxas SM_120 ground truth.
+#
+# Ground truth bytes (probe: _probe_landing/probe_shf.ptx, ptxas 13.2.78 sm_120):
+#   SHF.R.W.U32   R2,R6,R5,R7   → 19 72 02 06 05 00 00 00 07 1e 00 00 ...
+#   SHF.R.U32     R3,R6,R5,R7   → 19 72 03 06 05 00 00 00 07 16 00 00 ...
+#   SHF.L.W.U32.HI R0,R6,R5,R7  → 19 72 00 06 05 00 00 00 07 0e 01 00 ...
+#   SHF.L.U32.HI  R5,R6,R5,R7   → 19 72 05 06 05 00 00 00 07 06 01 00 ...
+#
+# byte[9] field decode (bits 72..79):
+#   bit 73-74 = data type: I64=00, U64=01, I32=10, U32=11  (=> U32 sets b9 bits[1:2]=11 → 0x06)
+#   bit 75    = .W (wrap)
+#   bit 76    = .R (right vs left)
+# byte[10] bit 0 = .HI
+#
+# PTX op: shf.l.wrap.b32 → SHF.L.W.U32 (no .HI here when result is 32-bit dst).
+# Note: ptxas often emits SHF.L.U32.HI even when the PTX is shf.l on a single
+# u32 dest, because LR funnel semantics push the wanted bits into the HI lane.
+# See _probe_landing/probe_shf.ptx — ptxas chose SHF.L.W.U32.HI for shf.l.wrap.b32.
+
+def encode_shf_l_u32_hi_var(dest, src_lo, shift_reg, src_hi, ctrl=0):
+    """SHF.L.U32.HI (variable shift) — left funnel-shift, clamp, take high 32 bits.
+
+    Variable-shift form: shift amount is in `shift_reg` (R-form, b1=0x72), not
+    an immediate.  This complements the immediate-shift `encode_shf_l_u32_hi`
+    in sass/encoding/sm_120_encode.py.
+
+    Ground truth: SHF.L.U32.HI R5, R6, R5, R7  →  byte[9]=0x06, byte[10]=0x01.
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x19, 0x72, b2=dest, b3=src_lo, b4=shift_reg, b8=src_hi,
+                  b9=0x06, b10=0x01, b11=0x00, ctrl=ctrl)
+
+def encode_shf_l_w_u32_hi_var(dest, src_lo, shift_reg, src_hi, ctrl=0):
+    """SHF.L.W.U32.HI (variable shift) — left funnel-shift, WRAP, take high 32 bits.
+
+    Variable-shift form: shift amount is in `shift_reg` (R-form, b1=0x72).
+    Wrap means the shift amount is masked (& 31) rather than clamped to 32.
+    Bit 75 (.W) is set, distinguishing wrap from clamp.
+
+    Ground truth: SHF.L.W.U32.HI R0, R6, R5, R7 → byte[9]=0x0e, byte[10]=0x01.
+    PTX lowering: ptxas emits this for `shf.l.wrap.b32` with a register shift.
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x19, 0x72, b2=dest, b3=src_lo, b4=shift_reg, b8=src_hi,
+                  b9=0x0e, b10=0x01, b11=0x00, ctrl=ctrl)
+
+def encode_shf_l_w_u32_var(dest, src_lo, shift_reg, src_hi, ctrl=0):
+    """SHF.L.W.U32 (variable shift) — left funnel-shift, WRAP, take low 32 bits.
+
+    Bit 76 (.R) cleared = .L; bit 75 (.W) set = wrap; bit 80 (.HI) cleared.
+    Ground truth: derived from SHF.R.W.U32 with bit 76 cleared:
+      SHF.R.W.U32:    byte[9]=0x1e (bits 73,74,75,76 set)
+      SHF.L.W.U32:    byte[9]=0x0e (bits 73,74,75 set, bit 76 cleared)
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x19, 0x72, b2=dest, b3=src_lo, b4=shift_reg, b8=src_hi,
+                  b9=0x0e, b10=0x00, b11=0x00, ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
 # REDUX.SUM — Warp-wide sum reduction → uniform register
 # ---------------------------------------------------------------------------
 # Ground truth (unsigned): REDUX.SUM UR6, R0 → b9=0x00, b10=0xc0

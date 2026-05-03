@@ -3819,6 +3819,16 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     _free_scratch(ctx, [r_b, r_c])
 
                 elif op in ('and', 'or', 'xor') and typ in ('b32', 'u32', 's32', 'b16', 'u16', 's16'):
+                    # Phase 41: commute IMM-on-LHS to RHS so LOP3.IMM fires instead
+                    # of materializing the IMM via MOV.IMM.  imm_propagate (Phase 27)
+                    # produces `xor.b32 %d, IMM_K, %r` for merkle Blake2 IV-XOR; the
+                    # add isel path at line 3710 already does the same swap for
+                    # IADD-IMM.  Safe: xor/and/or are commutative; the IMAD-FUSE-1
+                    # encoder at line 3845 handles (reg, imm) regardless of original
+                    # operand order.
+                    if (isinstance(instr.srcs[0], ImmOp)
+                            and isinstance(instr.srcs[1], RegOp)):
+                        instr.srcs = [instr.srcs[1], instr.srcs[0]]
                     # UNIF-1: propagate SR-derived tag through bitwise-with-immediate.
                     # Guard: don't propagate in atom.xor kernels (the template has
                     # its own SR-source handling and extra tags cause regression).

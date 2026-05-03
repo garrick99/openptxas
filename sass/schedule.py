@@ -755,6 +755,16 @@ def _enforce_gpr_latency(instrs: list[SassInstr]) -> list[SassInstr]:
                 # Phase 32 + (0x210,0x819) IADD3->SHF added in Phase 12).
                 (0x819, 0x210),  # SHF.IMM -> IADD3.RRR (mirror of Phase 12 (0x210,0x819))
                 (0x210, 0x210),  # IADD3.RRR self-chain (Phase 34 fusion target)
+                # Phase 41: isel.py commutes IMM-LHS xor/and/or to RHS so the
+                # IMAD-FUSE-1 LOP3.IMM (0x812) encoding fires for merkle's
+                # Blake2 IV-XOR.  This eliminates 13 MOV.IMM but creates new
+                # LOP3.IMM-as-writer pairs that the existing R-R-R (0x212)
+                # writer entries cover for their sibling.  Both 0x212 and
+                # 0x812 are LOP3 forms going through FXU/COUPLED_MATH, so the
+                # 6-cycle FXU->FXU RAW is enforced by the same soft-scoreboard
+                # mechanism as (0x212,0x819) Phase 12 and (0x212,0x212) Phase 32.
+                (0x812, 0x819),  # LOP3.IMM -> SHF.L.U32.HI (mirror of (0x212,0x819))
+                (0x812, 0x212),  # LOP3.IMM -> LOP3.LUT R-R-R (mirror of (0x212,0x212))
             }
             if (opc_i, opc_j) in _SCHED_FORWARDING_SAFE:
                 i += 1

@@ -890,6 +890,7 @@ def compile_function(fn: Function, verbose: bool = False,
     from ptx.passes.load_cse             import run_function as _load_cse_run
     from ptx.passes.add3_chain_reduce   import run_function as _add3_chain_reduce_run
     from ptx.passes.iadd3_pair_reduce   import run_function as _iadd3_pair_reduce_run
+    from ptx.passes.xor3_chain_reduce   import run_function as _xor3_chain_reduce_run
     from ptx.passes.mul3_chain_reduce   import run_function as _mul3_chain_reduce_run
     from ptx.passes.cvt_roundtrip_fold  import run_function as _cvt_roundtrip_fold_run
     from ptx.passes.add_forward_chain   import run_function as _add_forward_chain_run
@@ -969,6 +970,13 @@ def compile_function(fn: Function, verbose: bool = False,
         # add3_chain_reduce pass misses (it expects an immediate K).
         # Runs LAST so all upstream folds have settled.
         ("iadd3_pair_reduce",       _iadd3_pair_reduce_run),
+        # Phase 42: register-only 2-input XOR pair fusion -> single
+        # LOP3.LUT R-R-R with truth table 0x96 (a^b^c).  Mirrors
+        # iadd3_pair_reduce but for SHA-mixing-style XOR chains
+        # (`xor %tmp, %a, %b; xor %dst, %tmp, %c`).  Runs after the
+        # iadd3 pass so all upstream folds (including imm_xor_fold)
+        # have settled.
+        ("xor3_chain_reduce",       _xor3_chain_reduce_run),
     ]
     for _pass_name, _pass_fn in _ptx_passes:
         if _pass_name in _disabled:

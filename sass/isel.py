@@ -3735,6 +3735,22 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     output.append(SassInstr(encode_iadd3(d, a, b, c),
                                             f'IADD3 R{d}, R{a}, R{b}, R{c}  // iadd3.{typ}'))
 
+                elif op == 'xor3' and typ in ('b32', 'u32', 's32'):
+                    # Phase 42: synthetic 3-input XOR emitted by
+                    # xor3_chain_reduce.py to fuse merkle-style xor
+                    # chains (`xor %tmp, %a, %b; xor %dst, %tmp, %c`)
+                    # into a single LOP3.LUT R-R-R with the 3-input
+                    # XOR truth table.  All three sources are register
+                    # operands by construction of the pass.
+                    # LUT 0x96 = a XOR b XOR c, verified against ptxas
+                    # emission (xor3_probe 2026-05-03).
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = ctx.ra.r32(instr.srcs[0].name)
+                    b = ctx.ra.r32(instr.srcs[1].name)
+                    c = ctx.ra.r32(instr.srcs[2].name)
+                    _emit_lop3(output, ctx, d, a, b, c, 0x96,
+                               f'LOP3.LUT R{d}, R{a}, R{b}, R{c}, 0x96  // xor3.{typ}')
+
                 elif op == 'sub' and typ in ('u32', 's32'):
                     d = ctx.ra.r32(instr.dest.name)
                     if (isinstance(instr.srcs[0], ImmOp)

@@ -440,12 +440,36 @@ def _hoist_ldcu64(instrs: list[SassInstr]) -> list[SassInstr]:
                 # Result: 8 kernels moved from STRUCTURAL to MIXED (opcode
                 # match achieved).  But 20 proof violations from new edges.
                 # Kept active — GPU correctness verified (93/93 PASS).
-                pre_result = non_s2r_remaining[:1] + s2r_instrs + non_s2r_remaining[1:]
+                #
+                # Phase 37: an LDCU.64 with a pre-boundary UR consumer (e.g.
+                # Phase 30's u64 setp-only-param load feeding the bounds-check
+                # ISETP.U64.R-UR before the @!P0 EXIT) must stay pre-boundary;
+                # moving it past the EXIT leaves the consumer reading an
+                # uninitialized UR pair.  Partition by active consumer: an
+                # LDCU.64 has an "active" pre-boundary consumer if a real UR
+                # reader appears in `remaining` BEFORE any later LDCU.* writer
+                # clobbers the same UR (e.g. mem-desc LDCU.64 UR4 followed by
+                # setp's LDCU.32 UR4 — the desc value is dead pre-boundary).
+                def _has_active_pre_consumer(ldcu_si: SassInstr) -> bool:
+                    ur_dest = ldcu_si.raw[2]
+                    for ri in remaining:
+                        ropc = _get_opcode(ri.raw)
+                        # Clobbered: any later LDCU.* writes the same UR dest.
+                        if ropc == 0x7ac and ri.raw[2] == ur_dest:
+                            return False
+                        # Real consumer: opcode reads UR at byte[4].
+                        if ropc in _UR_CONSUMER_OPCODES and ri.raw[4] == ur_dest:
+                            return True
+                    return False
+                _ldcu_pre = [s for s in ldcu64s if _has_active_pre_consumer(s)]
+                _ldcu_post = [s for s in ldcu64s if not _has_active_pre_consumer(s)]
+                pre_result = (non_s2r_remaining[:1] + s2r_instrs
+                              + _ldcu_pre + non_s2r_remaining[1:])
                 _exit_instr = post_boundary[0]
                 _body_after = list(post_boundary[1:])
                 _interleaved = [_exit_instr]
                 _body_idx = 0
-                for _lsi in ldcu64s:
+                for _lsi in _ldcu_post:
                     _interleaved.append(_lsi)
                     if _body_idx < len(_body_after):
                         _interleaved.append(_body_after[_body_idx])

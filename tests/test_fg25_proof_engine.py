@@ -197,8 +197,12 @@ _EXPECTED_COUNTS = {
     # Phase 30 drift: cvt.u64.u32 hi-zero swapped from IADD3 (writes P0)
     # to MOV-imm (no P0 write).  The phantom scoreboard edge from the
     # IADD3 P0 write is gone, dropping total + MEMORY_SCOREBOARD_SAFE by 1.
-    "min_store_guarded":     (4, 0, 0, 0, 0, 2, 0, 0, 2, 0, 0, 0, 0),  # P30: cvt hi-zero IADD3→MOV
-    "probe_fresh":           (4, 0, 0, 0, 0, 2, 0, 0, 2, 0, 0, 0, 0),  # P30: cvt hi-zero IADD3→MOV
+    # P37: u64 setp-only-param LDCU.64 retained pre-boundary (was wrongly hoisted
+    # post-EXIT and consumer ISETP read uninitialized UR).  +1 total instruction
+    # (the kept LDCU.64) and +1 UR_MEMORY_SCOREBOARD_SAFE edge for the new
+    # LDCU.64 → ISETP.U64.R-UR chain.
+    "min_store_guarded":     (5, 0, 0, 0, 0, 2, 0, 0, 3, 0, 0, 0, 0),  # P37: pre-boundary LDCU.64
+    "probe_fresh":           (5, 0, 0, 0, 0, 2, 0, 0, 3, 0, 0, 0, 0),  # P37: pre-boundary LDCU.64
     "reduce_sum":            (19, 5, 6, 0, 0, 3, 0, 0, 4, 0, 1, 0, 0),  # TE12: 0xc11 now ALU
     # edge_87 drift: 32-bit IADD (opcode 0x235, b9=0x00) emitted for
     # add.u32/sub.u32 reg+reg via encode_iadd; 9 NOPs removed because
@@ -210,12 +214,13 @@ _EXPECTED_COUNTS = {
     # (total 6→5) and shifts the address-arithmetic consumer back to
     # MEMORY_SCOREBOARD_SAFE.  UR_MEMORY drops from 3 to 1.
     # P30: same cvt hi-zero IADD3→MOV drift as min_store_guarded above.
-    "fg21:k_ge":             (4, 0, 1, 0, 0, 2, 0, 0, 1, 0, 0, 0, 0),  # P30: cvt hi-zero IADD3→MOV
-    "fg21:k_lt":             (4, 0, 1, 0, 0, 2, 0, 0, 1, 0, 0, 0, 0),  # P30: cvt hi-zero IADD3→MOV
-    "fg21:k_gt":             (4, 0, 1, 0, 0, 2, 0, 0, 1, 0, 0, 0, 0),  # P30: cvt hi-zero IADD3→MOV
-    "fg21:k_le":             (4, 0, 1, 0, 0, 2, 0, 0, 1, 0, 0, 0, 0),  # P30: cvt hi-zero IADD3→MOV
-    "fg21:k_eq":             (4, 0, 1, 0, 0, 2, 0, 0, 1, 0, 0, 0, 0),  # P30: cvt hi-zero IADD3→MOV
-    "fg21:k_ne":             (4, 0, 1, 0, 0, 2, 0, 0, 1, 0, 0, 0, 0),  # P30: cvt hi-zero IADD3→MOV
+    # P37: same pre-boundary LDCU.64 retention as min_store_guarded.
+    "fg21:k_ge":             (5, 0, 1, 0, 0, 2, 0, 0, 2, 0, 0, 0, 0),  # P37: pre-boundary LDCU.64
+    "fg21:k_lt":             (5, 0, 1, 0, 0, 2, 0, 0, 2, 0, 0, 0, 0),  # P37: pre-boundary LDCU.64
+    "fg21:k_gt":             (5, 0, 1, 0, 0, 2, 0, 0, 2, 0, 0, 0, 0),  # P37: pre-boundary LDCU.64
+    "fg21:k_le":             (5, 0, 1, 0, 0, 2, 0, 0, 2, 0, 0, 0, 0),  # P37: pre-boundary LDCU.64
+    "fg21:k_eq":             (5, 0, 1, 0, 0, 2, 0, 0, 2, 0, 0, 0, 0),  # P37: pre-boundary LDCU.64
+    "fg21:k_ne":             (5, 0, 1, 0, 0, 2, 0, 0, 2, 0, 0, 0, 0),  # P37: pre-boundary LDCU.64
 }
 
 

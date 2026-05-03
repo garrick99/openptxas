@@ -56,7 +56,7 @@ from sass.encoding.sm_120_opcodes import (
     encode_fadd, encode_fmul, encode_fmul_imm, encode_ffma, encode_ffma_imm,
     encode_mufu, MUFU_RCP, MUFU_SQRT, MUFU_SIN, MUFU_COS, MUFU_EX2, MUFU_LG2,
     MUFU_RSQ, MUFU_TANH,
-    encode_sel, encode_sel_imm, encode_fsel,
+    encode_sel, encode_sel_imm, encode_fsel, encode_sel_64,
     encode_vimnmx_s32, encode_vimnmx_u32,
     encode_fmnmx,
     encode_prmt, encode_prmt_reg,
@@ -5989,6 +5989,32 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             f'FSEL R{d},   R{a},   R{b},   {"!" if neg else ""}P{pd}  // selp.f64 lo'))
                     output.append(SassInstr(encode_fsel(d+1, a+1, b+1, pd, neg),
                                             f'FSEL R{d+1}, R{a+1}, R{b+1}, {"!" if neg else ""}P{pd}  // selp.f64 hi'))
+
+                elif op == 'selp' and typ in ('b64', 'u64', 's64') \
+                        and len(instr.srcs) >= 2 \
+                        and isinstance(instr.srcs[0], RegOp) \
+                        and isinstance(instr.srcs[1], RegOp):
+                    # selp.b64/u64/s64 with two register sources — use the
+                    # native SEL.64 instruction (single-instruction 64-bit
+                    # selection of a register pair).  Mirrors what ptxas emits
+                    # for this exact pattern; see _probe_landing/probe_sel64_3.ptx.
+                    d = ctx.ra.lo(instr.dest.name)
+                    a = ctx.ra.lo(instr.srcs[0].name)
+                    b = ctx.ra.lo(instr.srcs[1].name)
+                    pd = 0
+                    neg = False
+                    if len(instr.srcs) > 2 and isinstance(instr.srcs[2], RegOp):
+                        pd = ctx.ra.pred(instr.srcs[2].name) if instr.srcs[2].name in ctx.ra.pred_regs else 0
+                        neg = hasattr(ctx, '_negated_preds') and pd in ctx._negated_preds
+                    # When neg is set, the stored predicate is inverted —
+                    # swap A/B operands so that "P? d=A : d=B" means the right
+                    # branch.  SEL.64 has no explicit "!P" guard bit; instead
+                    # we encode (P? src0 : src1) and rely on operand-swap.
+                    s0_reg, s1_reg = (a, b) if not neg else (b, a)
+                    raw = encode_sel_64(d, s0_reg, s1_reg, pred=pd)
+                    output.append(SassInstr(
+                        raw,
+                        f'SEL.64 R{d}, R{s0_reg}, R{s1_reg}, P{pd}  // selp.{typ}'))
 
                 elif op == 'selp':
                     d = ctx.ra.r32(instr.dest.name)

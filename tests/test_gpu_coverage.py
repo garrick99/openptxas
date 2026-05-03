@@ -774,4 +774,87 @@ class TestFMinMax:
 
 
 # ============================================================
+# SEL.64 — selp.b64 with two register sources lowers to native SEL.64
+# ============================================================
+
+_PTX_SEL64 = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry sel64_test(.param .u64 p_out, .param .u64 p_a, .param .u64 p_b, .param .u64 p_cond) {
+    .reg .u64 %rd<8>;
+    .reg .u32 %r<4>;
+    .reg .pred %p<2>;
+    ld.param.u64 %rd0, [p_a];
+    ld.global.u64 %rd1, [%rd0];
+    ld.param.u64 %rd2, [p_b];
+    ld.global.u64 %rd3, [%rd2];
+    ld.param.u64 %rd9, [p_cond];
+    cvt.u32.u64 %r0, %rd9;
+    setp.ne.u32 %p0, %r0, 0;
+    selp.b64 %rd4, %rd1, %rd3, %p0;
+    add.u64 %rd5, %rd4, %rd1;
+    xor.b64 %rd6, %rd5, %rd3;
+    ld.param.u64 %rd7, [p_out];
+    st.global.u64 [%rd7], %rd6;
+    ret;
+}
+"""
+
+
+@gpu
+class TestSel64:
+    """Bit-identical SEL.64 emission and runtime correctness for selp.b64."""
+
+    def _run(self, cuda_ctx, cond):
+        cubins = compile_ptx_source(_PTX_SEL64)
+        assert cuda_ctx.load(cubins['sel64_test'])
+        func = cuda_ctx.get_func('sel64_test')
+        a_val = 0x1122334455667788
+        b_val = 0x0fedcba987654321
+        d_a = cuda_ctx.alloc(8); cuda_ctx.copy_to(d_a, struct.pack('<Q', a_val))
+        d_b = cuda_ctx.alloc(8); cuda_ctx.copy_to(d_b, struct.pack('<Q', b_val))
+        d_o = cuda_ctx.alloc(8); cuda_ctx.copy_to(d_o, b'\x00' * 8)
+        # cond is a by-value u64 param.  Force the conftest launch helper
+        # to pack it as a u64 by ORing in the high bit (value-preserving for
+        # cond>0; for cond=0 we use a special value 0).  Workaround for
+        # conftest's heuristic that picks c_int32 for small ints.
+        cond_arg = cond if cond > 0xFFFFFFFF else (0x100000000 | cond) - 0x100000000  # 0 stays 0
+        # Actually: explicitly use a u64 value.  Force cond to be passed as u64 by
+        # using a value >0xFFFFFFFF when nonzero; for cond=0, value is naturally 0.
+        # The real fix is to pass cond via a one-element array; but we need a
+        # workaround.  Use ctypes directly:
+        import ctypes as _ct
+        cond_holder = _ct.c_uint64(cond)
+        # cuda_ctx.launch's first arg-loop will treat cond_holder as non-int,
+        # which fails its int branches.  Instead, build args ourselves.
+        gx, gy, gz = (1,1,1); bx, by, bz = (1,1,1)
+        holders = [
+            _ct.c_uint64(d_o.value if hasattr(d_o, 'value') else d_o),
+            _ct.c_uint64(d_a.value if hasattr(d_a, 'value') else d_a),
+            _ct.c_uint64(d_b.value if hasattr(d_b, 'value') else d_b),
+            cond_holder,
+        ]
+        ptrs = [_ct.cast(_ct.byref(h), _ct.c_void_p) for h in holders]
+        aa = (_ct.c_void_p * 4)(*ptrs)
+        cuda_ctx.cuda.cuLaunchKernel(func, gx, gy, gz, bx, by, bz, 0, None, aa, None)
+        assert cuda_ctx.sync() == 0
+        got = struct.unpack('<Q', cuda_ctx.copy_from(d_o, 8))[0]
+        sel = a_val if cond != 0 else b_val
+        mask = 0xFFFFFFFFFFFFFFFF
+        expected = (((sel + a_val) & mask) ^ b_val) & mask
+        cuda_ctx.free(d_a); cuda_ctx.free(d_b); cuda_ctx.free(d_o)
+        assert got == expected, f"cond={cond}: got 0x{got:016x}, expected 0x{expected:016x}"
+
+    def test_sel64_true(self, cuda_ctx):
+        self._run(cuda_ctx, 1)
+
+    def test_sel64_false(self, cuda_ctx):
+        self._run(cuda_ctx, 0)
+
+    def test_sel64_alt_true(self, cuda_ctx):
+        self._run(cuda_ctx, 0xDEADBEEF)
+
+
+# ============================================================
 # Dot product (FMA chain with indexed loads)

@@ -9,6 +9,7 @@ from sass.encoding.sm_120_opcodes import (
     encode_redux_sum, encode_ldgsts_e, encode_ldgdepbar, encode_depbar_le,
     encode_f2fp_f16_f32,
     encode_hmma_bf16_f32, encode_hmma_tf32_f32, encode_dmma_8x8x4, encode_cs2r,
+    encode_sel_64,
 )
 
 
@@ -604,6 +605,60 @@ def test_cctl_ivall_opcode():
     assert _opcode(raw) == 0x98f, f"opcode={_opcode(raw):#x}"
     assert raw[3] == 0xff  # always ff
     assert raw[11] == 0x02  # IVALL mode
+
+
+# --- SEL.64 (newly landed; ground truth from ptxas 13.2.78 sm_120) ---
+
+# Probe ptxas reproducer: see _probe_landing/probe_sel64_3.ptx + probe_sel64_preds.ptx.
+# Ground truth bytes (with default ctrl 0x7e0 → b13/14/15 = 0xc0,0x0f,0x00,
+# rather than ptxas-emitted scheduling bytes; we only verify *opcode/operand* bytes
+# 0..12 against ground truth, since b13..15 are scheduling-controlled by the caller).
+#   SEL.64 R8,R4,R6,P0 (real ptxas):
+#     07 76 08 04 06 00 00 00 00 00 00 00 00 c8 4f 00
+#   SEL.64 R6,R6,R8,P1:
+#     07 76 06 06 08 00 00 00 00 00 80 00 00 e4 8f 00
+#   SEL.64 R10,R4,R6,P0:
+#     07 76 0a 04 06 00 00 00 00 00 00 00 00 c4 4f 00
+
+def test_sel_64_opcode_p0():
+    """Byte-exact match against ptxas ground truth for SEL.64 R8,R4,R6,P0
+    (operand bytes 0..12). Control bytes 13..15 are caller-controlled."""
+    raw = encode_sel_64(dest=8, src0=4, src1=6, pred=0)
+    expected = bytes.fromhex('0776080406000000') + bytes.fromhex('0000000000')
+    assert raw[0:13] == expected, (
+        f"SEL.64 P0 byte mismatch:\n"
+        f"  got: {raw[0:13].hex()}\n"
+        f"  exp: {expected.hex()}"
+    )
+
+def test_sel_64_opcode_p1():
+    """Verify P1 sets bit 87 (byte[10] bit 7)."""
+    raw = encode_sel_64(dest=6, src0=6, src1=8, pred=1)
+    expected = bytes.fromhex('0776060608000000') + bytes.fromhex('0000800000')
+    assert raw[0:13] == expected, (
+        f"SEL.64 P1 byte mismatch:\n"
+        f"  got: {raw[0:13].hex()}\n"
+        f"  exp: {expected.hex()}"
+    )
+
+def test_sel_64_opcode_p2():
+    """Synthesize: P2 should set bit 88 (byte[11] bit 0)."""
+    raw = encode_sel_64(dest=4, src0=2, src1=6, pred=2)
+    # bit 87 (P_in[0]) == 0 for P2; bit 88 (P_in[1]) == 1.
+    assert raw[10] == 0x00
+    assert raw[11] == 0x01
+
+def test_sel_64_distinct_from_sel_32():
+    """Confirm byte[1]=0x76 (vs SEL.32's 0x72)."""
+    raw = encode_sel_64(dest=4, src0=2, src1=6, pred=0)
+    assert raw[0] == 0x07
+    assert raw[1] == 0x76
+
+def test_sel_64_dest_src_fields():
+    raw = encode_sel_64(dest=12, src0=20, src1=30, pred=0)
+    assert raw[2] == 12
+    assert raw[3] == 20
+    assert raw[4] == 30
 
 
 if __name__ == '__main__':

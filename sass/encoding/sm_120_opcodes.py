@@ -2535,6 +2535,74 @@ def encode_sel(dest: int, src0: int, src1: int, pred: int = 0,
 
 
 # ---------------------------------------------------------------------------
+# SEL.64 — Select on a 64-bit register pair (NEWLY ADDED)
+# ---------------------------------------------------------------------------
+# Source: ptxas-extracted ground truth (factual data) cross-referenced with
+#         sass-king Apache-2.0 SEL family table.
+#
+# Opcode: byte[0]=0x07, byte[1]=0x76  (vs SEL.32 byte[1]=0x72; bit 10 is the
+#         .64 width flag). 16-byte instruction.
+#
+# Ground truth (ptxas 13.2.78, sm_120, RTX 5090):
+#   SEL.64 R8, R4, R6, P0 →
+#       lo=0x0000000604087607  hi=0x004fc80000000000
+#   SEL.64 R6, R6, R8, P1 →
+#       lo=0x0000000806067607  hi=0x008fe40000800000
+#
+# Predicate field analysis (P0 vs P1 ground truth):
+#   P0  →  byte[10]=0x00  (bits 87..89 == 0)
+#   P1  →  byte[10]=0x80  (bit 87 == 1)
+# So the 3-bit P_in index lives at bits 87..89 (byte[10] bits 7..6 + byte[11] bit 0
+# from upstream investigation).  For P0..P3 the index fits entirely in byte[10]
+# bit 7 + byte[11] bits 0..1.  We only encode P0..P7 here.
+#
+# Source/PTX op: PTX `selp.b64 %rdD, %rdA, %rdB, %p` — when ptxas commits A and
+# B as register pairs (e.g. when the inputs are LDG.64 results that cannot be
+# fused into predicated loads), it emits a single SEL.64 instead of pairing two
+# SEL.32s.  See `_probe_landing/probe_sel64_3.ptx` and `_probe_landing/
+# probe_sel64_preds.ptx` for reproducers.
+
+def encode_sel_64(dest: int, src0: int, src1: int, pred: int = 0,
+                  ctrl: int = 0) -> bytes:
+    """Encode SEL.64 dest_pair, src0_pair, src1_pair, Ppred.
+
+    Selects between two 64-bit register pairs based on predicate.  All register
+    arguments are *base* indices of an even-aligned register pair.  When P==0
+    the destination pair is set to src0_pair; otherwise src1_pair.
+
+    Byte layout (verified byte-exact against ptxas SM_120 ground truth):
+      byte[0]   = 0x07          opcode low
+      byte[1]   = 0x76          opcode high (.64 = bit 10 set vs SEL.32's 0x72)
+      byte[2]   = dest          even-aligned base register
+      byte[3]   = src0          even-aligned base register
+      byte[4]   = src1          even-aligned base register
+      byte[5..7]= 0
+      byte[8]   = 0
+      byte[9]   = 0
+      byte[10]  = (pred & 1) << 7   bit 87 = P_in[0]
+      byte[11]  = (pred >> 1) & 0x03  bits 88..89 = P_in[1..2]
+      byte[12]  = 0
+      byte[13..15] = ctrl
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0]  = 0x07
+    raw[1]  = 0x76
+    raw[2]  = dest & 0xFF
+    raw[3]  = src0 & 0xFF
+    raw[4]  = src1 & 0xFF
+    p = pred & 0x07
+    raw[10] = (p & 0x01) << 7              # P_in[0] -> bit 87
+    raw[11] = (p >> 1) & 0x03              # P_in[1..2] -> bits 88..89
+    raw[13] = b13
+    raw[14] = b14
+    raw[15] = b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
 # PRMT — Byte Permute
 # ---------------------------------------------------------------------------
 # Immediate-selector PRMT: opcode 0x16, 0x74 → opc=0x416

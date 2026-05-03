@@ -109,6 +109,11 @@ _OPCODE_META: dict[int, _OpMeta] = {
     0x312: _OpMeta('I2F.F64',   1, 0x3e, 1),  # I2F.F64 int32-to-float64 conversion (writes pair)
     0x81a: _OpMeta('BFE_SEXT',  1, 0x3e, 1),  # BFE sign-extension step (bfe.s32 lowering)
     0x207: _OpMeta('SEL',       0, 0x3e, 1),  # SEL: register select (P3-2)
+    0x607: _OpMeta('SEL.64',    1, 0x3e, 1),  # SEL.64: 64-bit register-pair select.
+                                             # writes a register PAIR (so dest_kind=1
+                                             # like other 64-bit ops); same ALU
+                                             # latency class as SEL. Source: ptxas
+                                             # ground truth on SM_120, opcode 0x607.
     0x22a: _OpMeta('DSETP',     0, 0x3e, 0),  # DSETP FP64 compare → predicate (misc=0, like ISETP)
     # Tensor core MMA: dedicated wdep slot 0x32 with rbar bit 0x11 (bit 4 +
     # gate bit 0).  Previously used 0x3e (ALU class), which was too short a
@@ -278,6 +283,7 @@ _OPCODES_ALU = {
     0x219,        # SHF.R.S32.HI.VAR (arithmetic right shift, variable amount)
     # Select / predicate
     0x207,        # SEL (SM_120)
+    0x607,        # SEL.64 (SM_120) — 64-bit register-pair select
     0x807,        # SEL (SM_89, imm form)
     0xa0c,        # ISETP (SM_89 cbuf form)
     0x208,        # FSEL (register)
@@ -536,6 +542,9 @@ def _get_src_regs(raw: bytes) -> set[int]:
         elif opcode in (0x207, 0x20b, 0xc0b):  # SEL/FSETP/FSETP-UR: src0=b3, src1=b4
             if raw[3] < 255: regs.add(raw[3])
             if raw[4] < 255: regs.add(raw[4])
+        elif opcode == 0x607:  # SEL.64: reads register PAIRS at b3 and b4
+            if raw[3] < 255: regs |= {raw[3], raw[3] + 1}
+            if raw[4] < 255: regs |= {raw[4], raw[4] + 1}
         elif opcode in (0x816, 0x416):  # PRMT imm: src0=b3, selector in b4-b7 (imm), src1=b8
             if raw[3] < 255: regs.add(raw[3])
             if raw[8] < 255: regs.add(raw[8])
@@ -1357,6 +1366,8 @@ def _get_dest_regs(raw: bytes) -> set[int]:
             if raw[9] == 0x18:  # F2F.F64.F32: dest is f64 pair
                 regs.add(dest + 1)
     elif opcode == 0x312:  # I2F.F64: always writes dest pair
+        if dest < 255: regs |= {dest, dest + 1}
+    elif opcode == 0x607:  # SEL.64: writes a 64-bit register PAIR
         if dest < 255: regs |= {dest, dest + 1}
     elif opcode in _OPCODES_ALU:
         if dest < 255: regs.add(dest)

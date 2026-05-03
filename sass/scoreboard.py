@@ -1370,6 +1370,11 @@ def _get_dest_regs(raw: bytes) -> set[int]:
             regs.add(dest)
             if raw[9] == 0x18:  # F2F.F64.F32: dest is f64 pair
                 regs.add(dest + 1)
+    elif opcode == 0x311:  # F2I: 64-bit dest variants (b9 bit 3 set) write pair
+        if dest < 255:
+            regs.add(dest)
+            if raw is not None and (raw[9] & 0x08):  # F2I.{U,S}64{.F64}: dest pair
+                regs.add(dest + 1)
     elif opcode == 0x312:  # I2F.F64: always writes dest pair
         if dest < 255: regs |= {dest, dest + 1}
     elif opcode == 0x607:  # SEL.64: writes a 64-bit register PAIR

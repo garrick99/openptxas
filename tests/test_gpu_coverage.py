@@ -890,4 +890,123 @@ class TestSel64:
 
 
 # ============================================================
+# F2I.U64/S64 — float to 64-bit int (cvt.rzi.{u,s}64.{f32,f64})
+# ============================================================
+
+_PTX_F2I_U64_F32 = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry f2i_u64_f32_test(.param .u64 p_out, .param .u64 p_in) {
+    .reg .f32 %f<4>;
+    .reg .u64 %rd<8>;
+    ld.param.u64 %rd1, [p_in];
+    ld.global.f32 %f1, [%rd1];
+    cvt.rzi.u64.f32 %rd2, %f1;
+    ld.param.u64 %rd3, [p_out];
+    st.global.u64 [%rd3], %rd2;
+    ret;
+}
+"""
+
+_PTX_F2I_S64_F32 = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry f2i_s64_f32_test(.param .u64 p_out, .param .u64 p_in) {
+    .reg .f32 %f<4>;
+    .reg .s64 %sd<4>;
+    .reg .u64 %rd<8>;
+    ld.param.u64 %rd1, [p_in];
+    ld.global.f32 %f1, [%rd1];
+    cvt.rzi.s64.f32 %sd1, %f1;
+    ld.param.u64 %rd3, [p_out];
+    st.global.s64 [%rd3], %sd1;
+    ret;
+}
+"""
+
+_PTX_F2I_U64_F64 = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry f2i_u64_f64_test(.param .u64 p_out, .param .u64 p_in) {
+    .reg .f64 %fd<4>;
+    .reg .u64 %rd<8>;
+    ld.param.u64 %rd1, [p_in];
+    ld.global.f64 %fd1, [%rd1];
+    cvt.rzi.u64.f64 %rd2, %fd1;
+    ld.param.u64 %rd3, [p_out];
+    st.global.u64 [%rd3], %rd2;
+    ret;
+}
+"""
+
+_PTX_F2I_S64_F64 = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry f2i_s64_f64_test(.param .u64 p_out, .param .u64 p_in) {
+    .reg .f64 %fd<4>;
+    .reg .s64 %sd<4>;
+    .reg .u64 %rd<8>;
+    ld.param.u64 %rd1, [p_in];
+    ld.global.f64 %fd1, [%rd1];
+    cvt.rzi.s64.f64 %sd1, %fd1;
+    ld.param.u64 %rd3, [p_out];
+    st.global.s64 [%rd3], %sd1;
+    ret;
+}
+"""
+
+
+@gpu
+class TestF2I64:
+    """GPU correctness for cvt.rzi.{u,s}64.{f32,f64} → F2I.{U,S}64{.F64}.TRUNC."""
+
+    def _run_unsigned(self, cuda_ctx, ptx_src, kernel_name, fmt_in, in_size, val):
+        cubins = compile_ptx_source(ptx_src)
+        assert cuda_ctx.load(cubins[kernel_name])
+        d_in = cuda_ctx.alloc(in_size); cuda_ctx.copy_to(d_in, struct.pack(fmt_in, val))
+        d_out = cuda_ctx.alloc(8); cuda_ctx.copy_to(d_out, b'\x00' * 8)
+        cuda_ctx.launch(cuda_ctx.get_func(kernel_name), (1,1,1), (1,1,1), [d_out, d_in])
+        assert cuda_ctx.sync() == 0
+        got = struct.unpack('<Q', cuda_ctx.copy_from(d_out, 8))[0]
+        cuda_ctx.free(d_in); cuda_ctx.free(d_out)
+        # Reference: int(trunc(val)) for finite, in-range values.
+        # Out-of-range / NaN behavior is implementation-defined; tests pick safe
+        # in-range values.
+        ref = int(val) & 0xFFFFFFFFFFFFFFFF
+        assert got == ref, f"{kernel_name}({val}): got {got}, ref {ref}"
+
+    def _run_signed(self, cuda_ctx, ptx_src, kernel_name, fmt_in, in_size, val):
+        cubins = compile_ptx_source(ptx_src)
+        assert cuda_ctx.load(cubins[kernel_name])
+        d_in = cuda_ctx.alloc(in_size); cuda_ctx.copy_to(d_in, struct.pack(fmt_in, val))
+        d_out = cuda_ctx.alloc(8); cuda_ctx.copy_to(d_out, b'\x00' * 8)
+        cuda_ctx.launch(cuda_ctx.get_func(kernel_name), (1,1,1), (1,1,1), [d_out, d_in])
+        assert cuda_ctx.sync() == 0
+        got = struct.unpack('<q', cuda_ctx.copy_from(d_out, 8))[0]
+        cuda_ctx.free(d_in); cuda_ctx.free(d_out)
+        ref = int(val)
+        assert got == ref, f"{kernel_name}({val}): got {got}, ref {ref}"
+
+    def test_f2i_u64_f32_basic(self, cuda_ctx):
+        for v in [0.0, 1.5, 1234567.89, 1e10]:
+            self._run_unsigned(cuda_ctx, _PTX_F2I_U64_F32, 'f2i_u64_f32_test', '<f', 4, v)
+
+    def test_f2i_s64_f32_basic(self, cuda_ctx):
+        for v in [0.0, 1.5, -2.5, 1234567.89, -1e9]:
+            self._run_signed(cuda_ctx, _PTX_F2I_S64_F32, 'f2i_s64_f32_test', '<f', 4, v)
+
+    def test_f2i_u64_f64_basic(self, cuda_ctx):
+        for v in [0.0, 1.5, 1234567.89, 1e15]:
+            self._run_unsigned(cuda_ctx, _PTX_F2I_U64_F64, 'f2i_u64_f64_test', '<d', 8, v)
+
+    def test_f2i_s64_f64_basic(self, cuda_ctx):
+        for v in [0.0, 1.5, -2.5, 1234567.89, -1e15]:
+            self._run_signed(cuda_ctx, _PTX_F2I_S64_F64, 'f2i_s64_f64_test', '<d', 8, v)
+
+
+# ============================================================
 # Dot product (FMA chain with indexed loads)

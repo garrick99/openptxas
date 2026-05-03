@@ -13,6 +13,7 @@ from sass.encoding.sm_120_opcodes import (
     encode_shf_l_u32_hi_var, encode_shf_l_w_u32_hi_var, encode_shf_l_w_u32_var,
     encode_cs2ur,
     encode_lea_hi_x,
+    encode_f2i_u64,
 )
 
 
@@ -816,6 +817,56 @@ def test_lea_hi_x_pred_field():
         assert (raw[10] & 0x0f) == 0x0f
         assert (raw[10] >> 7) & 1 == (p & 1)
         assert raw[11] & 0x03 == ((p >> 1) & 0x03)
+
+
+# ---------------------------------------------------------------------------
+# F2I.{U,S}64 — float to 64-bit int
+# ---------------------------------------------------------------------------
+# Ground truth (ptxas 13.2.78, sm_120, _probe_landing/probe_f2i_64.ptx):
+#   F2I.U64.TRUNC      R6,  R2 (cvt.rzi.u64.f32): lo=0x0000000200067311 hi=0x004e24000020d800
+#   F2I.S64.TRUNC      R8,  R2 (cvt.rzi.s64.f32): lo=0x0000000200087311 hi=0x000e24000020d900
+#   F2I.U64.F64.TRUNC  R10, R4 (cvt.rzi.u64.f64): lo=0x00000004000a7311 hi=0x008e24000030d800
+#   F2I.S64.F64.TRUNC  R12, R4 (cvt.rzi.s64.f64): lo=0x00000004000c7311 hi=0x000e24000030d900
+
+def test_f2i_u64_f32_byte_exact():
+    """F2I.U64.TRUNC R6, R2 (cvt.rzi.u64.f32) — byte-exact ptxas match."""
+    raw = encode_f2i_u64(dest_lo=6, src=2, signed=False, src_is_f64=False)
+    lo, hi = _lo_hi(raw)
+    assert lo == 0x0000000200067311, f"lo=0x{lo:016x}"
+    # Ignore ctrl bytes 13..15 (high 24 bits of hi); compare lower 40 bits.
+    assert (hi & 0x000000ffffffffff) == 0x000000000020d800, f"hi&...=0x{hi & 0x000000ffffffffff:016x}"
+
+def test_f2i_s64_f32_byte_exact():
+    raw = encode_f2i_u64(dest_lo=8, src=2, signed=True, src_is_f64=False)
+    lo, hi = _lo_hi(raw)
+    assert lo == 0x0000000200087311
+    assert (hi & 0x000000ffffffffff) == 0x000000000020d900
+
+def test_f2i_u64_f64_byte_exact():
+    raw = encode_f2i_u64(dest_lo=10, src=4, signed=False, src_is_f64=True)
+    lo, hi = _lo_hi(raw)
+    assert lo == 0x00000004000a7311
+    assert (hi & 0x000000ffffffffff) == 0x000000000030d800
+
+def test_f2i_s64_f64_byte_exact():
+    raw = encode_f2i_u64(dest_lo=12, src=4, signed=True, src_is_f64=True)
+    lo, hi = _lo_hi(raw)
+    assert lo == 0x00000004000c7311
+    assert (hi & 0x000000ffffffffff) == 0x000000000030d900
+
+def test_f2i_u64_signed_bit():
+    """Bit 72 (byte[9] bit 0) is the signed-dst flag."""
+    u = encode_f2i_u64(dest_lo=4, src=2, signed=False)
+    s = encode_f2i_u64(dest_lo=4, src=2, signed=True)
+    assert (u[9] & 0x01) == 0
+    assert (s[9] & 0x01) == 1
+
+def test_f2i_u64_src_width_bit():
+    """Bit 84 (byte[10] bit 4) is the f64-src flag."""
+    f32 = encode_f2i_u64(dest_lo=4, src=2, src_is_f64=False)
+    f64 = encode_f2i_u64(dest_lo=4, src=2, src_is_f64=True)
+    assert (f32[10] & 0x10) == 0
+    assert (f64[10] & 0x10) == 0x10
 
 
 if __name__ == '__main__':

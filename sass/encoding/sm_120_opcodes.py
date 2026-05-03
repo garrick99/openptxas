@@ -3633,6 +3633,68 @@ def encode_i2f_f64_u32(dest_lo: int, src: int, ctrl: int = 0) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# F2I — Float-to-64-bit-integer conversions (NEWLY ADDED)
+# ---------------------------------------------------------------------------
+# Source: ptxas-extracted ground truth, cross-referenced against NAK's
+# encoders/sm70_encode.rs (MIT) which models the same opcode family on
+# earlier SMs.  delta_landing.md notes "F2I: opcode 0x111 for 64-bit dst,
+# bit 72 = signed dst" (i.e. byte[9] bit 0).
+#
+# Opcode 0x311 (byte[0]=0x11, byte[1]=0x73), shared with the existing F2I.{S,U}32.F64
+# 32-bit-dest encoders.  64-bit destination is signaled by bit 75 (byte[9] bit 3 = 0x08):
+#   F2I.U32.F64: b9=0xd0   F2I.U64.F64: b9=0xd8
+#   F2I.S32.F64: b9=0xd1   F2I.S64.F64: b9=0xd9
+#   F2I.S32.F32: b9=0xf1   F2I.S64.F32: b9=0xd9 (no f64 src bit; b9 bit 5 (0x20) is f32-src)
+#                                                wait — see ground truth below:
+#
+# Ground truth (ptxas 13.2.78, sm_120, see _probe_landing/probe_f2i_64.ptx):
+#   F2I.U64.TRUNC   R6,  R2  (cvt.rzi.u64.f32):  lo=0x0000000200067311 hi=0x004e24000020d800
+#       → b2=0x06 b4=0x02 b9=0xd8 b10=0x20
+#   F2I.S64.TRUNC   R8,  R2  (cvt.rzi.s64.f32):  lo=0x0000000200087311 hi=0x000e24000020d900
+#       → b2=0x08 b4=0x02 b9=0xd9 b10=0x20
+#   F2I.U64.F64.TRUNC R10, R4 (cvt.rzi.u64.f64): lo=0x00000004000a7311 hi=0x008e24000030d800
+#       → b2=0x0a b4=0x04 b9=0xd8 b10=0x30
+#   F2I.S64.F64.TRUNC R12, R4 (cvt.rzi.s64.f64): lo=0x00000004000c7311 hi=0x000e24000030d900
+#       → b2=0x0c b4=0x04 b9=0xd9 b10=0x30
+#
+# Field decomposition:
+#   b9 bit 0 (0x01) = signed dst   (matches delta_landing.md "bit 72 = signed dst")
+#   b9 bit 3 (0x08) = 64-bit dst   (delta_landing.md "0x111 for 64-bit dst")
+#   b9 bits 6..7 (0xc0) — TRUNC rounding mode (rzi)
+#   b10 bit 4 (0x10) — set when source is f64 (b10=0x30 vs 0x20 for f32)
+
+def encode_f2i_u64(dest_lo: int, src: int, signed: bool = False,
+                   src_is_f64: bool = False, ctrl: int = 0) -> bytes:
+    """Encode F2I.{U,S}64{.F64}.TRUNC.NTZ dest_lo, src — float to 64-bit int.
+
+    dest_lo is the lo register of the destination 64-bit pair (dest_lo+1 written
+    implicitly).  src is a single f32 GPR when src_is_f64=False, or the lo
+    register of an f64 pair when src_is_f64=True.
+
+    Args:
+        dest_lo:     Lo register index of destination 64-bit int pair.
+        src:         f32 register or lo of f64 pair source.
+        signed:      True for cvt.rzi.s64.*, False for cvt.rzi.u64.*.
+        src_is_f64:  True for cvt.rzi.*.f64, False for cvt.rzi.*.f32.
+        ctrl:        Optional control word; defaults to _CTRL_DEFAULT.
+
+    Byte layout (verified byte-exact against ptxas 13.2.78 ground truth):
+      byte[0..1] = 0x11 0x73   (opcode 0x311)
+      byte[2]    = dest_lo
+      byte[4]    = src
+      byte[9]    = 0xd8 | (1 if signed else 0)   bit 0 = signed dst
+      byte[10]   = 0x20 | (0x10 if src_is_f64 else 0)   bit 4 = f64 src
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b9  = 0xd8 | (0x01 if signed else 0x00)
+    b10 = 0x20 | (0x10 if src_is_f64 else 0x00)
+    return _build(0x11, 0x73,
+                  b2=dest_lo, b3=0x00, b4=src,
+                  b8=0x00, b9=b9, b10=b10, b11=0x00,
+                  ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
 # HFMA2 — Half-precision FMA2 (used as zero-init trick in div.u32)
 # ---------------------------------------------------------------------------
 # HFMA2 R2, -RZ, RZ, 0, 0 computes (-0.0)*0.0 + 0.0 = 0.0 and zero-extends to int.

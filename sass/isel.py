@@ -75,6 +75,7 @@ from sass.encoding.sm_120_opcodes import (
     encode_f2fp_f16_f32, encode_cvt_f16_f32,
     encode_f2f_f32_f64, encode_f2f_f64_f32,
     encode_f2i_s32_f64, encode_f2i_u32_f64, encode_i2f_f64_s32, encode_i2f_f64_u32,
+    encode_f2i_u64,
     encode_i2f_u32_rp, encode_i2f_s32_rp, encode_f2i_ftz_u32_trunc, encode_hfma2_zero,
     encode_hmma_f16_f32, encode_hmma_f16_f32_k8, encode_hmma_bf16_f32, encode_hmma_tf32_f32,
     encode_imma_s8_s32, encode_dmma_8x8x4,
@@ -5351,6 +5352,24 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 a_lo = ctx.ra.lo(s.name)
                                 output.append(SassInstr(encode_f2i_u32_f64(d_r, a_lo),
                                                         f'F2I.U32.F64 R{d_r}, R{a_lo}'))
+                            elif _dst_t in ('u64', 's64') and _src_t in ('f32', 'f64'):
+                                # cvt.rzi.{u,s}64.{f32,f64}: float to 64-bit int (truncate).
+                                # ptxas emits a single F2I.{U,S}64{.F64} writing the
+                                # 64-bit dest pair (dest_lo, dest_lo+1).
+                                d_lo = ctx.ra.lo(d.name)
+                                if _src_t == 'f64':
+                                    a_lo = ctx.ra.lo(s.name)  # f64 source pair
+                                else:
+                                    a_lo = ctx.ra.r32(s.name)  # f32 single GPR
+                                _signed = (_dst_t == 's64')
+                                _src_is_f64 = (_src_t == 'f64')
+                                _w_tag = '.F64' if _src_is_f64 else ''
+                                _s_tag = 'S' if _signed else 'U'
+                                output.append(SassInstr(
+                                    encode_f2i_u64(d_lo, a_lo,
+                                                   signed=_signed,
+                                                   src_is_f64=_src_is_f64),
+                                    f'F2I.{_s_tag}64{_w_tag}.TRUNC R{d_lo}, R{a_lo}'))
                             elif _dst_t == 'f64' and _src_t == 's32':
                                 # cvt.rn.f64.s32: signed int32 → double
                                 d_lo = ctx.ra.lo(d.name)

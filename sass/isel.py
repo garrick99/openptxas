@@ -3722,6 +3722,19 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         output.append(SassInstr(encode_iadd(d, a, b),
                                                 f'IADD R{d}, R{a}, R{b}  // add.{typ}'))
 
+                elif op == 'iadd3' and typ in ('u32', 's32'):
+                    # Phase 34: synthetic 3-input integer add emitted by
+                    # iadd3_pair_reduce.py to fuse merkle-style chains
+                    # (`add %tmp, %a, %b; add %dst, %tmp, %c`) into a
+                    # single IADD3 R-R-R.  All three sources are
+                    # register operands by construction of the pass.
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = ctx.ra.r32(instr.srcs[0].name)
+                    b = ctx.ra.r32(instr.srcs[1].name)
+                    c = ctx.ra.r32(instr.srcs[2].name)
+                    output.append(SassInstr(encode_iadd3(d, a, b, c),
+                                            f'IADD3 R{d}, R{a}, R{b}, R{c}  // iadd3.{typ}'))
+
                 elif op == 'sub' and typ in ('u32', 's32'):
                     d = ctx.ra.r32(instr.dest.name)
                     if (isinstance(instr.srcs[0], ImmOp)

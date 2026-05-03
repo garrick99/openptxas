@@ -877,6 +877,7 @@ def compile_function(fn: Function, verbose: bool = False,
     from ptx.passes.imm_propagate       import run_function as _imm_propagate_run
     from ptx.passes.load_cse             import run_function as _load_cse_run
     from ptx.passes.add3_chain_reduce   import run_function as _add3_chain_reduce_run
+    from ptx.passes.iadd3_pair_reduce   import run_function as _iadd3_pair_reduce_run
     from ptx.passes.mul3_chain_reduce   import run_function as _mul3_chain_reduce_run
     from ptx.passes.cvt_roundtrip_fold  import run_function as _cvt_roundtrip_fold_run
     from ptx.passes.add_forward_chain   import run_function as _add_forward_chain_run
@@ -950,6 +951,12 @@ def compile_function(fn: Function, verbose: bool = False,
         # construction.  Narrow `mov`-only DCE removes them; ptxas does
         # the same.  Runs last so prior chain-folds have settled.
         ("dead_mov_dce",            _dead_mov_dce_run),
+        # Phase 34: register-only 2-input add pair fusion -> single
+        # IADD3 R-R-R.  Catches merkle-style hash-mixing chains
+        # (`add %tmp, %a, %b; add %dst, %tmp, %c`) that the older
+        # add3_chain_reduce pass misses (it expects an immediate K).
+        # Runs LAST so all upstream folds have settled.
+        ("iadd3_pair_reduce",       _iadd3_pair_reduce_run),
     ]
     for _pass_name, _pass_fn in _ptx_passes:
         if _pass_name in _disabled:

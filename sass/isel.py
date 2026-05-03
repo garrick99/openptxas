@@ -6656,6 +6656,9 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     t3 = _alloc_gpr(ctx)
                     ab_s = _alloc_gpr(ctx)  # |a| temp / saved |a|
                     sign = _alloc_gpr(ctx)  # sign = a ^ b (bit 31)
+                    # Preds are ephemeral within this block; recycle on exit so
+                    # kernels with many div/rem ops don't exhaust the 3-bit pred field.
+                    _pred_save = ctx._next_pred
                     ppos  = ctx._next_pred; ctx._next_pred += 1  # result is positive
                     pge1  = ctx._next_pred; ctx._next_pred += 1
                     pge2  = ctx._next_pred; ctx._next_pred += 1
@@ -6720,6 +6723,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     output.append(SassInstr(
                         encode_lop3_pred(d, RZ, b, RZ, 0x33, pnz, inverted=True),
                         f'@!P{pnz} LOP3.LUT R{d}, RZ, R{b}, RZ, 0x33  // div-by-zero'))
+                    ctx._next_pred = _pred_save
 
                 elif op == 'rem' and typ == 'u32':
                     # rem.u32 d, a, b = a - (a/b)*b
@@ -6732,6 +6736,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     t1 = _alloc_gpr(ctx)
                     t2 = _alloc_gpr(ctx)
                     t3 = _alloc_gpr(ctx)
+                    _pred_save = ctx._next_pred
                     pnz  = ctx._next_pred; ctx._next_pred += 1
                     pge1 = ctx._next_pred; ctx._next_pred += 1
                     pge2 = ctx._next_pred; ctx._next_pred += 1
@@ -6772,6 +6777,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         f'@P{pge2} IADD3 R{d}, R{d}, -R{b}, RZ'))
                     output.append(SassInstr(encode_lop3_pred(d, RZ, b, RZ, 0x33, pnz, inverted=True),
                         f'@!P{pnz} LOP3.LUT R{d}, RZ, R{b}, RZ, 0x33  // rem of div-by-zero=0xFFFFFFFF'))
+                    ctx._next_pred = _pred_save
 
                 elif op == 'rem' and typ == 's32':
                     # Signed 32-bit remainder via Newton-Raphson on absolute values.
@@ -6786,6 +6792,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     t1    = _alloc_gpr(ctx)
                     t2    = _alloc_gpr(ctx)
                     t3    = _alloc_gpr(ctx)
+                    _pred_save = ctx._next_pred
                     pgt1  = ctx._next_pred; ctx._next_pred += 1  # |b| > rem (no correction)
                     psign = ctx._next_pred; ctx._next_pred += 1  # a >= 0
                     pgt2  = ctx._next_pred; ctx._next_pred += 1  # second correction check
@@ -6842,6 +6849,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     output.append(SassInstr(
                         encode_lop3_pred(d, RZ, b, RZ, 0x33, pnz, inverted=True),
                         f'@!P{pnz} LOP3.LUT R{d}, RZ, R{b}, RZ, 0x33  // rem-by-zero'))
+                    ctx._next_pred = _pred_save
 
                 elif op in ('div', 'rem') and typ == 'u64':
                     want_rem = (op == 'rem')
@@ -6864,6 +6872,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
 
                     aw = _alloc_gpr_pair(ctx)
                     rw = _alloc_gpr_pair(ctx)
+                    _pred_save = ctx._next_pred
                     p_guard = ctx._next_pred; ctx._next_pred += 1
 
                     output.append(SassInstr(encode_mov(aw, a_in),
@@ -6905,6 +6914,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         f'MOV R{d_lo}, R{src_lo}  // {op}.u64 result lo'))
                     output.append(SassInstr(encode_mov(d_lo + 1, src_lo + 1),
                         f'MOV R{d_lo+1}, R{src_lo+1}  // {op}.u64 result hi'))
+                    ctx._next_pred = _pred_save
 
                 elif op == 'rcp' and any(m in instr.types for m in ('approx','rn','rz','rm','rp')) and typ == 'f32':
                     d = ctx.ra.r32(instr.dest.name)

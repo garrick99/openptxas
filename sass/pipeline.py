@@ -864,6 +864,18 @@ def compile_function(fn: Function, verbose: bool = False,
         # DCE pass removes it.
         _dce_run_function(fn)
 
+    # Phase 40: M31 Mersenne-prime modular reduction.  Recognizes
+    # `rem.u64 %d, %x, 2^31 - 1` (FORGE NTT m31_scale et al.) and
+    # rewrites to a 9-op shift/and/add/setp/sub chain — ~10 SASS vs
+    # ~460 from the bit-serial divide loop.  Must run BEFORE
+    # _if_convert: if-conversion otherwise predicates the rem.u64 and
+    # the conservative pass skips predicated forms.  Toggle via
+    # OPENPTXAS_DISABLE_PASSES=m31_mod_fast_path.
+    if "m31_mod_fast_path" not in set(
+            os.environ.get("OPENPTXAS_DISABLE_PASSES", "").split(",")):
+        from ptx.passes.m31_mod_fast_path import run_function as _m31_pre_run
+        _m31_pre_run(fn)
+
     # 0a. If-conversion: convert short if-else diamonds to predicated instructions,
     # matching ptxas behaviour for divergent branches on SM_120.
     _if_convert(fn)

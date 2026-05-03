@@ -13,7 +13,8 @@ from sass.encoding.sm_120_opcodes import (
     encode_shf_l_u32_hi_var, encode_shf_l_w_u32_hi_var, encode_shf_l_w_u32_var,
     encode_cs2ur,
     encode_lea_hi_x,
-    encode_f2i_u64,
+    encode_f2i_u64, encode_i2f_u64,
+    encode_i2f_f64_u32,
 )
 
 
@@ -867,6 +868,61 @@ def test_f2i_u64_src_width_bit():
     f64 = encode_f2i_u64(dest_lo=4, src=2, src_is_f64=True)
     assert (f32[10] & 0x10) == 0
     assert (f64[10] & 0x10) == 0x10
+
+
+# ---------------------------------------------------------------------------
+# I2F.{F32,F64}.{U,S}64 — 64-bit int to float
+# ---------------------------------------------------------------------------
+# Ground truth (ptxas 13.2.78, sm_120, _probe_landing/probe_i2f_64.ptx):
+#   I2F.U64       R12, R2 (cvt.rn.f32.u64): lo=0x00000002000c7312 hi=0x004fde0000301000
+#   I2F.F64.U64   R6,  R2 (cvt.rn.f64.u64): lo=0x0000000200067312 hi=0x000e240000301800
+#   I2F.S64       R13, R4 (cvt.rn.f32.s64): lo=0x00000004000d7312 hi=0x008e240000301400
+#   I2F.F64.S64   R8,  R4 (cvt.rn.f64.s64): lo=0x0000000400087312 hi=0x000e240000301c00
+
+def test_i2f_f32_u64_byte_exact():
+    raw = encode_i2f_u64(dest=12, src_lo=2, signed=False, dst_is_f64=False)
+    lo, hi = _lo_hi(raw)
+    assert lo == 0x00000002000c7312
+    assert (hi & 0x000000ffffffffff) == 0x0000000000301000
+
+def test_i2f_f64_u64_byte_exact():
+    raw = encode_i2f_u64(dest=6, src_lo=2, signed=False, dst_is_f64=True)
+    lo, hi = _lo_hi(raw)
+    assert lo == 0x0000000200067312
+    assert (hi & 0x000000ffffffffff) == 0x0000000000301800
+
+def test_i2f_f32_s64_byte_exact():
+    raw = encode_i2f_u64(dest=13, src_lo=4, signed=True, dst_is_f64=False)
+    lo, hi = _lo_hi(raw)
+    assert lo == 0x00000004000d7312
+    assert (hi & 0x000000ffffffffff) == 0x0000000000301400
+
+def test_i2f_f64_s64_byte_exact():
+    raw = encode_i2f_u64(dest=8, src_lo=4, signed=True, dst_is_f64=True)
+    lo, hi = _lo_hi(raw)
+    assert lo == 0x0000000400087312
+    assert (hi & 0x000000ffffffffff) == 0x0000000000301c00
+
+def test_i2f_u64_signed_bit():
+    """Bit 74 (byte[9] bit 2) is the signed-src flag."""
+    u = encode_i2f_u64(dest=4, src_lo=2, signed=False)
+    s = encode_i2f_u64(dest=4, src_lo=2, signed=True)
+    assert (u[9] & 0x04) == 0
+    assert (s[9] & 0x04) == 0x04
+
+def test_i2f_u64_dst_width_bit():
+    """Bit 75 (byte[9] bit 3) is the f64-dst flag."""
+    f32 = encode_i2f_u64(dest=4, src_lo=2, dst_is_f64=False)
+    f64 = encode_i2f_u64(dest=4, src_lo=2, dst_is_f64=True)
+    assert (f32[9] & 0x08) == 0
+    assert (f64[9] & 0x08) == 0x08
+
+def test_i2f_f64_u32_b9_fixed():
+    """Verify I2F.F64.U32 b9=0x18 (was 0x20 inferred-and-wrong before this commit)."""
+    # Ground truth (probe_i2f_f64_u32.ptx): I2F.F64.U32 R4, R2 → b9=0x18 b10=0x20.
+    raw = encode_i2f_f64_u32(dest_lo=4, src=2)
+    assert raw[9] == 0x18, f"b9={raw[9]:#04x}"
+    assert raw[10] == 0x20
 
 
 if __name__ == '__main__':

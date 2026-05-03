@@ -1375,8 +1375,14 @@ def _get_dest_regs(raw: bytes) -> set[int]:
             regs.add(dest)
             if raw is not None and (raw[9] & 0x08):  # F2I.{U,S}64{.F64}: dest pair
                 regs.add(dest + 1)
-    elif opcode == 0x312:  # I2F.F64: always writes dest pair
-        if dest < 255: regs |= {dest, dest + 1}
+    elif opcode == 0x312:  # I2F: f64-dst forms write pair (b9 bit 3); f32-dst forms write single
+        if dest < 255:
+            regs.add(dest)
+            # delta_landing.md: bit 75 = f64 dst.  When raw is unavailable
+            # (legacy callers, no instruction bytes yet), assume the legacy
+            # always-pair behaviour for back-compat.
+            if raw is None or (raw[9] & 0x08):
+                regs.add(dest + 1)
     elif opcode == 0x607:  # SEL.64: writes a 64-bit register PAIR
         if dest < 255: regs |= {dest, dest + 1}
     elif opcode in _OPCODES_ALU:

@@ -3621,14 +3621,17 @@ def encode_i2f_f64_s32(dest_lo: int, src: int, ctrl: int = 0) -> bytes:
 def encode_i2f_f64_u32(dest_lo: int, src: int, ctrl: int = 0) -> bytes:
     """Encode I2F.F64.U32 dest_lo, src — convert unsigned int32 to f64 pair.
 
-    Layout inferred from I2F.F64.S32 (b9=0x1c) + F32 u32 pattern (b9 differs by bit).
-    F32 unsigned adds 0x04 to signed; applying same delta: b9=0x1c+0x04=0x20.
-    Needs hardware verification.
+    Ground truth (verified during I2F.U64 work, _probe_landing/
+    probe_i2f_f64_u32.ptx): I2F.F64.U32 R4, R2 → b9=0x18, b10=0x20.
+
+    Earlier inference of b9=0x20 was incorrect — the f64-dst flag is bit 75
+    (b9 bit 3 = 0x08), not bit 77.  S32→F64 has b9=0x1c (signed+f64dst);
+    U32→F64 has b9=0x18 (just f64dst, no signed flag).
     """
     if ctrl == 0: ctrl = _CTRL_DEFAULT
     return _build(0x12, 0x73,
                   b2=dest_lo, b3=0x00, b4=src,
-                  b8=0x00, b9=0x20, b10=0x20, b11=0x00,
+                  b8=0x00, b9=0x18, b10=0x20, b11=0x00,
                   ctrl=ctrl)
 
 
@@ -3690,6 +3693,69 @@ def encode_f2i_u64(dest_lo: int, src: int, signed: bool = False,
     b10 = 0x20 | (0x10 if src_is_f64 else 0x00)
     return _build(0x11, 0x73,
                   b2=dest_lo, b3=0x00, b4=src,
+                  b8=0x00, b9=b9, b10=b10, b11=0x00,
+                  ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# I2F — 64-bit-integer-to-float conversions (NEWLY ADDED)
+# ---------------------------------------------------------------------------
+# Source: ptxas-extracted ground truth, cross-referenced against NAK's
+# encoders/sm70_encode.rs (MIT).  delta_landing.md notes "I2F: opcode 0x112
+# for 64-bit src, bit 74 = signed src" (i.e. byte[9] bit 2).
+#
+# Opcode 0x312 (byte[0]=0x12, byte[1]=0x73), shared with the existing I2F.F64.{U,S}32
+# 32-bit-src encoders.  64-bit source is signaled by bit 84 (byte[10] bit 4 = 0x10);
+# 64-bit destination (f64) by bit 75 (byte[9] bit 3 = 0x08):
+#   I2F.F64.U32: b9=0x18 b10=0x20  (verified — see encode_i2f_f64_u32 fix)
+#   I2F.F64.S32: b9=0x1c b10=0x20
+#   I2F.F32.U64: b9=0x10 b10=0x30
+#   I2F.F32.S64: b9=0x14 b10=0x30
+#   I2F.F64.U64: b9=0x18 b10=0x30
+#   I2F.F64.S64: b9=0x1c b10=0x30
+#
+# Ground truth (ptxas 13.2.78, sm_120, see _probe_landing/probe_i2f_64.ptx):
+#   I2F.U64       R12, R2  (cvt.rn.f32.u64): lo=0x00000002000c7312 hi=0x004fde0000301000
+#       → b2=0x0c b4=0x02 b9=0x10 b10=0x30
+#   I2F.F64.U64   R6,  R2  (cvt.rn.f64.u64): lo=0x0000000200067312 hi=0x000e240000301800
+#       → b2=0x06 b4=0x02 b9=0x18 b10=0x30
+#   I2F.S64       R13, R4  (cvt.rn.f32.s64): lo=0x00000004000d7312 hi=0x008e240000301400
+#       → b2=0x0d b4=0x04 b9=0x14 b10=0x30
+#   I2F.F64.S64   R8,  R4  (cvt.rn.f64.s64): lo=0x0000000400087312 hi=0x000e240000301c00
+#       → b2=0x08 b4=0x04 b9=0x1c b10=0x30
+#
+# Field decomposition:
+#   b9 bit 2 (0x04) = signed src   (matches delta_landing.md "bit 74 = signed src")
+#   b9 bit 3 (0x08) = 64-bit dst (f64 dst)
+#   b10 bit 4 (0x10) = 64-bit src
+
+def encode_i2f_u64(dest: int, src_lo: int, signed: bool = False,
+                   dst_is_f64: bool = False, ctrl: int = 0) -> bytes:
+    """Encode I2F.{F32,F64}.{U,S}64 dest, src_lo — 64-bit int to float.
+
+    src_lo is the lo register of the source 64-bit int pair (src_lo+1 read
+    implicitly).  dest is a single f32 GPR when dst_is_f64=False, or the lo
+    register of an f64 pair when dst_is_f64=True.
+
+    Args:
+        dest:        f32 register or lo of f64 pair destination.
+        src_lo:      Lo register index of source 64-bit int pair.
+        signed:      True for cvt.rn.*.s64, False for cvt.rn.*.u64.
+        dst_is_f64:  True for cvt.rn.f64.*, False for cvt.rn.f32.*.
+        ctrl:        Optional control word; defaults to _CTRL_DEFAULT.
+
+    Byte layout (verified byte-exact against ptxas 13.2.78 ground truth):
+      byte[0..1] = 0x12 0x73   (opcode 0x312)
+      byte[2]    = dest
+      byte[4]    = src_lo
+      byte[9]    = 0x10 | (0x04 if signed else 0) | (0x08 if dst_is_f64 else 0)
+      byte[10]   = 0x30   (bit 4 = 64-bit src; always set here)
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    b9  = 0x10 | (0x04 if signed else 0x00) | (0x08 if dst_is_f64 else 0x00)
+    b10 = 0x30
+    return _build(0x12, 0x73,
+                  b2=dest, b3=0x00, b4=src_lo,
                   b8=0x00, b9=b9, b10=b10, b11=0x00,
                   ctrl=ctrl)
 

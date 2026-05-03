@@ -1009,4 +1009,124 @@ class TestF2I64:
 
 
 # ============================================================
+# I2F.{F32,F64}.{U,S}64 — 64-bit int to float (cvt.rn.{f32,f64}.{u,s}64)
+# ============================================================
+
+_PTX_I2F_F32_U64 = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry i2f_f32_u64_test(.param .u64 p_out, .param .u64 p_in) {
+    .reg .f32 %f<4>;
+    .reg .u64 %rd<8>;
+    ld.param.u64 %rd1, [p_in];
+    ld.global.u64 %rd2, [%rd1];
+    cvt.rn.f32.u64 %f1, %rd2;
+    ld.param.u64 %rd3, [p_out];
+    st.global.f32 [%rd3], %f1;
+    ret;
+}
+"""
+
+_PTX_I2F_F32_S64 = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry i2f_f32_s64_test(.param .u64 p_out, .param .u64 p_in) {
+    .reg .f32 %f<4>;
+    .reg .s64 %sd<4>;
+    .reg .u64 %rd<8>;
+    ld.param.u64 %rd1, [p_in];
+    ld.global.s64 %sd1, [%rd1];
+    cvt.rn.f32.s64 %f1, %sd1;
+    ld.param.u64 %rd3, [p_out];
+    st.global.f32 [%rd3], %f1;
+    ret;
+}
+"""
+
+_PTX_I2F_F64_U64 = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry i2f_f64_u64_test(.param .u64 p_out, .param .u64 p_in) {
+    .reg .f64 %fd<4>;
+    .reg .u64 %rd<8>;
+    ld.param.u64 %rd1, [p_in];
+    ld.global.u64 %rd2, [%rd1];
+    cvt.rn.f64.u64 %fd1, %rd2;
+    ld.param.u64 %rd3, [p_out];
+    st.global.f64 [%rd3], %fd1;
+    ret;
+}
+"""
+
+_PTX_I2F_F64_S64 = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry i2f_f64_s64_test(.param .u64 p_out, .param .u64 p_in) {
+    .reg .f64 %fd<4>;
+    .reg .s64 %sd<4>;
+    .reg .u64 %rd<8>;
+    ld.param.u64 %rd1, [p_in];
+    ld.global.s64 %sd1, [%rd1];
+    cvt.rn.f64.s64 %fd1, %sd1;
+    ld.param.u64 %rd3, [p_out];
+    st.global.f64 [%rd3], %fd1;
+    ret;
+}
+"""
+
+
+@gpu
+class TestI2F64:
+    """GPU correctness for cvt.rn.{f32,f64}.{u,s}64 → I2F.{F32,F64}.{U,S}64."""
+
+    def _run(self, cuda_ctx, ptx_src, kernel_name, in_fmt, in_size,
+             out_fmt, out_size, val, ref_fn, tol=0.0):
+        cubins = compile_ptx_source(ptx_src)
+        assert cuda_ctx.load(cubins[kernel_name])
+        d_in = cuda_ctx.alloc(in_size); cuda_ctx.copy_to(d_in, struct.pack(in_fmt, val))
+        d_out = cuda_ctx.alloc(out_size); cuda_ctx.copy_to(d_out, b'\x00' * out_size)
+        cuda_ctx.launch(cuda_ctx.get_func(kernel_name), (1,1,1), (1,1,1), [d_out, d_in])
+        assert cuda_ctx.sync() == 0
+        got = struct.unpack(out_fmt, cuda_ctx.copy_from(d_out, out_size))[0]
+        cuda_ctx.free(d_in); cuda_ctx.free(d_out)
+        ref = ref_fn(val)
+        if tol == 0.0:
+            assert got == ref, f"{kernel_name}({val}): got {got!r}, ref {ref!r}"
+        else:
+            assert abs(got - ref) <= tol * max(abs(ref), 1.0), \
+                f"{kernel_name}({val}): got {got!r}, ref {ref!r}, tol={tol}"
+
+    def test_i2f_f32_u64_basic(self, cuda_ctx):
+        # f32 has 24-bit mantissa; values that fit exactly are bit-identical.
+        # Use values where round-to-nearest-even matches.
+        for v in [0, 1, 1024, 0xFFFFFF, 0x100000000, 0xFFFFFFFFFFFFFFFF]:
+            self._run(cuda_ctx, _PTX_I2F_F32_U64, 'i2f_f32_u64_test',
+                      '<Q', 8, '<f', 4, v,
+                      ref_fn=lambda x: float(x), tol=2e-7)
+
+    def test_i2f_f32_s64_basic(self, cuda_ctx):
+        for v in [0, 1, -1, 1024, -1024, 0xFFFFFF, 0x100000000, -(2**62)]:
+            self._run(cuda_ctx, _PTX_I2F_F32_S64, 'i2f_f32_s64_test',
+                      '<q', 8, '<f', 4, v,
+                      ref_fn=lambda x: float(x), tol=2e-7)
+
+    def test_i2f_f64_u64_basic(self, cuda_ctx):
+        # f64 has 53-bit mantissa; values that fit exactly are bit-identical.
+        for v in [0, 1, 1024, 0x1FFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF]:
+            self._run(cuda_ctx, _PTX_I2F_F64_U64, 'i2f_f64_u64_test',
+                      '<Q', 8, '<d', 8, v,
+                      ref_fn=lambda x: float(x), tol=1e-15)
+
+    def test_i2f_f64_s64_basic(self, cuda_ctx):
+        for v in [0, 1, -1, 1024, -1024, 0x1FFFFFFFFFFFFF, -(2**52)]:
+            self._run(cuda_ctx, _PTX_I2F_F64_S64, 'i2f_f64_s64_test',
+                      '<q', 8, '<d', 8, v,
+                      ref_fn=lambda x: float(x), tol=1e-15)
+
+
+# ============================================================
 # Dot product (FMA chain with indexed loads)

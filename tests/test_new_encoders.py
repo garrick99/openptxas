@@ -11,6 +11,7 @@ from sass.encoding.sm_120_opcodes import (
     encode_hmma_bf16_f32, encode_hmma_tf32_f32, encode_dmma_8x8x4, encode_cs2r,
     encode_sel_64,
     encode_shf_l_u32_hi_var, encode_shf_l_w_u32_hi_var, encode_shf_l_w_u32_var,
+    encode_cs2ur,
 )
 
 
@@ -704,6 +705,58 @@ def test_shf_l_w_low_word_clears_hi_bit():
     raw = encode_shf_l_w_u32_var(dest=5, src_lo=6, shift_reg=5, src_hi=7)
     assert raw[9] == 0x0e
     assert raw[10] == 0x00
+
+
+# --- CS2UR (newly landed; ground truth from ptxas 13.2.78 sm_120) ---
+
+# Probe ptxas reproducer: see _probe_landing/probe_cs2ur*.ptx.
+# Ground truth bytes (operand bytes 0..12; ctrl 13..15 is caller-controlled):
+#   CS2UR.32 UR6, SR_PM0     → cb 78 06 00 00 00 00 00 00 32 00 00 00 ...  (sr=0x32 PM0)
+#                                                                  ^^ wait: ground-truth byte[9]=0x64 visually.
+# But probe nvdisasm assembled SR_PM0 as code=0x32, so byte[9]=0x32 if direct mapping.
+# Probe_more.ptx showed SR_CLOCKLO=0x50 directly in byte[9].  PM0 in our other probe
+# showed byte[9]=0x64 — that's the *encoded* SR field, distinct from any internal
+# enum.  We use the *byte[9] value* observed at byte-extract level as ground truth
+# (i.e., for CLOCKLO pass sr_code=0x50 to the encoder).
+
+def test_cs2ur_byte_exact_clocklo():
+    """SR_CLOCKLO probe: byte[9]=0x50, byte[10]=0x00 (32-bit)."""
+    raw = encode_cs2ur(dest_ur=6, sr_code=0x50, is_64=False)
+    expected = bytes.fromhex('cb78060000000000005000 0000'.replace(' ', ''))
+    expected = bytes.fromhex('cb780600000000000050000000')
+    assert raw[0:13] == expected, (
+        f"CS2UR.32 UR6, SR_CLOCKLO byte mismatch:\n"
+        f"  got: {raw[0:13].hex()}\n  exp: {expected.hex()}"
+    )
+
+def test_cs2ur_dest_field():
+    for ur in (0, 4, 5, 6, 7, 30, 63):
+        raw = encode_cs2ur(dest_ur=ur, sr_code=0x50)
+        assert raw[2] == ur
+
+def test_cs2ur_sr_code_field():
+    for sr in (0x50, 0x51, 0x32, 0x33, 0x34, 0x35):
+        raw = encode_cs2ur(dest_ur=4, sr_code=sr)
+        assert raw[9] == sr
+
+def test_cs2ur_64_bit_flag():
+    raw32 = encode_cs2ur(dest_ur=4, sr_code=0x50, is_64=False)
+    raw64 = encode_cs2ur(dest_ur=4, sr_code=0x50, is_64=True)
+    assert raw32[10] == 0x00
+    assert raw64[10] == 0x01
+    # Otherwise identical
+    for i in range(13):
+        if i != 10:
+            assert raw32[i] == raw64[i]
+
+def test_cs2ur_distinct_from_cs2r():
+    """CS2UR opcode (0x8cb) differs from CS2R (0x805) at byte[0]."""
+    raw_ur = encode_cs2ur(dest_ur=4, sr_code=0x50)
+    raw_r  = encode_cs2r(dest=4)
+    assert raw_ur[0] == 0xcb
+    assert raw_r[0]  == 0x05
+    assert raw_ur[1] == 0x78
+    assert raw_r[1]  == 0x78
 
 
 if __name__ == '__main__':

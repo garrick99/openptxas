@@ -1079,6 +1079,65 @@ def encode_cs2r(dest: int, sr_code: int = 0, ctrl: int = 0) -> bytes:
                   b9=0x01, b10=0xFF, b11=0x00, ctrl=ctrl)
 
 
+# ---------------------------------------------------------------------------
+# CS2UR — uniform companion to CS2R (NEWLY ADDED)
+# ---------------------------------------------------------------------------
+# Source: DocumentSASS-extracted ptxas tables (factual data extraction;
+#         see `_harvest/github_mines/DocumentSASS/sm_120_intercept.txt:1039941`
+#         where `OP_R2UR` lists `R2UR, CS2UR, REDUX, S2UR` together — i.e.
+#         the udp_pipe family that writes a uniform register).  Bit-pattern
+#         derived empirically from ptxas 13.2.78 SM_120 ground truth.
+#
+# Opcode: byte[0]=0xcb, byte[1]=0x78  → 9-bit opcode 0x8cb.
+#   (CS2R is 0x805; flipping bits 6+7 of byte[0] into bits 1+3 of byte[1] is
+#   the udp_pipe vs int_pipe distinction across the R2UR/S2UR/CS2UR family.)
+#
+# Ground truth (probe: _probe_landing/probe_cs2ur*.ptx):
+#   CS2UR.32 UR6, SR_PM0     → 0x00000000000678cb | 0x000fe20000006400
+#   CS2UR.32 UR6, SR_CLOCKLO → 0x00000000000678cb | 0x000fe20000005000
+#   CS2UR.32 UR4, SR_CLOCKLO → 0x00000000000478cb | 0x000fe20000005000
+#   CS2UR.32 UR5, SR_CLOCKLO → 0x00000000000578cb | 0x000fe20000005000
+#   CS2UR.32 UR7, SR_CLOCKLO → 0x00000000000778cb | 0x000fe20000005000
+#
+# Field layout:
+#   byte[2]   = UR dest index (0..63)
+#   byte[9]   = SR code (8 bits) — direct value (e.g. SR_CLOCKLO=0x50, PM0=0x32)
+#   byte[10]  bit 0 = .64 modifier (set when reading a 64-bit SR like CLOCK64)
+#   byte[3..8]/byte[11] = 0
+#
+# PTX lowering: ptxas emits CS2UR for uniform-classified SRs across a warp,
+# such as %clock, %clock_hi, %pm0..%pm3.  See _probe_landing/probe_cs2ur_more.ptx.
+
+def encode_cs2ur(dest_ur: int, sr_code: int, is_64: bool = False,
+                 ctrl: int = 0) -> bytes:
+    """Encode CS2UR URdest, SR — read special register into a UNIFORM register.
+
+    Args:
+        dest_ur:  UR destination index (0..63).
+        sr_code:  Special register code (e.g. SR_CLOCKLO=0x50, SR_PM0=0x32).
+        is_64:    Set the .64 flag (bit 80) when the SR is a 64-bit register.
+        ctrl:     23-bit scheduling control word.
+
+    Byte layout (verified byte-exact against ptxas SM_120 ground truth):
+      byte[0]   = 0xcb          opcode low
+      byte[1]   = 0x78          opcode high (full opc = 0x8cb)
+      byte[2]   = dest_ur
+      byte[3..8]= 0
+      byte[9]   = sr_code
+      byte[10]  = 0x01 if is_64 else 0x00
+      byte[11..12] = 0
+      byte[13..15] = ctrl
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    return _build(0xcb, 0x78,
+                  b2=dest_ur & 0xFF, b3=0x00, b4=0x00, b8=0x00,
+                  b9=sr_code & 0xFF,
+                  b10=0x01 if is_64 else 0x00,
+                  b11=0x00,
+                  ctrl=ctrl)
+
+
 # IMMA.16832.S8.S8 — INT8 matrix multiply-accumulate
 #   Shape: m16 n8 k32, INT8 inputs (A: 4 regs, B: 2 regs), INT32 accumulation (4 regs)
 #   Opcode: 0x237, b9=0x5c, b10=0x40

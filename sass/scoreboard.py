@@ -114,6 +114,10 @@ _OPCODE_META: dict[int, _OpMeta] = {
                                              # like other 64-bit ops); same ALU
                                              # latency class as SEL. Source: ptxas
                                              # ground truth on SM_120, opcode 0x607.
+    0x8cb: _OpMeta('CS2UR',    0, 0x3e, 0),  # CS2UR UR-dest, SR (no GPR write — UR bank).
+                                             # dest_kind=0, misc=0 (UR-only writer);
+                                             # same ALU class as CS2R. Source: probe
+                                             # ground truth on SM_120, opcode 0x8cb.
     0x22a: _OpMeta('DSETP',     0, 0x3e, 0),  # DSETP FP64 compare → predicate (misc=0, like ISETP)
     # Tensor core MMA: dedicated wdep slot 0x32 with rbar bit 0x11 (bit 4 +
     # gate bit 0).  Previously used 0x3e (ALU class), which was too short a
@@ -284,6 +288,7 @@ _OPCODES_ALU = {
     # Select / predicate
     0x207,        # SEL (SM_120)
     0x607,        # SEL.64 (SM_120) — 64-bit register-pair select
+    0x8cb,        # CS2UR (SM_120) — read SR into uniform register
     0x807,        # SEL (SM_89, imm form)
     0xa0c,        # ISETP (SM_89 cbuf form)
     0x208,        # FSEL (register)
@@ -1307,7 +1312,7 @@ def _get_ur_src(raw: bytes) -> int:
 def _get_dest_regs(raw: bytes) -> set[int]:
     """Get destination register indices this instruction writes."""
     opcode = _get_opcode(raw)
-    if opcode in (0x7ac, 0x9c3, 0x3c4):  # LDCU, S2UR, REDUX: write UR bank, not GPR
+    if opcode in (0x7ac, 0x9c3, 0x3c4, 0x8cb):  # LDCU/S2UR/REDUX/CS2UR: write UR bank, not GPR
         return set()
     if opcode in _OPCODES_DSETP:  # DSETP: writes predicate, not GPR
         return set()

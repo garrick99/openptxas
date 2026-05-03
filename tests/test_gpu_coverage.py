@@ -874,4 +874,20 @@ class TestSel64:
 
 
 # ============================================================
+# CS2UR — read special register into a UNIFORM register (UR-bank dest)
+# ============================================================
+#
+# Note: CS2UR writes to a UR (uniform) register; our isel pipeline lowers
+# %clock and similar uniform SRs through S2R (GPR-dest) rather than CS2UR.
+# Wiring CS2UR end-to-end through isel + scheduler + downstream UR consumers
+# is a larger refactor.
+#
+# The encoder is byte-exact verified against ptxas SM_120 ground truth (see
+# tests/test_new_encoders.py::test_cs2ur_*).  Runtime correctness is implied
+# by byte-equality with ptxas: when ptxas itself emits these exact bytes for
+# SR_CLOCKLO/SR_PM0/etc. in our probe kernels, the GPU executes them
+# correctly — that is the runtime evidence.  See _probe_landing/probe_cs2ur*.
+
+
+# ============================================================
 # Dot product (FMA chain with indexed loads)

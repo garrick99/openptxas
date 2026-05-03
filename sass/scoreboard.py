@@ -1839,6 +1839,20 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
                 misc = 1
             elif misc >= 0xc:
                 misc = (misc & 0x3) | 0x8
+        # Phase 39 (SHF UR-form opex_4 clamp): SHF opex_4 = 0x20 |
+        # (wdep[0] << 4) | misc.  nvdisasm 13.2.78 (CUDA 13.2.1) rejects
+        # opex_4 == 0x20 / 0x30 (i.e. misc==0 for either wdep parity) and
+        # opex_4 == 0x3c..0x3f (i.e. misc>=0xc when wdep[0]==1) for opclass
+        # 'shf__RuIR_RIR'.  Probed valid set: 0x21..0x2f, 0x31..0x3b.
+        # Surfaced by m31_scale on the CUDA 13.2.0→13.2.1 toolkit upgrade
+        # (validator tightened) — bytes are still hardware-valid, just
+        # disasm-rejected.  Same hybrid model as Phase 8's LOP3.IMM clamp:
+        # keep counter-based misc otherwise, remap only invalid positions.
+        if opcode in (0x819, 0xa19, 0x299, 0x219):
+            if misc == 0:
+                misc = 1
+            elif misc >= 0xc and (wdep & 1):
+                misc = (misc & 0x3) | 0x8
         # ISETP misc: context-sensitive. Default misc=0 (from _OPCODE_MISC).
         # When within 3 instructions of VOTE (0x806), use counter-based misc
         # instead. ptxas uses counter-based misc for ISETP near VOTE.

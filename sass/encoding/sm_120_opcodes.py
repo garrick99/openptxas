@@ -3785,6 +3785,74 @@ def encode_hfma2_zero(dest: int, ctrl: int = 0) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# HFMA2 — General half-precision FMA2 (FP16x2 fused multiply-add)
+# ---------------------------------------------------------------------------
+# Distinct opcode from the zero-init form above:
+#   zero-init form: b1=0x74, opcode 0x431 (shared with MOV32I)
+#   general form:   b1=0x72, opcode 0x231
+#
+# Ground truth (ptxas 13.2.78, sm_120, _probe_landing/probe_hfma2.ptx):
+#   HFMA2     R9,  R0, R7, R6:  lo=0x0000000700097231 hi=0x004fc40000000006
+#   HFMA2.FTZ R11, R0, R7, R6:  lo=0x00000007000b7231 hi=0x1c0fe40000010006
+#   HFMA2.SAT R7,  R0, R7, R6:  lo=0x0000000700077231 hi=0x000fe20000002006
+#   HFMA2.FTZ.SAT R7, R0, R7, R6: lo=0x0000000700077231 hi=0x004fca0000012006
+# Negation (probe_hfma2_more.ptx):
+#   HFMA2 R9, -R0, R7, R6:  hi=0x1c8fe40000000106  → byte[9] |= 0x01 (neg_a)
+#   HFMA2 R11, R0, -R7, R6: lo=0x80000007000b7231  → byte[7] |= 0x80 (neg_b)
+#   HFMA2 R7, R0, R7, -R6:  hi=0x000fe20000100006  → byte[10] |= 0x10 (neg_c)
+#
+# Field layout:
+#   byte[0..1] = 0x31 0x72   (opcode 0x231)
+#   byte[2]    = dest
+#   byte[3]    = src_a  (0xff = RZ)
+#   byte[4]    = src_b  (0xff = RZ)
+#   byte[7]    = 0x80 if neg_b else 0x00       (bit 63)
+#   byte[8]    = src_c  (0xff = RZ)
+#   byte[9]    = (0x01 if neg_a else 0)         (bit 72)
+#              | (0x10 if neg_c else 0)         (bit 76)
+#              | (0x20 if sat else 0)           (bit 77)  [matches NAK SM70]
+#   byte[10]   = 0x01 if ftz else 0             (bit 80)
+#   byte[11]   = 0x00
+#
+# NAK reference (encoders/sm70_encode.rs:1168, MIT) models the same opcode
+# family (HFMA2 / OpHFma2) with negation-per-source flags and modifier bits
+# at similar positions: bit 77 SAT and bit 80 FTZ match SM70.
+def encode_hfma2(dest: int, src_a: int, src_b: int, src_c: int,
+                 ftz: bool = False, sat: bool = False,
+                 neg_a: bool = False, neg_b: bool = False, neg_c: bool = False,
+                 ctrl: int = 0) -> bytes:
+    """Encode HFMA2 dest, [-]src_a, [-]src_b, [-]src_c — FP16x2 fused multiply-add.
+
+    All operands are 32-bit GPRs holding two packed FP16 values (low half =
+    lane 0, high half = lane 1).  Use 0xff for RZ.
+
+    Modifiers:
+        ftz   — flush subnormals to zero (HFMA2.FTZ, byte[10] bit 0)
+        sat   — saturate result to [0.0, 1.0] (HFMA2.SAT, byte[9] bit 5)
+        neg_a — negate src_a (byte[9] bit 0)
+        neg_b — negate src_b (byte[7] bit 7)
+        neg_c — negate src_c (byte[9] bit 4)
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0], raw[1] = 0x31, 0x72
+    raw[2] = dest & 0xFF
+    raw[3] = src_a & 0xFF
+    raw[4] = src_b & 0xFF
+    raw[7] = 0x80 if neg_b else 0x00
+    raw[8] = src_c & 0xFF
+    raw[9] = ((0x01 if neg_a else 0)
+              | (0x10 if neg_c else 0)
+              | (0x20 if sat else 0))
+    raw[10] = 0x01 if ftz else 0
+    raw[11] = 0x00
+    raw[13], raw[14], raw[15] = b13, b14, b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
 # MOV32I — 32-bit integer immediate to register (opcode 0x431, imm32 form)
 # ---------------------------------------------------------------------------
 # PTXAS-R23B.A: NVCC materializes 32-bit immediates for st.global payloads

@@ -77,6 +77,7 @@ from sass.encoding.sm_120_opcodes import (
     encode_f2i_s32_f64, encode_f2i_u32_f64, encode_i2f_f64_s32, encode_i2f_f64_u32,
     encode_f2i_u64, encode_i2f_u64,
     encode_i2f_u32_rp, encode_i2f_s32_rp, encode_f2i_ftz_u32_trunc, encode_hfma2_zero,
+    encode_hfma2,
     encode_hmma_f16_f32, encode_hmma_f16_f32_k8, encode_hmma_bf16_f32, encode_hmma_tf32_f32,
     encode_imma_s8_s32, encode_dmma_8x8x4,
     encode_qmma_e4m3_f32, encode_qmma_e5m2_f32,
@@ -4630,6 +4631,24 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         output.append(SassInstr(encode_ffma(d, a, b, c),
                                                 f'FFMA R{d}, R{a}, R{b}, R{c}  // fma.f32'))
                     # Clear zero-reg status: dest is no longer zero after FMA
+                    if hasattr(ctx, '_zero_regs'):
+                        ctx._zero_regs.discard(d)
+
+                elif op == 'fma' and typ == 'f16x2':
+                    # fma.rn.f16x2 d, a, b, c → HFMA2 R{d}, R{a}, R{b}, R{c}
+                    # All operands are 32-bit GPRs holding 2x packed FP16 values.
+                    # Modifiers .ftz / .sat ride along on instr.types.
+                    d = ctx.ra.r32(instr.dest.name)
+                    a = _materialize_imm(instr.srcs[0], ctx, ctx.ra, output)
+                    b = _materialize_imm(instr.srcs[1], ctx, ctx.ra, output)
+                    c = _materialize_imm(instr.srcs[2], ctx, ctx.ra, output)
+                    _types_set = set(instr.types)
+                    _ftz = 'ftz' in _types_set
+                    _sat = 'sat' in _types_set
+                    output.append(SassInstr(
+                        encode_hfma2(d, a, b, c, ftz=_ftz, sat=_sat),
+                        f'HFMA2{".FTZ" if _ftz else ""}{".SAT" if _sat else ""}'
+                        f' R{d}, R{a}, R{b}, R{c}  // fma.f16x2'))
                     if hasattr(ctx, '_zero_regs'):
                         ctx._zero_regs.discard(d)
 

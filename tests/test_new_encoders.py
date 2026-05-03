@@ -15,6 +15,7 @@ from sass.encoding.sm_120_opcodes import (
     encode_lea_hi_x,
     encode_f2i_u64, encode_i2f_u64,
     encode_i2f_f64_u32,
+    encode_hfma2,
 )
 
 
@@ -923,6 +924,106 @@ def test_i2f_f64_u32_b9_fixed():
     raw = encode_i2f_f64_u32(dest_lo=4, src=2)
     assert raw[9] == 0x18, f"b9={raw[9]:#04x}"
     assert raw[10] == 0x20
+
+
+# ---------------------------------------------------------------------------
+# HFMA2 — general FP16x2 fused multiply-add (opcode 0x231, b1=0x72)
+# ---------------------------------------------------------------------------
+# Ground truth (ptxas 13.2.78, sm_120, _probe_landing/probe_hfma2.ptx):
+#   HFMA2     R9,  R0, R7, R6:  lo=0x0000000700097231 hi=0x004fc40000000006
+#   HFMA2.FTZ R11, R0, R7, R6:  lo=0x00000007000b7231 hi=0x1c0fe40000010006
+#   HFMA2.SAT R7,  R0, R7, R6:  lo=0x0000000700077231 hi=0x000fe20000002006
+#   HFMA2.FTZ.SAT R7, R0, R7, R6: lo=0x0000000700077231 hi=0x004fca0000012006
+# Negation (probe_hfma2_more.ptx):
+#   HFMA2 R9, -R0, R7, R6:  hi=0x1c8fe40000000106  → byte[9] |= 0x01
+#   HFMA2 R11, R0, -R7, R6: lo=0x80000007000b7231  → byte[7] |= 0x80
+#   HFMA2 R7, R0, R7, -R6:  hi=0x000fe20000100006  → byte[10] |= 0x10
+
+def test_hfma2_basic_byte_exact():
+    """HFMA2 R9, R0, R7, R6 — byte-exact ptxas match (low qword and modifier bytes)."""
+    raw = encode_hfma2(dest=9, src_a=0, src_b=7, src_c=6)
+    lo, hi = _lo_hi(raw)
+    assert lo == 0x0000000700097231, f"lo=0x{lo:016x}"
+    # Compare modifier bytes 8..11 (mask off ctrl bytes 13..15 in upper bits).
+    assert (hi & 0x000000ffffffffff) == 0x0000000000000006, f"hi&...=0x{hi & 0x000000ffffffffff:016x}"
+
+def test_hfma2_ftz_byte_exact():
+    """HFMA2.FTZ R11, R0, R7, R6 — FTZ at byte[10] bit 0."""
+    raw = encode_hfma2(dest=11, src_a=0, src_b=7, src_c=6, ftz=True)
+    lo, hi = _lo_hi(raw)
+    assert lo == 0x00000007000b7231
+    assert (hi & 0x000000ffffffffff) == 0x0000000000010006
+
+def test_hfma2_sat_byte_exact():
+    """HFMA2.SAT R7, R0, R7, R6 — SAT at byte[9] bit 5 (bit 77, matches NAK SM70)."""
+    raw = encode_hfma2(dest=7, src_a=0, src_b=7, src_c=6, sat=True)
+    lo, hi = _lo_hi(raw)
+    assert lo == 0x0000000700077231
+    assert (hi & 0x000000ffffffffff) == 0x0000000000002006
+
+def test_hfma2_ftz_sat_byte_exact():
+    """HFMA2.FTZ.SAT R7, R0, R7, R6 — combined FTZ+SAT (byte[9]=0x20, byte[10]=0x01)."""
+    raw = encode_hfma2(dest=7, src_a=0, src_b=7, src_c=6, ftz=True, sat=True)
+    lo, hi = _lo_hi(raw)
+    assert lo == 0x0000000700077231
+    assert (hi & 0x000000ffffffffff) == 0x0000000000012006
+
+def test_hfma2_neg_a_byte_exact():
+    """HFMA2 R9, -R0, R7, R6 — neg_a at byte[9] bit 0."""
+    raw = encode_hfma2(dest=9, src_a=0, src_b=7, src_c=6, neg_a=True)
+    lo, hi = _lo_hi(raw)
+    assert lo == 0x0000000700097231
+    assert (hi & 0x000000ffffffffff) == 0x0000000000000106
+
+def test_hfma2_neg_b_byte_exact():
+    """HFMA2 R11, R0, -R7, R6 — neg_b at byte[7] bit 7 (low qword)."""
+    raw = encode_hfma2(dest=11, src_a=0, src_b=7, src_c=6, neg_b=True)
+    lo, hi = _lo_hi(raw)
+    assert lo == 0x80000007000b7231
+    assert (hi & 0x000000ffffffffff) == 0x0000000000000006
+
+def test_hfma2_neg_c_byte_exact():
+    """HFMA2 R7, R0, R7, -R6 — neg_c at byte[9] bit 4."""
+    raw = encode_hfma2(dest=7, src_a=0, src_b=7, src_c=6, neg_c=True)
+    lo, hi = _lo_hi(raw)
+    assert lo == 0x0000000700077231
+    assert (hi & 0x000000ffffffffff) == 0x0000000000001006
+
+def test_hfma2_distinct_from_zero_init():
+    """HFMA2 general (b1=0x72, opcode 0x231) is distinct from HFMA2 zero-init (b1=0x74, opcode 0x431)."""
+    raw = encode_hfma2(dest=9, src_a=0, src_b=7, src_c=6)
+    assert _opcode(raw) == 0x231
+    assert raw[1] == 0x72
+
+def test_hfma2_modifier_bit_isolation():
+    """Each modifier flips exactly the documented bit, no others."""
+    base = encode_hfma2(dest=9, src_a=0, src_b=7, src_c=6)
+    # FTZ
+    ftz = encode_hfma2(dest=9, src_a=0, src_b=7, src_c=6, ftz=True)
+    diff = bytes(a ^ b for a, b in zip(base, ftz))
+    # Only byte[10] bit 0 differs (ignoring ctrl bytes 13..15)
+    assert diff[10] == 0x01
+    assert all(diff[i] == 0 for i in range(13) if i != 10)
+    # SAT
+    sat = encode_hfma2(dest=9, src_a=0, src_b=7, src_c=6, sat=True)
+    diff = bytes(a ^ b for a, b in zip(base, sat))
+    assert diff[9] == 0x20
+    assert all(diff[i] == 0 for i in range(13) if i != 9)
+    # neg_a
+    na = encode_hfma2(dest=9, src_a=0, src_b=7, src_c=6, neg_a=True)
+    diff = bytes(a ^ b for a, b in zip(base, na))
+    assert diff[9] == 0x01
+    assert all(diff[i] == 0 for i in range(13) if i != 9)
+    # neg_b
+    nb = encode_hfma2(dest=9, src_a=0, src_b=7, src_c=6, neg_b=True)
+    diff = bytes(a ^ b for a, b in zip(base, nb))
+    assert diff[7] == 0x80
+    assert all(diff[i] == 0 for i in range(13) if i != 7)
+    # neg_c
+    nc = encode_hfma2(dest=9, src_a=0, src_b=7, src_c=6, neg_c=True)
+    diff = bytes(a ^ b for a, b in zip(base, nc))
+    assert diff[9] == 0x10
+    assert all(diff[i] == 0 for i in range(13) if i != 9)
 
 
 if __name__ == '__main__':

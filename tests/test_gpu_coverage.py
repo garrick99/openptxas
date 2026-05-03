@@ -1129,4 +1129,188 @@ class TestI2F64:
 
 
 # ============================================================
+# HFMA2 — FP16x2 fused multiply-add (fma.rn.f16x2)
+# ============================================================
+
+_PTX_HFMA2_F16X2 = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry hfma2_test(.param .u64 p_out, .param .u64 p_in) {
+    .reg .b32 %r<8>;
+    .reg .u64 %rd<8>;
+    ld.param.u64 %rd1, [p_in];
+    ld.global.b32 %r1, [%rd1+0];
+    ld.global.b32 %r2, [%rd1+4];
+    ld.global.b32 %r3, [%rd1+8];
+    fma.rn.f16x2 %r4, %r1, %r2, %r3;
+    ld.param.u64 %rd2, [p_out];
+    st.global.b32 [%rd2], %r4;
+    ret;
+}
+"""
+
+_PTX_HFMA2_F16X2_FTZ = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry hfma2_ftz_test(.param .u64 p_out, .param .u64 p_in) {
+    .reg .b32 %r<8>;
+    .reg .u64 %rd<8>;
+    ld.param.u64 %rd1, [p_in];
+    ld.global.b32 %r1, [%rd1+0];
+    ld.global.b32 %r2, [%rd1+4];
+    ld.global.b32 %r3, [%rd1+8];
+    fma.rn.ftz.f16x2 %r4, %r1, %r2, %r3;
+    ld.param.u64 %rd2, [p_out];
+    st.global.b32 [%rd2], %r4;
+    ret;
+}
+"""
+
+_PTX_HFMA2_F16X2_SAT = """
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry hfma2_sat_test(.param .u64 p_out, .param .u64 p_in) {
+    .reg .b32 %r<8>;
+    .reg .u64 %rd<8>;
+    ld.param.u64 %rd1, [p_in];
+    ld.global.b32 %r1, [%rd1+0];
+    ld.global.b32 %r2, [%rd1+4];
+    ld.global.b32 %r3, [%rd1+8];
+    fma.rn.sat.f16x2 %r4, %r1, %r2, %r3;
+    ld.param.u64 %rd2, [p_out];
+    st.global.b32 [%rd2], %r4;
+    ret;
+}
+"""
+
+
+def _pack_f16x2(lo, hi):
+    """Pack two FP16 floats into a u32 (low half = lo, high half = hi)."""
+    lo_u16 = struct.unpack('<H', struct.pack('<e', lo))[0]
+    hi_u16 = struct.unpack('<H', struct.pack('<e', hi))[0]
+    return (hi_u16 << 16) | lo_u16
+
+
+def _unpack_f16x2(u32):
+    """Unpack a u32 into (lo_f16, hi_f16) Python floats."""
+    lo = struct.unpack('<e', struct.pack('<H', u32 & 0xFFFF))[0]
+    hi = struct.unpack('<e', struct.pack('<H', (u32 >> 16) & 0xFFFF))[0]
+    return lo, hi
+
+
+def _round_to_f16(x):
+    """Round a Python float through FP16 to model the storage step."""
+    return struct.unpack('<e', struct.pack('<e', x))[0]
+
+
+@gpu
+class TestHfma2:
+    """GPU correctness for fma.rn.f16x2 → HFMA2 (FP16x2 fused multiply-add)."""
+
+    def _run(self, cuda_ctx, ptx_src, kernel_name, a_pair, b_pair, c_pair,
+             saturate=False, tol_ulps=1):
+        cubins = compile_ptx_source(ptx_src)
+        assert cuda_ctx.load(cubins[kernel_name])
+        # Pack inputs as 3 consecutive u32s (12 bytes).
+        in_buf = struct.pack('<III',
+                             _pack_f16x2(*a_pair),
+                             _pack_f16x2(*b_pair),
+                             _pack_f16x2(*c_pair))
+        d_in = cuda_ctx.alloc(12); cuda_ctx.copy_to(d_in, in_buf)
+        d_out = cuda_ctx.alloc(4); cuda_ctx.copy_to(d_out, b'\x00' * 4)
+        cuda_ctx.launch(cuda_ctx.get_func(kernel_name), (1,1,1), (1,1,1), [d_out, d_in])
+        assert cuda_ctx.sync() == 0
+        out_u32 = struct.unpack('<I', cuda_ctx.copy_from(d_out, 4))[0]
+        cuda_ctx.free(d_in); cuda_ctx.free(d_out)
+        got_lo, got_hi = _unpack_f16x2(out_u32)
+        # Reference: compute a*b+c lane-wise, rounding through FP16 at the end.
+        # Multiplicands a,b are already FP16-storable (we packed them); add the
+        # FP32-product to FP16-c then round.
+        ref_lo = _round_to_f16(float(a_pair[0]) * float(b_pair[0]) + float(c_pair[0]))
+        ref_hi = _round_to_f16(float(a_pair[1]) * float(b_pair[1]) + float(c_pair[1]))
+        if saturate:
+            ref_lo = max(0.0, min(1.0, ref_lo))
+            ref_hi = max(0.0, min(1.0, ref_hi))
+        # Compare via raw bit pattern (ULP tolerance).
+        def _to_u16(x):
+            return struct.unpack('<H', struct.pack('<e', x))[0]
+        got_lo_u, got_hi_u = _to_u16(got_lo), _to_u16(got_hi)
+        ref_lo_u, ref_hi_u = _to_u16(ref_lo), _to_u16(ref_hi)
+        # NaN handling: any NaN bit-pattern is acceptable when reference is NaN.
+        import math
+        def _close(g, r, gu, ru):
+            if math.isnan(r):
+                return math.isnan(g)
+            return abs(gu - ru) <= tol_ulps
+        assert _close(got_lo, ref_lo, got_lo_u, ref_lo_u), \
+            f"lane0: got {got_lo}({got_lo_u:#x}), ref {ref_lo}({ref_lo_u:#x})"
+        assert _close(got_hi, ref_hi, got_hi_u, ref_hi_u), \
+            f"lane1: got {got_hi}({got_hi_u:#x}), ref {ref_hi}({ref_hi_u:#x})"
+
+    def test_hfma2_basic(self, cuda_ctx):
+        # a*b+c: simple integers within FP16 mantissa range.
+        self._run(cuda_ctx, _PTX_HFMA2_F16X2, 'hfma2_test',
+                  a_pair=(2.0, 3.0), b_pair=(4.0, 5.0), c_pair=(1.0, -2.0))
+        # Expected: (2*4+1, 3*5-2) = (9, 13).
+
+    def test_hfma2_fractional(self, cuda_ctx):
+        # Fractional values; bit-identical to FP16 round of a*b+c.
+        self._run(cuda_ctx, _PTX_HFMA2_F16X2, 'hfma2_test',
+                  a_pair=(0.5, -0.25), b_pair=(0.5, 8.0), c_pair=(0.125, 1.0))
+
+    def test_hfma2_negative(self, cuda_ctx):
+        self._run(cuda_ctx, _PTX_HFMA2_F16X2, 'hfma2_test',
+                  a_pair=(-1.5, 2.5), b_pair=(2.0, -4.0), c_pair=(1.0, 0.0))
+
+    def test_hfma2_ftz_subnormal_flush(self, cuda_ctx):
+        # FP16 subnormals are values smaller than 2^-14 (~6.1e-5).
+        # 2^-15 * 1.0 + 0 = 2^-15, a subnormal.  With FTZ, this should flush to 0.
+        # Pick: a = 2^-15 = 3.0517578125e-05 (subnormal in FP16).
+        # b = 1.0, c = 0.0 → result = a, which is subnormal → FTZ flushes to 0.
+        # Without FTZ, would preserve the subnormal.
+        a = 3.0517578125e-05  # 2^-15, FP16 subnormal
+        # Run FTZ form — result must be 0 (or +/- 0).
+        cubins = compile_ptx_source(_PTX_HFMA2_F16X2_FTZ)
+        assert cuda_ctx.load(cubins['hfma2_ftz_test'])
+        in_buf = struct.pack('<III',
+                             _pack_f16x2(a, a),
+                             _pack_f16x2(1.0, 1.0),
+                             _pack_f16x2(0.0, 0.0))
+        d_in = cuda_ctx.alloc(12); cuda_ctx.copy_to(d_in, in_buf)
+        d_out = cuda_ctx.alloc(4); cuda_ctx.copy_to(d_out, b'\x00' * 4)
+        cuda_ctx.launch(cuda_ctx.get_func('hfma2_ftz_test'), (1,1,1), (1,1,1), [d_out, d_in])
+        assert cuda_ctx.sync() == 0
+        out_u32 = struct.unpack('<I', cuda_ctx.copy_from(d_out, 4))[0]
+        cuda_ctx.free(d_in); cuda_ctx.free(d_out)
+        got_lo, got_hi = _unpack_f16x2(out_u32)
+        # FTZ flushes subnormals to (signed) zero.
+        assert got_lo == 0.0, f"lane0 should be flushed to 0, got {got_lo}"
+        assert got_hi == 0.0, f"lane1 should be flushed to 0, got {got_hi}"
+
+    def test_hfma2_sat_clamp(self, cuda_ctx):
+        # SAT clamps result to [0.0, 1.0].
+        # a*b+c = 2*3+0 = 6 → clamped to 1.0.
+        # negative case: -1*1+0 = -1 → clamped to 0.0.
+        cubins = compile_ptx_source(_PTX_HFMA2_F16X2_SAT)
+        assert cuda_ctx.load(cubins['hfma2_sat_test'])
+        in_buf = struct.pack('<III',
+                             _pack_f16x2(2.0, -1.0),
+                             _pack_f16x2(3.0,  1.0),
+                             _pack_f16x2(0.0,  0.0))
+        d_in = cuda_ctx.alloc(12); cuda_ctx.copy_to(d_in, in_buf)
+        d_out = cuda_ctx.alloc(4); cuda_ctx.copy_to(d_out, b'\x00' * 4)
+        cuda_ctx.launch(cuda_ctx.get_func('hfma2_sat_test'), (1,1,1), (1,1,1), [d_out, d_in])
+        assert cuda_ctx.sync() == 0
+        out_u32 = struct.unpack('<I', cuda_ctx.copy_from(d_out, 4))[0]
+        cuda_ctx.free(d_in); cuda_ctx.free(d_out)
+        got_lo, got_hi = _unpack_f16x2(out_u32)
+        # Both lanes clamped to [0, 1].
+        assert got_lo == 1.0, f"lane0 (6.0 saturated) expected 1.0, got {got_lo}"
+        assert got_hi == 0.0, f"lane1 (-1.0 saturated) expected 0.0, got {got_hi}"
+
+
+# ============================================================
 # Dot product (FMA chain with indexed loads)

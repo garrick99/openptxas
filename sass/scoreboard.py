@@ -100,6 +100,7 @@ _OPCODE_META: dict[int, _OpMeta] = {
     0x20c: _OpMeta('ISETP.RR',   0, 0x3e, 0),  # ISETP R-R: misc=0 (SM_120 predicate)
     0xc0c: _OpMeta('ISETP.RU',   0, 0x3e, 0),  # ISETP R-UR: misc=0 on SM_120
     0x431: _OpMeta('HFMA2',      1, 0x3e, 1),  # HFMA2 (half-precision FMA2, used as zero-init in div.u32)
+    0x231: _OpMeta('HFMA2.GEN',  1, 0x3e, 1),  # HFMA2 general-arithmetic form (b1=0x72; FP16x2 fma)
     0x810: _OpMeta('IADD3.IMM',  1, 0x3e, 1),  # IADD3 with 32-bit immediate operand
     0x812: _OpMeta('LOP3.IMM',   1, 0x3e, 1),  # LOP3 with 32-bit immediate (IMAD-FUSE-1)
     0x306: _OpMeta('I2F.U32.RP', 1, 0x3e, 1),  # I2F unsigned int to float, round toward +inf
@@ -334,6 +335,7 @@ _OPCODES_ALU = {
     0xc11,        # TE12: IADD3.R-UR (carry-chain 64-bit address add)
     # Miscellaneous / div.u32 helpers
     0x431,        # HFMA2 (zero-init trick)
+    0x231,        # HFMA2.GEN (FP16x2 fused multiply-add, b1=0x72)
     0x810,        # IADD3 immediate form
     0x306,        # I2F.U32.RP
     0x305,        # F2I.FTZ.U32.TRUNC

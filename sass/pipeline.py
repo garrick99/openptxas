@@ -3428,7 +3428,7 @@ def compile_function(fn: Function, verbose: bool = False,
         # makes the IADD3/STG consumer skip the long-latency wait and read
         # stale tensor fragments.  Skip FG33 for these kernels.  Surfaced
         # 2026-04-29 via probe mower hmma probes.
-        if _fg33_ok and any(o in (0x23c, 0x237, 0x23f, 0x27a)
+        if _fg33_ok and any(o in (0x23c, 0x237, 0x23f, 0x27a, 0x47f)
                             for o in _fg31_opcodes):
             _fg33_ok = False
 
@@ -3547,8 +3547,8 @@ def compile_function(fn: Function, verbose: bool = False,
                     # generic body template would clobber wdep=0x32 → 0x3e
                     # and the IADD3/STG consumer would read stale fragments.
                     # Surfaced 2026-04-29 via probe mower hmma probes.
-                    if _body_opc in (0x23c, 0x237, 0x23f, 0x27a):
-                        continue  # leave HMMA/IMMA/DMMA/QMMA ctrl alone
+                    if _body_opc in (0x23c, 0x237, 0x23f, 0x27a, 0x47f):
+                        continue  # leave HMMA/IMMA/DMMA/QMMA/OMMA ctrl alone
                     # NB (2026-04-28): an earlier defensive fallback here
                     # forced last-body wdep=0x3e when STG consumed the
                     # body's dest, on the theory that untracking races

@@ -129,6 +129,12 @@ _OPCODE_META: dict[int, _OpMeta] = {
     0x237: _OpMeta('IMMA',      1, 0x32, 2),  # IMMA INT8 MMA (m16n8k32)
     0x23f: _OpMeta('DMMA',      1, 0x32, 2),  # DMMA FP64 MMA (m8n8k4)
     0x27a: _OpMeta('QMMA',      1, 0x32, 2),  # QMMA FP8 E4M3/E5M2 MMA (m16n8k32)
+    0x47f: _OpMeta('OMMA',      1, 0x32, 2),  # OMMA FP4 mxf4nvf4 MMA (m16n8k64)
+                                              # — Blackwell ~4.8x HMMA path.
+                                              # DocumentSASS places OMMA in the
+                                              # QMMA_OP set (fp16_pipe), so it
+                                              # inherits the same wdep slot
+                                              # 0x32 + misc=2 as QMMA/HMMA.
     0x83b: _OpMeta('LDSM',      1, 0x33, 2),  # LDSM load shared→matrix regs (wdep=LDS slot)
     0x3c4: _OpMeta('REDUX',     0, 0x3f, 0),  # REDUX warp reduction → UR (no GPR dest)
     0xc02: _OpMeta('MOV.UR',   1, 0x3e, 1),  # MOV R, UR — copy uniform reg to GPR
@@ -306,8 +312,8 @@ _OPCODES_ALU = {
     0x216,        # PRMT.REG (register selector, opc=0x216)
     0x589, 0xf89, 0x989,  # SHFL (reg-reg, reg-imm, imm-imm)
     # 0x806 VOTE removed from ALU — uses wdep=0x3F (see _wdep_for_opcode)
-    # Matrix multiply (HMMA, IMMA, DMMA, QMMA)
-    0x23c, 0x237, 0x23f, 0x27a,
+    # Matrix multiply (HMMA, IMMA, DMMA, QMMA, OMMA)
+    0x23c, 0x237, 0x23f, 0x27a, 0x47f,
     # Predicate ↔ register moves
     0x203,        # P2R (predicate-to-register move)
     0x204,        # R2P (register-to-predicate move)
@@ -580,6 +586,16 @@ def _get_src_regs(raw: bytes) -> set[int]:
             for r in range(2): regs.add(raw[4]+r)
             if raw[8] < 255:
                 for r in range(4): regs.add(raw[8]+r)
+        elif opcode == 0x47f:  # OMMA: a=b3(4 regs), b=b4(2), c=b8(4) — same
+                                # group sizes as QMMA, plus SFA (b5, 1 reg)
+                                # and SFB (bits 52..59, 1 reg) as scale srcs.
+            for r in range(4): regs.add(raw[3]+r)
+            for r in range(2): regs.add(raw[4]+r)
+            if raw[8] < 255:
+                for r in range(4): regs.add(raw[8]+r)
+            if raw[5] < 255: regs.add(raw[5])  # SFA
+            sfb = ((raw[6] >> 4) & 0x0F) | ((raw[7] & 0x0F) << 4)
+            if sfb < 255: regs.add(sfb)        # SFB
         elif opcode == 0x304:  # F2F.F16.F32: src at both b3 and b4 (same register)
             if raw[3] < 255: regs.add(raw[3])
             if raw[4] < 255: regs.add(raw[4])
@@ -1363,7 +1379,7 @@ def _get_dest_regs(raw: bytes) -> set[int]:
                 regs |= {dest, dest+1}
     elif opcode == 0xc35:  # IADD.64-UR: writes GPR pair
         if dest < 255: regs |= {dest, dest+1}
-    elif opcode in (0x23c, 0x237, 0x27a):  # HMMA/IMMA/QMMA: writes 4 regs
+    elif opcode in (0x23c, 0x237, 0x27a, 0x47f):  # HMMA/IMMA/QMMA/OMMA: writes 4 regs
         if dest < 255: regs |= {dest, dest+1, dest+2, dest+3}
     elif opcode in (0x825, 0x225):  # IMAD.WIDE: writes dest pair
         if dest < 255: regs |= {dest, dest+1}
@@ -1485,7 +1501,7 @@ def _wdep_for_opcode(opcode: int, raw: bytes = None) -> int:
     # mower hmma probe — was returning ALU slot 0x3e via the fallback
     # below, which gave too-short a latency window for the consumer to
     # see the tensor write retire.
-    if opcode in (0x23c, 0x237, 0x23f, 0x27a):
+    if opcode in (0x23c, 0x237, 0x23f, 0x27a, 0x47f):
         return 0x32
     if opcode in _OPCODES_ALU | _OPCODES_SMEM_SETUP:
         return 0x3e
@@ -1570,6 +1586,7 @@ _OPCODE_MISC: dict[int, int] = {
     0x237: 2,   # IMMA (INT8)
     0x23f: 2,   # DMMA (FP64)
     0x27a: 2,   # QMMA (FP8 E4M3/E5M2)
+    0x47f: 2,   # OMMA (FP4 mxf4nvf4) — DocumentSASS QMMA_OP set, fp16_pipe
     # LDC (0xb82) and S2UR (0x9c3) intentionally omitted — use counter for correct values
     # SHFL: ptxas uses misc=2 (ground truth SM_120)
     0x589: 2,   # SHFL R-R

@@ -5093,6 +5093,130 @@ def encode_qmma_e5m2_f32(dest: int, src_a: int, src_b: int, src_c: int,
 
 
 # ---------------------------------------------------------------------------
+# OMMA — Blackwell MXF4 FP4 block-scaled matrix multiply-accumulate (SM_120)
+# ---------------------------------------------------------------------------
+# Headline gap closer: FP4 tensor-core path (~4.8x HMMA throughput, ~565
+# FLOPs/cycle at chain-bound vs 117 for HMMA per sass-king Ch 16).  Distinct
+# SASS opcode family from HMMA (0x3c) and QMMA (0x7a) — OMMA is `0x7f` low
+# byte / `0x47f` 9-bit opcode.  Always block-scaled (.SF mandatory; no
+# unscaled OMMA exists on SM_120).
+#
+# Sources:
+#   * sass-king/FINDINGS.md Ch 16 (Apache-2.0; ground-truth families,
+#     mnemonic structure, scale_vec/scale_dtype encoding hypotheses).
+#   * DocumentSASS/sm_120_latencies.txt (factual ptxas table extraction;
+#     OMMA is in the QMMA_OP set sharing fp16_pipe scoreboard rules).
+#   * Probe-derived ptxas SM_120 ground truth (ptxas 13.2.78):
+#       _probe_landing/probe_omma.ptx        (.E8 2X)
+#       _probe_landing/probe_omma_4x.ptx     (.UE4M3 .4X)
+#       _probe_landing/probe_omma_regs.ptx   (SFA/SFB/A/B reg-field decode)
+#       _probe_landing/probe_omma_sfb.ptx    (SFB high-bits split)
+#       _probe_landing/probe_omma_sparse.ptx (.SP — sparse 168128)
+#
+# Shape: m16n8k64 always.  PTX kind: kind::mxf4nvf4 only.
+# Inputs: A=4 regs (16 FP4 packed in 4 uint32), B=2 regs (8 FP4 in 2 uint32),
+#         scales SFA/SFB = 1 reg each (2X mode = 2 ue8m0 packed in low 16 bits;
+#         4X mode = 4 ue4m3 packed in 32 bits).
+#
+# Field layout (verified byte-exact against ptxas SM_120 ground truth):
+#   byte[0]    = 0x7f         opcode low (family identifier)
+#   byte[1]    = 0x74         opcode high  (full 9-bit opcode = 0x47f)
+#   byte[2]    = D            dest GPR (4-reg group, FP32 accum)
+#   byte[3]    = A            src_a GPR (4-reg group, FP4 packed)
+#   byte[4]    = B            src_b GPR (2-reg group, FP4 packed)
+#   byte[5]    = SFA          scale-factor A GPR (1 reg, packed scales)
+#   byte[6] hi-nibble + byte[7] lo-nibble = SFB    scale-factor B (8 bits)
+#   byte[7] hi-nibble = 0x7   constant op extension
+#   byte[8]    = C            src_c GPR (4-reg group, FP32 accum init)
+#   byte[9]    = 0x3e         constant (vs HMMA b9=0x18 / QMMA b9=0x2c)
+#   byte[10]   = mode         scale_vec/scale_dtype encoding:
+#                                0x08 = scale_vec::2X ue8m0  (default OMMA)
+#                                0x04 = scale_vec::4X ue4m3  (FP4 peak path)
+#                                +0x01 if .SP (sparse, m16n8k128 form)
+#   byte[11]   = 0x00         reserved (or sparse-metadata-related)
+#   byte[12]   = 0x00
+#   byte[13..15]= 23-bit ctrl word
+#
+# Ground truth probes (RTX 5090, ptxas 13.2.78, SM_120):
+#   OMMA.SF.16864.F32.E2M1.E2M1.E8 R8, R8, R12, R16, R0, R0, URZ
+#     -> 7f 74 08 08 0c 00 00 70 | 10 3e 08 00 00 [ctrl]
+#   OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X R8, R8, R12, R16, R0, R0, URZ
+#     -> 7f 74 08 08 0c 00 00 70 | 10 3e 04 00 00 [ctrl]   (b10 differs)
+#   OMMA.SF.SP.168128.F32.E2M1.E2M1.E8 R12, R12, R16, R20, R8, R0, URZ, 0x0
+#     -> 7f 74 0c 0c 10 08 00 70 | 14 3e 09 00 00 [ctrl]   (b10 |= 0x01)
+#
+# Frontend gap: PTX parser does not yet accept the m16n8k64 shape, the
+# kind::mxf4nvf4 modifier, or e2m1/ue4m3/ue8m0 element types.  Encoder
+# lands without an isel hook — see _harvest/github_mines/_FOLLOWUP.md
+# section "OMMA frontend gap".  Encoder is reachable from Python only.
+
+# Mode constants for the byte[10] scale_vec/scale_dtype field.
+OMMA_MODE_2X_UE8M0 = 0x08   # scale_vec::2X with ue8m0 scales (default OMMA)
+OMMA_MODE_4X_UE4M3 = 0x04   # scale_vec::4X with ue4m3 scales (FP4 peak)
+OMMA_MODE_4X_UE8M0 = 0x00   # scale_vec::4X with ue8m0 (sparse-only per Ch 19;
+                             # GAP-16-1: dense form not exercisable on
+                             # current ptxas/CUTLASS atom set)
+OMMA_FLAG_SP       = 0x01   # OR into byte[10] for sparse (.SP)
+
+
+def encode_omma_mxf4_f32(dest: int, src_a: int, src_b: int, src_c: int,
+                          sfa: int = 0, sfb: int = 0,
+                          mode: int = OMMA_MODE_2X_UE8M0,
+                          sparse: bool = False,
+                          ctrl: int = 0) -> bytes:
+    """OMMA.SF.16864.F32.E2M1.E2M1.<scale> — FP4 block-scaled MMA on SM_120.
+
+    Blackwell's FP4 tensor-core path (kind::mxf4nvf4, m16n8k64, ~565
+    FLOPs/cycle at chain-bound — 4.8x HMMA per sass-king Ch 16).
+
+    Args:
+        dest:   D base GPR (4-reg group, FP32 accumulation output).
+        src_a:  A base GPR (4-reg group, 16 FP4 values packed e2m1).
+        src_b:  B base GPR (2-reg group, 8 FP4 values packed e2m1).
+        src_c:  C base GPR (4-reg group, FP32 init/accumulator).  Use RZ=255
+                for zero-initialised accumulator (chain head).
+        sfa:    Scale-factor A GPR (1 reg, packed scales).  R0 in CUTLASS
+                atom samples; 2X mode packs 2 ue8m0 in low 16 bits, 4X mode
+                packs 4 ue4m3 across 32 bits.
+        sfb:    Scale-factor B GPR (1 reg, packed scales).
+        mode:   byte[10] scale_vec/scale_dtype encoding — pass one of
+                OMMA_MODE_2X_UE8M0 (default) or OMMA_MODE_4X_UE4M3 (peak).
+        sparse: True for sparse mma.sp::ordered_metadata variant (.SP).  This
+                changes the displayed shape from .16864 to .168128 and the
+                semantic operand list (byte[5] becomes the metadata reg
+                rather than SFA).  Caller is responsible for placing the
+                metadata reg in src_a's slot when sparse=True (PTX frontend
+                does not yet wire this up — see _FOLLOWUP).
+        ctrl:   23-bit scheduling control word (default _CTRL_DEFAULT).
+
+    Cite: sass-king Ch 16 (Apache-2.0); structural template from
+    encode_qmma_e4m3_f32.  Byte layout verified byte-exact against ptxas
+    13.2.78 ground truth on RTX 5090 (see _probe_landing/probe_omma*.ptx).
+    """
+    if ctrl == 0:
+        ctrl = _CTRL_DEFAULT
+    b13, b14, b15 = _ctrl_to_bytes(ctrl)
+    raw = bytearray(16)
+    raw[0]  = 0x7f
+    raw[1]  = 0x74
+    raw[2]  = dest  & 0xFF
+    raw[3]  = src_a & 0xFF
+    raw[4]  = src_b & 0xFF
+    raw[5]  = sfa   & 0xFF
+    # SFB occupies bits 52..59 = byte[6] high nibble + byte[7] low nibble.
+    sfb &= 0xFF
+    raw[6]  = (sfb & 0x0F) << 4
+    raw[7]  = 0x70 | ((sfb >> 4) & 0x0F)
+    raw[8]  = src_c & 0xFF
+    raw[9]  = 0x3e
+    raw[10] = (mode & 0xFF) | (OMMA_FLAG_SP if sparse else 0)
+    raw[11] = 0x00
+    raw[12] = 0x00
+    raw[13] = b13; raw[14] = b14; raw[15] = b15
+    return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
 # MEMBAR — Memory Barrier (fence)
 # ---------------------------------------------------------------------------
 # Opcode: 0x92, 0x79 → opcode word 0x992.

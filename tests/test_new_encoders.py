@@ -16,6 +16,7 @@ from sass.encoding.sm_120_opcodes import (
     encode_f2i_u64, encode_i2f_u64,
     encode_i2f_f64_u32,
     encode_hfma2,
+    encode_omma_mxf4_f32, OMMA_MODE_2X_UE8M0, OMMA_MODE_4X_UE4M3,
 )
 
 
@@ -1024,6 +1025,144 @@ def test_hfma2_modifier_bit_isolation():
     diff = bytes(a ^ b for a, b in zip(base, nc))
     assert diff[9] == 0x10
     assert all(diff[i] == 0 for i in range(13) if i != 9)
+
+
+# ---------------------------------------------------------------------------
+# OMMA — Blackwell MXF4 FP4 block-scaled MMA, m16n8k64 (sass-king Ch 16
+# Apache-2.0 + ptxas SM_120 ground-truth probes)
+# ---------------------------------------------------------------------------
+# Probe-derived ground truth (RTX 5090, ptxas 13.2.78):
+#   _probe_landing/probe_omma.ptx     -> 2X ue8m0 baseline
+#   _probe_landing/probe_omma_4x.ptx  -> 4X ue4m3 (FP4 peak)
+#   _probe_landing/probe_omma_regs.ptx + probe_omma_sfb.ptx -> SFA/SFB layout
+#   _probe_landing/probe_omma_sparse.ptx -> .SP variant (byte[10] |= 0x01)
+
+
+def test_omma_2x_ue8m0_baseline():
+    """OMMA.SF.16864.F32.E2M1.E2M1.E8 R8, R8, R12, R16, R0, R0, URZ
+    Ground truth lo=0x7000000c0808747f hi=0x008ff60000083e10 (ctrl=0x47fb)
+    """
+    raw = encode_omma_mxf4_f32(dest=8, src_a=8, src_b=12, src_c=16,
+                                sfa=0, sfb=0,
+                                mode=OMMA_MODE_2X_UE8M0,
+                                ctrl=0x47fb)
+    lo, hi = _lo_hi(raw)
+    assert lo == 0x7000000c0808747f, f"lo={lo:#x}"
+    assert hi == 0x008ff60000083e10, f"hi={hi:#x}"
+    assert _opcode(raw) == 0x47f
+
+
+def test_omma_4x_ue4m3_peak():
+    """OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X R8, R8, R12, R16, R0, R0, URZ
+    The 900+ TFLOPS FP4 peak path — same opcode bytes as 2X, byte[10]
+    differs (0x04 vs 0x08).
+    Ground truth lo=0x7000000c0808747f hi=0x008ff60000043e10 (ctrl=0x47fb)
+    """
+    raw = encode_omma_mxf4_f32(dest=8, src_a=8, src_b=12, src_c=16,
+                                sfa=0, sfb=0,
+                                mode=OMMA_MODE_4X_UE4M3,
+                                ctrl=0x47fb)
+    lo, hi = _lo_hi(raw)
+    assert lo == 0x7000000c0808747f, f"lo={lo:#x}"
+    assert hi == 0x008ff60000043e10, f"hi={hi:#x}"
+    # byte[10] differs between 2X (0x08) and 4X (0x04); rest must match
+    base = encode_omma_mxf4_f32(dest=8, src_a=8, src_b=12, src_c=16,
+                                 sfa=0, sfb=0,
+                                 mode=OMMA_MODE_2X_UE8M0,
+                                 ctrl=0x47fb)
+    diff = bytes(a ^ b for a, b in zip(raw, base))
+    assert diff[10] == (0x04 ^ 0x08)
+    assert all(diff[i] == 0 for i in range(16) if i != 10)
+
+
+def test_omma_sfb_high_register():
+    """SFB lives in bits 52..59 (byte[6] high nibble + byte[7] low nibble).
+    Probe: SFA=R0, SFB=R19 -> byte[6]=0x30, byte[7]=0x71.
+    Full ground truth lo=0x713000100408747f hi=0x008fee0000083e08
+    (D=R8, A=R4, B=R16, C=R8, ctrl=0x77fc4).
+    """
+    raw = encode_omma_mxf4_f32(dest=8, src_a=4, src_b=16, src_c=8,
+                                sfa=0, sfb=19,
+                                mode=OMMA_MODE_2X_UE8M0,
+                                ctrl=0x47f7)
+    lo, hi = _lo_hi(raw)
+    assert lo == 0x713000100408747f, f"lo={lo:#x}"
+    assert hi == 0x008fee0000083e08, f"hi={hi:#x}"
+    # SFB=19 -> byte[6]=0x30 (low nibble 3 in high nibble), byte[7]=0x71
+    assert raw[6] == 0x30
+    assert raw[7] == 0x71
+    # SFA=0 in byte[5]; A=4 in byte[3]; B=16 in byte[4]
+    assert raw[3] == 4
+    assert raw[4] == 16
+    assert raw[5] == 0
+
+
+def test_omma_opcode_distinct_from_qmma_hmma():
+    """OMMA opcode 0x47f must differ from HMMA (0x23c) and QMMA (0x27a) —
+    the family-identifying low byte 0x7f is the sass-king Ch 16 marker."""
+    raw = encode_omma_mxf4_f32(dest=4, src_a=4, src_b=2, src_c=4)
+    assert raw[0] == 0x7f       # OMMA family low byte (vs 0x3c HMMA, 0x7a QMMA)
+    assert raw[1] == 0x74       # opcode high (vs 0x72 for HMMA/QMMA/IMMA)
+    assert _opcode(raw) == 0x47f
+
+
+def test_omma_register_field_isolation():
+    """Each register field (D, A, B, SFA, C) lives in an independent byte;
+    perturbing one must not leak into another.  SFB is a split field
+    (bits 52..59) that we test separately above.
+    """
+    base = encode_omma_mxf4_f32(dest=0, src_a=0, src_b=0, src_c=0,
+                                 sfa=0, sfb=0)
+    # D in byte[2]
+    d = encode_omma_mxf4_f32(dest=8, src_a=0, src_b=0, src_c=0)
+    diff = bytes(a ^ b for a, b in zip(d, base))
+    assert diff[2] == 8
+    assert all(diff[i] == 0 for i in range(13) if i != 2)
+    # A in byte[3]
+    a_ = encode_omma_mxf4_f32(dest=0, src_a=12, src_b=0, src_c=0)
+    diff = bytes(x ^ y for x, y in zip(a_, base))
+    assert diff[3] == 12
+    assert all(diff[i] == 0 for i in range(13) if i != 3)
+    # B in byte[4]
+    b_ = encode_omma_mxf4_f32(dest=0, src_a=0, src_b=20, src_c=0)
+    diff = bytes(x ^ y for x, y in zip(b_, base))
+    assert diff[4] == 20
+    assert all(diff[i] == 0 for i in range(13) if i != 4)
+    # SFA in byte[5]
+    s = encode_omma_mxf4_f32(dest=0, src_a=0, src_b=0, src_c=0, sfa=16)
+    diff = bytes(x ^ y for x, y in zip(s, base))
+    assert diff[5] == 16
+    assert all(diff[i] == 0 for i in range(13) if i != 5)
+    # C in byte[8]
+    c = encode_omma_mxf4_f32(dest=0, src_a=0, src_b=0, src_c=24)
+    diff = bytes(x ^ y for x, y in zip(c, base))
+    assert diff[8] == 24
+    assert all(diff[i] == 0 for i in range(13) if i != 8)
+
+
+def test_omma_sparse_flag():
+    """.SP modifier ORs 0x01 into byte[10].  Probe ground truth from
+    _probe_landing/probe_omma_sparse.ptx:
+      OMMA.SF.SP.168128.F32.E2M1.E2M1.E8 R12, R12, R16, R20, R8, R0, URZ, 0x0
+      lo=0x700008100c0c747f hi=0x010ff60000093e14
+    NB: in sparse mode byte[5] is the metadata register (per sass-king Ch 19),
+    not SFA — the encoder accepts the same parameter slot but the semantic
+    interpretation differs.  PTX-frontend wiring is deferred (see _FOLLOWUP).
+    """
+    # Pass metadata=R8 via the sfa slot, sfb=R0
+    raw = encode_omma_mxf4_f32(dest=12, src_a=12, src_b=16, src_c=20,
+                                sfa=8, sfb=0,
+                                mode=OMMA_MODE_2X_UE8M0,
+                                sparse=True,
+                                ctrl=0x47fb)
+    lo, hi = _lo_hi(raw)
+    # Ground truth control word from probe was 0x004ff6000009 (different
+    # ctrl pack); we check the first 13 bytes (opcode+operands+mode)
+    # which are control-independent.
+    assert raw[:13] == bytes([0x7f, 0x74, 0x0c, 0x0c, 0x10, 0x08, 0x00, 0x70,
+                              0x14, 0x3e, 0x09, 0x00, 0x00])
+    # byte[10] = 0x08 (2X mode) | 0x01 (sparse) = 0x09
+    assert raw[10] == 0x09
 
 
 if __name__ == '__main__':

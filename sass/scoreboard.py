@@ -1847,14 +1847,25 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
         # re-maps the overflow range 13-15 into 5-7 (valid, matches
         # ptxas's observed range).  Only LDC is affected — LDCU, S2R,
         # S2UR, ALU, etc. are untouched.
-        if opcode == 0xb82 and misc >= 0xb:
+        if opcode == 0xb82:
             # ptxas's observed misc range for LDC is 0..10 (0xa).  Empirically,
             # misc 0xc also produces an undefined opex at runtime (opex 0x1c
             # causes LAUNCH_FAILED/719) — confirmed by clz_prmt/bfx minimal
             # 0e6dcc8b on HEAD eea3523 (2026-04-20 patch_ldc_misc.py).  The
-            # earlier >= 0xd threshold missed 0xb/0xc.  Remap >= 0xb into 0..7
-            # via `& 0x7`, which stays within ptxas's observed safe range.
-            misc = misc & 0x7
+            # earlier >= 0xd threshold missed 0xb/0xc.
+            #
+            # 2026-05-04 (FB-1 fri_fold trace): the `ldc__RaRZ` opclass
+            # ALSO rejects opex=0x10 (i.e. misc=0).  fri_fold_circle has
+            # 8+ consecutive LDC.64 param loads; the misc counter wraps
+            # 7 → 0 mid-sequence, producing opex=0x10 which nvdisasm
+            # flags as "undefined value 0x10 for table 'TABLES_opex_0'
+            # at address 0x00000110".  Clamp misc=0 → 1 (matches the
+            # existing LOP3.IMM 0x812 clamp at the same opex=0x10|misc
+            # level).  Remap >= 0xb into 0..7 as before.
+            if misc == 0:
+                misc = 1
+            elif misc >= 0xb:
+                misc = misc & 0x7
         # Phase 20: S2UR (0x9c3) shares the same opex pattern as LDC.  Its
         # wdep is 0x31 (bit 0 set), so opex = 0x10 | misc.  Counter-based
         # misc values 0xd/0xe/0xf produce opex 0x1d/0x1e/0x1f, which
@@ -1864,8 +1875,16 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
         # surfaced by Phase 20's expanded LDC.64 prologue (each promoted
         # u64 param adds an LDC.64 before the S2UR, advancing the
         # counter past 0xc).  Remap to the same safe 0..7 range as LDC.
-        if opcode == 0x9c3 and misc >= 0xb:
-            misc = misc & 0x7
+        if opcode == 0x9c3:
+            # S2UR shares LDC's opex=0x10|misc structure (wdep=0x31).  Apply
+            # the same misc=0 → 1 clamp as LDC (2026-05-04) in addition to
+            # the >= 0xb remap.  Latent for S2UR until a kernel emits enough
+            # LDC.64-position-advancing instrs to push the counter through
+            # 0 at the S2UR slot.
+            if misc == 0:
+                misc = 1
+            elif misc >= 0xb:
+                misc = misc & 0x7
         # Phase 8 (LOP3.IMM opex_4 clamp): wdep=0x3f for LOP3.IMM (0x812)
         # → opex = 0x10 | misc.  Counter-based misc=0 / 0xc..0xf produces
         # opex values 0x10 / 0x1c..0x1f, which the SM_120 disassembler

@@ -834,6 +834,7 @@ def _if_convert(fn: Function) -> None:
 def compile_function(fn: Function, verbose: bool = False,
                      ptxas_meta: dict = None, sm_version: int = 120,
                      enable_dce: bool = False,
+                     enable_waw_rename: bool = False,
                      error_on_unimplemented: bool = False) -> bytes:
     """
     Compile a single PTX function/kernel to a cubin.
@@ -847,6 +848,13 @@ def compile_function(fn: Function, verbose: bool = False,
         reuse a physical register across a dead write and a subsequent
         live write, causing a hardware hazard that zeroes the live
         write's result (SHIFT_BOUNDARY and SIGN_FLIP_CHAIN clusters).
+    enable_waw_rename: when True (and enable_dce is False), runs only the
+        WAW-rename pass — splitting each multi-write vreg into fresh names
+        so single-def/single-use analyses (e.g. analyze_imad_wide_fuse)
+        can fire on non-SSA-style PTX such as FORGE-emitted wrappers.
+        Decoupled from enable_dce to avoid the DCE-breaks-emit-pattern-
+        tests problem; safe to flip on the standard compile_ptx_source
+        path because rename-only doesn't change which instructions emit.
     """
     # 0.  Optional pre-regalloc PTX-IR passes (factory/fuzzer path only).
     if enable_dce:
@@ -863,6 +871,9 @@ def compile_function(fn: Function, verbose: bool = False,
         # the earlier write a fresh name that nothing reads, so this
         # DCE pass removes it.
         _dce_run_function(fn)
+    elif enable_waw_rename:
+        from ptx.passes.waw_rename import run_function as _waw_run_function
+        _waw_run_function(fn)
 
     # Phase 40: M31 Mersenne-prime modular reduction.  Recognizes
     # `rem.u64 %d, %x, 2^31 - 1` (FORGE NTT m31_scale et al.) and

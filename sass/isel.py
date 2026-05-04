@@ -178,6 +178,93 @@ def _emit_ur_to_gpr(dest: int, ur_idx: int, comment: str = '',
     ]
 
 
+def _emit_ldc32_to_gpr(dest: int, byte_off: int,
+                       ctx: 'ISelContext',
+                       comment: str = '',
+                       ctrl: int = 0) -> list[SassInstr]:
+    """Load a 32-bit constant-bank value into a GPR.  Picks the right
+    encoding based on offset:
+
+    - **byte_off ≤ 0x3FC**: emit a single `LDC R{dest}, c[0][byte_off]`.
+      One instruction, GPR-direct.
+
+    - **byte_off > 0x3FC**: the LDC offset_word field caps at 0xFF
+      (byte_off 0x3FC).  LDCU.32 uses a split-byte encoding (b5 holds
+      bits[8:1], b4 bit 7 holds bit[0]) and reaches byte_off 0x7FC.
+      Mirror ptxas's strategy: `LDCU.32 UR_tmp, c[0][byte_off]` then
+      `MOV R{dest}, UR_tmp` to land the value in the requested GPR.
+      Allocates a UR pair from `ctx._next_ur` (advances by 2) so we
+      don't fragment into odd UR indices.
+
+    Companion of `_emit_ldc64_to_gpr_pair` for u32 params.  FB-1
+    trigger: kernels with many flattened spans push u32 params (alpha
+    coefficients, log_n, etc.) past offset 0x3FC after the prefix of
+    u64 span-flattened slots.
+    """
+    if byte_off <= 0x3FC:
+        if ctrl:
+            return [
+                SassInstr(encode_ldc(dest, 0, byte_off, ctrl=ctrl),
+                          f'LDC R{dest}, c[0][0x{byte_off:x}]'
+                          f'  // {comment or "ldc32-to-gpr"}'),
+            ]
+        return [
+            SassInstr(encode_ldc(dest, 0, byte_off),
+                      f'LDC R{dest}, c[0][0x{byte_off:x}]'
+                      f'  // {comment or "ldc32-to-gpr"}'),
+        ]
+    ur_tmp = ctx._next_ur
+    ctx._next_ur += 2
+    return [
+        SassInstr(encode_ldcu_32(ur_tmp, 0, byte_off),
+                  f'LDCU.32 UR{ur_tmp}, c[0][0x{byte_off:x}]'
+                  f'  // {comment or "ldc32-to-gpr large-offset"}'),
+        SassInstr(encode_mov_gpr_from_ur(dest, ur_tmp),
+                  f'MOV R{dest}, UR{ur_tmp}'
+                  f'  // {comment or "ldc32-to-gpr large-offset"} UR->GPR'),
+    ]
+
+
+def _emit_ldc64_to_gpr_pair(dest_lo: int, byte_off: int,
+                            ctx: 'ISelContext',
+                            comment: str = '') -> list[SassInstr]:
+    """Load a 64-bit constant-bank value into a GPR pair (dest_lo,
+    dest_lo+1).  Picks the right encoding based on the offset:
+
+    - **offset_word ≤ 0xFF (byte_off ≤ 0x3FC)**: emit a single
+      `LDC.64 R{dest_lo}, c[0][byte_off]`.  This is the fast path —
+      one instruction, GPR-direct.
+
+    - **offset_word > 0xFF (byte_off > 0x3FC)**: the LDC.64 offset
+      field truncates above 0xFF, producing invalid SASS.  Mirror
+      ptxas's strategy: emit `LDCU.64 UR_tmp, c[0][byte_off]` (qword
+      units, fits offsets up to 0x7F8) followed by `IADD.64 R,
+      RZ, UR_tmp` to land the value in the requested GPR pair.
+      Allocates a fresh UR pair from `ctx._next_ur` (advances by 2).
+
+    FB-1 trigger: FORGE-emitted wrappers with many flattened u64
+    spans (e.g. fri_fold_circle has 9 spans → 18 u64 params plus
+    extras) push kernel-arg offsets past 0x3FC.
+    """
+    if byte_off <= 0x3FC:
+        return [
+            SassInstr(encode_ldc_64(dest_lo, 0, byte_off),
+                      f'LDC.64 R{dest_lo}, c[0][0x{byte_off:x}]'
+                      f'  // {comment or "ldc64-to-gpr"}'),
+        ]
+    # Large-offset path: route through LDCU.64 + IADD.64 R, RZ, UR.
+    ur_tmp = ctx._next_ur
+    ctx._next_ur += 2
+    return [
+        SassInstr(encode_ldcu_64(ur_tmp, 0, byte_off),
+                  f'LDCU.64 UR{ur_tmp}, c[0][0x{byte_off:x}]'
+                  f'  // {comment or "ldc64-to-gpr large-offset"} (qword units)'),
+        SassInstr(encode_iadd64_ur(dest_lo, RZ, ur_tmp),
+                  f'IADD.64 R{dest_lo}, RZ, UR{ur_tmp}'
+                  f'  // {comment or "ldc64-to-gpr large-offset"} UR->GPR'),
+    ]
+
+
 def _f64_to_gpr(name: str, ctx, output: list) -> int:
     """Return the lo GPR index for an f64 register.
     If the register is GPR-backed, return it directly.
@@ -1596,10 +1683,11 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
                 and dest.name in ra.int_regs):
             dr = ctx.ra.lo(dest.name)
             ctx._gpr_written.add(dest.name)
-            return [
-                SassInstr(encode_ldc_64(dr, 0, byte_off),
-                          f'LDC.64 R{dr}, c[0][0x{byte_off:x}]  // {param_name} (tiny direct)'),
-            ]
+            # Use the offset-aware helper: small offsets stay LDC.64 R,
+            # large offsets (> 0x3FC) reroute through LDCU.64 + IADD.64.
+            return _emit_ldc64_to_gpr_pair(
+                dr, byte_off, ctx,
+                comment=f'{param_name} (tiny direct)')
         # SM_120 preamble interleaving: ALL pointer params are deferred.
         # Each add.u64 / ld.global / atom emits inline LDCU.64 UR6 + IADD.64,
         # reusing UR6 each time. No UR pressure, no clobber hazards.
@@ -1642,10 +1730,9 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
             if instr.pred or dest.name in ra.int_regs:
                 dr = ctx.ra.lo(dest.name)
                 ctx._gpr_written.add(dest.name)
-                return [
-                    SassInstr(encode_ldc_64(dr, 0, byte_off),
-                              f'LDC.64 R{dr}, c[0][0x{byte_off:x}]  // {param_name} (GPR direct)'),
-                ]
+                return _emit_ldc64_to_gpr_pair(
+                    dr, byte_off, ctx,
+                    comment=f'{param_name} (GPR direct)')
             # Preamble preload: assign UR pair, record for preamble emission.
             # The LDCU is emitted by compile_function in the preamble window.
             # Body code uses _ur_params to find the UR index.
@@ -1722,12 +1809,11 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
             if ctx.sm_version == 120 and has_bar:
                 if not hasattr(ctx, '_preamble_ldcus'):
                     ctx._preamble_ldcus = []
-                ctx._preamble_ldcus.append(
-                    SassInstr(encode_ldc(d, 0, byte_off),
-                              f'LDC R{d}, c[0][0x{byte_off:x}]  // preamble setp param'))
+                ctx._preamble_ldcus.extend(_emit_ldc32_to_gpr(
+                    d, byte_off, ctx, comment='preamble setp param'))
                 return []
-            return [SassInstr(encode_ldc(d, 0, byte_off),
-                              f'LDC R{d}, c[0][0x{byte_off:x}]  // setp param')]
+            return _emit_ldc32_to_gpr(d, byte_off, ctx,
+                                       comment='setp param')
 
         # SM_120 rule #25: body LDC (0xb82) causes ERR715 in kernels
         # with VOTE+LDG or BAR.SYNC. Load in preamble instead.
@@ -1763,13 +1849,12 @@ def _select_ld_param(instr: Instruction, ra: RegAlloc,
                     d = _r57_new
                 if not hasattr(ctx, '_preamble_ldcus'):
                     ctx._preamble_ldcus = []
-                ctx._preamble_ldcus.append(
-                    SassInstr(encode_ldc(d, 0, byte_off),
-                              f'LDC R{d}, c[0][0x{byte_off:x}]  // preamble param'))
+                ctx._preamble_ldcus.extend(_emit_ldc32_to_gpr(
+                    d, byte_off, ctx, comment='preamble param'))
             return []
         else:
-            return [SassInstr(encode_ldc(d, 0, byte_off, ctrl=0x7f1),
-                              f'LDC R{d}, c[0][0x{byte_off:x}]  // {param_name}')]
+            return _emit_ldc32_to_gpr(d, byte_off, ctx,
+                                       comment=param_name, ctrl=0x7f1)
 
 
 def _select_ld_global(instr: Instruction, ra: RegAlloc,

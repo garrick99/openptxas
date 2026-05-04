@@ -257,6 +257,15 @@ def encode_ldc(dest: int, const_bank: int, const_offset_bytes: int,
     Returns:
         16-byte little-endian instruction encoding.
 
+    Raises:
+        ValueError: when const_offset_bytes does not fit the 8-bit
+        offset_word field (i.e. when const_offset_bytes // 4 > 0xFF,
+        equivalently const_offset_bytes > 0x3FC).  ptxas avoids this
+        by routing such loads through LDCU + UMOV-to-GPR — callers
+        that hit the limit should follow the same strategy rather
+        than silently emit truncated bytes that decode to a different
+        offset at runtime.
+
     Ground truth:
         encode_ldc(1, 0, 0x37c, ctrl=0x7f1)
             -> bytes.fromhex('827b01ff00df00000008000000e20f00')
@@ -265,7 +274,14 @@ def encode_ldc(dest: int, const_bank: int, const_offset_bytes: int,
     """
     if ctrl == 0:
         ctrl = _CTRL_DEFAULT
-    offset_word = (const_offset_bytes // 4) & 0xFF
+    _word = const_offset_bytes // 4
+    if _word > 0xFF:
+        raise ValueError(
+            f'encode_ldc: const_offset_bytes 0x{const_offset_bytes:x} '
+            f'(offset_word 0x{_word:x}) exceeds the 0xFF limit of '
+            f'the 32-bit LDC offset field; route through LDCU + UMOV '
+            f'(uniform-load qword units encode up to offset 0x7F8).')
+    offset_word = _word & 0xFF
 
     # Build the 16-byte encoding.  b5 carries the word offset — _build() only
     # handles b0-b4 + b8-b11, so we patch b5 manually.
@@ -307,6 +323,17 @@ def encode_ldc_64(dest: int, const_bank: int, const_offset_bytes: int,
     Returns:
         16-byte little-endian instruction encoding.
 
+    Raises:
+        ValueError: when const_offset_bytes // 4 > 0xFF (i.e. offset
+        > 0x3FC).  Per the LDC field layout, the dword-unit offset must
+        fit in 8 bits.  Kernels with many flattened u64 params (FORGE-
+        emitted span flattening, FB-1 path) push offsets past this.
+        ptxas avoids the issue by emitting LDCU.64 (uniform load,
+        qword-unit offset → max 0x7F8) and materialising to GPR via
+        IADD.64 R, RZ, UR.  Callers that hit the limit should follow
+        the same strategy rather than silently emit a truncated offset
+        that decodes to a different runtime address.
+
     Ground truth:
         encode_ldc_64(2, 0, 0x388, ctrl=0x711)
             -> bytes.fromhex('827b02ff00e20000000a000000220e00')
@@ -315,7 +342,15 @@ def encode_ldc_64(dest: int, const_bank: int, const_offset_bytes: int,
     """
     if ctrl == 0:
         ctrl = _CTRL_DEFAULT
-    offset_word = (const_offset_bytes // 4) & 0xFF
+    _word = const_offset_bytes // 4
+    if _word > 0xFF:
+        raise ValueError(
+            f'encode_ldc_64: const_offset_bytes 0x{const_offset_bytes:x} '
+            f'(offset_word 0x{_word:x}) exceeds the 0xFF limit of '
+            f'the LDC.64 offset field; route through LDCU.64 + '
+            f'IADD.64 R, RZ, UR (uniform-load qword units encode up '
+            f'to offset 0x7F8).')
+    offset_word = _word & 0xFF
 
     raw = bytearray(_build(0x82, 0x7b,
                            b2=dest, b3=0xFF, b4=const_bank & 0xFF,

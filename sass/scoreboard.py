@@ -240,8 +240,8 @@ _OPCODES_ATOMG = {0x3a9,   # ATOMG.E.CAS.b32 / CAS.b64
 _OPCODES_LDC = {0xb82, 0x7ac, 0x919, 0x9c3,  # SM_120: LDC, LDCU, S2R, S2UR
                 0x624, 0xab9, 0xa02}           # SM_89: IMAD.MOV.U32(cbuf), ULDC.64, MOV(cbuf)
 _OPCODES_LDS = {0x984, 0x83b,  # LDS, LDSM (load shared to matrix)
-                 0x383,         # LDL [Raddr]   (no UR base, no offset)
-                 0x983}         # LDL [R+UR]    (UR base form)
+                 0x983}         # LDL (load local) — same opcode for no-UR
+                                # and +UR forms; b1 differs (0x79 in both)
 _OPCODES_STG = {0x986, 0xf9d}  # STG, SUST
 # 0x988 = STS (store shared), 0x388 = SHF.L (alias?), 0x387 = STL (store local).
 # STL and STS share the decoupled-rd-scbd dispatch class per denvdis sm120
@@ -1576,8 +1576,7 @@ _OPCODE_MISC: dict[int, int] = {
     0x988: 4,   # STS.E: misc=4
     0x387: 1,   # STL: misc=1 (mirror STG.E — local-mem stores use the
                 #   same scoreboard category and are typically counter-stable)
-    0x383: 2,   # LDL no-UR: misc=2 (mirror LDS at 0x984)
-    0x983: 2,   # LDL +UR: misc=2 (same)
+    0x983: 2,   # LDL (load local, both no-UR and +UR forms): misc=2 (mirror LDS at 0x984)
     0x225: 1,   # IMAD.WIDE R-R: misc=1
     0x825: 1,   # IMAD.WIDE R-imm: misc=1
     0xc24: 1,   # IMAD R-UR: misc=1

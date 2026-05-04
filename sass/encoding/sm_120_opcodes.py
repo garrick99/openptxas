@@ -7327,10 +7327,13 @@ def encode_stl_u32(addr_gpr: int, src_gpr: int, ctrl: int = 0) -> bytes:
 # ---------------------------------------------------------------------------
 # PTX op: ld.local.u32 %r, [%rd] → LDL Rdst, [Raddr]
 #
-# Layout mirrors STL (b0=0x83 vs 0x87 distinguishes load/store).
-# b1=0x73 for the no-UR-base no-immediate-offset form.
-# b2=Rdst, b3=Raddr, b4=0 (no UR base), b5..b7=offset (0).
-# b9=0x08 (32-bit), b10=0x10, b11=0x00.
+# Ground truth (ptxas 13.2 SM_120, _harvest probe_ldl2):
+#   LDL R9, [R0]  → 83 79 09 00 00 00 00 00 00 08 10 00 00 a2 0e 00
+#                   b0=0x83 b1=0x79 b2=R9(dst) b3=R0(addr) b4=0
+#                   b9=0x08 (32-bit) b10=0x10 b11=0x00
+#                   b13..b15=ctrl
+# Note: byte1 differs from STL (0x73 vs 0x79) — denvdis confirms LDL=0x983
+# and STL=0x387 are different opcodes despite the symmetric name pattern.
 
 def encode_ldl_u32(dst_gpr: int, addr_gpr: int, ctrl: int = 0) -> bytes:
     """LDL Rdst, [Raddr] — load 32-bit value from thread-local memory.
@@ -7341,7 +7344,7 @@ def encode_ldl_u32(dst_gpr: int, addr_gpr: int, ctrl: int = 0) -> bytes:
         ctrl:     23-bit scheduling control word (default 0x7e0).
     """
     if ctrl == 0: ctrl = _CTRL_DEFAULT
-    return _build(0x83, 0x73,
+    return _build(0x83, 0x79,
                   b2=dst_gpr, b3=addr_gpr, b4=0x00,
                   b8=0x00,
                   b9=0x08, b10=0x10, b11=0x00,

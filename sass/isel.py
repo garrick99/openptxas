@@ -832,34 +832,44 @@ def analyze_imad_wide_fuse(fn) -> dict:
             if K == 0 or (K >> 32) != 0:
                 continue
             mul_dest = inst.dest.name
-            if def_count.get(mul_dest, 0) != 1:
-                continue
-            if use_count.get(mul_dest, 0) != 1:
-                continue
             if not _idx_hi_zero(idx_op.name):
                 continue
-            # The single use must be an add.u64/s64/b64 in the same BB,
-            # immediately following or close after the mul.
+            # Local live-range walk replaces the global def_count/use_count
+            # checks (which were too conservative for non-SSA PTX such as
+            # FORGE-emitted wrappers, where vreg names are heavily reused).
+            #
+            # The window of interest for our shl/mul value is [i+1, next_def
+            # of %mul_dest), i.e. until %mul_dest is reassigned (or end of
+            # BB).  Within that window, %mul_dest must have exactly one
+            # reader — the candidate add — for the fusion to be safe.
+            # Multiple readers would all observe our value, and dropping the
+            # shl/mul emit would break the other readers (FG-2.2 alias
+            # invariant catches this on ilp_dual_int64).
             if i + 1 >= len(instrs):
                 continue
-            # Find the add.u64 use within this BB.  Walk forward; if the
-            # mul dest appears in any *non*-add instruction, bail.
-            add_inst = None
+            # Find end of live range: position of next write of mul_dest.
+            end_pos = len(instrs)
             for j in range(i + 1, len(instrs)):
-                later = instrs[j]
-                # Check if `later` reads mul_dest.
-                reads_md = any(
-                    isinstance(s, RegOp) and s.name == mul_dest
-                    for s in (later.srcs or []))
-                if reads_md:
-                    if (later.op == 'add'
-                            and any(t in ('u64', 's64', 'b64') for t in (later.types or ()))
-                            and isinstance(later.dest, RegOp)
-                            and len(later.srcs or []) == 2):
-                        add_inst = later
+                if (isinstance(instrs[j].dest, RegOp)
+                        and instrs[j].dest.name == mul_dest):
+                    end_pos = j
                     break
-            if add_inst is None:
+            # Collect readers of mul_dest in [i+1, end_pos).
+            readers = []
+            for j in range(i + 1, end_pos):
+                later = instrs[j]
+                if any(isinstance(s, RegOp) and s.name == mul_dest
+                       for s in (later.srcs or [])):
+                    readers.append(later)
+            if len(readers) != 1:
                 continue
+            cand_add = readers[0]
+            if not (cand_add.op == 'add'
+                    and any(t in ('u64', 's64', 'b64') for t in (cand_add.types or ()))
+                    and isinstance(cand_add.dest, RegOp)
+                    and len(cand_add.srcs or []) == 2):
+                continue
+            add_inst = cand_add
             a, b = add_inst.srcs[0], add_inst.srcs[1]
             base = None
             if isinstance(a, RegOp) and a.name == mul_dest and isinstance(b, RegOp):
@@ -870,6 +880,22 @@ def analyze_imad_wide_fuse(fn) -> dict:
                 continue
             # Base must be u64 — Forge convention: %rdN.
             if not base.startswith('%rd'):
+                continue
+            # Condition 4: no intervening write of base between inst and add.
+            j_add = None
+            for j2 in range(i + 1, len(instrs)):
+                if instrs[j2] is add_inst:
+                    j_add = j2
+                    break
+            base_clobbered = False
+            if j_add is not None:
+                for j2 in range(i + 1, j_add):
+                    later = instrs[j2]
+                    if (isinstance(later.dest, RegOp)
+                            and later.dest.name == base):
+                        base_clobbered = True
+                        break
+            if base_clobbered:
                 continue
             fuse_map[id(inst)] = (idx_op.name, K, base, add_inst.dest.name,
                                   id(add_inst), dead_mov_id)

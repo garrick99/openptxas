@@ -239,9 +239,15 @@ _OPCODES_ATOMG = {0x3a9,   # ATOMG.E.CAS.b32 / CAS.b64
                  0x9a3}   # ATOMG.E.ADD.F32
 _OPCODES_LDC = {0xb82, 0x7ac, 0x919, 0x9c3,  # SM_120: LDC, LDCU, S2R, S2UR
                 0x624, 0xab9, 0xa02}           # SM_89: IMAD.MOV.U32(cbuf), ULDC.64, MOV(cbuf)
-_OPCODES_LDS = {0x984, 0x83b}  # LDS, LDSM (load shared to matrix)
+_OPCODES_LDS = {0x984, 0x83b,  # LDS, LDSM (load shared to matrix)
+                 0x383,         # LDL [Raddr]   (no UR base, no offset)
+                 0x983}         # LDL [R+UR]    (UR base form)
 _OPCODES_STG = {0x986, 0xf9d}  # STG, SUST
-_OPCODES_STS = {0x988, 0x388}
+# 0x988 = STS (store shared), 0x388 = SHF.L (alias?), 0x387 = STL (store local).
+# STL and STS share the decoupled-rd-scbd dispatch class per denvdis sm120
+# (CLASS "stl_*" / "sts_*" both INST_TYPE_DECOUPLED_RD_SCBD), so they live
+# under the same scoreboard category.
+_OPCODES_STS = {0x988, 0x388, 0x387}
 _OPCODES_BAR = {0xb1d, 0x941}  # BAR.SYNC + BSYNC
 _OPCODES_DFPU  = {0x229, 0x228, 0x22b, 0xc2b}  # DADD, DMUL, DFMA (R-R b1=0x72), DFMA-UR-UR (b1=0x7c)
 _OPCODES_DSETP = {0x22a}                 # DSETP (FP64 compare → predicate; reads pairs, no GPR dest)
@@ -1568,6 +1574,10 @@ _OPCODE_MISC: dict[int, int] = {
     0x806: 5,   # VOTE: misc=5 (ptxas-verified on b24a5fa6 vote+IADD3 kernel)
     0x986: 1,   # STG.E: misc=1 (from ptxas ground truth)
     0x988: 4,   # STS.E: misc=4
+    0x387: 1,   # STL: misc=1 (mirror STG.E — local-mem stores use the
+                #   same scoreboard category and are typically counter-stable)
+    0x383: 2,   # LDL no-UR: misc=2 (mirror LDS at 0x984)
+    0x983: 2,   # LDL +UR: misc=2 (same)
     0x225: 1,   # IMAD.WIDE R-R: misc=1
     0x825: 1,   # IMAD.WIDE R-imm: misc=1
     0xc24: 1,   # IMAD R-UR: misc=1

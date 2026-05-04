@@ -4699,6 +4699,42 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         output.append(SassInstr(encode_lds(dest_r, 4, 0),
                                                 f'LDS R{dest_r}, [UR4+0x0]  // ld.shared'))
 
+                elif op == 'st' and 'local' in instr.types:
+                    # st.local.u32 [%rd], %r → STL [Raddr], Rsrc.
+                    # Address is the low 32 bits of the u64 reg pair (local
+                    # memory is byte-addressed within thread-local space,
+                    # so high 32 bits of the address are zero).
+                    from ptx.ir import MemOp
+                    from sass.encoding.sm_120_opcodes import encode_stl_u32
+                    addr_op = instr.srcs[0]
+                    data_op = instr.srcs[1]
+                    data_r = ctx.ra.r32(data_op.name) if isinstance(data_op, RegOp) else RZ
+                    if isinstance(addr_op, MemOp) and addr_op.base.startswith('%'):
+                        addr_r = ctx.ra.lo(addr_op.base)
+                        output.append(SassInstr(
+                            encode_stl_u32(addr_r, data_r),
+                            f'STL [R{addr_r}], R{data_r}  // st.local.u32'))
+                    else:
+                        output.append(SassInstr(
+                            encode_stl_u32(RZ, data_r),
+                            f'STL [RZ], R{data_r}  // st.local.u32 (no base)'))
+
+                elif op == 'ld' and 'local' in instr.types:
+                    # ld.local.u32 %r, [%rd] → LDL Rdst, [Raddr].
+                    from ptx.ir import MemOp
+                    from sass.encoding.sm_120_opcodes import encode_ldl_u32
+                    dest_r = ctx.ra.r32(instr.dest.name)
+                    addr_op = instr.srcs[0]
+                    if isinstance(addr_op, MemOp) and addr_op.base.startswith('%'):
+                        addr_r = ctx.ra.lo(addr_op.base)
+                        output.append(SassInstr(
+                            encode_ldl_u32(dest_r, addr_r),
+                            f'LDL R{dest_r}, [R{addr_r}]  // ld.local.u32'))
+                    else:
+                        output.append(SassInstr(
+                            encode_ldl_u32(dest_r, RZ),
+                            f'LDL R{dest_r}, [RZ]  // ld.local.u32 (no base)'))
+
                 elif op == 'bar':
                     # SM_120: BSYNC before BAR.SYNC for shared memory visibility
                     _has_sts_in_kernel = any(

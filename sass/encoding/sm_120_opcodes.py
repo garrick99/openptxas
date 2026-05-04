@@ -7291,3 +7291,59 @@ def encode_fsetp_ur(pred_dest: int, gpr_src: int, ur_src: int, cmp: int = FSETP_
     raw[11] = 0x0b  # R-UR flag
     raw[13], raw[14], raw[15] = b13, b14, b15
     return bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# STL — Store to thread-local memory (32-bit)
+# ---------------------------------------------------------------------------
+# PTX op: st.local.u32 [%rd], %r → STL [Raddr], Rsrc
+#
+# Ground truth (ptxas 13.2 SM_120, _harvest probe_local2):
+#   STL [R1], R2  → 87 73 00 01 02 00 00 00 00 08 10 00 00 d8 41 00
+#                   b0=0x87 b1=0x73 b2=0 (no dst) b3=R1(addr) b4=R2(src)
+#                   b5..b7=0 (offset = 0)
+#                   b8=0 b9=0x08 (32-bit size) b10=0x10 b11=0 (no UR-base)
+#                   b13..b15=ctrl
+# UR-base form (b1=0x79) and immediate-offset form not yet supported.
+
+def encode_stl_u32(addr_gpr: int, src_gpr: int, ctrl: int = 0) -> bytes:
+    """STL [Raddr], Rsrc — store 32-bit value to thread-local memory.
+
+    Args:
+        addr_gpr: GPR holding the local-memory byte address.
+        src_gpr:  GPR holding the value to store.
+        ctrl:     23-bit scheduling control word (default 0x7e0).
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x87, 0x73,
+                  b2=0x00, b3=addr_gpr, b4=src_gpr,
+                  b8=0x00,
+                  b9=0x08, b10=0x10, b11=0x00,
+                  ctrl=ctrl)
+
+
+# ---------------------------------------------------------------------------
+# LDL — Load from thread-local memory (32-bit)
+# ---------------------------------------------------------------------------
+# PTX op: ld.local.u32 %r, [%rd] → LDL Rdst, [Raddr]
+#
+# Layout mirrors STL (b0=0x83 vs 0x87 distinguishes load/store).
+# b1=0x73 for the no-UR-base no-immediate-offset form.
+# b2=Rdst, b3=Raddr, b4=0 (no UR base), b5..b7=offset (0).
+# b9=0x08 (32-bit), b10=0x10, b11=0x00.
+
+def encode_ldl_u32(dst_gpr: int, addr_gpr: int, ctrl: int = 0) -> bytes:
+    """LDL Rdst, [Raddr] — load 32-bit value from thread-local memory.
+
+    Args:
+        dst_gpr:  Destination GPR.
+        addr_gpr: GPR holding the local-memory byte address.
+        ctrl:     23-bit scheduling control word (default 0x7e0).
+    """
+    if ctrl == 0: ctrl = _CTRL_DEFAULT
+    return _build(0x83, 0x73,
+                  b2=dst_gpr, b3=addr_gpr, b4=0x00,
+                  b8=0x00,
+                  b9=0x08, b10=0x10, b11=0x00,
+                  ctrl=ctrl)
+

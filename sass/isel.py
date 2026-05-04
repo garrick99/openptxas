@@ -5294,10 +5294,10 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 ctx._zero_regs.add(d_lo+1)
                                 # Phase 30 Part C: zero-ext via MOV (0x802) not
                                 # IADD3 (0x810).  ptxas emits MOV R_hi, RZ for
-                                # cvt.u64.u32 hi-zero; this is also strictly
-                                # safer (no P0 clobber).
+                                # cvt.u64.u32 hi-zero (reg-form, b1=0x72), not
+                                # MOV R_hi, 0x0 (imm-form, b1=0x78).
                                 output.append(SassInstr(
-                                    encode_mov_imm(d_lo+1, 0),
+                                    encode_mov(d_lo+1, RZ),
                                     f'MOV R{d_lo+1}, RZ  // cvt.64.32 hi=0 (CSE)'))
                                 # Record for IMAD.WIDE fusion (CSE path)
                                 if not hasattr(ctx, '_cvt_src_map'):
@@ -5317,7 +5317,9 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 output.append(SassInstr(encode_iadd3(d_lo, s_r, RZ, RZ),
                                                         f'MOV R{d_lo}, R{s_r}  // cvt.64.32 lo'))
                             # Phase 30 Part C: MOV (0x802) instead of IADD3 (0x810).
-                            output.append(SassInstr(encode_mov_imm(d_lo+1, 0),
+                            # Use reg-form MOV from RZ (b1=0x72) to match ptxas,
+                            # not imm-form MOV with imm=0 (b1=0x78).
+                            output.append(SassInstr(encode_mov(d_lo+1, RZ),
                                                     f'MOV R{d_lo+1}, RZ  // cvt.64.32 hi=0'))
                         elif _is_64_dst and any(t == 's32' for t in instr.types[1:]):
                             # Sign-extend s32 → s64/u64/b64

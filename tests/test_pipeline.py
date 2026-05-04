@@ -497,13 +497,15 @@ def test_cvt_same_width_compiles():
     text = elf.section_data('.text.cvt_kernel')
     opcodes = [struct.unpack_from('<Q', text, off)[0] & 0xFFF
                for off in range(0, len(text), 16)]
-    # IADD3 (0x210) or MOV-imm (0x802) used as MOV — must appear.
-    # Phase 30 swapped cvt.u64.u32 hi-zero from IADD3 → MOV-imm; the
-    # cvt.s32.u32 same-width path may also alias to NOP, so this test
-    # accepts either opcode as evidence the cvt produced real code.
-    assert 0x210 in opcodes or 0x802 in opcodes, (
-        "Neither IADD3 (0x210) nor MOV-imm (0x802) found — "
-        "cvt produced no reg-write")
+    # IADD3 (0x210), MOV-imm (0x802), or MOV-reg (0x202) used as MOV
+    # — must appear.  Phase 30 swapped cvt.u64.u32 hi-zero from IADD3 →
+    # MOV-imm; Phase 45 (Change D) further swapped to MOV-reg-from-RZ
+    # to match ptxas's encoding (b1=0x72 vs 0x78).  The cvt.s32.u32
+    # same-width path may also alias to NOP, so this test accepts any
+    # of the three opcodes as evidence the cvt produced real code.
+    assert 0x210 in opcodes or 0x802 in opcodes or 0x202 in opcodes, (
+        "None of IADD3 (0x210) / MOV-imm (0x802) / MOV-reg (0x202) found "
+        "— cvt produced no reg-write")
 
 
 def test_cvt_u64_u32_compiles():

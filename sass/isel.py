@@ -792,21 +792,43 @@ def analyze_imad_wide_fuse(fn) -> dict:
     for bb in fn.blocks:
         instrs = bb.instructions
         for i, inst in enumerate(instrs):
-            if inst.op != 'mul' or 'lo' not in (inst.types or ()):
-                continue
-            if not any(t == 'u64' for t in (inst.types or ())):
-                continue
+            # Two equivalent patterns — both produce (idx * K) feeding an add:
+            #   mul.lo.u64 %M, %I, IMM_K  → K is the immediate
+            #   shl.b64    %M, %I, IMM_S  → K = (1 << IMM_S) (Phase-FB1 SHF→IMAD.WIDE
+            #   fusion).  shl is the address-arithmetic form Forge emits for
+            #   `addr = base + idx * 4` / `* 8` etc.; without folding into
+            #   IMAD.WIDE we lower it as SHF.L.U32 + SHF.L.U64.HI, which then
+            #   needs IADD3 + IADD3.X for the add — 4 instructions vs ptxas's 1.
             if not isinstance(inst.dest, RegOp):
                 continue
             if len(inst.srcs or []) < 2:
                 continue
-            idx_op, k_op = inst.srcs[0], inst.srcs[1]
+            idx_op = inst.srcs[0]
             if not isinstance(idx_op, RegOp):
                 continue
-            kc = _resolve_u64_const(k_op)
-            if kc is None:
+            K = None
+            dead_mov_id = None
+            if (inst.op == 'mul'
+                    and 'lo' in (inst.types or ())
+                    and any(t == 'u64' for t in (inst.types or ()))):
+                kc = _resolve_u64_const(inst.srcs[1])
+                if kc is None:
+                    continue
+                K, dead_mov_id = kc
+            elif (inst.op == 'shl'
+                    and any(t in ('b64', 'u64', 's64') for t in (inst.types or ()))):
+                k_op = inst.srcs[1]
+                if not isinstance(k_op, ImmOp):
+                    continue
+                shift_K = k_op.value
+                # PTX shift amount for 64-bit ops fits in [0, 63]; only
+                # shifts that keep (1<<K) within u32 (i.e. K <= 31) can be
+                # folded into IMAD.WIDE.U32, whose multiplicand field is u32.
+                if shift_K <= 0 or shift_K > 31:
+                    continue
+                K = 1 << shift_K
+            else:
                 continue
-            K, dead_mov_id = kc
             if K == 0 or (K >> 32) != 0:
                 continue
             mul_dest = inst.dest.name
@@ -853,6 +875,63 @@ def analyze_imad_wide_fuse(fn) -> dict:
                                   id(add_inst), dead_mov_id)
 
     return fuse_map
+
+
+def _emit_imad_wide_fused(instr, ctx, output, op_label: str = 'fused') -> bool:
+    """If `instr` is in ctx._imad_wide_fuse_map, emit the fused
+    IMAD.WIDE.U32 sequence (replacing both the producer of idx*K and the
+    downstream add.u64) and return True; the caller skips the default
+    lowering.  Returns False otherwise.
+
+    The fuse map is pre-computed in analyze_imad_wide_fuse and matches
+    either:
+      mul.lo.u64 %M, %I, IMM_K     (K = IMM_K)
+      shl.b64    %M, %I, IMM_S     (K = 1 << IMM_S)
+    followed in the same basic block by:
+      add.u64    %F, %B, %M        (or symmetric)
+    where %M is single-def / single-use and %I has zero-extended high.
+    """
+    _fuse_map = getattr(ctx, '_imad_wide_fuse_map', {})
+    if id(instr) not in _fuse_map:
+        return False
+    (_idx_name, _K, _base_name, _fused_dest_name,
+     _add_id, _dead_mov_id) = _fuse_map[id(instr)]
+    _idx_lo = ctx.ra.lo(_idx_name)
+    _final_lo = ctx.ra.lo(_fused_dest_name)
+    _gw = getattr(ctx, '_gpr_written', set())
+    _ur = getattr(ctx, '_ur_params', {})
+    if (_base_name not in _ur) or (_base_name in _gw):
+        # Already GPR-resident (or never UR-bound).
+        _base_lo = ctx.ra.lo(_base_name)
+    else:
+        # UR-only: materialize via 2 MOV R,UR (amortized across later
+        # uses since we update _gpr_written).
+        _ur_base = _ur[_base_name]
+        _tmp_lo = _alloc_gpr_pair(ctx)
+        output.append(SassInstr(
+            encode_mov_gpr_from_ur(_tmp_lo, _ur_base),
+            f'MOV R{_tmp_lo}, UR{_ur_base}  '
+            f'// {op_label}: materialize {_base_name}.lo for IMAD.WIDE.U32'))
+        output.append(SassInstr(
+            encode_mov_gpr_from_ur(_tmp_lo + 1, _ur_base + 1),
+            f'MOV R{_tmp_lo+1}, UR{_ur_base+1}  '
+            f'// {op_label}: materialize {_base_name}.hi for IMAD.WIDE.U32'))
+        ctx.ra.int_regs[_base_name] = _tmp_lo
+        if hasattr(ctx, '_gpr_written'):
+            ctx._gpr_written.add(_base_name)
+        _base_lo = _tmp_lo
+    output.append(SassInstr(
+        encode_imad_wide_u32_imm(_final_lo, _idx_lo, _K, _base_lo),
+        f'IMAD.WIDE.U32 R{_final_lo}, R{_idx_lo}, 0x{_K:x}, R{_base_lo}'
+        f'  // {op_label}'))
+    if hasattr(ctx, '_gpr_written'):
+        ctx._gpr_written.add(_fused_dest_name)
+    if not hasattr(ctx, '_skip_instrs'):
+        ctx._skip_instrs = set()
+    ctx._skip_instrs.add(_add_id)
+    # _dead_mov_id (if present) is already in _skip_instrs via
+    # pipeline.compile_function pre-population.
+    return True
 
 
 def _alloc_gpr_pair(ctx: 'ISelContext') -> int:
@@ -3556,6 +3635,12 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                             f'SHF.L.U32.HI R{d}, R{s}, 0x{k:x}, R{s}  // rot.b32 {k} (Phase 11)'))
 
                 elif op == 'shl' and typ in ('b64', 'u64', 's64'):
+                    # FB-1 SHF→IMAD.WIDE fusion: when this shl feeds an
+                    # add.u64 (single-use, zero-ext idx) it lowers to a single
+                    # IMAD.WIDE.U32 instead of SHF.L.U32+SHF.L.U64.HI+IADD3+
+                    # IADD3.X.  See analyze_imad_wide_fuse / _emit_imad_wide_fused.
+                    if _emit_imad_wide_fused(instr, ctx, output, op_label='shl.b64+add.u64'):
+                        continue
                     output.extend(_select_shl_b64(instr, ctx.ra, ctx, output))
 
                 elif op == 'shl' and typ in ('b32', 'u32', 's32'):
@@ -4410,52 +4495,13 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             f'IMAD R{d}, R{a}, R{b}, RZ  // mul.lo.{typ} R-R'))
 
                 elif op == 'mul' and 'lo' in instr.types and typ in ('u64', 's64', 'b64'):
-                    # Phase 19v2: fuse `mul.lo.u64 %M, %I, K + add.u64 %F, %B, %M`
-                    # into a single IMAD.WIDE.U32 %F, %I_lo, K, %B.  Pre-computed
-                    # by analyze_imad_wide_fuse.  Saves 3 instructions per
-                    # address-arithmetic site (IADD3 imm.lo + IADD3 imm.hi +
-                    # IADD.64 R-UR collapsed into one IMAD.WIDE.U32).
-                    _fuse_map = getattr(ctx, '_imad_wide_fuse_map', {})
-                    if id(instr) in _fuse_map:
-                        (_idx_name, _K, _base_name, _fused_dest_name,
-                         _add_id, _dead_mov_id) = _fuse_map[id(instr)]
-                        _idx_lo = ctx.ra.lo(_idx_name)
-                        _final_lo = ctx.ra.lo(_fused_dest_name)
-                        _gw = getattr(ctx, '_gpr_written', set())
-                        _ur = getattr(ctx, '_ur_params', {})
-                        _base_lo = None
-                        if (_base_name not in _ur) or (_base_name in _gw):
-                            # Already GPR-resident (or never UR-bound).
-                            _base_lo = ctx.ra.lo(_base_name)
-                        else:
-                            # UR-only: materialize via 2 MOV R,UR (amortized
-                            # across later uses since we update _gpr_written).
-                            _ur_base = _ur[_base_name]
-                            _tmp_lo = _alloc_gpr_pair(ctx)
-                            output.append(SassInstr(
-                                encode_mov_gpr_from_ur(_tmp_lo, _ur_base),
-                                f'MOV R{_tmp_lo}, UR{_ur_base}  '
-                                f'// P19v2: materialize {_base_name}.lo for IMAD.WIDE.U32'))
-                            output.append(SassInstr(
-                                encode_mov_gpr_from_ur(_tmp_lo + 1, _ur_base + 1),
-                                f'MOV R{_tmp_lo+1}, UR{_ur_base+1}  '
-                                f'// P19v2: materialize {_base_name}.hi for IMAD.WIDE.U32'))
-                            ctx.ra.int_regs[_base_name] = _tmp_lo
-                            if hasattr(ctx, '_gpr_written'):
-                                ctx._gpr_written.add(_base_name)
-                            _base_lo = _tmp_lo
-                        output.append(SassInstr(
-                            encode_imad_wide_u32_imm(_final_lo, _idx_lo, _K, _base_lo),
-                            f'IMAD.WIDE.U32 R{_final_lo}, R{_idx_lo}, 0x{_K:x}, R{_base_lo}'
-                            f'  // P19v2: fused mul.lo.u64+add.u64'))
-                        if hasattr(ctx, '_gpr_written'):
-                            ctx._gpr_written.add(_fused_dest_name)
-                        if not hasattr(ctx, '_skip_instrs'):
-                            ctx._skip_instrs = set()
-                        ctx._skip_instrs.add(_add_id)
-                        # Note: _dead_mov_id is already in _skip_instrs (pre-
-                        # populated by pipeline.compile_function) so the mov
-                        # was skipped before reaching this point.
+                    # Phase 19v2 / FB-1: fuse `(mul.lo.u64 | shl.b64) %M, %I, K
+                    # + add.u64 %F, %B, %M` into a single IMAD.WIDE.U32
+                    # %F, %I_lo, K, %B.  Pre-computed by analyze_imad_wide_fuse
+                    # (now matches both mul and shl forms — shl K folds with
+                    # multiplicand 1<<K).  Saves 3+ instructions per
+                    # address-arithmetic site.
+                    if _emit_imad_wide_fused(instr, ctx, output, op_label='mul.lo.u64+add.u64'):
                         continue
 
                     # mul.lo.u64 d, a, b = lower 64 bits of a * b
